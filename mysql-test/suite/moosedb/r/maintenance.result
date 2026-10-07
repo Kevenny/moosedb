@@ -30,7 +30,7 @@ CHECK TABLE t;
 Table	Op	Msg_type	Msg_text
 test.t	check	Warning	MooseDB: 1 corrupt chunk(s): chunk_X.tfl: test.t/chunk_X.tfl checksum mismatch
 test.t	check	error	Corrupt
-SELECT SUM(v) FROM t;
+SELECT SUM(v), MIN(ts) FROM t;
 ERROR HY000: Table 't' is marked as crashed and should be repaired
 DROP TABLE t;
 # A corrupt NEWEST chunk is quarantined (.tfl.corrupt) when the table

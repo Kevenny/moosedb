@@ -257,6 +257,19 @@ Segmento cifrado só com header não exige a chave no replay.
   Para não ver um statement pela metade, o handler relê a versão depois de
   abrir o scan e refaz se ela mudou; após 16 tentativas (ou erro), abre o
   scan sem filtro de séries — correto, pois o servidor avalia o WHERE inteiro.
+* **Leitura colunar, projetada e em lote**: o scan recebe as colunas
+  pedidas (o handler deriva do `read_set`) e só elas são decodificadas; cada
+  série vira colunas tipadas e as linhas são emitidas em lotes colunares
+  reutilizáveis (`moosedb_scan_next_batch` / `prev_batch`), sem alocação por
+  linha. Dentro da série (ordenada por ts — fora de ordem é `Corrupt`), o
+  intervalo de tempo é achado por busca binária e as demais colunas são
+  decodificadas só até o fim dele. Medido no core (2M linhas): full scan de
+  135 → 5 ns/linha; range de 1 h em chunk de 1 dia, 236 → 6 ms.
+  Consequência: uma consulta só detecta corrupção nos blocos que lê (ex.:
+  `SUM(v)` não acusa um bloco de `ts` danificado); `CHECK TABLE` continua
+  verificando o CRC de todos os blocos. Colunas virtuais, comandos que não
+  são SELECT e `read_set` ampliado após a abertura usam a linha inteira;
+  `rnd_pos` sempre devolve a linha inteira.
 * **Full scan**: chunk por chunk, série por série (blocos lidos sob demanda,
   via cache LRU), e por fim a MemTable.
 * **Scan por índice** (`index_read_map`, `index_first/last`, `ORDER BY ts`):
@@ -348,6 +361,7 @@ v3. Salvaguardas atuais:
 | 23 | `RETENTION_PERIOD` / `HOT_THRESHOLD` sem limite | ≤ 10 000 anos; cálculo de cutoff saturante | Períodos absurdos estouravam a aritmética e geravam cutoff no futuro (retenção apagaria tudo). |
 | 24 | — (isolamento não especificado) | atomicidade por statement: linhas de um statement aparecem todas de uma vez; crash no meio não deixa nada; sem MVCC nem transações multi-statement | Leituras nunca veem statements parciais; MVCC completo não se justifica com dados imutáveis. Erro no meio do statement mantém as linhas já inseridas (coerente com o binlog de engine não transacional). |
 | 25 | Entrada do WAL única | WAL v2 com `ROW`/`COMMIT`/`ROW_COMMIT`; MANIFEST v2 com `replay_seq` | Necessário para a atomicidade por statement com escritores concorrentes. v1 continua legível. |
+| 26 | Leitura linha a linha | leitura colunar projetada e em lote pela FFI (`TFBatch`), poda por ts dentro da série | O custo dominante era montar linhas (4 mallocs/linha), não decodificar. |
 
 ## Limitações conhecidas
 

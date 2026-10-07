@@ -96,6 +96,31 @@ void micros_to_time(longlong us, MYSQL_TIME *lt)
   lt->time_type= MYSQL_TIMESTAMP_DATETIME;
 }
 
+/*
+  micros_to_time() with a one-day cache: consecutive rows of a scan usually
+  share the day, which saves civil_from_days() (a dozen divisions) per row.
+*/
+void micros_to_time_cached(longlong us, MYSQL_TIME *lt, longlong *cday,
+                           longlong *cy, unsigned *cm, unsigned *cd)
+{
+  const longlong days= floor_div(us, MICROS_PER_DAY);
+  const longlong tod= us - days * MICROS_PER_DAY;
+  if (days != *cday)
+  {
+    civil_from_days(days, cy, cm, cd);
+    *cday= days;
+  }
+  memset(lt, 0, sizeof(*lt));
+  lt->year= (uint) *cy;
+  lt->month= *cm;
+  lt->day= *cd;
+  lt->hour= (uint) (tod / (3600 * MICROS_PER_SEC));
+  lt->minute= (uint) (tod / (60 * MICROS_PER_SEC) % 60);
+  lt->second= (uint) (tod / MICROS_PER_SEC % 60);
+  lt->second_part= (ulong) (tod % MICROS_PER_SEC);
+  lt->time_type= MYSQL_TIMESTAMP_DATETIME;
+}
+
 bool is_tag_comment(const LEX_CSTRING &c)
 {
   const char *s= c.str, *e= c.str + c.length;
@@ -1020,6 +1045,147 @@ int ha_moosedb::fill_record(uchar *buf, const TFRow &row)
   return 0;
 }
 
+/*
+  Fills the record from row `row` of the current batch. Only the columns the
+  scan was asked for (`active_cols_`) are written; the null bits of the
+  others come from `null_template_` (unrequested nullable fields read NULL).
+*/
+int ha_moosedb::fill_from_batch(uchar *buf, uint32_t row)
+{
+  assert(table);
+  if (!table || !share_ || !buf)
+    return HA_ERR_INTERNAL_ERROR;
+  const tf_layout &l= share_->layout;
+  if (row >= bat_rows_ || !bat_.columns || bat_.col_count != l.columns.size())
+    return HA_ERR_INTERNAL_ERROR;
+  const size_t nb= table->s->null_bytes;
+  if (null_template_.size() == nb)
+    memcpy(buf, null_template_.data(), nb);
+  else
+    memset(buf, 0, nb);
+  const my_ptrdiff_t diff= buf - table->record[0];
+  if (buf != tag_buf_)
+  {
+    std::fill(tag_last_ok_.begin(), tag_last_ok_.end(), 0);
+    tag_buf_= buf;
+  }
+  MY_BITMAP *old_map= dbug_tmp_use_all_columns(table, &table->write_set);
+  int rc= 0;
+
+  for (const uint32_t ci : active_cols_)
+  {
+    if (ci >= l.columns.size() || ci >= tag_last_ok_.size() ||
+        ci >= tag_last_start_.size() || ci >= tag_last_len_.size() || ci >= tag_snap_.size())
+    {
+      rc= HA_ERR_INTERNAL_ERROR;
+      break;
+    }
+    const tf_column &c= l.columns[ci];
+    const TFColumnBatch &cb= bat_.columns[ci];
+    if (c.field_index >= table->s->fields || !table->field[c.field_index])
+    {
+      rc= HA_ERR_INTERNAL_ERROR;
+      break;
+    }
+    Field *f= table->field[c.field_index];
+    f->move_field_offset(diff);
+    if (cb.nulls && cb.nulls[row])
+    {
+      f->set_null();
+      f->reset();
+      tag_last_ok_[ci]= 0;
+      f->move_field_offset(-diff);
+      continue;
+    }
+    f->set_notnull();
+    switch (c.conv) {
+    case tf_conv::DATETIME:
+    case tf_conv::TIMESTAMP:
+    case tf_conv::INT:
+    {
+      if (!cb.values)
+      {
+        rc= HA_ERR_INTERNAL_ERROR;
+        break;
+      }
+      const int64_t x= static_cast<const int64_t *>(cb.values)[row];
+      if (c.conv == tf_conv::DATETIME)
+      {
+        MYSQL_TIME lt;
+        micros_to_time_cached(x, &lt, &cached_day_, &cached_y_, &cached_m_,
+                              &cached_d_);
+        f->store_time_dec(&lt, f->decimals());
+      }
+      else if (c.conv == tf_conv::TIMESTAMP)
+      {
+        const longlong secs= floor_div(x, MICROS_PER_SEC);
+        f->store_timestamp((my_time_t) secs, (ulong) (x - secs * MICROS_PER_SEC));
+      }
+      else
+        f->store(x, f->is_unsigned());
+      break;
+    }
+    case tf_conv::FLOAT:
+      if (!cb.values)
+        rc= HA_ERR_INTERNAL_ERROR;
+      else
+        f->store((double) static_cast<const float *>(cb.values)[row]);
+      break;
+    case tf_conv::DOUBLE:
+      if (!cb.values)
+        rc= HA_ERR_INTERNAL_ERROR;
+      else
+        f->store(static_cast<const double *>(cb.values)[row]);
+      break;
+    case tf_conv::DECIMAL:
+    case tf_conv::STRING:
+    case tf_conv::TAG:
+    {
+      if (!cb.starts || !cb.lens)
+      {
+        rc= HA_ERR_INTERNAL_ERROR;
+        break;
+      }
+      const uint32_t st= cb.starts[row], len= cb.lens[row];
+      if (len != 0 && !cb.data)
+      {
+        rc= HA_ERR_INTERNAL_ERROR;
+        break;
+      }
+      /*
+        TAG rows of one series run share `starts`. The store is skipped only
+        when the Field in *this* record buffer still holds exactly the bytes
+        the previous store produced (checked against a snapshot of them), so
+        a server that overwrote the buffer in between (outer-join NULL row,
+        restore_record, ...) always gets a fresh store.
+      */
+      const enum_field_types rt= f->real_type();
+      const bool memo= c.conv == tf_conv::TAG &&
+                       (rt == MYSQL_TYPE_VARCHAR || rt == MYSQL_TYPE_STRING) &&
+                       f->pack_length() <= 1024;
+      if (memo && tag_last_ok_[ci] && tag_last_start_[ci] == st && tag_last_len_[ci] == len &&
+          tag_snap_[ci].size() == f->pack_length() &&
+          memcmp(tag_snap_[ci].data(), f->ptr, tag_snap_[ci].size()) == 0)
+        break;
+      f->store(len ? (const char *) cb.data + st : "", len, f->charset());
+      if (memo)
+      {
+        tag_snap_[ci].assign((const char *) f->ptr, f->pack_length());
+        tag_last_start_[ci]= st;
+        tag_last_len_[ci]= len;
+        tag_last_ok_[ci]= 1;
+      }
+      break;
+    }
+    }
+    f->move_field_offset(-diff);
+    if (rc)
+      break;
+  }
+  dbug_tmp_restore_column_map(&table->write_set, old_map);
+  return rc;
+}
+
 /* ── Statement end / durability ───────────────────────────────────────── */
 
 int ha_moosedb::commit_batch()
@@ -1358,6 +1524,7 @@ int ha_moosedb::reset()
   pushed_.clear();
   pushed_valid_= false;
   scan_.reset();
+  reset_batch_state();
   snapshots_.clear();
   scan_snapshot_saved_= false;
   return error;
@@ -1692,12 +1859,114 @@ bool ha_moosedb::pushed_series_cached(
 
 /* ── Scans ────────────────────────────────────────────────────────────── */
 
-int ha_moosedb::open_scan(longlong lo, longlong hi, bool sorted)
+void ha_moosedb::reset_batch_state()
+{
+  bat_= TFBatch{0, 0, nullptr, nullptr};
+  bat_rows_= 0;
+  bat_pos_= 0;
+  bat_dir_= 0;
+  bat_hint_= 16;
+  bat_skip_= 0;
+  bat_ended_= false;
+  bitmaps_dirty_= false;
+  degraded_= false;
+  degraded_snap_.reset();
+  active_cols_.clear();
+  tag_buf_= nullptr;
+}
+
+/*
+  Decides which columns the scan decodes (proj_mask_ / proj_all_). The mask
+  follows table->read_set; everything else the server might read without
+  declaring it asks for all columns:
+   - statements other than SELECT / INSERT..SELECT / REPLACE..SELECT (UPDATE,
+     DELETE, CREATE..SELECT, ALTER, CHECK, ...), and no THD or no read_set;
+   - the table has virtual columns (their inputs are computed by the server).
+  Index scans always include the timestamp: the server compares the row's
+  key against end_range (handler::compare_key) reading it from the record.
+  If read_set grows after the scan opened (column_bitmaps_signal), rows are
+  fetched whole instead (degraded_), see read_from_scan().
+*/
+void ha_moosedb::build_projection(bool index_scan)
+{
+  proj_all_= true;
+  proj_mask_.clear();
+  if (!table || !share_ || !table->read_set || table->vfield)
+    return;
+  THD *thd= ha_thd();
+  if (!thd)
+    return;
+  switch (thd_sql_command(thd)) {
+  case SQLCOM_SELECT:
+  case SQLCOM_INSERT_SELECT:
+  case SQLCOM_REPLACE_SELECT:
+    break;
+  default:
+    return;
+  }
+  const tf_layout &l= share_->layout;
+  std::vector<uint8_t> mask(l.columns.size(), 0);
+  bool any_off= false;
+  for (size_t i= 0; i < l.columns.size(); i++)
+  {
+    const uint fi= l.columns[i].field_index;
+    if (fi >= table->s->fields)
+      return;
+    if (bitmap_is_set(table->read_set, fi) ||
+        (index_scan && i == l.ts_column))
+      mask[i]= 1;
+    else
+      any_off= true;
+  }
+  if (!any_off || mask.empty())
+    return;
+  proj_mask_= std::move(mask);
+  proj_all_= false;
+}
+
+/* Switches to whole-row reads if read_set asks for an undecoded column. */
+void ha_moosedb::recheck_projection()
+{
+  bitmaps_dirty_= false;
+  if (proj_all_ || degraded_)
+    return;
+  if (!table || !table->read_set || !share_)
+  {
+    degraded_= true;
+    return;
+  }
+  const tf_layout &l= share_->layout;
+  for (size_t i= 0; i < l.columns.size() && i < proj_mask_.size(); i++)
+    if (!proj_mask_[i] && l.columns[i].field_index < table->s->fields &&
+        bitmap_is_set(table->read_set, l.columns[i].field_index))
+    {
+      degraded_= true;
+      if (bat_pos_ > 0 && !warned_degraded_)
+      {
+        warned_degraded_= true;
+        sql_print_warning("MooseDB: read_set grew after rows were served from "
+                          "a projected scan of %s; falling back to whole rows",
+                          share_ ? share_->display.c_str() : "?");
+      }
+      return;
+    }
+}
+
+void ha_moosedb::column_bitmaps_signal(bool mark_for_update)
+{
+  bitmaps_dirty_= true;
+  handler::column_bitmaps_signal(mark_for_update);
+}
+
+int ha_moosedb::open_scan(longlong lo, longlong hi, bool sorted,
+                          bool index_scan)
 {
   scan_.reset();
   scan_snapshot_saved_= false;
+  reset_batch_state();
   if (!share_ || !share_->table)
     return HA_ERR_INTERNAL_ERROR;
+  build_projection(index_scan);
   /*
     The ids of a TAG filter and the scan are two separate calls: a statement
     that commits between them with a brand-new series would be seen only
@@ -1730,9 +1999,11 @@ int ha_moosedb::open_scan(longlong lo, longlong hi, bool sorted)
     if (filtered)
       pushed_version_= v0;
     s= nullptr;
-    error= map_status(moosedb_scan_open_filtered(
+    error= map_status(moosedb_scan_open_projected(
         share_->table.get(), lo, hi, filtered ? ids->data() : nullptr,
-        filtered ? (int64_t) ids->size() : -1, sorted, &s));
+        filtered ? (int64_t) ids->size() : -1, sorted,
+        proj_all_ ? nullptr : proj_mask_.data(),
+        proj_all_ ? 0 : (uint32_t) proj_mask_.size(), &s));
     if (error || !filtered)
       break;
     uint64_t v1= 0;
@@ -1760,22 +2031,192 @@ int ha_moosedb::rnd_init(bool scan)
   DBUG_ENTER("ha_moosedb::rnd_init");
   /* scan == false: only rnd_pos() follows; positions resolve through the
      snapshots kept by position(). */
-  DBUG_RETURN(scan ? open_scan(LONGLONG_MIN, LONGLONG_MAX, false) : 0);
+  DBUG_RETURN(scan ? open_scan(LONGLONG_MIN, LONGLONG_MAX, false, false) : 0);
+}
+
+/*
+  Reads the next batch (returns 0), or -1 at the end of the scan. After a
+  direction switch `bat_skip_` rows are dropped first: the core cursor sits
+  on the last row of the previous batch, so the rows between it and the row
+  last served (read ahead, already decoded) would otherwise be repeated.
+*/
+int ha_moosedb::refill_batch(bool backward)
+{
+  if (!scan_ || !share_)
+    return HA_ERR_INTERNAL_ERROR;
+  const tf_layout &l= share_->layout;
+  for (;;)
+  {
+    const uint32_t want= std::min<uint32_t>(bat_hint_ + bat_skip_, 65536);
+    TFBatch b{0, 0, nullptr, nullptr};
+    bool end= false;
+    bat_rows_= 0;
+    bat_pos_= 0;
+    active_cols_.clear();
+    TFStatus st= backward
+        ? moosedb_scan_prev_batch(scan_.get(), want, &b, &end)
+        : moosedb_scan_next_batch(scan_.get(), want, &b, &end);
+    if (st != TF_OK)
+    {
+      bat_dir_= 0;
+      bat_skip_= 0;
+      return map_status(st);
+    }
+    if (b.row_count == 0)
+    {
+      bat_skip_= 0;
+      bat_ended_= true;
+      return -1;
+    }
+    if (!b.columns || !b.positions || b.col_count != l.columns.size())
+    {
+      bat_dir_= 0;
+      bat_skip_= 0;
+      last_error_= "batch shape does not match the table definition";
+      return HA_ERR_MOOSEDB_BASE + TF_ERR_CORRUPT;
+    }
+    /* Validate the batch against the layout and the projection. */
+    for (size_t i= 0; i < l.columns.size(); i++)
+    {
+      const TFColumnBatch &cb= b.columns[i];
+      const bool wanted= proj_all_ || (i < proj_mask_.size() && proj_mask_[i]);
+      if (!cb.present)
+      {
+        if (wanted)
+          goto bad_batch;
+        continue;
+      }
+      if (cb.kind != (uint8_t) l.columns[i].type)
+        goto bad_batch;
+      switch (l.columns[i].conv) {
+      case tf_conv::DECIMAL:
+      case tf_conv::STRING:
+      case tf_conv::TAG:
+        if (!cb.starts || !cb.lens || (!cb.data && cb.data_len))
+          goto bad_batch;
+        for (uint32_t r= 0; r < b.row_count; r++)
+          if ((uint64_t) cb.starts[r] + (uint64_t) cb.lens[r] > cb.data_len)
+            goto bad_batch;
+        break;
+      default:
+        if (!cb.values)
+          goto bad_batch;
+        break;
+      }
+    }
+    goto batch_ok;
+  bad_batch:
+    bat_dir_= 0;
+    bat_skip_= 0;
+    last_error_= "batch does not match the table definition or projection";
+    return HA_ERR_MOOSEDB_BASE + TF_ERR_CORRUPT;
+  batch_ok:
+    uint32_t take= 0;
+    if (bat_skip_)
+    {
+      take= std::min(bat_skip_, b.row_count);
+      bat_skip_-= take;
+      if (take == b.row_count)
+        continue;               /* still dropping: read the next batch */
+    }
+    bat_ended_= false;
+    bat_= b;
+    bat_rows_= b.row_count;
+    bat_pos_= take;
+    break;
+  }
+  if (bat_hint_ < 1024)
+    bat_hint_= std::min<uint32_t>(bat_hint_ * 2, 1024);
+
+  /* Per-batch column plan; the TAG store-skip memo is per batch (starts). */
+  const size_t n= l.columns.size();
+  tag_last_ok_.assign(n, 0);
+  tag_last_start_.assign(n, 0);
+  tag_last_len_.assign(n, 0);
+  tag_snap_.resize(n);
+  const size_t nb= table ? table->s->null_bytes : 0;
+  null_template_.assign(nb, 0);
+  for (size_t i= 0; i < n; i++)
+  {
+    if (bat_.columns[i].present)
+    {
+      active_cols_.push_back((uint32_t) i);
+      continue;
+    }
+    /* unrequested: make a nullable field read NULL */
+    const uint fi= l.columns[i].field_index;
+    if (table && fi < table->s->fields && table->field[fi])
+    {
+      const Field *f= table->field[fi];
+      if (f->null_ptr && table->record[0])
+      {
+        const my_ptrdiff_t off= f->null_ptr - table->record[0];
+        if (off >= 0 && (size_t) off < nb)
+          null_template_[(size_t) off]|= f->null_bit;
+      }
+    }
+  }
+  return 0;
 }
 
 int ha_moosedb::read_from_scan(uchar *buf, bool backward, int end_error)
 {
-  if (!scan_)
+  if (!scan_ || !buf || !table)
     return HA_ERR_INTERNAL_ERROR;
-  TFRow row{0, nullptr};
-  bool end= false;
-  TFStatus st= backward ? moosedb_scan_prev(scan_.get(), &row, &end)
-                        : moosedb_scan_next(scan_.get(), &row, &end);
-  if (int error= map_status(st))
+  const int dir= backward ? 2 : 1;
+  if (bat_dir_ != 0 && bat_dir_ != dir)
+  {
+    /* Rows read ahead but not served: n - bat_pos_ (0 once the scan ended). */
+    bat_skip_= bat_rows_ > bat_pos_ ? bat_rows_ - bat_pos_ : 0;
+    bat_rows_= 0;
+    bat_pos_= 0;
+    if (bat_ended_)
+    {
+      /*
+        The core cursor is not reliable after an empty (EOF/BOF) batch:
+        reposition explicitly. Forward EOF -> backward starts from the end;
+        backward BOF -> forward uses moosedb_scan_seek_start (same snapshot).
+      */
+      bat_skip_= 0;
+      if (int error= map_status(backward ? moosedb_scan_seek_end(scan_.get())
+                                         : moosedb_scan_seek_start(scan_.get())))
+        return error;
+      bat_ended_= false;
+    }
+  }
+  else if (bat_ended_ && bat_dir_ == dir)
+    return end_error;   /* the core cursor is not usable after an empty batch */
+  bat_dir_= dir;
+  if (bitmaps_dirty_)
+    recheck_projection();
+  if (bat_pos_ >= bat_rows_)
+  {
+    const int r= refill_batch(backward);
+    if (r < 0)
+      return end_error;
+    if (r)
+      return r;
+  }
+  if (bat_pos_ >= bat_rows_)
+    return HA_ERR_INTERNAL_ERROR;
+  const uint32_t row= bat_pos_++;
+  if (!degraded_)
+    return fill_from_batch(buf, row);
+
+  /* read_set outgrew the projection: serve whole rows by position */
+  if (!degraded_snap_)
+  {
+    MooseDBSnapshot *snap= nullptr;
+    if (int error= map_status(moosedb_scan_snapshot(scan_.get(), &snap)))
+      return error;
+    degraded_snap_.reset(snap);
+  }
+  TFRow full{0, nullptr};
+  if (int error= map_status(moosedb_snapshot_fetch(
+          degraded_snap_.get(), bat_.positions + (size_t) row * TF_POSITION_LEN,
+          &full)))
     return error;
-  if (end)
-    return end_error;
-  return fill_record(buf, row);
+  return fill_record(buf, full);
 }
 
 int ha_moosedb::rnd_next(uchar *buf)
@@ -1788,13 +2229,18 @@ int ha_moosedb::rnd_end()
 {
   DBUG_ENTER("ha_moosedb::rnd_end");
   scan_.reset();
+  reset_batch_state();
   DBUG_RETURN(0);
 }
 
 void ha_moosedb::position(const uchar *)
 {
   DBUG_ENTER("ha_moosedb::position");
-  if (!scan_ || moosedb_scan_position(scan_.get(), ref) != TF_OK)
+  if (scan_ && bat_dir_ != 0 && bat_pos_ > 0 && bat_pos_ <= bat_rows_ &&
+      bat_.positions)
+    memcpy(ref, bat_.positions + (size_t) (bat_pos_ - 1) * TF_POSITION_LEN,
+           TF_POSITION_LEN);
+  else if (!scan_ || moosedb_scan_position(scan_.get(), ref) != TF_OK)
   {
     take_last_error();
     memset(ref, 0xff, ref_length);
@@ -1865,6 +2311,7 @@ int ha_moosedb::index_init(uint idx, bool)
   DBUG_ENTER("ha_moosedb::index_init");
   active_index= idx;
   scan_.reset();
+  reset_batch_state();
   DBUG_RETURN(0);
 }
 
@@ -1872,6 +2319,7 @@ int ha_moosedb::index_end()
 {
   DBUG_ENTER("ha_moosedb::index_end");
   scan_.reset();
+  reset_batch_state();
   active_index= MAX_KEY;
   DBUG_RETURN(0);
 }
@@ -1912,7 +2360,7 @@ int ha_moosedb::key_to_ts(uint idx, const uchar *key, longlong *out)
 int ha_moosedb::open_range_scan(longlong lo, longlong hi, bool backward,
                                  uchar *buf, int not_found_error)
 {
-  if (int error= open_scan(lo, hi, true))
+  if (int error= open_scan(lo, hi, true, true))
     return error;
   if (backward)
     if (int error= map_status(moosedb_scan_seek_end(scan_.get())))

@@ -194,6 +194,7 @@ public:
   const COND *cond_push(const COND *cond) override;
   void cond_pop() override;
   int reset() override;
+  void column_bitmaps_signal(bool mark_for_update) override;
 
   /* ── Info ─────────────────────────────────────────────────────────── */
   int info(uint flag) override;
@@ -217,7 +218,7 @@ public:
     return HA_NO_TRANSACTIONS | HA_REC_NOT_IN_SEQ |
            HA_STATS_RECORDS_IS_EXACT | HA_NO_AUTO_INCREMENT |
            HA_BINLOG_ROW_CAPABLE | HA_BINLOG_STMT_CAPABLE |
-           HA_CAN_TABLE_CONDITION_PUSHDOWN;
+           HA_CAN_TABLE_CONDITION_PUSHDOWN | HA_PARTIAL_COLUMN_READ;
   }
   ulong index_flags(uint, uint, bool) const override
   {
@@ -234,11 +235,16 @@ public:
 
 private:
   MooseDB_share *get_share();
-  int open_scan(longlong lo, longlong hi, bool sorted);
+  int open_scan(longlong lo, longlong hi, bool sorted, bool index_scan);
   int open_range_scan(longlong lo, longlong hi, bool backward, uchar *buf,
                       int not_found_error);
   int read_from_scan(uchar *buf, bool backward, int end_error);
   int fill_record(uchar *buf, const TFRow &row);
+  int fill_from_batch(uchar *buf, uint32_t row);
+  int refill_batch(bool backward);
+  void reset_batch_state();
+  void build_projection(bool index_scan);
+  void recheck_projection();
   int key_to_ts(uint idx, const uchar *key, longlong *out);
   int map_status(TFStatus status, const char *name= nullptr);
   int commit_batch();   /* publish + sync the open statement batch, if any */
@@ -261,6 +267,35 @@ private:
   bool in_bulk_insert_= false;
   query_id_t bulk_query_id_= 0;  /* statement that called start_bulk_insert */
   std::string last_error_;     /* message for get_error_message()        */
+  /*
+    Read-ahead state of the projected batch scan. `bat_` is owned by the
+    scan and valid only until the next call on it; `bat_pos_` is the index of
+    the next row to serve (the row being served is `bat_pos_ - 1`).
+  */
+  TFBatch bat_{0, 0, nullptr, nullptr};
+  uint32_t bat_rows_= 0;          /* rows in bat_ (0 = none / ended)      */
+  uint32_t bat_pos_= 0;
+  int bat_dir_= 0;                /* 0 none, 1 forward, 2 backward         */
+  uint32_t bat_hint_= 16;         /* next max_rows, grows to 1024          */
+  bool bat_ended_= false;         /* last refill returned the empty batch  */
+  bool warned_degraded_= false;   /* degradation already logged           */
+  uint32_t bat_skip_= 0;          /* rows to drop after a direction switch */
+  std::vector<uint32_t> active_cols_;   /* layout indexes with present=1   */
+  std::vector<uchar> null_template_;    /* null bits of unrequested fields */
+  std::vector<uint8_t> proj_mask_;      /* 1 byte per layout column        */
+  bool proj_all_= true;           /* every column requested               */
+  bool bitmaps_dirty_= false;     /* read_set may have changed            */
+  bool degraded_= false;          /* read_set outgrew the mask: use whole rows */
+  tf_snapshot_ptr degraded_snap_; /* snapshot used while degraded_        */
+  /* DATETIME day cache and TAG store-skip memo (see fill_from_batch). */
+  longlong cached_day_= LONGLONG_MIN;
+  longlong cached_y_= 0;
+  unsigned cached_m_= 0, cached_d_= 0;
+  std::vector<uint32_t> tag_last_start_;
+  std::vector<uint32_t> tag_last_len_;
+  std::vector<uchar> tag_last_ok_;
+  std::vector<std::string> tag_snap_;
+  uchar *tag_buf_= nullptr;       /* record buffer the memo refers to      */
   std::vector<String> str_bufs_;
   std::vector<TFValue> values_;
 

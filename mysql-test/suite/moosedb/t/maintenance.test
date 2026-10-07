@@ -33,7 +33,8 @@ FLUSH TABLES t;
 --replace_regex /chunk_[0-9T_]+.tfl/chunk_X.tfl/
 CHECK TABLE t;
 --error ER_CRASHED_ON_USAGE
-SELECT SUM(v) FROM t;
+# reads ts too: a projected read of v alone never touches the corrupted ts block
+SELECT SUM(v), MIN(ts) FROM t;
 DROP TABLE t;
 
 --echo # A corrupt NEWEST chunk is quarantined (.tfl.corrupt) when the table

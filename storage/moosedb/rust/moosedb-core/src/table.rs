@@ -918,6 +918,14 @@ impl Table {
     /// Opens a scan over a snapshot of the table. With `sorted`, rows come in
     /// timestamp order and the scan supports backward iteration.
     pub fn scan(&self, filter: &ScanFilter, sorted: bool) -> Result<Scan> {
+        self.scan_projected(filter, sorted, None)
+    }
+
+    /// [`Table::scan`] returning only the columns flagged in `columns` (one flag
+    /// per schema column; `None` = all). Other columns are not decoded and read
+    /// as NULL. The timestamp is decoded internally whenever the range or the
+    /// order needs it, even if not projected.
+    pub fn scan_projected(&self, filter: &ScanFilter, sorted: bool, columns: Option<&[bool]>) -> Result<Scan> {
         // Both views under ONE acquisition of the mutex: a commit between two
         // acquisitions could show the rows of a statement's series X but not
         // of its new series Y (a partly visible statement).
@@ -927,7 +935,7 @@ impl Table {
             (self.snapshot_locked(&mut guard), all)
         };
         let resolved = self.resolve(filter, all)?;
-        Scan::new(snap, resolved, sorted)
+        Scan::new(snap, resolved, sorted, columns)
     }
 
     /// Re-reads the row at `pos` from the current contents.

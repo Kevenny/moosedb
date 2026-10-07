@@ -18,7 +18,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use std::cell::RefCell;
-use std::ffi::{c_char, CStr, CString};
+use std::ffi::{c_char, c_void, CStr, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 use std::sync::Arc;
@@ -26,8 +26,8 @@ use std::sync::Arc;
 use moosedb_core::compression::Codec;
 use moosedb_core::inspect::{ChunkStatus, TableInfo};
 use moosedb_core::{
-    crypto, maintenance, settings, Batch, Column, ColumnType, Error, Position, RawOptions, Row, Scan, ScanFilter,
-    Schema, SeriesSnapshot, Snapshot, Table, TableConfig, Value, POSITION_LEN,
+    crypto, maintenance, settings, Batch, BatchColumn, Column, ColumnType, Error, Position, RawOptions, Row, Scan,
+    ScanFilter, Schema, SeriesSnapshot, Snapshot, Table, TableConfig, Value, POSITION_LEN,
 };
 
 /// Size in bytes of a row position (`handler::ref_length`).
@@ -106,6 +106,56 @@ pub struct TFValue {
 pub struct TFRow {
     pub col_count: u32,
     pub values: *mut TFValue,
+}
+
+/// One column of a `TFBatch` (see `moosedb_scan_next_batch`). All pointers
+/// belong to the scan and follow the lifetime of the batch.
+///
+/// `row_count` below is `TFBatch::row_count`. If `present == 0` the column was
+/// not requested by the projection and every pointer is NULL.
+///
+/// * `nulls`: NULL when no row of the batch is NULL in this column; otherwise
+///   `row_count` bytes, non-zero = NULL. A NULL row holds 0 / an empty string in
+///   the value arrays below.
+/// * fixed-width columns use `values` (`row_count` elements):
+///   `TF_COL_TIMESTAMP` int64 microseconds, `TF_COL_INT64` int64,
+///   `TF_COL_FLOAT64` double, `TF_COL_FLOAT32` float, `TF_COL_BOOL` uint8 (0/1).
+///   Elements are naturally aligned for their type.
+/// * variable-width columns (`TF_COL_VARCHAR`, `TF_COL_TAG`, `TF_COL_DECIMAL`)
+///   use `starts` and `lens` (`row_count` uint32 each): the value of row `i`
+///   is `data[starts[i] .. starts[i] + lens[i]]`; `data` may be NULL when
+///   every length is 0. Bytes are not NUL-terminated. A TAG value is stored
+///   once per series run: rows of the same series in one batch share the
+///   same `starts[i]`, so a handler may skip re-storing a TAG whose `starts`
+///   equals the previous row's.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TFColumnBatch {
+    /// A `TFColumnType` code.
+    pub kind: u8,
+    /// 1 if projected (filled), 0 if not requested.
+    pub present: u8,
+    pub nulls: *const u8,
+    pub values: *const c_void,
+    pub starts: *const u32,
+    pub lens: *const u32,
+    pub data: *const u8,
+    /// Size in bytes of `data`; `starts[i] + lens[i] <= data_len` for every row.
+    pub data_len: u64,
+}
+
+/// Up to N rows of a scan in columnar form (`moosedb_scan_next_batch`).
+/// Owned by the scan; valid until the next call on it.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TFBatch {
+    /// Rows in this batch; 0 means the end of the scan.
+    pub row_count: u32,
+    /// Number of table columns: `columns[c]` describes schema column `c`.
+    pub col_count: u32,
+    pub columns: *const TFColumnBatch,
+    /// `row_count * TF_POSITION_LEN` bytes: the position of each row.
+    pub positions: *const u8,
 }
 
 /// Table configuration. String options may be NULL to select defaults.
@@ -234,6 +284,8 @@ pub struct MooseDBScan {
     types: Vec<ColumnType>,
     position: Option<Position>,
     row: RowOut,
+    /// Descriptors the last `TFBatch` points to.
+    batch_cols: Vec<TFColumnBatch>,
 }
 
 /// Opaque snapshot handle: resolves row positions (`rnd_pos`).
@@ -772,14 +824,26 @@ pub unsafe extern "C" fn moosedb_truncate(table: *mut MooseDBTable) -> TFStatus 
 
 // ─── scans ───────────────────────────────────────────────────────────────────
 
-fn open_scan(table: *mut MooseDBTable, filter: &ScanFilter, sorted: bool, out_scan: *mut *mut MooseDBScan) -> TFStatus {
+fn open_scan(
+    table: *mut MooseDBTable,
+    filter: &ScanFilter,
+    sorted: bool,
+    projection: Option<&[bool]>,
+    out_scan: *mut *mut MooseDBScan,
+) -> TFStatus {
     guard(|| {
         let out = handle_mut(out_scan, "out_scan")?;
         *out = ptr::null_mut();
         let t = table_ref(table)?;
-        let scan = t.table.scan(filter, sorted)?;
+        let scan = t.table.scan_projected(filter, sorted, projection)?;
         let types = t.table.schema().columns().iter().map(|c| c.ty).collect();
-        *out = Box::into_raw(Box::new(MooseDBScan { scan, types, position: None, row: RowOut::new() }));
+        *out = Box::into_raw(Box::new(MooseDBScan {
+            scan,
+            types,
+            position: None,
+            row: RowOut::new(),
+            batch_cols: Vec::new(),
+        }));
         Ok(())
     })
 }
@@ -790,7 +854,7 @@ fn open_scan(table: *mut MooseDBTable, filter: &ScanFilter, sorted: bool, out_sc
 /// `table` must be a valid handle; `out_scan` writable.
 #[no_mangle]
 pub unsafe extern "C" fn moosedb_scan_open(table: *mut MooseDBTable, out_scan: *mut *mut MooseDBScan) -> TFStatus {
-    open_scan(table, &ScanFilter::default(), false, out_scan)
+    open_scan(table, &ScanFilter::default(), false, None, out_scan)
 }
 
 /// Opens a scan of rows with `ts_start_us <= ts <= ts_end_us` whose TAG columns
@@ -823,7 +887,27 @@ pub unsafe extern "C" fn moosedb_range_scan_open(
     if status != TFStatus::TF_OK {
         return status;
     }
-    open_scan(table, &filter, true, out_scan)
+    open_scan(table, &filter, true, None, out_scan)
+}
+
+/// Series restriction of a general scan: `series_count < 0` = all series.
+///
+/// # Safety
+/// `series_ids` must hold `series_count` elements when `series_count > 0`.
+unsafe fn series_filter(
+    ts_start_us: i64,
+    ts_end_us: i64,
+    series_ids: *const u64,
+    series_count: i64,
+) -> Result<ScanFilter, Error> {
+    let mut filter = ScanFilter::range(ts_start_us, ts_end_us);
+    if series_count >= 0 {
+        // SAFETY: caller contract.
+        let ids = unsafe { slice(series_ids, series_count as usize, "series_ids") }?;
+        // Copying can fail (allocation): the callers run this under `guard`.
+        filter.series = Some(ids.to_vec());
+    }
+    Ok(filter)
 }
 
 /// General scan: timestamp range, optional series restriction
@@ -841,20 +925,64 @@ pub unsafe extern "C" fn moosedb_scan_open_filtered(
     sorted: bool,
     out_scan: *mut *mut MooseDBScan,
 ) -> TFStatus {
-    let mut filter = ScanFilter::range(ts_start_us, ts_end_us);
+    let mut filter = ScanFilter::default();
     let status = guard(|| {
-        if series_count >= 0 {
-            // SAFETY: caller contract.
-            let ids = unsafe { slice(series_ids, series_count as usize, "series_ids") }?;
-            // Copying can fail (allocation): keep it under the guard.
-            filter.series = Some(ids.to_vec());
+        // SAFETY: caller contract.
+        filter = unsafe { series_filter(ts_start_us, ts_end_us, series_ids, series_count) }?;
+        Ok(())
+    });
+    if status != TFStatus::TF_OK {
+        return status;
+    }
+    open_scan(table, &filter, sorted, None, out_scan)
+}
+
+/// `moosedb_scan_open_filtered` that decodes and returns only some columns.
+///
+/// `columns_mask` holds `mask_len` bytes, one per table column in schema
+/// order; a non-zero byte requests the column. `mask_len` must equal the
+/// number of columns of the table, else `TF_ERR_INVALID_ARG`.
+/// `columns_mask == NULL` with `mask_len == 0` requests every column.
+///
+/// Columns that are not requested are never decoded. Through
+/// `moosedb_scan_next` / `moosedb_scan_prev` they read as NULL; through the
+/// batch calls they are reported with `present == 0`. The timestamp is
+/// decoded internally when the range or the order needs it, whether or not it
+/// is requested. `moosedb_snapshot_fetch` ignores the projection: it returns
+/// whole rows.
+///
+/// # Safety
+/// `series_ids` must hold `series_count` elements when `series_count > 0`;
+/// `columns_mask` must hold `mask_len` readable bytes (or be NULL with
+/// `mask_len == 0`).
+#[no_mangle]
+pub unsafe extern "C" fn moosedb_scan_open_projected(
+    table: *mut MooseDBTable,
+    ts_start_us: i64,
+    ts_end_us: i64,
+    series_ids: *const u64,
+    series_count: i64,
+    sorted: bool,
+    columns_mask: *const u8,
+    mask_len: u32,
+    out_scan: *mut *mut MooseDBScan,
+) -> TFStatus {
+    let mut filter = ScanFilter::default();
+    let mut mask: Option<Vec<bool>> = None;
+    let status = guard(|| {
+        // SAFETY: caller contract for both pointers.
+        unsafe {
+            filter = series_filter(ts_start_us, ts_end_us, series_ids, series_count)?;
+            if mask_len > 0 || !columns_mask.is_null() {
+                mask = Some(slice(columns_mask, mask_len as usize, "columns_mask")?.iter().map(|&b| b != 0).collect());
+            }
         }
         Ok(())
     });
     if status != TFStatus::TF_OK {
         return status;
     }
-    open_scan(table, &filter, sorted, out_scan)
+    open_scan(table, &filter, sorted, mask.as_deref(), out_scan)
 }
 
 fn step(scan: *mut MooseDBScan, out_row: *mut TFRow, out_end: *mut bool, backward: bool) -> TFStatus {
@@ -902,6 +1030,155 @@ pub unsafe extern "C" fn moosedb_scan_prev(
     out_bof: *mut bool,
 ) -> TFStatus {
     step(scan, out_row, out_bof, true)
+}
+
+/// Pointer to the first element, or NULL for an empty slice.
+fn ptr_or_null<T>(s: &[T]) -> *const T {
+    if s.is_empty() {
+        ptr::null()
+    } else {
+        s.as_ptr()
+    }
+}
+
+fn column_to_c(c: &BatchColumn) -> TFColumnBatch {
+    let mut out = TFColumnBatch {
+        kind: c.column_type() as u8,
+        present: 0,
+        nulls: ptr::null(),
+        values: ptr::null(),
+        starts: ptr::null(),
+        lens: ptr::null(),
+        data: ptr::null(),
+        data_len: 0,
+    };
+    if !c.is_present() {
+        return out;
+    }
+    out.present = 1;
+    out.nulls = c.nulls().map_or(ptr::null(), ptr_or_null);
+    match c.column_type() {
+        ColumnType::Timestamp | ColumnType::Int64 | ColumnType::Float64 => {
+            out.values = ptr_or_null(c.values_w64()).cast();
+        }
+        ColumnType::Float32 => out.values = ptr_or_null(c.values_w32()).cast(),
+        ColumnType::Bool => out.values = ptr_or_null(c.values_w8()).cast(),
+        ColumnType::Varchar | ColumnType::Tag | ColumnType::Decimal => {
+            out.starts = ptr_or_null(c.starts());
+            out.lens = ptr_or_null(c.lens());
+            out.data = ptr_or_null(c.data());
+            out.data_len = c.data().len() as u64;
+        }
+    }
+    out
+}
+
+fn step_batch(
+    scan: *mut MooseDBScan,
+    max_rows: u32,
+    out: *mut TFBatch,
+    out_end: *mut bool,
+    backward: bool,
+) -> TFStatus {
+    guard(|| {
+        let s = handle_mut(scan, "scan")?;
+        let (out, end) = (handle_mut(out, "out")?, handle_mut(out_end, "out_end")?);
+        // Whatever the previous call returned is invalid from here on.
+        *out = TFBatch { row_count: 0, col_count: 0, columns: ptr::null(), positions: ptr::null() };
+        *end = false;
+        s.position = None;
+        let max = max_rows as usize; // 0 selects the core default
+        let MooseDBScan { scan, position, batch_cols, .. } = s;
+        let batch = scan.next_batch(max, backward)?;
+        let rows = batch.rows();
+        batch_cols.clear();
+        batch_cols.extend(batch.columns().iter().map(column_to_c));
+        *position = batch.positions().last().map(Position::from_bytes);
+        *end = rows == 0;
+        out.row_count = rows as u32;
+        out.col_count = batch_cols.len() as u32;
+        out.columns = ptr_or_null(batch_cols);
+        out.positions = ptr_or_null(batch.positions()).cast();
+        Ok(())
+    })
+}
+
+/// Reads the next rows of the scan into columnar buffers owned by the scan.
+///
+/// Fills `*out` with up to `max_rows` rows (`0` = 1024; at most 65536). When
+/// the scan is exhausted `out->row_count` is 0 and `*out_end` is set; a
+/// non-empty batch never sets `*out_end` (the end is reported by the next
+/// call). A batch may hold fewer rows than asked for.
+///
+/// Lifetime: everything `*out` points to (the `columns` array, every column
+/// buffer and `positions`) belongs to the scan and stays valid until the next
+/// call on that scan (`moosedb_scan_next`, `_prev`, `_next_batch`,
+/// `_prev_batch`, `_seek_end`) or `moosedb_scan_close`. It is invalidated even
+/// if that next call fails. Buffers are reused, so the steady state does not
+/// allocate.
+///
+/// Position: after the call, `moosedb_scan_position` returns the position of
+/// the last row of the batch. `positions` holds `row_count` entries of
+/// `TF_POSITION_LEN` bytes, one per row, in the format `moosedb_scan_position`
+/// writes and `moosedb_snapshot_fetch` takes, so `position()` can be served
+/// for any row of the batch without calling back.
+///
+/// Direction: the batch calls work on sorted and unsorted scans alike, but
+/// `moosedb_scan_prev_batch` needs a sorted scan (`TF_ERR_UNSUPPORTED`
+/// otherwise). The cursor ends after the last row of the batch, not after the
+/// row the handler is serving: a handler that switches direction
+/// (`index_prev` after `index_next`) must account for the rows read ahead
+/// (the next row in the other direction is the one before the batch's last).
+/// Reading ahead decodes data early; `ORDER BY ... LIMIT n` should start with
+/// a small `max_rows`.
+///
+/// # Safety
+/// `scan` must be valid; `out` and `out_end` writable.
+#[no_mangle]
+pub unsafe extern "C" fn moosedb_scan_next_batch(
+    scan: *mut MooseDBScan,
+    max_rows: u32,
+    out: *mut TFBatch,
+    out_end: *mut bool,
+) -> TFStatus {
+    step_batch(scan, max_rows, out, out_end, false)
+}
+
+/// Like `moosedb_scan_next_batch`, for the rows before the cursor (sorted
+/// scans only), nearest first: after `moosedb_scan_seek_end` the batch holds
+/// the newest rows, newest first.
+///
+/// # Safety
+/// As `moosedb_scan_next_batch`.
+#[no_mangle]
+pub unsafe extern "C" fn moosedb_scan_prev_batch(
+    scan: *mut MooseDBScan,
+    max_rows: u32,
+    out: *mut TFBatch,
+    out_end: *mut bool,
+) -> TFStatus {
+    step_batch(scan, max_rows, out, out_end, true)
+}
+
+/// Rewinds the scan to before its first row on the same snapshot it opened with
+/// (no new snapshot: rows written since the scan opened stay invisible). Works
+/// on sorted and unsorted scans; the next `moosedb_scan_next` /
+/// `moosedb_scan_next_batch` returns the first row.
+///
+/// After a scan reported its end (EOF with `next*`, BOF with `prev*`), the
+/// only supported way to continue is `moosedb_scan_seek_start` or
+/// `moosedb_scan_seek_end`; what `prev`/`next` do straight after an end is
+/// unspecified.
+///
+/// # Safety
+/// `scan` must be valid.
+#[no_mangle]
+pub unsafe extern "C" fn moosedb_scan_seek_start(scan: *mut MooseDBScan) -> TFStatus {
+    guard(|| {
+        let s = handle_mut(scan, "scan")?;
+        s.position = None;
+        s.scan.seek_start()
+    })
 }
 
 /// Positions a sorted scan after its last row (for `index_last`).

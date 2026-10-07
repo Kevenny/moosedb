@@ -16,7 +16,7 @@ use crate::compression::{MAX_BLOCK_RAW, MAX_SERIES_ROWS};
 use crate::crypto::CipherParams;
 use crate::error::{corrupt, Error, Result};
 use crate::index::bloom::Bloom;
-use crate::schema::{Row, Schema};
+use crate::schema::{ColumnType, Row, Schema};
 
 struct Footer {
     index_offset: u64,
@@ -219,6 +219,104 @@ pub(crate) fn decode_series(schema: &Schema, meta: &ChunkMeta, idx: usize) -> Re
         rows.push(row);
     }
     Ok(rows)
+}
+
+/// The part of one chunk series a scan needs: rows `[lo, hi)` of the series,
+/// as typed columns (see [`load_window`]).
+pub(crate) struct Window {
+    pub lo: usize,
+    pub hi: usize,
+    /// By schema column. Each present column is indexed by the row number
+    /// *within the series* and holds at least rows `[0, hi)`.
+    pub cols: Vec<Option<block::ColumnData>>,
+    ts_index: usize,
+}
+
+impl Window {
+    /// Timestamp of row `i` of the series (`lo <= i < hi`), when the window
+    /// decoded the timestamp column (always, if `need_ts` was set).
+    pub(crate) fn ts_at(&self, i: usize) -> Result<i64> {
+        self.cols
+            .get(self.ts_index)
+            .and_then(Option::as_ref)
+            .and_then(|c| c.ints())
+            .and_then(|v| v.get(i))
+            .copied()
+            .ok_or_else(|| corrupt("timestamp column missing from a decoded series"))
+    }
+}
+
+/// Decodes the rows of series `idx` whose timestamp lies in `[ts_min, ts_max]`
+/// and only the columns flagged in `want`.
+///
+/// * The timestamp column is decoded first (it is cheap and rows of a series
+///   are sorted by it), and the range is found by binary search. When the
+///   series index says every row is inside the range and the timestamp is
+///   neither wanted nor `need_ts`, it is not decoded at all.
+/// * Other columns decode only rows `[0, hi)`: Delta and Gorilla streams
+///   cannot be entered in the middle, but nothing past the range is expanded.
+///
+/// Returns `None` when no row of the series is in range.
+pub(crate) fn load_window(
+    schema: &Schema,
+    meta: &ChunkMeta,
+    idx: usize,
+    (ts_min, ts_max): (i64, i64),
+    want: &[bool],
+    need_ts: bool,
+) -> Result<Option<Window>> {
+    let entry = meta.series.get(idx).ok_or_else(|| corrupt("series entry index out of range"))?;
+    let n = entry.row_count as usize;
+    if n == 0 || u64::from(entry.row_count) > MAX_SERIES_ROWS {
+        return Err(corrupt(format!("{} has a series with {n} rows", meta.path().display())));
+    }
+    if entry.blocks.len() != schema.data_indices().len() || entry.tags.len() != schema.tag_indices().len() {
+        return Err(corrupt(format!("{} does not match the table schema", meta.path().display())));
+    }
+    block::check_materialization(n, 9 * schema.data_indices().len().max(1))
+        .map_err(|e| corrupt(format!("{}: {e}", meta.path().display())))?;
+    let ts_idx = schema.ts_index();
+    let mut cols: Vec<Option<block::ColumnData>> = (0..schema.columns().len()).map(|_| None).collect();
+    let decode_err = |b: BlockRef, e: Error| corrupt(format!("{} at offset {}: {e}", meta.path().display(), b.offset));
+
+    let covers_all = entry.ts_min >= ts_min && entry.ts_max <= ts_max;
+    let want_ts = need_ts || want.get(ts_idx).copied().unwrap_or(false);
+    let (lo, hi) = if covers_all && !want_ts {
+        (0, n)
+    } else {
+        let pos =
+            schema.data_indices().iter().position(|&c| c == ts_idx).ok_or_else(|| corrupt("no timestamp block"))?;
+        let b = entry.blocks[pos];
+        let payload = read_block(meta, b)?;
+        let data = block::decode_compact(ColumnType::Timestamp, n, &payload).map_err(|e| decode_err(b, e))?;
+        let ts = data.ints().filter(|t| t.len() == n && data.null_flags().is_none());
+        let ts = ts.ok_or_else(|| corrupt(format!("{}: bad timestamp block", meta.path().display())))?;
+        if !ts.windows(2).all(|w| w[0] <= w[1]) {
+            return Err(corrupt(format!("{}: series rows are not sorted by timestamp", meta.path().display())));
+        }
+        let lo = ts.partition_point(|&t| t < ts_min);
+        let hi = ts.partition_point(|&t| t <= ts_max);
+        if want_ts {
+            cols[ts_idx] = Some(data);
+        }
+        (lo, hi)
+    };
+    if lo >= hi {
+        return Ok(None);
+    }
+    for (&col, &b) in schema.data_indices().iter().zip(&entry.blocks) {
+        if col == ts_idx || !want.get(col).copied().unwrap_or(false) {
+            continue;
+        }
+        let payload = read_block(meta, b)?;
+        let data =
+            block::decode_compact_prefix(schema.columns()[col].ty, n, hi, &payload).map_err(|e| decode_err(b, e))?;
+        if data.len() != hi {
+            return Err(corrupt("column block too short"));
+        }
+        cols[col] = Some(data);
+    }
+    Ok(Some(Window { lo, hi, cols, ts_index: ts_idx }))
 }
 
 /// Decodes series `idx` into compact columns, through the cache.

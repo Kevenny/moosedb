@@ -70,7 +70,7 @@ ERROR HY000: MooseDB: invalid argument: CHUNK_INTERVAL '3 DAY' not supported; us
 ALTER TABLE m COMPRESSION='RAR';
 ERROR HY000: MooseDB: invalid argument: COMPRESSION 'RAR' not supported; use ZSTD, LZ4 or NONE
 ALTER TABLE m TIMESTAMP_COLUMN='host';
-ERROR HY000: MooseDB: timestamp column 'host' must be a stored DATETIME or TIMESTAMP column
+ERROR HY000: MooseDB: timestamp column 'host' must be a stored DATETIME, TIMESTAMP, INT or BIGINT column
 ALTER TABLE m ENCRYPTION='YES' ENCRYPTION_KEY_ID=77;
 ERROR HY000: MooseDB: invalid argument: encryption key 77 is not available: encryption: encryption key 77 (version latest) is not available
 SELECT CHUNK_INTERVAL, RETENTION, COMPRESSION, ENCRYPTED FROM information_schema.MOOSEDB_TABLES WHERE TABLE_NAME = 'm';

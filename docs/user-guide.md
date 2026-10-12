@@ -56,7 +56,39 @@ Regras:
 * colunas com `COMMENT 'TAG'` formam a identidade da **série** (host, sensor,
   métrica…). Filtros `=`/`IN` sobre TAGs leem só as séries correspondentes;
 * `DATETIME` é armazenado como relógio de parede (UTC); `TIMESTAMP`, como
-  instante Unix.
+  instante Unix;
+* **Eixo de tempo inteiro** (ex.: `clock INT` do Zabbix): com
+  `TIMESTAMP_COLUMN='clock'`, uma coluna `INT` ou `BIGINT` (com ou sem sinal,
+  `NOT NULL`, armazenada, com o índice simples `INDEX (clock)`) é o eixo, lida
+  como **segundos desde 1970 UTC**. A engine guarda segundos × 10⁶ µs, então
+  `CHUNK_INTERVAL`, retenção e poda por faixa funcionam como no `DATETIME`
+  (fronteiras de chunk à meia-noite UTC). Uma coluna inteira **só** vira eixo
+  quando nomeada em `TIMESTAMP_COLUMN` — um índice sobre `INT` sozinho não basta
+  (o `CREATE` falha pedindo a coluna de tempo). Valores fora de
+  ±9.223.372.036.854 s (acima disso, segundos × 10⁶ estoura 64 bits) são
+  **recusados** com erro claro, nunca truncados — inclusive `BIGINT UNSIGNED`
+  acima de 2⁶³. A coluna de tempo não pode ser TAG. Uma coluna `ns`
+  (nanossegundos) é comum e **não** entra no eixo: `ORDER BY clock, ns` é
+  ordenado por filesort e fica correto. `clock > N`, `BETWEEN`,
+  `ORDER BY clock DESC LIMIT n` e `MIN/MAX` usam o índice e a poda por tempo.
+  Ex.: `clock INT NOT NULL, INDEX (clock)` + `TIMESTAMP_COLUMN='clock'`;
+* **TAG inteira** (`TINYINT`..`BIGINT`, com ou sem sinal, ex.:
+  `itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG'`): `=`, `IN` e igualdades
+  múltiplas (`AND`) com constantes numéricas — **sem aspas** (`itemid = 123`,
+  `itemid IN (1,2,3)`) ou com — leem só as séries correspondentes. A constante
+  vira o texto decimal canônico da coluna: inteira, decimal integral (`123.0`)
+  e `DOUBLE` integral abaixo de 2⁵³ são empurrados; fracionária (`123.5`) ou
+  fora do intervalo da coluna não casa série alguma; string só é empurrada se
+  for um inteiro "limpo" (`'123'`; não `'0123'`, `' 12'`, `'12abc'`, `'1e3'`),
+  e tudo que for duvidoso fica para o servidor, que sempre reavalia o `WHERE`
+  completo (o pushdown só poda séries). Em coluna `BIGINT` o próprio servidor
+  já converte constantes string em inteiras antes de a engine ver a condição.
+  **`ZEROFILL` desliga o pushdown da coluna** (o texto gravado é preenchido com
+  zeros). Uma TAG `VARCHAR` comparada com número **não** é empurrada (o
+  servidor compara como `DOUBLE`: `'0123' = 123`). `IN` com mais de
+  `in_predicate_conversion_threshold` (1000) valores vira subquery no servidor
+  e não é empurrado — para listas maiores,
+  `SET in_predicate_conversion_threshold = 0`.
 
 | Opção | Valores | Padrão |
 |---|---|---|
@@ -66,7 +98,7 @@ Regras:
 | `COMPRESSION_LEVEL` | 1–19 | 3 |
 | `HOT_THRESHOLD` | período; mais novos = LZ4 | `7 DAYS` |
 | `MEMTABLE_SIZE` | bytes (4096 – 96 MiB) | `moosedb_memtable_flush_threshold` |
-| `TIMESTAMP_COLUMN` | nome da coluna | coluna do índice temporal |
+| `TIMESTAMP_COLUMN` | nome da coluna (`DATETIME`/`TIMESTAMP`/`INT`/`BIGINT`) | coluna `DATETIME`/`TIMESTAMP` do índice temporal |
 | `ENCRYPTION` | `YES`/`NO` | `NO` |
 | `ENCRYPTION_KEY_ID` | id no key management | 1 |
 

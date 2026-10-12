@@ -15,6 +15,8 @@
 #include <algorithm>
 #include <cctype>
 #include <climits>
+#include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -142,6 +144,48 @@ bool is_temporal(const Field *f)
   default:
     return false;
   }
+}
+
+/* INT / BIGINT (signed or unsigned): usable as a seconds-since-epoch axis. */
+bool is_int_axis(const Field *f)
+{
+  switch (f->real_type()) {
+  case MYSQL_TYPE_LONG:
+  case MYSQL_TYPE_LONGLONG:
+    return true;
+  default:
+    return false;
+  }
+}
+
+/* TINYINT..BIGINT: a TAG of these types is stored as val_str()'s text. */
+bool is_int_tag_field(const Field *f)
+{
+  switch (f->real_type()) {
+  case MYSQL_TYPE_TINY:
+  case MYSQL_TYPE_SHORT:
+  case MYSQL_TYPE_INT24:
+  case MYSQL_TYPE_LONG:
+  case MYSQL_TYPE_LONGLONG:
+    return true;
+  default:
+    return false;
+  }
+}
+
+/*
+  Seconds -> µs for a range bound taken from an index key: saturates instead
+  of wrapping (a bound beyond what can be stored selects nothing / everything,
+  exactly like the unbounded side).
+*/
+longlong secs_to_micros_saturating(longlong secs, bool field_unsigned)
+{
+  if (field_unsigned && secs < 0)       /* BIGINT UNSIGNED above LONGLONG_MAX */
+    return LONGLONG_MAX;
+  longlong us;
+  if (__builtin_mul_overflow(secs, MICROS_PER_SEC, &us))
+    return secs < 0 ? LONGLONG_MIN : LONGLONG_MAX;
+  return us;
 }
 
 /* Message of the last Rust error on this thread ("" if none). */
@@ -482,10 +526,16 @@ bool build_layout(TABLE_SHARE *s, tf_layout *out, std::string *err)
           "(INDEX ts_idx (ts)) or TIMESTAMP_COLUMN = '<column>'";
     return true;
   }
-  if (!is_temporal(ts_field) || !ts_field->stored_in_db())
+  /*
+    An INT/BIGINT axis (seconds since 1970 UTC) is accepted only when named
+    explicitly by TIMESTAMP_COLUMN: a plain integer index must never silently
+    turn an existing table definition into a time axis.
+  */
+  if (!(is_temporal(ts_field) || is_int_axis(ts_field)) ||
+      !ts_field->stored_in_db())
   {
     *err= std::string("timestamp column '") + ts_field->field_name.str +
-          "' must be a stored DATETIME or TIMESTAMP column";
+          "' must be a stored DATETIME, TIMESTAMP, INT or BIGINT column";
     return true;
   }
   if (ts_field->real_maybe_null())
@@ -545,6 +595,14 @@ bool build_layout(TABLE_SHARE *s, tf_layout *out, std::string *err)
       }
       c.type= TF_COL_TAG;
       c.conv= tf_conv::TAG;
+      l.columns.push_back(c);
+      continue;
+    }
+    if (f == ts_field && !is_temporal(f))
+    {
+      /* integer axis: seconds since 1970 UTC, stored as µs (secs * 1e6) */
+      c.type= TF_COL_TIMESTAMP;
+      c.conv= tf_conv::INT_SECS;
       l.columns.push_back(c);
       continue;
     }
@@ -906,6 +964,23 @@ int ha_moosedb::write_row(const uchar *buf)
         v.data.ts_us= (longlong) secs * MICROS_PER_SEC + (longlong) usec;
         break;
       }
+      case tf_conv::INT_SECS:
+      {
+        const longlong secs= f->val_int();
+        longlong us= 0;
+        /* a BIGINT UNSIGNED above LONGLONG_MAX reads back negative */
+        if ((f->is_unsigned() && secs < 0) ||
+            __builtin_mul_overflow(secs, MICROS_PER_SEC, &us))
+        {
+          last_error_= std::string("column '") + f->field_name.str +
+                       "': time value outside the supported range "
+                       "(+/-9223372036854 seconds since 1970)";
+          error= HA_ERR_MOOSEDB_BASE + TF_ERR_INVALID_ARG;
+          break;
+        }
+        v.data.ts_us= us;
+        break;
+      }
       case tf_conv::INT:
         v.data.int_val= f->val_int();
         break;
@@ -1022,6 +1097,9 @@ int ha_moosedb::fill_record(uchar *buf, const TFRow &row)
         f->store_timestamp((my_time_t) secs, (ulong) (us - secs * MICROS_PER_SEC));
         break;
       }
+      case tf_conv::INT_SECS:
+        f->store(floor_div(v.data.ts_us, MICROS_PER_SEC), f->is_unsigned());
+        break;
       case tf_conv::INT:
         f->store(v.data.int_val, f->is_unsigned());
         break;
@@ -1101,6 +1179,7 @@ int ha_moosedb::fill_from_batch(uchar *buf, uint32_t row)
     switch (c.conv) {
     case tf_conv::DATETIME:
     case tf_conv::TIMESTAMP:
+    case tf_conv::INT_SECS:
     case tf_conv::INT:
     {
       if (!cb.values)
@@ -1121,6 +1200,8 @@ int ha_moosedb::fill_from_batch(uchar *buf, uint32_t row)
         const longlong secs= floor_div(x, MICROS_PER_SEC);
         f->store_timestamp((my_time_t) secs, (ulong) (x - secs * MICROS_PER_SEC));
       }
+      else if (c.conv == tf_conv::INT_SECS)
+        f->store(floor_div(x, MICROS_PER_SEC), f->is_unsigned());
       else
         f->store(x, f->is_unsigned());
       break;
@@ -1407,6 +1488,188 @@ bool const_string(Item *item, CHARSET_INFO *cs, std::string *out,
   return true;
 }
 
+/*
+  Numeric pushdown for integer TAG columns.
+
+  A series of such a column carries the canonical decimal text of the value
+  (Field::val_str: no padding, no '+', '-' only for negatives, unsigned
+  columns printed unsigned). A comparison `col = K` is turned into "the
+  series text equals the canonical text of K" -- but only where that is
+  provably what the server's own comparison decides, because the server
+  evaluates the whole WHERE again and a series dropped here is gone for good:
+
+  * INT constant: the server compares exactly (signed/unsigned aware).
+  * DECIMAL constant: exact too. A fractional value (123.5) equals no integer
+    column value; an integral one (123.0) is the integer itself.
+  * REAL constant: compared as DOUBLE. Safe only while |K| < 2^53 (every
+    integer there is a double, so (double) c == K  <=>  c == K); a fractional
+    double equals no integer; a bigger one is not pushed (c = 2^53 + 1 would
+    compare equal to 2^53).
+  * String constant: the server compares it as DOUBLE (or as an exact integer
+    when it converts cleanly); either way a *clean* integer text -- optional
+    '-', no leading zeros, no sign '+', no spaces, no exponent, not "-0" --
+    with |K| < 2^53 behaves like the integer K. Anything else ('0123', ' 12',
+    '12abc', '1e3', '', 'abc', binary strings such as x'3132') is not pushed:
+    the server would compare the number it parses, not the text.
+  * A value outside the column's range matches no series.
+  * ZEROFILL columns are never pushed (their stored text is padded).
+*/
+enum class num_const { PUSH, NO_MATCH, IS_NULL, REFUSE };
+
+constexpr uint64_t EXACT_DOUBLE_LIMIT= 1ULL << 53;
+
+/* Does -mag / +mag fit the integer Field `f`? (neg implies mag != 0) */
+bool int_fits_field(const Field *f, bool neg, uint64_t mag)
+{
+  const unsigned bits= (unsigned) f->pack_length() * 8;
+  if (bits == 0 || bits > 64)
+    return false;
+  if (f->is_unsigned())
+    return !neg && (bits == 64 || mag <= ((uint64_t) 1 << bits) - 1);
+  const uint64_t lim= (uint64_t) 1 << (bits - 1);
+  return neg ? mag <= lim : mag < lim;
+}
+
+std::string canonical_int_text(bool neg, uint64_t mag)
+{
+  char buf[32];
+  snprintf(buf, sizeof(buf), "%s%llu", neg ? "-" : "",
+           (unsigned long long) mag);
+  return buf;
+}
+
+/* Digits [from, to) -> value; false on overflow of uint64_t. */
+bool digits_to_u64(const char *p, size_t from, size_t to, uint64_t *out)
+{
+  uint64_t v= 0;
+  for (size_t i= from; i < to; i++)
+  {
+    const unsigned d= (unsigned) (p[i] - '0');
+    if (v > (UINT64_MAX - d) / 10)
+      return false;
+    v= v * 10 + d;
+  }
+  *out= v;
+  return true;
+}
+
+num_const numeric_const(Item *item, const Field *fld, std::string *text,
+                       bool *big)
+{
+  assert(fld);
+  assert(big);
+  if (!fld || !big)
+    return num_const::REFUSE;
+  /* set when the value is >= 2^53 in magnitude (or overflows): see add() */
+  *big= false;
+  if (item->type() == Item::NULL_ITEM)
+    return num_const::IS_NULL;
+  if (!item->const_item() || item->is_expensive())
+    return num_const::REFUSE;
+
+  bool neg= false;
+  uint64_t mag= 0;
+  switch (item->cmp_type()) {
+  case INT_RESULT:
+  {
+    const longlong v= item->val_int();
+    if (item->null_value)
+      return num_const::IS_NULL;
+    if (item->unsigned_flag || v >= 0)
+      mag= (uint64_t) v;
+    else
+    {
+      neg= true;
+      mag= (uint64_t) 0 - (uint64_t) v;
+    }
+    *big= mag >= EXACT_DOUBLE_LIMIT;
+    break;
+  }
+  case DECIMAL_RESULT:
+  {
+    StringBuffer<MAX_FIELD_WIDTH> buf;
+    String *s= item->val_str(&buf);
+    if (!s || item->null_value)
+      return num_const::IS_NULL;
+    const char *p= s->ptr();
+    const size_t n= s->length();
+    size_t i= 0;
+    if (i < n && p[i] == '-')
+      neg= true, i++;
+    const size_t int_from= i;
+    while (i < n && p[i] >= '0' && p[i] <= '9')
+      i++;
+    const size_t int_to= i;
+    size_t frac_from= i, frac_to= i;
+    if (i < n && p[i] == '.')
+    {
+      frac_from= ++i;
+      while (i < n && p[i] >= '0' && p[i] <= '9')
+        i++;
+      frac_to= i;
+    }
+    if (i != n || (int_to == int_from && frac_to == frac_from))
+      return num_const::REFUSE;
+    const bool fits= digits_to_u64(p, int_from, int_to, &mag);
+    *big= !fits || mag >= EXACT_DOUBLE_LIMIT;
+    for (size_t k= frac_from; k < frac_to; k++)
+      if (p[k] != '0')
+        return num_const::NO_MATCH;       /* exact fraction: equals no integer */
+    if (!fits)
+      return num_const::NO_MATCH;         /* beyond any column, exact compare */
+    break;
+  }
+  case REAL_RESULT:
+  {
+    const double d= item->val_real();
+    if (item->null_value)
+      return num_const::IS_NULL;
+    if (!std::isfinite(d) || std::fabs(d) >= (double) EXACT_DOUBLE_LIMIT)
+      return num_const::REFUSE;
+    if (d != std::trunc(d))
+      return num_const::NO_MATCH;
+    neg= d < 0;
+    mag= (uint64_t) std::fabs(d);
+    break;
+  }
+  case STRING_RESULT:
+  {
+    if (item->collation.collation == &my_charset_bin)
+      return num_const::REFUSE;
+    StringBuffer<MAX_FIELD_WIDTH> buf;
+    String *s= item->val_str(&buf);
+    if (!s || item->null_value)
+      return num_const::IS_NULL;
+    if (s->charset()->mbminlen != 1)
+      return num_const::REFUSE;
+    const char *p= s->ptr();
+    const size_t n= s->length();
+    size_t i= 0;
+    if (i < n && p[i] == '-')
+      neg= true, i++;
+    const size_t from= i;
+    if (n - from == 0 || n - from > 16)        /* 16 digits < 2^53 ~ 9.0e15 */
+      return num_const::REFUSE;
+    for (size_t k= from; k < n; k++)
+      if (p[k] < '0' || p[k] > '9')
+        return num_const::REFUSE;
+    if (p[from] == '0' && (n - from > 1 || neg))   /* '0123', '-0' */
+      return num_const::REFUSE;
+    if (!digits_to_u64(p, from, n, &mag) || mag >= EXACT_DOUBLE_LIMIT)
+      return num_const::REFUSE;
+    break;
+  }
+  default:
+    return num_const::REFUSE;
+  }
+  if (mag == 0)
+    neg= false;
+  if (!int_fits_field(fld, neg, mag))
+    return num_const::NO_MATCH;
+  *text= canonical_int_text(neg, mag);
+  return num_const::PUSH;
+}
+
 } // namespace
 
 void ha_moosedb::collect_tag_predicates(const Item *cond,
@@ -1431,7 +1694,52 @@ void ha_moosedb::collect_tag_predicates(const Item *cond,
   auto add= [&](const Item_field *f, CHARSET_INFO *cmp_cs, Item **consts,
                 uint n) {
     const int pos= share_->layout.tag_position(f->field->field_index);
-    if (pos < 0 || f->field->cmp_type() != STRING_RESULT)
+    if (pos < 0)
+      return;
+    if (is_int_tag_field(f->field))
+    {
+      /* Integer TAG: compare canonical decimal text, byte for byte. */
+      if (f->field->flags & ZEROFILL_FLAG)
+        return;
+      tf_tag_predicate p{pos, &my_charset_bin, {}};
+      p.values.reserve(n);
+      /*
+        The server may compare a whole IN list with one aggregated type. If
+        any constant is DOUBLE or string (or the types are otherwise not just
+        INT/DECIMAL), the comparison can be inexact, and then a constant of
+        magnitude >= 2^53 can equal column values that differ from it (2^53
+        and 2^53+1 are the same double). So: only INT/DECIMAL-only lists may
+        carry such magnitudes; otherwise any big constant refuses the whole
+        predicate.
+      */
+      bool exact= true;
+      for (uint i= 0; i < n; i++)
+        if (consts[i]->type() != Item::NULL_ITEM &&
+            consts[i]->cmp_type() != INT_RESULT &&
+            consts[i]->cmp_type() != DECIMAL_RESULT)
+          exact= false;
+      for (uint i= 0; i < n; i++)
+      {
+        std::string v;
+        bool big= false;
+        const num_const r= numeric_const(consts[i], f->field, &v, &big);
+        if (big && !exact)
+          return;
+        switch (r) {
+        case num_const::PUSH:
+          p.values.push_back(std::move(v));
+          break;
+        case num_const::NO_MATCH:     /* equals no value of the column */
+        case num_const::IS_NULL:      /* "col = NULL" never matches    */
+          break;
+        case num_const::REFUSE:
+          return;                     /* the server decides this one   */
+        }
+      }
+      out->push_back(std::move(p));
+      return;
+    }
+    if (f->field->cmp_type() != STRING_RESULT)
       return;
     tf_tag_predicate p{pos, cmp_cs ? cmp_cs : f->field->charset(), {}};
     for (uint i= 0; i < n; i++)
@@ -1464,10 +1772,32 @@ void ha_moosedb::collect_tag_predicates(const Item *cond,
     Item *c= eq->get_const();
     if (!c)
       return;
+    /*
+      For an integer TAG, every member must itself be an integer column: with
+      a DOUBLE, DECIMAL or string member the equality is evaluated under
+      another comparison type (e.g. DOUBLE, where 2^53 and 2^53+1 are equal),
+      not exactly. String TAGs are not affected by this.
+    */
+    bool all_int= true;
+    {
+      Item_equal_fields_iterator chk(*eq);
+      while (Item *m= chk++)
+      {
+        Item *r= m->real_item();
+        const Field *mf= r->type() == Item::FIELD_ITEM
+                           ? static_cast<Item_field *>(r)->field : nullptr;
+        if (!mf || !is_int_tag_field(mf))
+          all_int= false;
+      }
+    }
     Item_equal_fields_iterator it(*eq);
     while (Item *fi= it++)
       if (const Item_field *f= field_of(fi, table))
+      {
+        if (is_int_tag_field(f->field) && !all_int)
+          continue;
         add(f, eq->compare_collation(), &c, 1);
+      }
     return;
   }
   case Item_func::IN_FUNC:
@@ -1570,7 +1900,10 @@ bool ha_moosedb::pushed_series(const std::vector<uint64_t> **ids)
         pushed_filter_= false;
         return false;
       }
-      tag_cs.push_back(table->field[c.field_index]->charset());
+      /* Integer TAGs are matched on their decimal text, byte for byte. */
+      tag_cs.push_back(is_int_tag_field(table->field[c.field_index])
+                         ? &my_charset_bin
+                         : table->field[c.field_index]->charset());
     }
   for (const tf_tag_predicate *p : preds)
     if (p->tag_pos < 0 || (size_t) p->tag_pos >= tag_cs.size() || !p->cs)
@@ -2343,6 +2676,11 @@ int ha_moosedb::key_to_ts(uint idx, const uchar *key, longlong *out)
   {
     ulong usec= 0;
     ts= (longlong) f->get_timestamp(&usec) * MICROS_PER_SEC + (longlong) usec;
+  }
+  else if (is_int_axis(f))
+  {
+    /* integer axis: key image -> seconds -> µs (saturating, see above) */
+    ts= secs_to_micros_saturating(f->val_int(), f->is_unsigned());
   }
   else
   {

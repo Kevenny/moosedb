@@ -67,8 +67,8 @@ CREATE TABLE t1 (ts DATETIME NOT NULL, v INT NOT NULL, INDEX(ts), INDEX(v)) ENGI
 ERROR HY000: MooseDB: index 'v' is not supported: MooseDB only indexes the timestamp column (TAG columns are indexed implicitly)
 CREATE TABLE t1 (ts DATETIME NOT NULL, INDEX(ts)) ENGINE=MooseDB TIMESTAMP_COLUMN='nope';
 ERROR HY000: MooseDB: TIMESTAMP_COLUMN 'nope' does not exist
-CREATE TABLE t1 (ts DATETIME NOT NULL, v INT NOT NULL, INDEX(ts)) ENGINE=MooseDB TIMESTAMP_COLUMN='v';
-ERROR HY000: MooseDB: timestamp column 'v' must be a stored DATETIME or TIMESTAMP column
+CREATE TABLE t1 (ts DATETIME NOT NULL, v DOUBLE NOT NULL, INDEX(ts)) ENGINE=MooseDB TIMESTAMP_COLUMN='v';
+ERROR HY000: MooseDB: timestamp column 'v' must be a stored DATETIME, TIMESTAMP, INT or BIGINT column
 CREATE TABLE t1 (id INT NOT NULL AUTO_INCREMENT, ts DATETIME NOT NULL, INDEX(id), INDEX(ts)) ENGINE=MooseDB;
 ERROR 42000: Storage engine MooseDB doesn't support AUTO_INCREMENT columns
 # TIMESTAMP columns work as the time axis too

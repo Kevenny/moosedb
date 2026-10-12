@@ -1,0 +1,492 @@
+#
+# INT / BIGINT time axis: TIMESTAMP_COLUMN names an integer column that holds
+# seconds since 1970-01-01 UTC (Zabbix: clock INT). The engine stores secs *
+# 1e6 microseconds, so chunking, retention and range pruning work as for
+# DATETIME. Every query runs on the MooseDB table and on an InnoDB mirror;
+# "SAME" means identical count, minimum and row checksum.
+#
+--source include/not_embedded.inc
+--source include/have_innodb.inc
+--source include/have_sequence.inc
+--source suite/moosedb/include/have_moosedb.inc
+
+--let $quiet= 0
+--let $show_status= 0
+--let $mt= z
+--let $it= zi
+--let $sel= COUNT(*), MIN(clock), BIT_XOR(CRC32(CONCAT(clock, '|', itemid, '|', ns)))
+
+--echo ##################################################################
+--echo # DDL rules
+--echo ##################################################################
+--echo # An integer column is the axis only when TIMESTAMP_COLUMN names it
+--error ER_ILLEGAL_HA_CREATE_OPTION
+CREATE TABLE e (clock INT NOT NULL, INDEX(clock)) ENGINE=MooseDB;
+--error ER_ILLEGAL_HA_CREATE_OPTION
+CREATE TABLE e (ts DATETIME NOT NULL, clock INT NOT NULL, INDEX(clock)) ENGINE=MooseDB;
+--echo # NOT NULL, stored, INT or BIGINT, not a TAG, indexed (non-unique)
+--error ER_NULL_COLUMN_IN_INDEX
+CREATE TABLE e (clock INT, INDEX(clock)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+--error ER_ILLEGAL_HA_CREATE_OPTION
+CREATE TABLE e (clock SMALLINT NOT NULL, INDEX(clock)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+--error ER_ILLEGAL_HA_CREATE_OPTION
+CREATE TABLE e (clock TINYINT NOT NULL, INDEX(clock)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+--error ER_ILLEGAL_HA_CREATE_OPTION
+CREATE TABLE e (clock DOUBLE NOT NULL, INDEX(clock)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+--error ER_ILLEGAL_HA_CREATE_OPTION
+CREATE TABLE e (clock INT NOT NULL COMMENT 'TAG', INDEX(clock)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+--error ER_ILLEGAL_HA_CREATE_OPTION
+CREATE TABLE e (clock INT NOT NULL, v INT) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+--error ER_ILLEGAL_HA_CREATE_OPTION
+CREATE TABLE e (clock INT NOT NULL, UNIQUE(clock)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+--error ER_ILLEGAL_HA_CREATE_OPTION
+CREATE TABLE e (clock INT NOT NULL, v INT NOT NULL, INDEX(clock), INDEX(v)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+--echo # An index on a DATETIME column is not the axis when TIMESTAMP_COLUMN says otherwise
+--error ER_ILLEGAL_HA_CREATE_OPTION
+CREATE TABLE e (ts DATETIME NOT NULL, clock INT NOT NULL, INDEX(ts)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+
+--echo ##################################################################
+--echo # Basic table: INT axis, integer TAG, ns as an ordinary column
+--echo ##################################################################
+CREATE TABLE z (
+  clock  INT NOT NULL,
+  itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG',
+  ns     INT NOT NULL,
+  value  DOUBLE NOT NULL,
+  INDEX clock_idx (clock)
+) ENGINE=MooseDB TIMESTAMP_COLUMN='clock' CHUNK_INTERVAL='1 DAY';
+CREATE TABLE zi (
+  clock  INT NOT NULL,
+  itemid BIGINT UNSIGNED NOT NULL,
+  ns     INT NOT NULL,
+  value  DOUBLE NOT NULL,
+  KEY clock_idx (clock)
+) ENGINE=InnoDB;
+SHOW CREATE TABLE z;
+
+--echo # 2000 rows, one every 10 minutes from 2026-01-01 00:00:00 UTC (7 daily chunks sealed + the second half in the MemTable)
+--let $row= 1767225600 + seq * 600, 1 + seq MOD 5, (seq * 7919) MOD 1000000, seq / 4
+eval INSERT INTO z SELECT $row FROM seq_0_to_999;
+eval INSERT INTO zi SELECT $row FROM seq_0_to_999;
+FLUSH TABLES z;
+eval INSERT INTO z SELECT $row FROM seq_1000_to_1999;
+eval INSERT INTO zi SELECT $row FROM seq_1000_to_1999;
+SELECT COUNT(*), MIN(clock), MAX(clock), COUNT(DISTINCT itemid) FROM z;
+SELECT COUNT(*), MIN(clock), MAX(clock), COUNT(DISTINCT itemid) FROM zi;
+
+--echo # Chunks are cut at UTC midnight of the epoch seconds
+SELECT COUNT(*) AS chunks, MIN(TS_MIN) AS first_min, MAX(TS_MAX) AS last_max
+  FROM information_schema.MOOSEDB_CHUNKS WHERE TABLE_NAME = 'z';
+SELECT TS_MIN, TS_MAX, `ROWS` FROM information_schema.MOOSEDB_CHUNKS
+  WHERE TABLE_NAME = 'z' ORDER BY CHUNK_ID LIMIT 2;
+
+--echo ##################################################################
+--echo # Ranges (X = 1767825600 is row 1000)
+--echo ##################################################################
+--let $tail= WHERE clock = 1767825600
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock = 1767825601
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock < 1767825600
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock <= 1767825600
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock > 1767825600
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock >= 1767825600
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock BETWEEN 1767825000 AND 1767826200
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock BETWEEN 1767825001 AND 1767825599
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock > 1767825000 AND clock < 1767826200
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock >= 1767825000 AND clock < 1767826200
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock > 1767825000 AND clock <= 1767826200
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock NOT BETWEEN 1767225600 AND 1768400000
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock IN (1767225600, 1767825600, 1768425000, 5)
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock <> 1767825600
+--source suite/moosedb/include/mirror_cmp.inc
+--echo # Edges of the data (MIN = 1767225600, MAX = 1768425000)
+--let $tail= WHERE clock <= 1767225600
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock < 1767225600
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock >= 1768425000
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock > 1768425000
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock > 1767225600 AND clock < 1768425000
+--source suite/moosedb/include/mirror_cmp.inc
+--echo # Constants of other types and beyond the INT range
+--let $tail= WHERE clock = '1767825600'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock > 1767825600.5
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock < 1767825600.5
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock > 9999999999999
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock < 9999999999999
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock > -9999999999999
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock < -9999999999999
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock > 2147483647
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock <= 2147483647
+--source suite/moosedb/include/mirror_cmp.inc
+--echo # Combined with integer TAG pushdown
+--let $tail= WHERE itemid IN (1, 3) AND clock BETWEEN 1767900000 AND 1768000000
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid = 2 AND clock > 1768300000
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid = 2 AND clock > 1768300000 AND ns > 500000
+--source suite/moosedb/include/mirror_cmp.inc
+
+--echo # The scan really uses the index: reads only the rows of the range
+EXPLAIN SELECT COUNT(*) FROM z WHERE clock BETWEEN 1767825000 AND 1767826200;
+FLUSH STATUS;
+SELECT COUNT(*) FROM z WHERE clock BETWEEN 1767825000 AND 1767826200;
+SHOW SESSION STATUS WHERE Variable_name IN ('Handler_read_key', 'Handler_read_next', 'Handler_read_rnd_next', 'Handler_read_first');
+FLUSH STATUS;
+SELECT COUNT(*) FROM z WHERE clock > 1768400000;
+SHOW SESSION STATUS WHERE Variable_name IN ('Handler_read_key', 'Handler_read_next', 'Handler_read_rnd_next', 'Handler_read_first');
+
+--echo ##################################################################
+--echo # ORDER BY clock, LIMIT, MIN/MAX
+--echo ##################################################################
+EXPLAIN SELECT clock, itemid FROM z ORDER BY clock DESC LIMIT 5;
+SELECT clock, itemid, ns FROM z ORDER BY clock DESC LIMIT 5;
+SELECT clock, itemid, ns FROM zi ORDER BY clock DESC LIMIT 5;
+SELECT clock, itemid, ns FROM z ORDER BY clock LIMIT 3;
+SELECT clock, itemid, ns FROM zi ORDER BY clock LIMIT 3;
+SELECT clock, itemid, ns FROM z WHERE clock < 1767825600 ORDER BY clock DESC LIMIT 3;
+SELECT clock, itemid, ns FROM zi WHERE clock < 1767825600 ORDER BY clock DESC LIMIT 3;
+SELECT clock, itemid, ns FROM z WHERE clock >= 1767825600 ORDER BY clock LIMIT 3 OFFSET 2;
+SELECT clock, itemid, ns FROM zi WHERE clock >= 1767825600 ORDER BY clock LIMIT 3 OFFSET 2;
+--echo # Zabbix pattern: one item, newest first
+SELECT clock, itemid, value FROM z WHERE itemid = 3 ORDER BY clock DESC LIMIT 4;
+SELECT clock, itemid, value FROM zi WHERE itemid = 3 ORDER BY clock DESC LIMIT 4;
+SELECT clock, itemid, value FROM z WHERE itemid IN (2, 4) AND clock <= 1768000000 ORDER BY clock DESC LIMIT 4;
+SELECT clock, itemid, value FROM zi WHERE itemid IN (2, 4) AND clock <= 1768000000 ORDER BY clock DESC LIMIT 4;
+--echo # Min/max by the index
+EXPLAIN SELECT MIN(clock), MAX(clock) FROM z;
+SELECT MIN(clock), MAX(clock) FROM z;
+SELECT MIN(clock), MAX(clock) FROM zi;
+SELECT MIN(clock), MAX(clock) FROM z WHERE clock > 1767825600 AND clock < 1768000000;
+SELECT MIN(clock), MAX(clock) FROM zi WHERE clock > 1767825600 AND clock < 1768000000;
+SELECT MIN(clock), MAX(clock) FROM z WHERE clock > 1768425000;
+SELECT MIN(clock), MAX(clock) FROM zi WHERE clock > 1768425000;
+SELECT COUNT(*), MIN(clock), MAX(clock) FROM z WHERE itemid = 5;
+SELECT COUNT(*), MIN(clock), MAX(clock) FROM zi WHERE itemid = 5;
+
+--echo # ns is an ordinary column: ORDER BY clock, ns is a filesort and stays correct
+CREATE TABLE zt (clock INT NOT NULL, itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG', ns INT NOT NULL, value DOUBLE NOT NULL,
+  INDEX (clock)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock' CHUNK_INTERVAL='1 HOUR';
+CREATE TABLE zti (clock INT NOT NULL, itemid BIGINT UNSIGNED NOT NULL, ns INT NOT NULL, value DOUBLE NOT NULL,
+  KEY (clock)) ENGINE=InnoDB;
+--let $row= 1767225600 + seq DIV 6, 1 + seq MOD 3, 999999999 - (seq * 7) MOD 100, seq
+eval INSERT INTO zt SELECT $row FROM seq_0_to_59;
+eval INSERT INTO zti SELECT $row FROM seq_0_to_59;
+FLUSH TABLES zt;
+eval INSERT INTO zt SELECT $row FROM seq_60_to_119;
+eval INSERT INTO zti SELECT $row FROM seq_60_to_119;
+SELECT clock, ns, itemid FROM zt ORDER BY clock DESC, ns DESC LIMIT 7;
+SELECT clock, ns, itemid FROM zti ORDER BY clock DESC, ns DESC LIMIT 7;
+SELECT clock, ns, itemid FROM zt ORDER BY clock, ns LIMIT 7;
+SELECT clock, ns, itemid FROM zti ORDER BY clock, ns LIMIT 7;
+SELECT clock, COUNT(*) FROM zt WHERE clock BETWEEN 1767225603 AND 1767225605 GROUP BY clock;
+SELECT clock, COUNT(*) FROM zti WHERE clock BETWEEN 1767225603 AND 1767225605 GROUP BY clock;
+--let $mt= zt
+--let $it= zti
+--let $tail= WHERE clock = 1767225605
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock > 1767225605 AND ns > 999999950
+--source suite/moosedb/include/mirror_cmp.inc
+DROP TABLE zt, zti;
+--let $mt= z
+--let $it= zi
+
+--echo ##################################################################
+--echo # Value range: BIGINT / BIGINT UNSIGNED / INT UNSIGNED / signed negatives
+--echo ##################################################################
+--let $sel= COUNT(*), MIN(clock), BIT_XOR(CRC32(CONCAT(clock, '|', v)))
+CREATE TABLE zs (clock BIGINT NOT NULL, v INT NOT NULL, INDEX(clock)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock' CHUNK_INTERVAL='1 MONTH';
+CREATE TABLE zsi (clock BIGINT NOT NULL, v INT NOT NULL, KEY(clock)) ENGINE=InnoDB;
+--echo # The limits are +/-9223372036854 s (about year 292277): beyond that secs * 1e6 would overflow a signed 64-bit microsecond count
+INSERT INTO zs VALUES (-9223372036854, 1), (-86400 * 365 * 100, 2), (-86400, 3), (-1, 4), (0, 5), (1, 6), (86399, 7), (1767225600, 8), (253402300799, 9), (9223372036853, 10), (9223372036854, 11);
+INSERT INTO zsi SELECT * FROM zs;
+--error ER_GET_ERRMSG
+INSERT INTO zs VALUES (9223372036855, 12);
+--error ER_GET_ERRMSG
+INSERT INTO zs VALUES (-9223372036855, 13);
+--error ER_GET_ERRMSG
+INSERT INTO zs VALUES (9223372036854775807, 14);
+--error ER_GET_ERRMSG
+INSERT INTO zs VALUES (-9223372036854775808, 15);
+--echo # A failing statement keeps the rows before the bad one, like any non-transactional engine error
+--error ER_GET_ERRMSG
+INSERT INTO zs VALUES (100, 16), (9223372036855, 17), (200, 18);
+INSERT INTO zsi VALUES (100, 16);
+SELECT COUNT(*), MIN(clock), MAX(clock) FROM zs;
+SELECT COUNT(*), MIN(clock), MAX(clock) FROM zsi;
+SELECT clock, v FROM zs ORDER BY clock;
+SELECT clock, v FROM zsi ORDER BY clock;
+SELECT clock, v FROM zs ORDER BY clock DESC LIMIT 4;
+SELECT clock, v FROM zsi ORDER BY clock DESC LIMIT 4;
+--let $mt= zs
+--let $it= zsi
+--let $tail= WHERE clock < 0
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock <= 0
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock = -1
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock BETWEEN -2 AND 2
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock BETWEEN -86400 AND -1
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock >= 9223372036854
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock > 9223372036853
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock > 9223372036854
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock <= -9223372036854
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock < -9223372036854
+--source suite/moosedb/include/mirror_cmp.inc
+--echo # Bounds beyond the representable range saturate instead of wrapping
+--let $tail= WHERE clock > 9223372036855
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock >= 9223372036855
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock < 9223372036855
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock <= 9223372036855
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock = 9223372036855
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock < -9223372036855
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock >= -9223372036855
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock BETWEEN -9223372036855 AND 9223372036855
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock > 9223372036854775806
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock < -9223372036854775807
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock = 253402300799
+--source suite/moosedb/include/mirror_cmp.inc
+--echo # Seal the MemTable: the extreme rows must flush into chunks (month bucket arithmetic at the edges of i64)
+FLUSH TABLES zs;
+--echo # (INFORMATION_SCHEMA shows DATETIME values, which stop at year 9999; only the counts are shown)
+SELECT COUNT(*) AS chunks, SUM(`ROWS`) AS chunk_rows FROM information_schema.MOOSEDB_CHUNKS WHERE TABLE_NAME = 'zs';
+CHECK TABLE zs;
+OPTIMIZE TABLE zs;
+SELECT COUNT(*), MIN(clock), MAX(clock) FROM zs;
+--echo # Saturated bounds with backward / ordered index scans
+SELECT clock, v FROM zs WHERE clock <= 9223372036855 ORDER BY clock DESC LIMIT 3;
+SELECT clock, v FROM zsi WHERE clock <= 9223372036855 ORDER BY clock DESC LIMIT 3;
+SELECT clock, v FROM zs WHERE clock < -9223372036855 ORDER BY clock DESC;
+SELECT clock, v FROM zsi WHERE clock < -9223372036855 ORDER BY clock DESC;
+SELECT clock, v FROM zs WHERE clock >= -9223372036855 ORDER BY clock LIMIT 2;
+SELECT clock, v FROM zsi WHERE clock >= -9223372036855 ORDER BY clock LIMIT 2;
+SELECT clock, v FROM zs WHERE clock < 9223372036855 AND clock > -9223372036855 ORDER BY clock DESC LIMIT 2;
+SELECT clock, v FROM zsi WHERE clock < 9223372036855 AND clock > -9223372036855 ORDER BY clock DESC LIMIT 2;
+DROP TABLE zs, zsi;
+
+CREATE TABLE zu (clock BIGINT UNSIGNED NOT NULL, v INT NOT NULL, INDEX(clock)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock' CHUNK_INTERVAL='1 MONTH';
+CREATE TABLE zui (clock BIGINT UNSIGNED NOT NULL, v INT NOT NULL, KEY(clock)) ENGINE=InnoDB;
+INSERT INTO zu VALUES (0, 1), (1, 2), (1767225600, 3), (9223372036853, 4), (9223372036854, 5);
+INSERT INTO zui SELECT * FROM zu;
+--echo # Above LONGLONG_MAX (negative as a signed value) and above the supported range
+--error ER_GET_ERRMSG
+INSERT INTO zu VALUES (9223372036855, 6);
+--error ER_GET_ERRMSG
+INSERT INTO zu VALUES (9223372036854775808, 7);
+--error ER_GET_ERRMSG
+INSERT INTO zu VALUES (18446744073709551615, 8);
+--error ER_GET_ERRMSG
+INSERT INTO zu VALUES (18446744073709551614, 9);
+SELECT clock, v FROM zu ORDER BY clock;
+--let $mt= zu
+--let $it= zui
+--let $tail= WHERE clock >= 9223372036854
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock > 9223372036854
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock > 9223372036855
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock < 18446744073709551615
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock <= 18446744073709551615
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock >= 18446744073709551615
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock = 18446744073709551615
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock > 9223372036854775807
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock >= 9223372036854775808
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock < 9223372036854775808
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock BETWEEN 1 AND 18446744073709551615
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock < 1
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock <= 0
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock < 0
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock > -1
+--source suite/moosedb/include/mirror_cmp.inc
+SELECT clock, v FROM zu ORDER BY clock DESC LIMIT 2;
+SELECT clock, v FROM zui ORDER BY clock DESC LIMIT 2;
+DROP TABLE zu, zui;
+
+CREATE TABLE zn (clock INT UNSIGNED NOT NULL, v INT NOT NULL, INDEX(clock)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+CREATE TABLE zni (clock INT UNSIGNED NOT NULL, v INT NOT NULL, KEY(clock)) ENGINE=InnoDB;
+INSERT INTO zn VALUES (0, 1), (2147483647, 2), (2147483648, 3), (4294967294, 4), (4294967295, 5);
+INSERT INTO zni SELECT * FROM zn;
+--let $mt= zn
+--let $it= zni
+--let $tail= WHERE clock > 2147483647
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock >= 4294967295
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock BETWEEN 2147483648 AND 4294967294
+--source suite/moosedb/include/mirror_cmp.inc
+SELECT clock, v FROM zn ORDER BY clock DESC LIMIT 3;
+SELECT clock, v FROM zni ORDER BY clock DESC LIMIT 3;
+DROP TABLE zn, zni;
+
+CREATE TABLE zq (clock INT NOT NULL, v INT NOT NULL, INDEX(clock)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+CREATE TABLE zqi (clock INT NOT NULL, v INT NOT NULL, KEY(clock)) ENGINE=InnoDB;
+INSERT INTO zq VALUES (-2147483648, 1), (-1, 2), (0, 3), (2147483647, 4);
+INSERT INTO zqi SELECT * FROM zq;
+--let $mt= zq
+--let $it= zqi
+--let $tail= WHERE clock < 0
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock <= -2147483648
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock >= 2147483647
+--source suite/moosedb/include/mirror_cmp.inc
+SELECT clock, v FROM zq ORDER BY clock;
+SELECT clock, v FROM zqi ORDER BY clock;
+--echo # Out of the column's own range: the server rejects it, not the engine
+--error ER_WARN_DATA_OUT_OF_RANGE
+INSERT INTO zq VALUES (2147483648, 5);
+DROP TABLE zq, zqi;
+
+--echo ##################################################################
+--echo # Writes of other shapes: multi-row, INSERT ... SELECT, REPLACE, TRUNCATE
+--echo ##################################################################
+CREATE TABLE zw (clock INT NOT NULL, itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG', value DOUBLE NOT NULL, INDEX(clock))
+  ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+INSERT INTO zw VALUES (1767225600, 1, 1.5), (1767225601, 2, 2.5);
+INSERT INTO zw SELECT clock + 10, itemid, value * 2 FROM zw;
+INSERT INTO zw (clock, itemid, value) VALUES (1767225700, 3, 3.5), (1767225701, 3, 4.5);
+REPLACE INTO zw VALUES (1767225800, 4, 5.5);
+SELECT * FROM zw ORDER BY clock;
+SELECT COUNT(*) FROM zw;
+TRUNCATE TABLE zw;
+SELECT COUNT(*) FROM zw;
+INSERT INTO zw VALUES (1767225900, 9, 9.5);
+SELECT * FROM zw;
+DROP TABLE zw;
+
+--echo ##################################################################
+--echo # ALTER TABLE changing the axis column type (rebuilds the table)
+--echo ##################################################################
+CREATE TABLE za (clock INT NOT NULL, v INT NOT NULL, INDEX(clock)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+INSERT INTO za VALUES (20260101, 1), (20260102, 2);
+ALTER TABLE za MODIFY clock DATETIME NOT NULL;
+SELECT clock, v FROM za ORDER BY clock;
+SELECT COUNT(*) FROM za WHERE clock > '2026-01-01 12:00:00';
+--echo # DATETIME -> BIGINT gives 20260101000000, beyond the supported range: refused, table intact
+--error ER_GET_ERRMSG
+ALTER TABLE za MODIFY clock BIGINT NOT NULL;
+SELECT clock, v FROM za ORDER BY clock;
+--error ER_WARN_DATA_OUT_OF_RANGE
+ALTER TABLE za MODIFY clock INT NOT NULL;
+SHOW CREATE TABLE za;
+DROP TABLE za;
+
+--echo ##################################################################
+--echo # Retention works on the integer axis (UNIX_TIMESTAMP based)
+--echo ##################################################################
+--exec $MYSQL test < $MOOSEDB_INSTALL_SQL
+CREATE TABLE zr (clock INT NOT NULL, itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG', v INT, INDEX(clock))
+  ENGINE=MooseDB TIMESTAMP_COLUMN='clock' CHUNK_INTERVAL='1 DAY' RETENTION_PERIOD='30 DAYS';
+INSERT INTO zr VALUES
+  (UNIX_TIMESTAMP() - 400 * 86400, 1, 1),
+  (UNIX_TIMESTAMP() - 100 * 86400, 1, 2),
+  (UNIX_TIMESTAMP() - 1 * 86400, 1, 3),
+  (UNIX_TIMESTAMP(), 2, 4);
+FLUSH TABLES zr;
+SELECT EXPIRED_CHUNKS, RETENTION FROM information_schema.MOOSEDB_TABLES WHERE TABLE_NAME = 'zr';
+CALL moosedb_apply_retention('test.zr');
+SELECT v FROM zr ORDER BY clock;
+INSERT INTO zr VALUES (UNIX_TIMESTAMP() - 200 * 86400, 3, 5);
+OPTIMIZE TABLE zr;
+SELECT v FROM zr ORDER BY clock;
+DROP TABLE zr;
+DROP PROCEDURE moosedb_compact;
+DROP PROCEDURE moosedb_apply_retention;
+DROP FUNCTION moosedb_compact_impl;
+DROP FUNCTION moosedb_retention_impl;
+
+--echo ##################################################################
+--echo # Restart (rows in chunks + MemTable), TRUNCATE, then a crash (WAL replay)
+--echo ##################################################################
+--let $mt= z
+--let $it= zi
+--let $sel= COUNT(*), MIN(clock), BIT_XOR(CRC32(CONCAT(clock, '|', itemid, '|', ns)))
+INSERT INTO z SELECT 1768500000 + seq, 1 + seq MOD 5, seq, seq FROM seq_0_to_99;
+INSERT INTO zi SELECT 1768500000 + seq, 1 + seq MOD 5, seq, seq FROM seq_0_to_99;
+--let $tail= WHERE clock >= 0
+--source suite/moosedb/include/mirror_cmp.inc
+--source include/restart_mysqld.inc
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid = 4 AND clock > 1768400000
+--source suite/moosedb/include/mirror_cmp.inc
+SELECT clock, itemid FROM z ORDER BY clock DESC LIMIT 2;
+SHOW CREATE TABLE z;
+
+--echo # Rows only in the WAL survive kill -9 with the right clock values
+INSERT INTO z SELECT 1769000000 + seq, 1 + seq MOD 5, seq, seq FROM seq_0_to_49;
+INSERT INTO zi SELECT 1769000000 + seq, 1 + seq MOD 5, seq, seq FROM seq_0_to_49;
+INSERT INTO z VALUES (-5, 1, 0, 0), (2147483647, 2, 0, 0);
+INSERT INTO zi VALUES (-5, 1, 0, 0), (2147483647, 2, 0, 0);
+--source include/kill_mysqld.inc
+--source include/start_mysqld.inc
+--let $tail= WHERE clock >= 0
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock >= 1769000000
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE clock < 0
+--source suite/moosedb/include/mirror_cmp.inc
+SELECT MIN(clock), MAX(clock) FROM z;
+SELECT clock, itemid FROM z ORDER BY clock DESC LIMIT 2;
+CHECK TABLE z;
+
+TRUNCATE TABLE z;
+TRUNCATE TABLE zi;
+INSERT INTO z VALUES (1770000000, 1, 1, 1);
+INSERT INTO zi VALUES (1770000000, 1, 1, 1);
+--let $tail= WHERE clock >= 0
+--source suite/moosedb/include/mirror_cmp.inc
+--source include/restart_mysqld.inc
+--source suite/moosedb/include/mirror_cmp.inc
+
+DROP TABLE z, zi;

@@ -1,0 +1,827 @@
+##################################################################
+# DDL rules
+##################################################################
+# An integer column is the axis only when TIMESTAMP_COLUMN names it
+CREATE TABLE e (clock INT NOT NULL, INDEX(clock)) ENGINE=MooseDB;
+ERROR HY000: MooseDB: a MooseDB table needs a DATETIME/TIMESTAMP column with an index (INDEX ts_idx (ts)) or TIMESTAMP_COLUMN = '<column>'
+CREATE TABLE e (ts DATETIME NOT NULL, clock INT NOT NULL, INDEX(clock)) ENGINE=MooseDB;
+ERROR HY000: MooseDB: a MooseDB table needs a DATETIME/TIMESTAMP column with an index (INDEX ts_idx (ts)) or TIMESTAMP_COLUMN = '<column>'
+# NOT NULL, stored, INT or BIGINT, not a TAG, indexed (non-unique)
+CREATE TABLE e (clock INT, INDEX(clock)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+ERROR 42000: Table handler doesn't support NULL in given index. Please change column 'clock' to be NOT NULL or use another handler
+CREATE TABLE e (clock SMALLINT NOT NULL, INDEX(clock)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+ERROR HY000: MooseDB: timestamp column 'clock' must be a stored DATETIME, TIMESTAMP, INT or BIGINT column
+CREATE TABLE e (clock TINYINT NOT NULL, INDEX(clock)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+ERROR HY000: MooseDB: timestamp column 'clock' must be a stored DATETIME, TIMESTAMP, INT or BIGINT column
+CREATE TABLE e (clock DOUBLE NOT NULL, INDEX(clock)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+ERROR HY000: MooseDB: timestamp column 'clock' must be a stored DATETIME, TIMESTAMP, INT or BIGINT column
+CREATE TABLE e (clock INT NOT NULL COMMENT 'TAG', INDEX(clock)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+ERROR HY000: MooseDB: the timestamp column cannot be a TAG
+CREATE TABLE e (clock INT NOT NULL, v INT) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+ERROR HY000: MooseDB: missing index on the timestamp column: add INDEX (clock)
+CREATE TABLE e (clock INT NOT NULL, UNIQUE(clock)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+ERROR HY000: MooseDB: index 'clock' cannot be UNIQUE/PRIMARY: time-series rows are not unique by time
+CREATE TABLE e (clock INT NOT NULL, v INT NOT NULL, INDEX(clock), INDEX(v)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+ERROR HY000: MooseDB: index 'v' is not supported: MooseDB only indexes the timestamp column (TAG columns are indexed implicitly)
+# An index on a DATETIME column is not the axis when TIMESTAMP_COLUMN says otherwise
+CREATE TABLE e (ts DATETIME NOT NULL, clock INT NOT NULL, INDEX(ts)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+ERROR HY000: MooseDB: index 'ts' is not supported: MooseDB only indexes the timestamp column (TAG columns are indexed implicitly)
+##################################################################
+# Basic table: INT axis, integer TAG, ns as an ordinary column
+##################################################################
+CREATE TABLE z (
+clock  INT NOT NULL,
+itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG',
+ns     INT NOT NULL,
+value  DOUBLE NOT NULL,
+INDEX clock_idx (clock)
+) ENGINE=MooseDB TIMESTAMP_COLUMN='clock' CHUNK_INTERVAL='1 DAY';
+CREATE TABLE zi (
+clock  INT NOT NULL,
+itemid BIGINT UNSIGNED NOT NULL,
+ns     INT NOT NULL,
+value  DOUBLE NOT NULL,
+KEY clock_idx (clock)
+) ENGINE=InnoDB;
+SHOW CREATE TABLE z;
+Table	Create Table
+z	CREATE TABLE `z` (
+  `clock` int(11) NOT NULL,
+  `itemid` bigint(20) unsigned NOT NULL COMMENT 'TAG',
+  `ns` int(11) NOT NULL,
+  `value` double NOT NULL,
+  KEY `clock_idx` (`clock`)
+) ENGINE=MooseDB DEFAULT CHARSET=latin1 COLLATE=latin1_swedish_ci `TIMESTAMP_COLUMN`='clock' `CHUNK_INTERVAL`='1 DAY'
+# 2000 rows, one every 10 minutes from 2026-01-01 00:00:00 UTC (7 daily chunks sealed + the second half in the MemTable)
+INSERT INTO z SELECT 1767225600 + seq * 600, 1 + seq MOD 5, (seq * 7919) MOD 1000000, seq / 4 FROM seq_0_to_999;
+INSERT INTO zi SELECT 1767225600 + seq * 600, 1 + seq MOD 5, (seq * 7919) MOD 1000000, seq / 4 FROM seq_0_to_999;
+FLUSH TABLES z;
+INSERT INTO z SELECT 1767225600 + seq * 600, 1 + seq MOD 5, (seq * 7919) MOD 1000000, seq / 4 FROM seq_1000_to_1999;
+INSERT INTO zi SELECT 1767225600 + seq * 600, 1 + seq MOD 5, (seq * 7919) MOD 1000000, seq / 4 FROM seq_1000_to_1999;
+SELECT COUNT(*), MIN(clock), MAX(clock), COUNT(DISTINCT itemid) FROM z;
+COUNT(*)	MIN(clock)	MAX(clock)	COUNT(DISTINCT itemid)
+2000	1767225600	1768425000	5
+SELECT COUNT(*), MIN(clock), MAX(clock), COUNT(DISTINCT itemid) FROM zi;
+COUNT(*)	MIN(clock)	MAX(clock)	COUNT(DISTINCT itemid)
+2000	1767225600	1768425000	5
+# Chunks are cut at UTC midnight of the epoch seconds
+SELECT COUNT(*) AS chunks, MIN(TS_MIN) AS first_min, MAX(TS_MAX) AS last_max
+FROM information_schema.MOOSEDB_CHUNKS WHERE TABLE_NAME = 'z';
+chunks	first_min	last_max
+7	2026-01-01 00:00:00.000000	2026-01-07 22:30:00.000000
+SELECT TS_MIN, TS_MAX, `ROWS` FROM information_schema.MOOSEDB_CHUNKS
+WHERE TABLE_NAME = 'z' ORDER BY CHUNK_ID LIMIT 2;
+TS_MIN	TS_MAX	ROWS
+2026-01-01 00:00:00.000000	2026-01-01 23:50:00.000000	144
+2026-01-02 00:00:00.000000	2026-01-02 23:50:00.000000	144
+##################################################################
+# Ranges (X = 1767825600 is row 1000)
+##################################################################
+# WHERE clock = 1767825600
+a	b	c	vs_innodb
+1	1767825600	1263986693	SAME
+# WHERE clock = 1767825601
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# WHERE clock < 1767825600
+a	b	c	vs_innodb
+1000	1767225600	2867915265	SAME
+# WHERE clock <= 1767825600
+a	b	c	vs_innodb
+1001	1767225600	3785753092	SAME
+# WHERE clock > 1767825600
+a	b	c	vs_innodb
+999	1767826200	2132908852	SAME
+# WHERE clock >= 1767825600
+a	b	c	vs_innodb
+1000	1767825600	880243505	SAME
+# WHERE clock BETWEEN 1767825000 AND 1767826200
+a	b	c	vs_innodb
+3	1767825000	450714064	SAME
+# WHERE clock BETWEEN 1767825001 AND 1767825599
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# WHERE clock > 1767825000 AND clock < 1767826200
+a	b	c	vs_innodb
+1	1767825600	1263986693	SAME
+# WHERE clock >= 1767825000 AND clock < 1767826200
+a	b	c	vs_innodb
+2	1767825000	287127915	SAME
+# WHERE clock > 1767825000 AND clock <= 1767826200
+a	b	c	vs_innodb
+2	1767825600	1083607230	SAME
+# WHERE clock NOT BETWEEN 1767225600 AND 1768400000
+a	b	c	vs_innodb
+42	1768400400	611916829	SAME
+# WHERE clock IN (1767225600, 1767825600, 1768425000, 5)
+a	b	c	vs_innodb
+3	1767225600	3659052226	SAME
+# WHERE clock <> 1767825600
+a	b	c	vs_innodb
+1999	1767225600	3587273013	SAME
+# Edges of the data (MIN = 1767225600, MAX = 1768425000)
+# WHERE clock <= 1767225600
+a	b	c	vs_innodb
+1	1767225600	154838231	SAME
+# WHERE clock < 1767225600
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# WHERE clock >= 1768425000
+a	b	c	vs_innodb
+1	1768425000	2557802512	SAME
+# WHERE clock > 1768425000
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# WHERE clock > 1767225600 AND clock < 1768425000
+a	b	c	vs_innodb
+1998	1767226200	264881655	SAME
+# Constants of other types and beyond the INT range
+# WHERE clock = '1767825600'
+a	b	c	vs_innodb
+1	1767825600	1263986693	SAME
+# WHERE clock > 1767825600.5
+a	b	c	vs_innodb
+999	1767826200	2132908852	SAME
+# WHERE clock < 1767825600.5
+a	b	c	vs_innodb
+1001	1767225600	3785753092	SAME
+# WHERE clock > 9999999999999
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# WHERE clock < 9999999999999
+a	b	c	vs_innodb
+2000	1767225600	2659686704	SAME
+# WHERE clock > -9999999999999
+a	b	c	vs_innodb
+2000	1767225600	2659686704	SAME
+# WHERE clock < -9999999999999
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# WHERE clock > 2147483647
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# WHERE clock <= 2147483647
+a	b	c	vs_innodb
+2000	1767225600	2659686704	SAME
+# Combined with integer TAG pushdown
+# WHERE itemid IN (1, 3) AND clock BETWEEN 1767900000 AND 1768000000
+a	b	c	vs_innodb
+67	1767900600	1436949835	SAME
+# WHERE itemid = 2 AND clock > 1768300000
+a	b	c	vs_innodb
+42	1768300200	110828908	SAME
+# WHERE itemid = 2 AND clock > 1768300000 AND ns > 500000
+a	b	c	vs_innodb
+20	1768327200	2144820050	SAME
+# The scan really uses the index: reads only the rows of the range
+EXPLAIN SELECT COUNT(*) FROM z WHERE clock BETWEEN 1767825000 AND 1767826200;
+id	select_type	table	type	possible_keys	key	key_len	ref	rows	Extra
+1	SIMPLE	z	range	clock_idx	clock_idx	4	NULL	2	Using where
+FLUSH STATUS;
+SELECT COUNT(*) FROM z WHERE clock BETWEEN 1767825000 AND 1767826200;
+COUNT(*)
+3
+SHOW SESSION STATUS WHERE Variable_name IN ('Handler_read_key', 'Handler_read_next', 'Handler_read_rnd_next', 'Handler_read_first');
+Variable_name	Value
+Handler_read_first	0
+Handler_read_key	1
+Handler_read_next	3
+Handler_read_rnd_next	0
+FLUSH STATUS;
+SELECT COUNT(*) FROM z WHERE clock > 1768400000;
+COUNT(*)
+42
+SHOW SESSION STATUS WHERE Variable_name IN ('Handler_read_key', 'Handler_read_next', 'Handler_read_rnd_next', 'Handler_read_first');
+Variable_name	Value
+Handler_read_first	0
+Handler_read_key	1
+Handler_read_next	42
+Handler_read_rnd_next	0
+##################################################################
+# ORDER BY clock, LIMIT, MIN/MAX
+##################################################################
+EXPLAIN SELECT clock, itemid FROM z ORDER BY clock DESC LIMIT 5;
+id	select_type	table	type	possible_keys	key	key_len	ref	rows	Extra
+1	SIMPLE	z	index	NULL	clock_idx	4	NULL	5	
+SELECT clock, itemid, ns FROM z ORDER BY clock DESC LIMIT 5;
+clock	itemid	ns
+1768425000	5	830081
+1768424400	4	822162
+1768423800	3	814243
+1768423200	2	806324
+1768422600	1	798405
+SELECT clock, itemid, ns FROM zi ORDER BY clock DESC LIMIT 5;
+clock	itemid	ns
+1768425000	5	830081
+1768424400	4	822162
+1768423800	3	814243
+1768423200	2	806324
+1768422600	1	798405
+SELECT clock, itemid, ns FROM z ORDER BY clock LIMIT 3;
+clock	itemid	ns
+1767225600	1	0
+1767226200	2	7919
+1767226800	3	15838
+SELECT clock, itemid, ns FROM zi ORDER BY clock LIMIT 3;
+clock	itemid	ns
+1767225600	1	0
+1767226200	2	7919
+1767226800	3	15838
+SELECT clock, itemid, ns FROM z WHERE clock < 1767825600 ORDER BY clock DESC LIMIT 3;
+clock	itemid	ns
+1767825000	5	911081
+1767824400	4	903162
+1767823800	3	895243
+SELECT clock, itemid, ns FROM zi WHERE clock < 1767825600 ORDER BY clock DESC LIMIT 3;
+clock	itemid	ns
+1767825000	5	911081
+1767824400	4	903162
+1767823800	3	895243
+SELECT clock, itemid, ns FROM z WHERE clock >= 1767825600 ORDER BY clock LIMIT 3 OFFSET 2;
+clock	itemid	ns
+1767826800	3	934838
+1767827400	4	942757
+1767828000	5	950676
+SELECT clock, itemid, ns FROM zi WHERE clock >= 1767825600 ORDER BY clock LIMIT 3 OFFSET 2;
+clock	itemid	ns
+1767826800	3	934838
+1767827400	4	942757
+1767828000	5	950676
+# Zabbix pattern: one item, newest first
+SELECT clock, itemid, value FROM z WHERE itemid = 3 ORDER BY clock DESC LIMIT 4;
+clock	itemid	value
+1768423800	3	499.25
+1768420800	3	498
+1768417800	3	496.75
+1768414800	3	495.5
+SELECT clock, itemid, value FROM zi WHERE itemid = 3 ORDER BY clock DESC LIMIT 4;
+clock	itemid	value
+1768423800	3	499.25
+1768420800	3	498
+1768417800	3	496.75
+1768414800	3	495.5
+SELECT clock, itemid, value FROM z WHERE itemid IN (2, 4) AND clock <= 1768000000 ORDER BY clock DESC LIMIT 4;
+clock	itemid	value
+1767998400	4	322
+1767997200	2	321.5
+1767995400	4	320.75
+1767994200	2	320.25
+SELECT clock, itemid, value FROM zi WHERE itemid IN (2, 4) AND clock <= 1768000000 ORDER BY clock DESC LIMIT 4;
+clock	itemid	value
+1767998400	4	322
+1767997200	2	321.5
+1767995400	4	320.75
+1767994200	2	320.25
+# Min/max by the index
+EXPLAIN SELECT MIN(clock), MAX(clock) FROM z;
+id	select_type	table	type	possible_keys	key	key_len	ref	rows	Extra
+1	SIMPLE	NULL	NULL	NULL	NULL	NULL	NULL	NULL	Select tables optimized away
+SELECT MIN(clock), MAX(clock) FROM z;
+MIN(clock)	MAX(clock)
+1767225600	1768425000
+SELECT MIN(clock), MAX(clock) FROM zi;
+MIN(clock)	MAX(clock)
+1767225600	1768425000
+SELECT MIN(clock), MAX(clock) FROM z WHERE clock > 1767825600 AND clock < 1768000000;
+MIN(clock)	MAX(clock)
+1767826200	1767999600
+SELECT MIN(clock), MAX(clock) FROM zi WHERE clock > 1767825600 AND clock < 1768000000;
+MIN(clock)	MAX(clock)
+1767826200	1767999600
+SELECT MIN(clock), MAX(clock) FROM z WHERE clock > 1768425000;
+MIN(clock)	MAX(clock)
+NULL	NULL
+SELECT MIN(clock), MAX(clock) FROM zi WHERE clock > 1768425000;
+MIN(clock)	MAX(clock)
+NULL	NULL
+SELECT COUNT(*), MIN(clock), MAX(clock) FROM z WHERE itemid = 5;
+COUNT(*)	MIN(clock)	MAX(clock)
+400	1767228000	1768425000
+SELECT COUNT(*), MIN(clock), MAX(clock) FROM zi WHERE itemid = 5;
+COUNT(*)	MIN(clock)	MAX(clock)
+400	1767228000	1768425000
+# ns is an ordinary column: ORDER BY clock, ns is a filesort and stays correct
+CREATE TABLE zt (clock INT NOT NULL, itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG', ns INT NOT NULL, value DOUBLE NOT NULL,
+INDEX (clock)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock' CHUNK_INTERVAL='1 HOUR';
+CREATE TABLE zti (clock INT NOT NULL, itemid BIGINT UNSIGNED NOT NULL, ns INT NOT NULL, value DOUBLE NOT NULL,
+KEY (clock)) ENGINE=InnoDB;
+INSERT INTO zt SELECT 1767225600 + seq DIV 6, 1 + seq MOD 3, 999999999 - (seq * 7) MOD 100, seq FROM seq_0_to_59;
+INSERT INTO zti SELECT 1767225600 + seq DIV 6, 1 + seq MOD 3, 999999999 - (seq * 7) MOD 100, seq FROM seq_0_to_59;
+FLUSH TABLES zt;
+INSERT INTO zt SELECT 1767225600 + seq DIV 6, 1 + seq MOD 3, 999999999 - (seq * 7) MOD 100, seq FROM seq_60_to_119;
+INSERT INTO zti SELECT 1767225600 + seq DIV 6, 1 + seq MOD 3, 999999999 - (seq * 7) MOD 100, seq FROM seq_60_to_119;
+SELECT clock, ns, itemid FROM zt ORDER BY clock DESC, ns DESC LIMIT 7;
+clock	ns	itemid
+1767225619	999999994	2
+1767225619	999999987	3
+1767225619	999999980	1
+1767225619	999999973	2
+1767225619	999999966	3
+1767225619	999999901	1
+1767225618	999999943	1
+SELECT clock, ns, itemid FROM zti ORDER BY clock DESC, ns DESC LIMIT 7;
+clock	ns	itemid
+1767225619	999999994	2
+1767225619	999999987	3
+1767225619	999999980	1
+1767225619	999999973	2
+1767225619	999999966	3
+1767225619	999999901	1
+1767225618	999999943	1
+SELECT clock, ns, itemid FROM zt ORDER BY clock, ns LIMIT 7;
+clock	ns	itemid
+1767225600	999999964	3
+1767225600	999999971	2
+1767225600	999999978	1
+1767225600	999999985	3
+1767225600	999999992	2
+1767225600	999999999	1
+1767225601	999999922	3
+SELECT clock, ns, itemid FROM zti ORDER BY clock, ns LIMIT 7;
+clock	ns	itemid
+1767225600	999999964	3
+1767225600	999999971	2
+1767225600	999999978	1
+1767225600	999999985	3
+1767225600	999999992	2
+1767225600	999999999	1
+1767225601	999999922	3
+SELECT clock, COUNT(*) FROM zt WHERE clock BETWEEN 1767225603 AND 1767225605 GROUP BY clock;
+clock	COUNT(*)
+1767225603	6
+1767225604	6
+1767225605	6
+SELECT clock, COUNT(*) FROM zti WHERE clock BETWEEN 1767225603 AND 1767225605 GROUP BY clock;
+clock	COUNT(*)
+1767225603	6
+1767225604	6
+1767225605	6
+# WHERE clock = 1767225605
+a	b	c	vs_innodb
+6	1767225605	2873045816	SAME
+# WHERE clock > 1767225605 AND ns > 999999950
+a	b	c	vs_innodb
+40	1767225607	1976425372	SAME
+DROP TABLE zt, zti;
+##################################################################
+# Value range: BIGINT / BIGINT UNSIGNED / INT UNSIGNED / signed negatives
+##################################################################
+CREATE TABLE zs (clock BIGINT NOT NULL, v INT NOT NULL, INDEX(clock)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock' CHUNK_INTERVAL='1 MONTH';
+CREATE TABLE zsi (clock BIGINT NOT NULL, v INT NOT NULL, KEY(clock)) ENGINE=InnoDB;
+# The limits are +/-9223372036854 s (about year 292277): beyond that secs * 1e6 would overflow a signed 64-bit microsecond count
+INSERT INTO zs VALUES (-9223372036854, 1), (-86400 * 365 * 100, 2), (-86400, 3), (-1, 4), (0, 5), (1, 6), (86399, 7), (1767225600, 8), (253402300799, 9), (9223372036853, 10), (9223372036854, 11);
+INSERT INTO zsi SELECT * FROM zs;
+INSERT INTO zs VALUES (9223372036855, 12);
+ERROR HY000: Got error 1205 'column 'clock': time value outside the supported range (+/-9223372036854 seconds since 1970)' from MooseDB
+INSERT INTO zs VALUES (-9223372036855, 13);
+ERROR HY000: Got error 1205 'column 'clock': time value outside the supported range (+/-9223372036854 seconds since 1970)' from MooseDB
+INSERT INTO zs VALUES (9223372036854775807, 14);
+ERROR HY000: Got error 1205 'column 'clock': time value outside the supported range (+/-9223372036854 seconds since 1970)' from MooseDB
+INSERT INTO zs VALUES (-9223372036854775808, 15);
+ERROR HY000: Got error 1205 'column 'clock': time value outside the supported range (+/-9223372036854 seconds since 1970)' from MooseDB
+# A failing statement keeps the rows before the bad one, like any non-transactional engine error
+INSERT INTO zs VALUES (100, 16), (9223372036855, 17), (200, 18);
+ERROR HY000: Got error 1205 'column 'clock': time value outside the supported range (+/-9223372036854 seconds since 1970)' from MooseDB
+INSERT INTO zsi VALUES (100, 16);
+SELECT COUNT(*), MIN(clock), MAX(clock) FROM zs;
+COUNT(*)	MIN(clock)	MAX(clock)
+12	-9223372036854	9223372036854
+SELECT COUNT(*), MIN(clock), MAX(clock) FROM zsi;
+COUNT(*)	MIN(clock)	MAX(clock)
+12	-9223372036854	9223372036854
+SELECT clock, v FROM zs ORDER BY clock;
+clock	v
+-9223372036854	1
+-3153600000	2
+-86400	3
+-1	4
+0	5
+1	6
+100	16
+86399	7
+1767225600	8
+253402300799	9
+9223372036853	10
+9223372036854	11
+SELECT clock, v FROM zsi ORDER BY clock;
+clock	v
+-9223372036854	1
+-3153600000	2
+-86400	3
+-1	4
+0	5
+1	6
+100	16
+86399	7
+1767225600	8
+253402300799	9
+9223372036853	10
+9223372036854	11
+SELECT clock, v FROM zs ORDER BY clock DESC LIMIT 4;
+clock	v
+9223372036854	11
+9223372036853	10
+253402300799	9
+1767225600	8
+SELECT clock, v FROM zsi ORDER BY clock DESC LIMIT 4;
+clock	v
+9223372036854	11
+9223372036853	10
+253402300799	9
+1767225600	8
+# WHERE clock < 0
+a	b	c	vs_innodb
+4	-9223372036854	1811720305	SAME
+# WHERE clock <= 0
+a	b	c	vs_innodb
+5	-9223372036854	1710188074	SAME
+# WHERE clock = -1
+a	b	c	vs_innodb
+1	-1	4102808855	SAME
+# WHERE clock BETWEEN -2 AND 2
+a	b	c	vs_innodb
+3	-1	1816190618	SAME
+# WHERE clock BETWEEN -86400 AND -1
+a	b	c	vs_innodb
+2	-86400	114169575	SAME
+# WHERE clock >= 9223372036854
+a	b	c	vs_innodb
+1	9223372036854	2149299942	SAME
+# WHERE clock > 9223372036853
+a	b	c	vs_innodb
+1	9223372036854	2149299942	SAME
+# WHERE clock > 9223372036854
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# WHERE clock <= -9223372036854
+a	b	c	vs_innodb
+1	-9223372036854	1420176404	SAME
+# WHERE clock < -9223372036854
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# Bounds beyond the representable range saturate instead of wrapping
+# WHERE clock > 9223372036855
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# WHERE clock >= 9223372036855
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# WHERE clock < 9223372036855
+a	b	c	vs_innodb
+12	-9223372036854	914293776	SAME
+# WHERE clock <= 9223372036855
+a	b	c	vs_innodb
+12	-9223372036854	914293776	SAME
+# WHERE clock = 9223372036855
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# WHERE clock < -9223372036855
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# WHERE clock >= -9223372036855
+a	b	c	vs_innodb
+12	-9223372036854	914293776	SAME
+# WHERE clock BETWEEN -9223372036855 AND 9223372036855
+a	b	c	vs_innodb
+12	-9223372036854	914293776	SAME
+# WHERE clock > 9223372036854775806
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# WHERE clock < -9223372036854775807
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# WHERE clock = 253402300799
+a	b	c	vs_innodb
+1	253402300799	3693696213	SAME
+# Seal the MemTable: the extreme rows must flush into chunks (month bucket arithmetic at the edges of i64)
+FLUSH TABLES zs;
+# (INFORMATION_SCHEMA shows DATETIME values, which stop at year 9999; only the counts are shown)
+SELECT COUNT(*) AS chunks, SUM(`ROWS`) AS chunk_rows FROM information_schema.MOOSEDB_CHUNKS WHERE TABLE_NAME = 'zs';
+chunks	chunk_rows
+7	12
+CHECK TABLE zs;
+Table	Op	Msg_type	Msg_text
+test.zs	check	status	OK
+OPTIMIZE TABLE zs;
+Table	Op	Msg_type	Msg_text
+test.zs	optimize	status	OK
+SELECT COUNT(*), MIN(clock), MAX(clock) FROM zs;
+COUNT(*)	MIN(clock)	MAX(clock)
+12	-9223372036854	9223372036854
+# Saturated bounds with backward / ordered index scans
+SELECT clock, v FROM zs WHERE clock <= 9223372036855 ORDER BY clock DESC LIMIT 3;
+clock	v
+9223372036854	11
+9223372036853	10
+253402300799	9
+SELECT clock, v FROM zsi WHERE clock <= 9223372036855 ORDER BY clock DESC LIMIT 3;
+clock	v
+9223372036854	11
+9223372036853	10
+253402300799	9
+SELECT clock, v FROM zs WHERE clock < -9223372036855 ORDER BY clock DESC;
+clock	v
+SELECT clock, v FROM zsi WHERE clock < -9223372036855 ORDER BY clock DESC;
+clock	v
+SELECT clock, v FROM zs WHERE clock >= -9223372036855 ORDER BY clock LIMIT 2;
+clock	v
+-9223372036854	1
+-3153600000	2
+SELECT clock, v FROM zsi WHERE clock >= -9223372036855 ORDER BY clock LIMIT 2;
+clock	v
+-9223372036854	1
+-3153600000	2
+SELECT clock, v FROM zs WHERE clock < 9223372036855 AND clock > -9223372036855 ORDER BY clock DESC LIMIT 2;
+clock	v
+9223372036854	11
+9223372036853	10
+SELECT clock, v FROM zsi WHERE clock < 9223372036855 AND clock > -9223372036855 ORDER BY clock DESC LIMIT 2;
+clock	v
+9223372036854	11
+9223372036853	10
+DROP TABLE zs, zsi;
+CREATE TABLE zu (clock BIGINT UNSIGNED NOT NULL, v INT NOT NULL, INDEX(clock)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock' CHUNK_INTERVAL='1 MONTH';
+CREATE TABLE zui (clock BIGINT UNSIGNED NOT NULL, v INT NOT NULL, KEY(clock)) ENGINE=InnoDB;
+INSERT INTO zu VALUES (0, 1), (1, 2), (1767225600, 3), (9223372036853, 4), (9223372036854, 5);
+INSERT INTO zui SELECT * FROM zu;
+# Above LONGLONG_MAX (negative as a signed value) and above the supported range
+INSERT INTO zu VALUES (9223372036855, 6);
+ERROR HY000: Got error 1205 'column 'clock': time value outside the supported range (+/-9223372036854 seconds since 1970)' from MooseDB
+INSERT INTO zu VALUES (9223372036854775808, 7);
+ERROR HY000: Got error 1205 'column 'clock': time value outside the supported range (+/-9223372036854 seconds since 1970)' from MooseDB
+INSERT INTO zu VALUES (18446744073709551615, 8);
+ERROR HY000: Got error 1205 'column 'clock': time value outside the supported range (+/-9223372036854 seconds since 1970)' from MooseDB
+INSERT INTO zu VALUES (18446744073709551614, 9);
+ERROR HY000: Got error 1205 'column 'clock': time value outside the supported range (+/-9223372036854 seconds since 1970)' from MooseDB
+SELECT clock, v FROM zu ORDER BY clock;
+clock	v
+0	1
+1	2
+1767225600	3
+9223372036853	4
+9223372036854	5
+# WHERE clock >= 9223372036854
+a	b	c	vs_innodb
+1	9223372036854	1993775515	SAME
+# WHERE clock > 9223372036854
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# WHERE clock > 9223372036855
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# WHERE clock < 18446744073709551615
+a	b	c	vs_innodb
+5	0	1525600767	SAME
+# WHERE clock <= 18446744073709551615
+a	b	c	vs_innodb
+5	0	1525600767	SAME
+# WHERE clock >= 18446744073709551615
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# WHERE clock = 18446744073709551615
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# WHERE clock > 9223372036854775807
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# WHERE clock >= 9223372036854775808
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# WHERE clock < 9223372036854775808
+a	b	c	vs_innodb
+5	0	1525600767	SAME
+# WHERE clock BETWEEN 1 AND 18446744073709551615
+a	b	c	vs_innodb
+4	1	1402002365	SAME
+# WHERE clock < 1
+a	b	c	vs_innodb
+1	0	159255106	SAME
+# WHERE clock <= 0
+a	b	c	vs_innodb
+1	0	159255106	SAME
+# WHERE clock < 0
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# WHERE clock > -1
+a	b	c	vs_innodb
+5	1	1525600767	SAME
+SELECT clock, v FROM zu ORDER BY clock DESC LIMIT 2;
+clock	v
+9223372036854	5
+9223372036853	4
+SELECT clock, v FROM zui ORDER BY clock DESC LIMIT 2;
+clock	v
+9223372036854	5
+9223372036853	4
+DROP TABLE zu, zui;
+CREATE TABLE zn (clock INT UNSIGNED NOT NULL, v INT NOT NULL, INDEX(clock)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+CREATE TABLE zni (clock INT UNSIGNED NOT NULL, v INT NOT NULL, KEY(clock)) ENGINE=InnoDB;
+INSERT INTO zn VALUES (0, 1), (2147483647, 2), (2147483648, 3), (4294967294, 4), (4294967295, 5);
+INSERT INTO zni SELECT * FROM zn;
+# WHERE clock > 2147483647
+a	b	c	vs_innodb
+3	2147483648	1749101941	SAME
+# WHERE clock >= 4294967295
+a	b	c	vs_innodb
+1	4294967295	315778977	SAME
+# WHERE clock BETWEEN 2147483648 AND 4294967294
+a	b	c	vs_innodb
+2	2147483648	2056473300	SAME
+SELECT clock, v FROM zn ORDER BY clock DESC LIMIT 3;
+clock	v
+4294967295	5
+4294967294	4
+2147483648	3
+SELECT clock, v FROM zni ORDER BY clock DESC LIMIT 3;
+clock	v
+4294967295	5
+4294967294	4
+2147483648	3
+DROP TABLE zn, zni;
+CREATE TABLE zq (clock INT NOT NULL, v INT NOT NULL, INDEX(clock)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+CREATE TABLE zqi (clock INT NOT NULL, v INT NOT NULL, KEY(clock)) ENGINE=InnoDB;
+INSERT INTO zq VALUES (-2147483648, 1), (-1, 2), (0, 3), (2147483647, 4);
+INSERT INTO zqi SELECT * FROM zq;
+# WHERE clock < 0
+a	b	c	vs_innodb
+2	-2147483648	1838284220	SAME
+# WHERE clock <= -2147483648
+a	b	c	vs_innodb
+1	-2147483648	1887026590	SAME
+# WHERE clock >= 2147483647
+a	b	c	vs_innodb
+1	2147483647	2344396106	SAME
+SELECT clock, v FROM zq ORDER BY clock;
+clock	v
+-2147483648	1
+-1	2
+0	3
+2147483647	4
+SELECT clock, v FROM zqi ORDER BY clock;
+clock	v
+-2147483648	1
+-1	2
+0	3
+2147483647	4
+# Out of the column's own range: the server rejects it, not the engine
+INSERT INTO zq VALUES (2147483648, 5);
+ERROR 22003: Out of range value for column 'clock' at row 1
+DROP TABLE zq, zqi;
+##################################################################
+# Writes of other shapes: multi-row, INSERT ... SELECT, REPLACE, TRUNCATE
+##################################################################
+CREATE TABLE zw (clock INT NOT NULL, itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG', value DOUBLE NOT NULL, INDEX(clock))
+ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+INSERT INTO zw VALUES (1767225600, 1, 1.5), (1767225601, 2, 2.5);
+INSERT INTO zw SELECT clock + 10, itemid, value * 2 FROM zw;
+INSERT INTO zw (clock, itemid, value) VALUES (1767225700, 3, 3.5), (1767225701, 3, 4.5);
+REPLACE INTO zw VALUES (1767225800, 4, 5.5);
+SELECT * FROM zw ORDER BY clock;
+clock	itemid	value
+1767225600	1	1.5
+1767225601	2	2.5
+1767225610	1	3
+1767225611	2	5
+1767225700	3	3.5
+1767225701	3	4.5
+1767225800	4	5.5
+SELECT COUNT(*) FROM zw;
+COUNT(*)
+7
+TRUNCATE TABLE zw;
+SELECT COUNT(*) FROM zw;
+COUNT(*)
+0
+INSERT INTO zw VALUES (1767225900, 9, 9.5);
+SELECT * FROM zw;
+clock	itemid	value
+1767225900	9	9.5
+DROP TABLE zw;
+##################################################################
+# ALTER TABLE changing the axis column type (rebuilds the table)
+##################################################################
+CREATE TABLE za (clock INT NOT NULL, v INT NOT NULL, INDEX(clock)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+INSERT INTO za VALUES (20260101, 1), (20260102, 2);
+ALTER TABLE za MODIFY clock DATETIME NOT NULL;
+SELECT clock, v FROM za ORDER BY clock;
+clock	v
+2026-01-01 00:00:00	1
+2026-01-02 00:00:00	2
+SELECT COUNT(*) FROM za WHERE clock > '2026-01-01 12:00:00';
+COUNT(*)
+1
+# DATETIME -> BIGINT gives 20260101000000, beyond the supported range: refused, table intact
+ALTER TABLE za MODIFY clock BIGINT NOT NULL;
+ERROR HY000: Got error 1205 'column 'clock': time value outside the supported range (+/-9223372036854 seconds since 1970)' from MooseDB
+SELECT clock, v FROM za ORDER BY clock;
+clock	v
+2026-01-01 00:00:00	1
+2026-01-02 00:00:00	2
+ALTER TABLE za MODIFY clock INT NOT NULL;
+ERROR 22003: Out of range value for column 'clock' at row 1
+SHOW CREATE TABLE za;
+Table	Create Table
+za	CREATE TABLE `za` (
+  `clock` datetime NOT NULL,
+  `v` int(11) NOT NULL,
+  KEY `clock` (`clock`)
+) ENGINE=MooseDB DEFAULT CHARSET=latin1 COLLATE=latin1_swedish_ci `TIMESTAMP_COLUMN`='clock'
+DROP TABLE za;
+##################################################################
+# Retention works on the integer axis (UNIX_TIMESTAMP based)
+##################################################################
+CREATE TABLE zr (clock INT NOT NULL, itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG', v INT, INDEX(clock))
+ENGINE=MooseDB TIMESTAMP_COLUMN='clock' CHUNK_INTERVAL='1 DAY' RETENTION_PERIOD='30 DAYS';
+INSERT INTO zr VALUES
+(UNIX_TIMESTAMP() - 400 * 86400, 1, 1),
+(UNIX_TIMESTAMP() - 100 * 86400, 1, 2),
+(UNIX_TIMESTAMP() - 1 * 86400, 1, 3),
+(UNIX_TIMESTAMP(), 2, 4);
+FLUSH TABLES zr;
+SELECT EXPIRED_CHUNKS, RETENTION FROM information_schema.MOOSEDB_TABLES WHERE TABLE_NAME = 'zr';
+EXPIRED_CHUNKS	RETENTION
+2	30 DAYS
+CALL moosedb_apply_retention('test.zr');
+SELECT v FROM zr ORDER BY clock;
+v
+3
+4
+INSERT INTO zr VALUES (UNIX_TIMESTAMP() - 200 * 86400, 3, 5);
+OPTIMIZE TABLE zr;
+Table	Op	Msg_type	Msg_text
+test.zr	optimize	status	OK
+SELECT v FROM zr ORDER BY clock;
+v
+3
+4
+DROP TABLE zr;
+DROP PROCEDURE moosedb_compact;
+DROP PROCEDURE moosedb_apply_retention;
+DROP FUNCTION moosedb_compact_impl;
+DROP FUNCTION moosedb_retention_impl;
+##################################################################
+# Restart (rows in chunks + MemTable), TRUNCATE, then a crash (WAL replay)
+##################################################################
+INSERT INTO z SELECT 1768500000 + seq, 1 + seq MOD 5, seq, seq FROM seq_0_to_99;
+INSERT INTO zi SELECT 1768500000 + seq, 1 + seq MOD 5, seq, seq FROM seq_0_to_99;
+# WHERE clock >= 0
+a	b	c	vs_innodb
+2100	1767225600	1757111077	SAME
+# restart
+# WHERE clock >= 0
+a	b	c	vs_innodb
+2100	1767225600	1757111077	SAME
+# WHERE itemid = 4 AND clock > 1768400000
+a	b	c	vs_innodb
+29	1768400400	1294536977	SAME
+SELECT clock, itemid FROM z ORDER BY clock DESC LIMIT 2;
+clock	itemid
+1768500099	5
+1768500098	4
+SHOW CREATE TABLE z;
+Table	Create Table
+z	CREATE TABLE `z` (
+  `clock` int(11) NOT NULL,
+  `itemid` bigint(20) unsigned NOT NULL COMMENT 'TAG',
+  `ns` int(11) NOT NULL,
+  `value` double NOT NULL,
+  KEY `clock_idx` (`clock`)
+) ENGINE=MooseDB DEFAULT CHARSET=latin1 COLLATE=latin1_swedish_ci `TIMESTAMP_COLUMN`='clock' `CHUNK_INTERVAL`='1 DAY'
+# Rows only in the WAL survive kill -9 with the right clock values
+INSERT INTO z SELECT 1769000000 + seq, 1 + seq MOD 5, seq, seq FROM seq_0_to_49;
+INSERT INTO zi SELECT 1769000000 + seq, 1 + seq MOD 5, seq, seq FROM seq_0_to_49;
+INSERT INTO z VALUES (-5, 1, 0, 0), (2147483647, 2, 0, 0);
+INSERT INTO zi VALUES (-5, 1, 0, 0), (2147483647, 2, 0, 0);
+# Kill the server
+# restart
+# WHERE clock >= 0
+a	b	c	vs_innodb
+2151	1767225600	1861314892	SAME
+# WHERE clock >= 1769000000
+a	b	c	vs_innodb
+51	1769000000	105515625	SAME
+# WHERE clock < 0
+a	b	c	vs_innodb
+1	-5	3257013864	SAME
+SELECT MIN(clock), MAX(clock) FROM z;
+MIN(clock)	MAX(clock)
+-5	2147483647
+SELECT clock, itemid FROM z ORDER BY clock DESC LIMIT 2;
+clock	itemid
+2147483647	2
+1769000049	5
+CHECK TABLE z;
+Table	Op	Msg_type	Msg_text
+test.z	check	status	OK
+TRUNCATE TABLE z;
+TRUNCATE TABLE zi;
+INSERT INTO z VALUES (1770000000, 1, 1, 1);
+INSERT INTO zi VALUES (1770000000, 1, 1, 1);
+# WHERE clock >= 0
+a	b	c	vs_innodb
+1	1770000000	3448770120	SAME
+# restart
+# WHERE clock >= 0
+a	b	c	vs_innodb
+1	1770000000	3448770120	SAME
+DROP TABLE z, zi;

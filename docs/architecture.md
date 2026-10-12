@@ -282,6 +282,22 @@ Segmento cifrado só com header não exige a chave no replay.
   calculado comparando os valores de cada série **com a collation da
   comparação** (`strnncollsp`). Só essas séries são lidas; os Bloom filters
   podam chunks. O servidor continua avaliando o WHERE inteiro.
+  **TAG inteira** (`TINYINT`..`BIGINT`, signed/unsigned, sem `ZEROFILL`): a
+  série guarda o texto de `val_str()` (decimal canônico) e o predicado é
+  comparado **byte a byte** (`my_charset_bin`, também no cache — o mesmo
+  `hash_sort` + `strnncollsp` do caminho string, então cache e fallback
+  coincidem). A constante é convertida ao mesmo texto só quando isso é
+  exatamente o que o servidor decide (`numeric_const()`): `INT` e `DECIMAL`
+  são exatos; `DOUBLE` só abaixo de 2⁵³ (acima, `2⁵³+1` compara igual a `2⁵³`
+  como double); string só se for inteiro limpo (`-?(0|[1-9]\d*)`, ≤ 16
+  dígitos, charset não binário e de 1 byte por caractere); fracionária ou
+  fora do intervalo do campo → o valor não casa série alguma e sai da lista;
+  qualquer valor duvidoso (`'0123'`, `' 12'`, `'1e3'`, hex/binário, ≥ 2⁵³) →
+  o predicado inteiro **não** é empurrado. `ZEROFILL` nunca é empurrado (o
+  texto gravado é preenchido). TAG `VARCHAR` comparada com número também não
+  (o servidor compara como `DOUBLE`). Em coluna `BIGINT` o servidor converte
+  constantes string em inteiras antes de `cond_push` (`convert_const_to_int`),
+  então o handler já recebe a constante `INT`.
 
 ## Manutenção em background
 
@@ -326,6 +342,7 @@ v3. Salvaguardas atuais:
 | DATETIME | TIMESTAMP (µs) | relógio de parede tratado como UTC — fronteiras de chunk independem de `time_zone` |
 | TIMESTAMP | TIMESTAMP (µs) | tempo Unix real |
 | TINYINT..BIGINT, YEAR, BIT | INT64 | BIGINT UNSIGNED preservado bit a bit |
+| INT/BIGINT nomeado em `TIMESTAMP_COLUMN` | TIMESTAMP (µs) | segundos desde 1970 UTC × 10⁶ (eixo inteiro); fora de ±9223372036854 s o INSERT é recusado |
 | FLOAT / DOUBLE | FLOAT32 / FLOAT64 | |
 | DECIMAL | DECIMAL | string canônica (exata) |
 | `COMMENT 'TAG'` | TAG | identidade da série |
@@ -362,6 +379,8 @@ v3. Salvaguardas atuais:
 | 24 | — (isolamento não especificado) | atomicidade por statement: linhas de um statement aparecem todas de uma vez; crash no meio não deixa nada; sem MVCC nem transações multi-statement | Leituras nunca veem statements parciais; MVCC completo não se justifica com dados imutáveis. Erro no meio do statement mantém as linhas já inseridas (coerente com o binlog de engine não transacional). |
 | 25 | Entrada do WAL única | WAL v2 com `ROW`/`COMMIT`/`ROW_COMMIT`; MANIFEST v2 com `replay_seq` | Necessário para a atomicidade por statement com escritores concorrentes. v1 continua legível. |
 | 26 | Leitura linha a linha | leitura colunar projetada e em lote pela FFI (`TFBatch`), poda por ts dentro da série | O custo dominante era montar linhas (4 mallocs/linha), não decodificar. |
+| 27 | Eixo de tempo só `DATETIME`/`TIMESTAMP` | + `INT`/`BIGINT` (signed/unsigned, `NOT NULL`, armazenada) **somente** via `TIMESTAMP_COLUMN='col'`, lido como segundos epoch UTC (`ts_us = secs × 10⁶`); índice simples sobre a coluna continua obrigatório; `ns` não é dobrado no eixo | Zabbix guarda `clock INT` + `ns INT`. Exigir `TIMESTAMP_COLUMN` evita que um índice qualquer sobre um inteiro mude o significado de tabelas existentes. Produto que estoura `i64` (ou `BIGINT UNSIGNED` > 2⁶³) é erro explícito, não truncamento; limites de range vindos do índice saturam. O core não mudou (mesmo `TF_COL_TIMESTAMP`, sem mudança de FFI); o IS exibe o eixo como DATETIME (clampa em 0000/9999 nos extremos). |
+| 28 | Pushdown de TAG só para strings | + TAG inteira (`TINYINT`..`BIGINT`) com constantes `INT`/`DECIMAL`/`DOUBLE`/string-inteira-limpa em `=`, `IN`, igualdade múltipla; comparação binária do texto canônico | O Zabbix consulta `itemid = 123` sem aspas; cada query varria todas as séries. Regra de correção: o servidor reavalia o WHERE, então só se poda uma série quando é certo que o servidor não a casaria (ver §Leitura). Tipos mistos: em `IN`, uma constante de módulo ≥ 2⁵³ junto de constante `DOUBLE`/string (a lista pode ser comparada como DOUBLE) recusa o pushdown; em igualdade múltipla, todos os membros precisam ser colunas inteiras (membro `DOUBLE`/`DECIMAL`/string recusa). |
 
 ## Limitações conhecidas
 
@@ -369,9 +388,17 @@ v3. Salvaguardas atuais:
   `OPTIMIZE TABLE` e as procedures funcionam sempre.
 * `DELETE FROM t` sem `WHERE` com `binlog_format=ROW` é executado linha a linha
   pelo servidor e falha (`ER_ILLEGAL_HA`); `TRUNCATE` funciona sempre.
-* Pushdown de TAG só para constantes string em `=`, `IN` e igualdades
-  múltiplas ligadas por `AND` (OR e TAGs numéricas são avaliados só pelo
-  servidor).
+* Pushdown de TAG só em `=`, `IN` (não negado) e igualdades múltiplas ligadas
+  por `AND` (OR, `NOT IN`, `<>`, `<=>` são avaliados só pelo servidor), com
+  constantes string (colunas string) ou numéricas (TAG inteira, ver §Leitura).
+  Sem pushdown: TAG `ZEROFILL`, TAG `VARCHAR` comparada com número, TAG
+  `DECIMAL`/`DOUBLE`/`YEAR`/`BIT`, strings inteiras ≥ 2⁵³ ou não limpas e
+  `DOUBLE` ≥ 2⁵³.
+* Eixo de tempo inteiro: só `INT`/`BIGINT` e só por `TIMESTAMP_COLUMN`; intervalo
+  ±9223372036854 s (≈ ano 292277); `SMALLINT`/`MEDIUMINT`/`TINYINT` não são
+  aceitos como eixo. `ns` do Zabbix é coluna comum (não há `TIMESTAMP_NS_COLUMN`);
+  `ORDER BY clock, ns` usa filesort. As procedures de manutenção continuam
+  recebendo limites como `'YYYY-MM-DD[ HH:MM:SS]'` (UTC) também para eixo inteiro.
 * A compactação mantém um intervalo de tempo em um chunk; com
   `CHUNK_INTERVAL='1 MONTH'` e muitas séries, o chunk resultante pode ser grande.
   Uma série que não cabe nos limites de bloco é dividida em vários chunks do

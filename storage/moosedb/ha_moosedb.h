@@ -33,6 +33,7 @@ enum class tf_conv : uint8_t
 {
   DATETIME,   /* DATETIME            <-> TF_COL_TIMESTAMP (UTC wall clock, µs) */
   TIMESTAMP,  /* TIMESTAMP           <-> TF_COL_TIMESTAMP (Unix time, µs)      */
+  INT_SECS,   /* INT/BIGINT axis, ONLY via explicit TIMESTAMP_COLUMN <-> TF_COL_TIMESTAMP (secs * 1e6 µs) */
   INT,        /* integer types, YEAR, BIT <-> TF_COL_INT64                     */
   FLOAT,      /* FLOAT               <-> TF_COL_FLOAT32                        */
   DOUBLE,     /* DOUBLE              <-> TF_COL_FLOAT64                        */
@@ -89,6 +90,8 @@ using tf_snapshot_ptr= std::unique_ptr<MooseDBSnapshot, tf_snapshot_closer>;
 /*
   An equality/IN predicate on a TAG column, pushed down from the WHERE
   clause: the column must equal one of `values` under collation `cs`.
+  Integer TAG columns (TINYINT..BIGINT) use my_charset_bin and `values` holds
+  the canonical decimal text the column itself stores (numeric_const()).
 */
 struct tf_tag_predicate
 {

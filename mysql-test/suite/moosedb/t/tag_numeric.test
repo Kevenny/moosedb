@@ -1,0 +1,653 @@
+#
+# Pushdown of predicates on INTEGER TAG columns (TINYINT..BIGINT, signed and
+# unsigned) with numeric and numeric-looking constants, as sent by the Zabbix
+# server (itemid = 123, itemid IN (1,2,3), no quotes).
+#
+# Every query runs on the MooseDB table and on an InnoDB mirror holding the
+# same rows; "SAME" means identical row count, sum and row checksum. The
+# Handler_read_rnd_next line shows how many rows the engine handed to the
+# server: just the matching series (+1 for the end of the scan) when the
+# predicate was pushed, every row (+1) when it was not pushed.
+#
+# The mirror has no index on the tag columns: an index range would round the
+# constant (itemid = 123.5 -> 124) while the table scan the engine is compared
+# with evaluates the predicate exactly; both are legitimate server behaviour.
+#
+--source include/have_innodb.inc
+--source include/have_sequence.inc
+--source suite/moosedb/include/have_moosedb.inc
+
+--let $quiet= 0
+--let $show_status= 1
+--let $mt= m
+--let $it= i
+--let $sel= COUNT(*), SUM(v), BIT_XOR(CRC32(CONCAT(itemid, '|', v)))
+
+CREATE TABLE m (ts DATETIME NOT NULL, itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG',
+                v INT NOT NULL, INDEX(ts)) ENGINE=MooseDB;
+CREATE TABLE i (ts DATETIME NOT NULL, itemid BIGINT UNSIGNED NOT NULL,
+                v INT NOT NULL, KEY(ts)) ENGINE=InnoDB;
+# join partner for the multiple-equality (Item_equal) cases
+CREATE TABLE x (id BIGINT UNSIGNED NOT NULL, KEY(id)) ENGINE=InnoDB;
+INSERT INTO x VALUES (123), (124), (1), (3), (18446744073709551615), (5);
+
+--echo # 16 series around the interesting boundaries, 5 rows each; half sealed, half in the MemTable
+--let $ids= ELT(1 + seq MOD 16, '0', '1', '2', '3', '10', '123', '124', '1000', '4294967296', '9007199254740991', '9007199254740992', '9007199254740993', '9223372036854775807', '9223372036854775808', '18446744073709551614', '18446744073709551615')
+eval INSERT INTO m SELECT '2026-03-01 00:00:00' + INTERVAL seq SECOND, $ids, seq FROM seq_0_to_39;
+eval INSERT INTO i SELECT '2026-03-01 00:00:00' + INTERVAL seq SECOND, $ids, seq FROM seq_0_to_39;
+FLUSH TABLES m;
+eval INSERT INTO m SELECT '2026-03-01 00:00:00' + INTERVAL seq SECOND, $ids, seq FROM seq_40_to_79;
+eval INSERT INTO i SELECT '2026-03-01 00:00:00' + INTERVAL seq SECOND, $ids, seq FROM seq_40_to_79;
+SELECT COUNT(*), COUNT(DISTINCT itemid), MAX(itemid) FROM m;
+SELECT COUNT(*), COUNT(DISTINCT itemid), MAX(itemid) FROM i;
+
+--echo ##################################################################
+--echo # Equality with numeric constants (pushed): one series = 5 rows -> 6
+--echo ##################################################################
+--let $tail= WHERE itemid = 123
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE 123 = itemid
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid = 0
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid = 123.0
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid = 1.23e2
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid = 0.0
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid = -0.0
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid = 100 + 23
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid = CAST('123' AS UNSIGNED)
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid = (SELECT 123)
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid = 0x7B
+--source suite/moosedb/include/mirror_cmp.inc
+
+--echo # Fractional constants and values outside the column range match nothing: no row read (-> 1)
+--let $tail= WHERE itemid = 123.5
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid = 123.5e0
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid = -1
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid = '-1'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid = 18446744073709551616
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid = 18446744073709551616.0
+--source suite/moosedb/include/mirror_cmp.inc
+
+--echo # The whole unsigned range, above 2^63
+--let $tail= WHERE itemid = 18446744073709551615
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid = 18446744073709551615.0
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid = 9223372036854775808
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid = 9223372036854775807
+--source suite/moosedb/include/mirror_cmp.inc
+
+--echo # Around 2^53: 2^53-1, 2^53 and 2^53+1 are three different series; INT and DECIMAL constants are exact, a DOUBLE constant is pushed only below 2^53
+--let $tail= WHERE itemid = 9007199254740991
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid = 9007199254740992
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid = 9007199254740993
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid = 9007199254740991e0
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid = 9007199254740992e0
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid = 9007199254740993e0
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid = 18446744073709551615e0
+--source suite/moosedb/include/mirror_cmp.inc
+
+--echo ##################################################################
+--echo # String constants
+--echo ##################################################################
+--echo # Clean integer text
+--let $tail= WHERE itemid = '123'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid = '0'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid = '4294967296'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid = '9007199254740991'
+--source suite/moosedb/include/mirror_cmp.inc
+--echo # Texts that are not clean integers. For a BIGINT column the server itself turns a string constant into an integer constant (convert_const_to_int) before the engine sees it, so what is pushed here is that integer; the same texts on INT columns (compared as DOUBLE by the server) are tested with the mx table below
+--let $tail= WHERE itemid = '0123'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid = ' 123'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid = '123 '
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid = '123abc'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid = '1.23e2'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid = '1e3'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid = '123.0'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid = '+123'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid = '-0'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid = ''
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid = 'abc'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid = '12345678901234567890'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid = '9007199254740993'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid = '18446744073709551615'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid = '18446744073709551616'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid = x'3132'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid = _utf16 '123'
+--source suite/moosedb/include/mirror_cmp.inc
+
+--echo ##################################################################
+--echo # NULL
+--echo ##################################################################
+--let $tail= WHERE itemid = NULL
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid IS NULL
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid IN (123, NULL)
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid <=> 123
+--source suite/moosedb/include/mirror_cmp.inc
+
+--echo ##################################################################
+--echo # IN lists
+--echo ##################################################################
+--let $tail= WHERE itemid IN (1, 2, 3)
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid IN (3, 3, 3, 123, 124)
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid IN (1, 2.5, 3)
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid IN (123, 124.0, '1000')
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid IN (18446744073709551615, 18446744073709551614, -1, 18446744073709551616)
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid IN (-5, -6, 99999999999999999999)
+--source suite/moosedb/include/mirror_cmp.inc
+--echo # One value the engine cannot convert safely keeps the whole IN list unpushed (81)
+--let $tail= WHERE itemid IN (1, '0123')
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid IN (1, 'abc')
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid IN (1, 9007199254740993e0)
+--source suite/moosedb/include/mirror_cmp.inc
+--echo # Negated and OR'ed predicates are left to the server
+--let $tail= WHERE itemid NOT IN (1, 2, 3)
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid <> 123
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid = 123 OR v = 3
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid = 123 OR itemid = 124
+--source suite/moosedb/include/mirror_cmp.inc
+--echo # AND of two predicates on the same tag intersects
+--let $tail= WHERE itemid IN (1, 2, 3, 123) AND itemid IN (3, 123, 124) AND v > 20
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid = 123 AND itemid = 124
+--source suite/moosedb/include/mirror_cmp.inc
+
+--echo ##################################################################
+--echo # Multiple equalities (Item_equal): a.itemid = x.id AND x.id = const
+--echo ##################################################################
+--let $tail= JOIN x ON tt.itemid = x.id WHERE x.id = 123
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= JOIN x ON tt.itemid = x.id WHERE x.id = 18446744073709551615
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= JOIN x ON tt.itemid = x.id WHERE x.id = '123'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid = v AND v = 3
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid = v AND v = 1
+--source suite/moosedb/include/mirror_cmp.inc
+--echo # Join without a constant: nothing to push (81)
+--let $tail= JOIN x ON tt.itemid = x.id
+--source suite/moosedb/include/mirror_cmp.inc
+
+--echo ##################################################################
+--echo # Mixed-type IN lists: the server may compare the whole list as DOUBLE,
+--echo # where 2^53 and 2^53+1 are equal -> a constant >= 2^53 next to a DOUBLE or
+--echo # string constant is never pushed (81); INT/DECIMAL-only lists are exact
+--echo ##################################################################
+--let $tail= WHERE itemid IN (9007199254740993, 1e0)
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid IN (9007199254740992, '1')
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid IN (9007199254740992, 1.5e0)
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid IN (9007199254740993, '1')
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid IN (9007199254740993, NULL, 1e0)
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid IN (18446744073709551615, 1e0)
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid IN (18446744073709551616, 1e0)
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid IN (18446744073709551616.5, 1e0)
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid IN (-9007199254740993, 'x')
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid IN (9007199254740993, 3, '2', 1.0e1)
+--source suite/moosedb/include/mirror_cmp.inc
+--echo # Small constants of mixed types are still pushed
+--let $tail= WHERE itemid IN (3, 1e0, '2', 10.0)
+--source suite/moosedb/include/mirror_cmp.inc
+--echo # INT/DECIMAL only: exact, pushed
+--let $tail= WHERE itemid IN (9007199254740993, 9007199254740992)
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid IN (9007199254740993, 5.0)
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid IN (18446744073709551616, 9007199254740993.0)
+--source suite/moosedb/include/mirror_cmp.inc
+
+--echo ##################################################################
+--echo # Multiple equalities across column types (joined column DOUBLE, DECIMAL,
+--echo # VARCHAR: not pushed, 81; integer columns of any width/sign: pushed)
+--echo ##################################################################
+CREATE TABLE xd (d DOUBLE NOT NULL, dec20 DECIMAL(20,0) NOT NULL, vc VARCHAR(30) NOT NULL,
+                 ti TINYINT NOT NULL, ub BIGINT UNSIGNED NOT NULL) ENGINE=InnoDB;
+INSERT INTO xd VALUES (9007199254740992, 9007199254740993, '9007199254740993', 3, 9007199254740993),
+                      (3, 3, '3', 1, 18446744073709551615),
+                      (1, 1, '1', 2, 0);
+--let $tail= JOIN xd ON tt.itemid = xd.d WHERE xd.d = 9007199254740993
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= JOIN xd ON tt.itemid = xd.d WHERE xd.d = 9007199254740992
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= JOIN xd ON tt.itemid = xd.d WHERE xd.d = 3
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= JOIN xd ON tt.itemid = xd.dec20 WHERE xd.dec20 = 9007199254740993
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= JOIN xd ON tt.itemid = xd.vc WHERE xd.vc = '9007199254740993'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= JOIN xd ON tt.itemid = xd.vc WHERE xd.vc = '3'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= JOIN xd ON tt.itemid = xd.ti WHERE xd.ti = 3
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= JOIN xd ON tt.itemid = xd.ub WHERE xd.ub = 9007199254740993
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= JOIN xd ON tt.itemid = xd.ub WHERE xd.ub = 18446744073709551615
+--source suite/moosedb/include/mirror_cmp.inc
+DROP TABLE xd;
+
+--echo ##################################################################
+--echo # Prepared statements (parameters are constants too)
+--echo ##################################################################
+PREPARE ps FROM 'SELECT COUNT(*), SUM(v) FROM m WHERE itemid = ?';
+PREPARE psi FROM 'SELECT COUNT(*), SUM(v) FROM i WHERE itemid = ?';
+SET @p= 123;
+FLUSH STATUS;
+EXECUTE ps USING @p;
+SHOW SESSION STATUS LIKE 'Handler_read_rnd_next';
+EXECUTE psi USING @p;
+SET @p= '123';
+FLUSH STATUS;
+EXECUTE ps USING @p;
+SHOW SESSION STATUS LIKE 'Handler_read_rnd_next';
+EXECUTE psi USING @p;
+SET @p= '0123';
+EXECUTE ps USING @p;
+EXECUTE psi USING @p;
+SET @p= 123.5;
+EXECUTE ps USING @p;
+EXECUTE psi USING @p;
+DEALLOCATE PREPARE ps;
+DEALLOCATE PREPARE psi;
+
+--echo ##################################################################
+--echo # TAG cache: new series appended after the cache was built, TRUNCATE
+--echo ##################################################################
+--let $show_status= 0
+--let $tail= WHERE itemid IN (777, 123)
+--source suite/moosedb/include/mirror_cmp.inc
+INSERT INTO m VALUES ('2026-04-01', 777, 1000), ('2026-04-01', 123, 1001);
+INSERT INTO i VALUES ('2026-04-01', 777, 1000), ('2026-04-01', 123, 1001);
+--source suite/moosedb/include/mirror_cmp.inc
+TRUNCATE TABLE m;
+TRUNCATE TABLE i;
+--source suite/moosedb/include/mirror_cmp.inc
+INSERT INTO m VALUES ('2026-04-02', 123, 5), ('2026-04-02', 124, 6);
+INSERT INTO i VALUES ('2026-04-02', 123, 5), ('2026-04-02', 124, 6);
+--source suite/moosedb/include/mirror_cmp.inc
+--let $show_status= 1
+
+DROP TABLE m, i, x;
+
+--echo ##################################################################
+--echo # Several TAG columns of different integer types, a VARCHAR TAG and a nullable TAG
+--echo ##################################################################
+--let $mt= mx
+--let $it= ix
+--let $sel= COUNT(*), SUM(v), BIT_XOR(CRC32(CONCAT_WS('|', itemid, host, tiny, usmall, med, uint, sint, IFNULL(nul, 'N'), v)))
+CREATE TABLE mx (ts DATETIME NOT NULL,
+  itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG',
+  host   VARCHAR(8) NOT NULL COMMENT 'TAG',
+  tiny   TINYINT NOT NULL COMMENT 'TAG',
+  usmall SMALLINT UNSIGNED NOT NULL COMMENT 'TAG',
+  med    MEDIUMINT NOT NULL COMMENT 'TAG',
+  uint   INT UNSIGNED NOT NULL COMMENT 'TAG',
+  sint   INT NOT NULL COMMENT 'TAG',
+  nul    BIGINT COMMENT 'TAG',
+  v INT NOT NULL, INDEX(ts)) ENGINE=MooseDB;
+CREATE TABLE ix (ts DATETIME NOT NULL, itemid BIGINT UNSIGNED NOT NULL, host VARCHAR(8) NOT NULL,
+  tiny TINYINT NOT NULL, usmall SMALLINT UNSIGNED NOT NULL, med MEDIUMINT NOT NULL,
+  uint INT UNSIGNED NOT NULL, sint INT NOT NULL, nul BIGINT, v INT NOT NULL, KEY(ts)) ENGINE=InnoDB;
+--let $row= SELECT '2026-03-02 00:00:00' + INTERVAL seq SECOND, ELT(1 + seq MOD 6, '0', '1', '18446744073709551615', '123', '9007199254740993', '5'), CONCAT('h', seq MOD 4), ELT(1 + seq MOD 3, -128, 0, 127), ELT(1 + (seq DIV 3) MOD 2, 0, 65535), ELT(1 + (seq DIV 6) MOD 2, -8388608, 8388607), ELT(1 + (seq DIV 12) MOD 2, 0, 4294967295), ELT(1 + (seq DIV 24) MOD 2, -2147483648, 2147483647), IF(seq MOD 2, NULL, 7), seq FROM seq_0_to_239
+eval INSERT INTO mx $row;
+eval INSERT INTO ix $row;
+SELECT COUNT(*), COUNT(DISTINCT itemid, host, tiny, usmall, med, uint, sint, nul) FROM mx;
+
+--echo # Range edges of each column type (in range -> pushed; just outside -> matches nothing -> 1)
+--let $tail= WHERE tiny = -128
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE tiny = 127
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE tiny = 128
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE tiny = -129
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE tiny IN (-128, 127, 200, -200)
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE tiny = '127'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE tiny = 127.0
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE usmall = 65535
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE usmall = 65536
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE usmall = -1
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE med = -8388608
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE med = -8388609
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE med = 8388607
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE med = 8388608
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE uint = 4294967295
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE uint = 4294967296
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE uint = -1
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE sint = -2147483648
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE sint = 2147483647
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE sint = 2147483648
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE sint = -2147483649
+--source suite/moosedb/include/mirror_cmp.inc
+
+--echo # Several tags at once, integer and VARCHAR
+--let $tail= WHERE itemid IN (1, 123) AND host = 'h1'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE host = 'h1' AND tiny = 0 AND usmall = 65535 AND itemid = 5
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE itemid = 18446744073709551615 AND sint = -2147483648 AND med = 8388607
+--source suite/moosedb/include/mirror_cmp.inc
+
+--echo # String constants on INT columns: the server compares them as DOUBLE, so the engine sees the text.
+--echo # Clean integers are pushed (121 = 120 rows + 1), anything else is left to the server (241)
+--let $tail= WHERE uint = '4294967295'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE uint = '0'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE uint = '-1'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE uint = '4294967296'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE sint = '-2147483648'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE sint IN ('2147483647', 5, 7.0)
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE uint = '04294967295'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE uint = ' 4294967295'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE uint = '4294967295 '
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE uint = '4294967295abc'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE uint = '4.294967295e9'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE uint = '+4294967295'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE uint = '-0'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE uint = ''
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE uint = 'abc'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE sint = '-02147483648'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE usmall = '65535.0'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE tiny = '1e2'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE sint IN ('2147483647', 'x')
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE uint = '9007199254740993'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE uint = _utf16 '4294967295'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE uint = x'31'
+--source suite/moosedb/include/mirror_cmp.inc
+--echo # DECIMAL and DOUBLE constants on INT columns
+--let $tail= WHERE uint = 4294967295.0
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE uint = 4294967295.5
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE uint = 4.294967295e9
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE uint = 4.2949672955e9
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE sint = -2147483648.0
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE sint = -2147483648.1
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE tiny = 1e308
+--source suite/moosedb/include/mirror_cmp.inc
+
+--echo # Nullable integer TAG
+--let $tail= WHERE nul = 7
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE nul IS NULL
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE nul = NULL
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE nul IN (7, NULL)
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE nul = 8
+--source suite/moosedb/include/mirror_cmp.inc
+
+--echo # A VARCHAR TAG compared with a number is NOT pushed: the server compares as DOUBLE ('h1' = 0)
+--let $tail= WHERE host = 0
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE host = 1
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE host IN (0, 1)
+--source suite/moosedb/include/mirror_cmp.inc
+--echo # ... while a string constant on it is still pushed
+--let $tail= WHERE host = 'h1'
+--source suite/moosedb/include/mirror_cmp.inc
+
+--echo # Combined with the timestamp index
+--let $tail= WHERE itemid = 123 AND ts BETWEEN '2026-03-02 00:00:30' AND '2026-03-02 00:02:00'
+--source suite/moosedb/include/mirror_cmp.inc
+
+DROP TABLE mx, ix;
+
+--echo ##################################################################
+--echo # VARCHAR TAG holding numeric-looking text, compared with numbers
+--echo ##################################################################
+--let $mt= vt
+--let $it= vi
+--let $sel= COUNT(*), SUM(v), BIT_XOR(CRC32(CONCAT(tagv, '|', v)))
+CREATE TABLE vt (ts DATETIME NOT NULL, tagv VARCHAR(16) NOT NULL COMMENT 'TAG', v INT NOT NULL, INDEX(ts))
+  ENGINE=MooseDB DEFAULT CHARSET=latin1;
+CREATE TABLE vi (ts DATETIME NOT NULL, tagv VARCHAR(16) NOT NULL, v INT NOT NULL, KEY(ts))
+  ENGINE=InnoDB DEFAULT CHARSET=latin1;
+--let $row= SELECT '2026-03-03 00:00:00' + INTERVAL seq SECOND, ELT(1 + seq MOD 12, '123', '0123', ' 12', '12abc', 'abc', '', '0', '1e2', '100', '123.0', '-5', '5'), seq FROM seq_0_to_59
+eval INSERT INTO vt $row;
+eval INSERT INTO vi $row;
+--echo # '0123' = 123 and '123.0' = 123 for the server: no numeric pushdown on VARCHAR (61 rows read)
+--let $tail= WHERE tagv = 123
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE tagv = 0
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE tagv = 100
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE tagv = 12
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE tagv IN (5, 123)
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE tagv = 123.0
+--source suite/moosedb/include/mirror_cmp.inc
+--echo # String constant: string comparison, pushed
+--let $tail= WHERE tagv = '123'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE tagv = '0123'
+--source suite/moosedb/include/mirror_cmp.inc
+DROP TABLE vt, vi;
+
+--echo ##################################################################
+--echo # ZEROFILL integer TAG: stored text is padded, never pushed (all rows read) but answers stay right
+--echo ##################################################################
+--let $mt= zm
+--let $it= zi
+--let $sel= COUNT(*), SUM(v), BIT_XOR(CRC32(CONCAT(zf, '|', v)))
+CREATE TABLE zm (ts DATETIME NOT NULL, zf INT(6) UNSIGNED ZEROFILL NOT NULL COMMENT 'TAG', v INT NOT NULL, INDEX(ts))
+  ENGINE=MooseDB;
+CREATE TABLE zi (ts DATETIME NOT NULL, zf INT(6) UNSIGNED ZEROFILL NOT NULL, v INT NOT NULL, KEY(ts))
+  ENGINE=InnoDB;
+--let $row= SELECT '2026-03-04 00:00:00' + INTERVAL seq SECOND, ELT(1 + seq MOD 4, 0, 7, 123, 4294967295), seq FROM seq_0_to_11
+eval INSERT INTO zm $row;
+eval INSERT INTO zi $row;
+SELECT zf, COUNT(*) FROM zm GROUP BY zf ORDER BY zf;
+--let $tail= WHERE zf = 123
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE zf = '000123'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE zf IN (7, 123)
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE zf = 4294967295
+--source suite/moosedb/include/mirror_cmp.inc
+DROP TABLE zm, zi;
+
+--echo ##################################################################
+--echo # Large IN list (3000 values) on 2000 series
+--echo ##################################################################
+SET @thr_save= @@in_predicate_conversion_threshold;
+SET in_predicate_conversion_threshold= 0;
+--let $mt= bm
+--let $it= bi
+--let $sel= COUNT(*), SUM(v), BIT_XOR(CRC32(CONCAT(itemid, '|', v)))
+CREATE TABLE bm (ts DATETIME NOT NULL, itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG', v INT NOT NULL, INDEX(ts))
+  ENGINE=MooseDB;
+CREATE TABLE bi (ts DATETIME NOT NULL, itemid BIGINT UNSIGNED NOT NULL, v INT NOT NULL, KEY(ts))
+  ENGINE=InnoDB;
+INSERT INTO bm SELECT '2026-03-05 00:00:00' + INTERVAL seq SECOND, seq DIV 2 * 3 + 1, seq FROM seq_0_to_3999;
+INSERT INTO bi SELECT * FROM bm;
+SELECT COUNT(*), COUNT(DISTINCT itemid) FROM bm;
+SELECT GROUP_CONCAT(seq) INTO @list FROM seq_1_to_3000;
+SET @in= CONCAT('WHERE itemid IN (', @list, ')');
+--disable_query_log
+--disable_warnings
+SET @q1= CONCAT('SELECT COUNT(*), SUM(v), BIT_XOR(CRC32(CONCAT(itemid, ''|'', v))) INTO @a1, @b1, @c1 FROM bm AS tt ', @in);
+SET @q2= CONCAT('SELECT COUNT(*), SUM(v), BIT_XOR(CRC32(CONCAT(itemid, ''|'', v))) INTO @a2, @b2, @c2 FROM bi AS tt ', @in);
+PREPARE s1 FROM @q1;
+PREPARE s2 FROM @q2;
+FLUSH STATUS;
+EXECUTE s1;
+SHOW SESSION STATUS LIKE 'Handler_read_rnd_next';
+EXECUTE s2;
+--enable_warnings
+--enable_query_log
+SELECT @a1 AS a, @b1 AS b, IF(@a1 <=> @a2 AND @b1 <=> @b2 AND @c1 <=> @c2, 'SAME', 'DIFFERENT') AS vs_innodb;
+--echo # Same list with some strings and fractions mixed in
+--disable_query_log
+--disable_warnings
+SET @in= CONCAT('WHERE itemid IN (', @list, ', ''4000'', 4003.0, 4006.5, -1)');
+SET @q1= CONCAT('SELECT COUNT(*), SUM(v), BIT_XOR(CRC32(CONCAT(itemid, ''|'', v))) INTO @a1, @b1, @c1 FROM bm AS tt ', @in);
+SET @q2= CONCAT('SELECT COUNT(*), SUM(v), BIT_XOR(CRC32(CONCAT(itemid, ''|'', v))) INTO @a2, @b2, @c2 FROM bi AS tt ', @in);
+DEALLOCATE PREPARE s1;
+DEALLOCATE PREPARE s2;
+PREPARE s1 FROM @q1;
+PREPARE s2 FROM @q2;
+FLUSH STATUS;
+EXECUTE s1;
+SHOW SESSION STATUS LIKE 'Handler_read_rnd_next';
+EXECUTE s2;
+DEALLOCATE PREPARE s1;
+DEALLOCATE PREPARE s2;
+--enable_warnings
+--enable_query_log
+SELECT @a1 AS a, @b1 AS b, IF(@a1 <=> @a2 AND @b1 <=> @b2 AND @c1 <=> @c2, 'SAME', 'DIFFERENT') AS vs_innodb;
+SET in_predicate_conversion_threshold= @thr_save;
+DROP TABLE bm, bi;
+
+--echo ##################################################################
+--echo # More distinct (column, collation) indexes than the TAG cache holds (32):
+--echo # the 33rd column falls back to the direct comparison; answers must agree
+--echo ##################################################################
+--let $cols= c1 TINYINT NOT NULL COMMENT 'TAG'
+--let $icols= c1 TINYINT NOT NULL
+--let $exprs= CAST((seq * 1 + 1) MOD 7 AS SIGNED) - 3
+--let $k= 2
+while ($k <= 33)
+{
+  --let $cols= $cols, c$k TINYINT NOT NULL COMMENT 'TAG'
+  --let $icols= $icols, c$k TINYINT NOT NULL
+  --let $exprs= $exprs, CAST((seq * $k + $k) MOD 7 AS SIGNED) - 3
+  inc $k;
+}
+--echo # (DDL and INSERT of the 33-column tables not echoed)
+--disable_query_log
+eval CREATE TABLE wm (ts DATETIME NOT NULL, $cols, v INT NOT NULL, INDEX(ts)) ENGINE=MooseDB;
+eval CREATE TABLE wi (ts DATETIME NOT NULL, $icols, v INT NOT NULL, KEY(ts)) ENGINE=InnoDB;
+eval INSERT INTO wm SELECT '2026-03-06 00:00:00' + INTERVAL seq SECOND, $exprs, seq FROM seq_0_to_139;
+INSERT INTO wi SELECT * FROM wm;
+--enable_query_log
+CREATE TABLE verdicts (tag VARCHAR(100), same INT);
+--let $mt= wm
+--let $it= wi
+--let $sel= COUNT(*), SUM(v), BIT_XOR(CRC32(v))
+--let $quiet= 1
+--let $show_status= 0
+--let $k= 1
+while ($k <= 33)
+{
+  --let $tail= WHERE c$k = 0 AND v > 3
+  --source suite/moosedb/include/mirror_cmp.inc
+  --let $tail= WHERE c$k IN (-3, 3, 9)
+  --source suite/moosedb/include/mirror_cmp.inc
+  inc $k;
+}
+--let $quiet= 0
+SELECT COUNT(*) AS queries, SUM(same) AS identical_to_innodb FROM verdicts;
+--echo # Column 1 (cached) and column 33 (direct comparison) prune the same way (20 rows -> 21)
+--let $show_status= 1
+--let $tail= WHERE c1 = 0
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE c33 = 0
+--source suite/moosedb/include/mirror_cmp.inc
+DROP TABLE wm, wi, verdicts;

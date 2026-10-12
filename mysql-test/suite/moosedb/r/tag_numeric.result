@@ -1,0 +1,1093 @@
+CREATE TABLE m (ts DATETIME NOT NULL, itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG',
+v INT NOT NULL, INDEX(ts)) ENGINE=MooseDB;
+CREATE TABLE i (ts DATETIME NOT NULL, itemid BIGINT UNSIGNED NOT NULL,
+v INT NOT NULL, KEY(ts)) ENGINE=InnoDB;
+CREATE TABLE x (id BIGINT UNSIGNED NOT NULL, KEY(id)) ENGINE=InnoDB;
+INSERT INTO x VALUES (123), (124), (1), (3), (18446744073709551615), (5);
+# 16 series around the interesting boundaries, 5 rows each; half sealed, half in the MemTable
+INSERT INTO m SELECT '2026-03-01 00:00:00' + INTERVAL seq SECOND, ELT(1 + seq MOD 16, '0', '1', '2', '3', '10', '123', '124', '1000', '4294967296', '9007199254740991', '9007199254740992', '9007199254740993', '9223372036854775807', '9223372036854775808', '18446744073709551614', '18446744073709551615'), seq FROM seq_0_to_39;
+INSERT INTO i SELECT '2026-03-01 00:00:00' + INTERVAL seq SECOND, ELT(1 + seq MOD 16, '0', '1', '2', '3', '10', '123', '124', '1000', '4294967296', '9007199254740991', '9007199254740992', '9007199254740993', '9223372036854775807', '9223372036854775808', '18446744073709551614', '18446744073709551615'), seq FROM seq_0_to_39;
+FLUSH TABLES m;
+INSERT INTO m SELECT '2026-03-01 00:00:00' + INTERVAL seq SECOND, ELT(1 + seq MOD 16, '0', '1', '2', '3', '10', '123', '124', '1000', '4294967296', '9007199254740991', '9007199254740992', '9007199254740993', '9223372036854775807', '9223372036854775808', '18446744073709551614', '18446744073709551615'), seq FROM seq_40_to_79;
+INSERT INTO i SELECT '2026-03-01 00:00:00' + INTERVAL seq SECOND, ELT(1 + seq MOD 16, '0', '1', '2', '3', '10', '123', '124', '1000', '4294967296', '9007199254740991', '9007199254740992', '9007199254740993', '9223372036854775807', '9223372036854775808', '18446744073709551614', '18446744073709551615'), seq FROM seq_40_to_79;
+SELECT COUNT(*), COUNT(DISTINCT itemid), MAX(itemid) FROM m;
+COUNT(*)	COUNT(DISTINCT itemid)	MAX(itemid)
+80	16	18446744073709551615
+SELECT COUNT(*), COUNT(DISTINCT itemid), MAX(itemid) FROM i;
+COUNT(*)	COUNT(DISTINCT itemid)	MAX(itemid)
+80	16	18446744073709551615
+##################################################################
+# Equality with numeric constants (pushed): one series = 5 rows -> 6
+##################################################################
+# WHERE itemid = 123
+Variable_name	Value
+Handler_read_rnd_next	6
+a	b	c	vs_innodb
+5	185	3369456056	SAME
+# WHERE 123 = itemid
+Variable_name	Value
+Handler_read_rnd_next	6
+a	b	c	vs_innodb
+5	185	3369456056	SAME
+# WHERE itemid = 0
+Variable_name	Value
+Handler_read_rnd_next	6
+a	b	c	vs_innodb
+5	160	1889710822	SAME
+# WHERE itemid = 123.0
+Variable_name	Value
+Handler_read_rnd_next	6
+a	b	c	vs_innodb
+5	185	3369456056	SAME
+# WHERE itemid = 1.23e2
+Variable_name	Value
+Handler_read_rnd_next	6
+a	b	c	vs_innodb
+5	185	3369456056	SAME
+# WHERE itemid = 0.0
+Variable_name	Value
+Handler_read_rnd_next	6
+a	b	c	vs_innodb
+5	160	1889710822	SAME
+# WHERE itemid = -0.0
+Variable_name	Value
+Handler_read_rnd_next	6
+a	b	c	vs_innodb
+5	160	1889710822	SAME
+# WHERE itemid = 100 + 23
+Variable_name	Value
+Handler_read_rnd_next	6
+a	b	c	vs_innodb
+5	185	3369456056	SAME
+# WHERE itemid = CAST('123' AS UNSIGNED)
+Variable_name	Value
+Handler_read_rnd_next	6
+a	b	c	vs_innodb
+5	185	3369456056	SAME
+# WHERE itemid = (SELECT 123)
+Variable_name	Value
+Handler_read_rnd_next	6
+a	b	c	vs_innodb
+5	185	3369456056	SAME
+# WHERE itemid = 0x7B
+Variable_name	Value
+Handler_read_rnd_next	6
+a	b	c	vs_innodb
+5	185	3369456056	SAME
+# Fractional constants and values outside the column range match nothing: no row read (-> 1)
+# WHERE itemid = 123.5
+Variable_name	Value
+Handler_read_rnd_next	1
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# WHERE itemid = 123.5e0
+Variable_name	Value
+Handler_read_rnd_next	1
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# WHERE itemid = -1
+Variable_name	Value
+Handler_read_rnd_next	1
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# WHERE itemid = '-1'
+Variable_name	Value
+Handler_read_rnd_next	1
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# WHERE itemid = 18446744073709551616
+Variable_name	Value
+Handler_read_rnd_next	1
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# WHERE itemid = 18446744073709551616.0
+Variable_name	Value
+Handler_read_rnd_next	1
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# The whole unsigned range, above 2^63
+# WHERE itemid = 18446744073709551615
+Variable_name	Value
+Handler_read_rnd_next	6
+a	b	c	vs_innodb
+5	235	2243753229	SAME
+# WHERE itemid = 18446744073709551615.0
+Variable_name	Value
+Handler_read_rnd_next	6
+a	b	c	vs_innodb
+5	235	2243753229	SAME
+# WHERE itemid = 9223372036854775808
+Variable_name	Value
+Handler_read_rnd_next	6
+a	b	c	vs_innodb
+5	225	301447833	SAME
+# WHERE itemid = 9223372036854775807
+Variable_name	Value
+Handler_read_rnd_next	6
+a	b	c	vs_innodb
+5	220	1049860697	SAME
+# Around 2^53: 2^53-1, 2^53 and 2^53+1 are three different series; INT and DECIMAL constants are exact, a DOUBLE constant is pushed only below 2^53
+# WHERE itemid = 9007199254740991
+Variable_name	Value
+Handler_read_rnd_next	6
+a	b	c	vs_innodb
+5	205	2852344525	SAME
+# WHERE itemid = 9007199254740992
+Variable_name	Value
+Handler_read_rnd_next	6
+a	b	c	vs_innodb
+5	210	2792792690	SAME
+# WHERE itemid = 9007199254740993
+Variable_name	Value
+Handler_read_rnd_next	6
+a	b	c	vs_innodb
+5	215	1775105409	SAME
+# WHERE itemid = 9007199254740991e0
+Variable_name	Value
+Handler_read_rnd_next	6
+a	b	c	vs_innodb
+5	205	2852344525	SAME
+# WHERE itemid = 9007199254740992e0
+Variable_name	Value
+Handler_read_rnd_next	6
+a	b	c	vs_innodb
+5	210	2792792690	SAME
+# WHERE itemid = 9007199254740993e0
+Variable_name	Value
+Handler_read_rnd_next	6
+a	b	c	vs_innodb
+5	210	2792792690	SAME
+# WHERE itemid = 18446744073709551615e0
+Variable_name	Value
+Handler_read_rnd_next	81
+a	b	c	vs_innodb
+10	465	3485161459	SAME
+##################################################################
+# String constants
+##################################################################
+# Clean integer text
+# WHERE itemid = '123'
+Variable_name	Value
+Handler_read_rnd_next	6
+a	b	c	vs_innodb
+5	185	3369456056	SAME
+# WHERE itemid = '0'
+Variable_name	Value
+Handler_read_rnd_next	6
+a	b	c	vs_innodb
+5	160	1889710822	SAME
+# WHERE itemid = '4294967296'
+Variable_name	Value
+Handler_read_rnd_next	6
+a	b	c	vs_innodb
+5	200	172580929	SAME
+# WHERE itemid = '9007199254740991'
+Variable_name	Value
+Handler_read_rnd_next	6
+a	b	c	vs_innodb
+5	205	2852344525	SAME
+# Texts that are not clean integers. For a BIGINT column the server itself turns a string constant into an integer constant (convert_const_to_int) before the engine sees it, so what is pushed here is that integer; the same texts on INT columns (compared as DOUBLE by the server) are tested with the mx table below
+# WHERE itemid = '0123'
+Variable_name	Value
+Handler_read_rnd_next	6
+a	b	c	vs_innodb
+5	185	3369456056	SAME
+# WHERE itemid = ' 123'
+Variable_name	Value
+Handler_read_rnd_next	6
+a	b	c	vs_innodb
+5	185	3369456056	SAME
+# WHERE itemid = '123 '
+Variable_name	Value
+Handler_read_rnd_next	6
+a	b	c	vs_innodb
+5	185	3369456056	SAME
+# WHERE itemid = '123abc'
+Variable_name	Value
+Handler_read_rnd_next	6
+a	b	c	vs_innodb
+5	185	3369456056	SAME
+# WHERE itemid = '1.23e2'
+Variable_name	Value
+Handler_read_rnd_next	6
+a	b	c	vs_innodb
+5	185	3369456056	SAME
+# WHERE itemid = '1e3'
+Variable_name	Value
+Handler_read_rnd_next	6
+a	b	c	vs_innodb
+5	195	4230429997	SAME
+# WHERE itemid = '123.0'
+Variable_name	Value
+Handler_read_rnd_next	6
+a	b	c	vs_innodb
+5	185	3369456056	SAME
+# WHERE itemid = '+123'
+Variable_name	Value
+Handler_read_rnd_next	6
+a	b	c	vs_innodb
+5	185	3369456056	SAME
+# WHERE itemid = '-0'
+Variable_name	Value
+Handler_read_rnd_next	6
+a	b	c	vs_innodb
+5	160	1889710822	SAME
+# WHERE itemid = ''
+Variable_name	Value
+Handler_read_rnd_next	6
+a	b	c	vs_innodb
+5	160	1889710822	SAME
+# WHERE itemid = 'abc'
+Variable_name	Value
+Handler_read_rnd_next	6
+a	b	c	vs_innodb
+5	160	1889710822	SAME
+# WHERE itemid = '12345678901234567890'
+Variable_name	Value
+Handler_read_rnd_next	1
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# WHERE itemid = '9007199254740993'
+Variable_name	Value
+Handler_read_rnd_next	6
+a	b	c	vs_innodb
+5	215	1775105409	SAME
+# WHERE itemid = '18446744073709551615'
+Variable_name	Value
+Handler_read_rnd_next	6
+a	b	c	vs_innodb
+5	235	2243753229	SAME
+# WHERE itemid = '18446744073709551616'
+Variable_name	Value
+Handler_read_rnd_next	81
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# WHERE itemid = x'3132'
+Variable_name	Value
+Handler_read_rnd_next	1
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# WHERE itemid = _utf16 '123'
+Variable_name	Value
+Handler_read_rnd_next	6
+a	b	c	vs_innodb
+5	165	107472967	SAME
+##################################################################
+# NULL
+##################################################################
+# WHERE itemid = NULL
+Variable_name	Value
+Handler_read_rnd_next	1
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# WHERE itemid IS NULL
+Variable_name	Value
+Handler_read_rnd_next	0
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# WHERE itemid IN (123, NULL)
+Variable_name	Value
+Handler_read_rnd_next	6
+a	b	c	vs_innodb
+5	185	3369456056	SAME
+# WHERE itemid <=> 123
+Variable_name	Value
+Handler_read_rnd_next	81
+a	b	c	vs_innodb
+5	185	3369456056	SAME
+##################################################################
+# IN lists
+##################################################################
+# WHERE itemid IN (1, 2, 3)
+Variable_name	Value
+Handler_read_rnd_next	16
+a	b	c	vs_innodb
+15	510	1889710822	SAME
+# WHERE itemid IN (3, 3, 3, 123, 124)
+Variable_name	Value
+Handler_read_rnd_next	16
+a	b	c	vs_innodb
+15	550	2007702074	SAME
+# WHERE itemid IN (1, 2.5, 3)
+Variable_name	Value
+Handler_read_rnd_next	11
+a	b	c	vs_innodb
+10	340	446686511	SAME
+# WHERE itemid IN (123, 124.0, '1000')
+Variable_name	Value
+Handler_read_rnd_next	16
+a	b	c	vs_innodb
+15	570	2540972671	SAME
+# WHERE itemid IN (18446744073709551615, 18446744073709551614, -1, 18446744073709551616)
+Variable_name	Value
+Handler_read_rnd_next	11
+a	b	c	vs_innodb
+10	465	3485161459	SAME
+# WHERE itemid IN (-5, -6, 99999999999999999999)
+Variable_name	Value
+Handler_read_rnd_next	1
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# One value the engine cannot convert safely keeps the whole IN list unpushed (81)
+# WHERE itemid IN (1, '0123')
+Variable_name	Value
+Handler_read_rnd_next	11
+a	b	c	vs_innodb
+10	350	3467786751	SAME
+# WHERE itemid IN (1, 'abc')
+Variable_name	Value
+Handler_read_rnd_next	11
+a	b	c	vs_innodb
+10	325	1992645281	SAME
+# WHERE itemid IN (1, 9007199254740993e0)
+Variable_name	Value
+Handler_read_rnd_next	81
+a	b	c	vs_innodb
+15	590	3386687412	SAME
+# Negated and OR'ed predicates are left to the server
+# WHERE itemid NOT IN (1, 2, 3)
+Variable_name	Value
+Handler_read_rnd_next	81
+a	b	c	vs_innodb
+65	2650	3170812795	SAME
+# WHERE itemid <> 123
+Variable_name	Value
+Handler_read_rnd_next	81
+a	b	c	vs_innodb
+75	2975	76128293	SAME
+# WHERE itemid = 123 OR v = 3
+Variable_name	Value
+Handler_read_rnd_next	81
+a	b	c	vs_innodb
+6	188	769852559	SAME
+# WHERE itemid = 123 OR itemid = 124
+Variable_name	Value
+Handler_read_rnd_next	81
+a	b	c	vs_innodb
+10	375	1800607570	SAME
+# AND of two predicates on the same tag intersects
+# WHERE itemid IN (1, 2, 3, 123) AND itemid IN (3, 123, 124) AND v > 20
+Variable_name	Value
+Handler_read_rnd_next	11
+a	b	c	vs_innodb
+7	333	3307692075	SAME
+# WHERE itemid = 123 AND itemid = 124
+Variable_name	Value
+Handler_read_rnd_next	0
+a	b	c	vs_innodb
+0	NULL	0	SAME
+##################################################################
+# Multiple equalities (Item_equal): a.itemid = x.id AND x.id = const
+##################################################################
+# JOIN x ON tt.itemid = x.id WHERE x.id = 123
+Variable_name	Value
+Handler_read_rnd_next	6
+a	b	c	vs_innodb
+5	185	3369456056	SAME
+# JOIN x ON tt.itemid = x.id WHERE x.id = 18446744073709551615
+Variable_name	Value
+Handler_read_rnd_next	6
+a	b	c	vs_innodb
+5	235	2243753229	SAME
+# JOIN x ON tt.itemid = x.id WHERE x.id = '123'
+Variable_name	Value
+Handler_read_rnd_next	6
+a	b	c	vs_innodb
+5	185	3369456056	SAME
+# WHERE itemid = v AND v = 3
+Variable_name	Value
+Handler_read_rnd_next	6
+a	b	c	vs_innodb
+1	3	3845575991	SAME
+# WHERE itemid = v AND v = 1
+Variable_name	Value
+Handler_read_rnd_next	6
+a	b	c	vs_innodb
+1	1	146563189	SAME
+# Join without a constant: nothing to push (81)
+# JOIN x ON tt.itemid = x.id
+Variable_name	Value
+Handler_read_rnd_next	81
+a	b	c	vs_innodb
+25	950	4100982640	SAME
+##################################################################
+# Mixed-type IN lists: the server may compare the whole list as DOUBLE,
+# where 2^53 and 2^53+1 are equal -> a constant >= 2^53 next to a DOUBLE or
+# string constant is never pushed (81); INT/DECIMAL-only lists are exact
+##################################################################
+# WHERE itemid IN (9007199254740993, 1e0)
+Variable_name	Value
+Handler_read_rnd_next	81
+a	b	c	vs_innodb
+10	380	1873419718	SAME
+# WHERE itemid IN (9007199254740992, '1')
+Variable_name	Value
+Handler_read_rnd_next	11
+a	b	c	vs_innodb
+10	375	2685487669	SAME
+# WHERE itemid IN (9007199254740992, 1.5e0)
+Variable_name	Value
+Handler_read_rnd_next	81
+a	b	c	vs_innodb
+5	210	2792792690	SAME
+# WHERE itemid IN (9007199254740993, '1')
+Variable_name	Value
+Handler_read_rnd_next	11
+a	b	c	vs_innodb
+10	380	1873419718	SAME
+# WHERE itemid IN (9007199254740993, NULL, 1e0)
+Variable_name	Value
+Handler_read_rnd_next	81
+a	b	c	vs_innodb
+10	380	1873419718	SAME
+# WHERE itemid IN (18446744073709551615, 1e0)
+Variable_name	Value
+Handler_read_rnd_next	81
+a	b	c	vs_innodb
+10	400	2212175178	SAME
+# WHERE itemid IN (18446744073709551616, 1e0)
+Variable_name	Value
+Handler_read_rnd_next	81
+a	b	c	vs_innodb
+5	165	107472967	SAME
+# WHERE itemid IN (18446744073709551616.5, 1e0)
+Variable_name	Value
+Handler_read_rnd_next	81
+a	b	c	vs_innodb
+5	165	107472967	SAME
+# WHERE itemid IN (-9007199254740993, 'x')
+Variable_name	Value
+Handler_read_rnd_next	6
+a	b	c	vs_innodb
+5	160	1889710822	SAME
+# WHERE itemid IN (9007199254740993, 3, '2', 1.0e1)
+Variable_name	Value
+Handler_read_rnd_next	81
+a	b	c	vs_innodb
+20	740	3406751374	SAME
+# Small constants of mixed types are still pushed
+# WHERE itemid IN (3, 1e0, '2', 10.0)
+Variable_name	Value
+Handler_read_rnd_next	21
+a	b	c	vs_innodb
+20	690	2762275656	SAME
+# INT/DECIMAL only: exact, pushed
+# WHERE itemid IN (9007199254740993, 9007199254740992)
+Variable_name	Value
+Handler_read_rnd_next	11
+a	b	c	vs_innodb
+10	425	3485161459	SAME
+# WHERE itemid IN (9007199254740993, 5.0)
+Variable_name	Value
+Handler_read_rnd_next	6
+a	b	c	vs_innodb
+5	215	1775105409	SAME
+# WHERE itemid IN (18446744073709551616, 9007199254740993.0)
+Variable_name	Value
+Handler_read_rnd_next	6
+a	b	c	vs_innodb
+5	215	1775105409	SAME
+##################################################################
+# Multiple equalities across column types (joined column DOUBLE, DECIMAL,
+# VARCHAR: not pushed, 81; integer columns of any width/sign: pushed)
+##################################################################
+CREATE TABLE xd (d DOUBLE NOT NULL, dec20 DECIMAL(20,0) NOT NULL, vc VARCHAR(30) NOT NULL,
+ti TINYINT NOT NULL, ub BIGINT UNSIGNED NOT NULL) ENGINE=InnoDB;
+INSERT INTO xd VALUES (9007199254740992, 9007199254740993, '9007199254740993', 3, 9007199254740993),
+(3, 3, '3', 1, 18446744073709551615),
+(1, 1, '1', 2, 0);
+# JOIN xd ON tt.itemid = xd.d WHERE xd.d = 9007199254740993
+Variable_name	Value
+Handler_read_rnd_next	85
+a	b	c	vs_innodb
+10	425	3485161459	SAME
+# JOIN xd ON tt.itemid = xd.d WHERE xd.d = 9007199254740992
+Variable_name	Value
+Handler_read_rnd_next	85
+a	b	c	vs_innodb
+10	425	3485161459	SAME
+# JOIN xd ON tt.itemid = xd.d WHERE xd.d = 3
+Variable_name	Value
+Handler_read_rnd_next	85
+a	b	c	vs_innodb
+5	175	486018408	SAME
+# JOIN xd ON tt.itemid = xd.dec20 WHERE xd.dec20 = 9007199254740993
+Variable_name	Value
+Handler_read_rnd_next	85
+a	b	c	vs_innodb
+5	215	1775105409	SAME
+# JOIN xd ON tt.itemid = xd.vc WHERE xd.vc = '9007199254740993'
+Variable_name	Value
+Handler_read_rnd_next	85
+a	b	c	vs_innodb
+5	215	1775105409	SAME
+# JOIN xd ON tt.itemid = xd.vc WHERE xd.vc = '3'
+Variable_name	Value
+Handler_read_rnd_next	85
+a	b	c	vs_innodb
+5	175	486018408	SAME
+# JOIN xd ON tt.itemid = xd.ti WHERE xd.ti = 3
+Variable_name	Value
+Handler_read_rnd_next	10
+a	b	c	vs_innodb
+5	175	486018408	SAME
+# JOIN xd ON tt.itemid = xd.ub WHERE xd.ub = 9007199254740993
+Variable_name	Value
+Handler_read_rnd_next	10
+a	b	c	vs_innodb
+5	215	1775105409	SAME
+# JOIN xd ON tt.itemid = xd.ub WHERE xd.ub = 18446744073709551615
+Variable_name	Value
+Handler_read_rnd_next	10
+a	b	c	vs_innodb
+5	235	2243753229	SAME
+DROP TABLE xd;
+##################################################################
+# Prepared statements (parameters are constants too)
+##################################################################
+PREPARE ps FROM 'SELECT COUNT(*), SUM(v) FROM m WHERE itemid = ?';
+PREPARE psi FROM 'SELECT COUNT(*), SUM(v) FROM i WHERE itemid = ?';
+SET @p= 123;
+FLUSH STATUS;
+EXECUTE ps USING @p;
+COUNT(*)	SUM(v)
+5	185
+SHOW SESSION STATUS LIKE 'Handler_read_rnd_next';
+Variable_name	Value
+Handler_read_rnd_next	6
+EXECUTE psi USING @p;
+COUNT(*)	SUM(v)
+5	185
+SET @p= '123';
+FLUSH STATUS;
+EXECUTE ps USING @p;
+COUNT(*)	SUM(v)
+5	185
+SHOW SESSION STATUS LIKE 'Handler_read_rnd_next';
+Variable_name	Value
+Handler_read_rnd_next	6
+EXECUTE psi USING @p;
+COUNT(*)	SUM(v)
+5	185
+SET @p= '0123';
+EXECUTE ps USING @p;
+COUNT(*)	SUM(v)
+5	185
+EXECUTE psi USING @p;
+COUNT(*)	SUM(v)
+5	185
+SET @p= 123.5;
+EXECUTE ps USING @p;
+COUNT(*)	SUM(v)
+0	NULL
+EXECUTE psi USING @p;
+COUNT(*)	SUM(v)
+0	NULL
+DEALLOCATE PREPARE ps;
+DEALLOCATE PREPARE psi;
+##################################################################
+# TAG cache: new series appended after the cache was built, TRUNCATE
+##################################################################
+# WHERE itemid IN (777, 123)
+a	b	c	vs_innodb
+5	185	3369456056	SAME
+INSERT INTO m VALUES ('2026-04-01', 777, 1000), ('2026-04-01', 123, 1001);
+INSERT INTO i VALUES ('2026-04-01', 777, 1000), ('2026-04-01', 123, 1001);
+# WHERE itemid IN (777, 123)
+a	b	c	vs_innodb
+7	2186	2954134808	SAME
+TRUNCATE TABLE m;
+TRUNCATE TABLE i;
+# WHERE itemid IN (777, 123)
+a	b	c	vs_innodb
+0	NULL	0	SAME
+INSERT INTO m VALUES ('2026-04-02', 123, 5), ('2026-04-02', 124, 6);
+INSERT INTO i VALUES ('2026-04-02', 123, 5), ('2026-04-02', 124, 6);
+# WHERE itemid IN (777, 123)
+a	b	c	vs_innodb
+1	5	4082499345	SAME
+DROP TABLE m, i, x;
+##################################################################
+# Several TAG columns of different integer types, a VARCHAR TAG and a nullable TAG
+##################################################################
+CREATE TABLE mx (ts DATETIME NOT NULL,
+itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG',
+host   VARCHAR(8) NOT NULL COMMENT 'TAG',
+tiny   TINYINT NOT NULL COMMENT 'TAG',
+usmall SMALLINT UNSIGNED NOT NULL COMMENT 'TAG',
+med    MEDIUMINT NOT NULL COMMENT 'TAG',
+uint   INT UNSIGNED NOT NULL COMMENT 'TAG',
+sint   INT NOT NULL COMMENT 'TAG',
+nul    BIGINT COMMENT 'TAG',
+v INT NOT NULL, INDEX(ts)) ENGINE=MooseDB;
+CREATE TABLE ix (ts DATETIME NOT NULL, itemid BIGINT UNSIGNED NOT NULL, host VARCHAR(8) NOT NULL,
+tiny TINYINT NOT NULL, usmall SMALLINT UNSIGNED NOT NULL, med MEDIUMINT NOT NULL,
+uint INT UNSIGNED NOT NULL, sint INT NOT NULL, nul BIGINT, v INT NOT NULL, KEY(ts)) ENGINE=InnoDB;
+INSERT INTO mx SELECT '2026-03-02 00:00:00' + INTERVAL seq SECOND, ELT(1 + seq MOD 6, '0', '1', '18446744073709551615', '123', '9007199254740993', '5'), CONCAT('h', seq MOD 4), ELT(1 + seq MOD 3, -128, 0, 127), ELT(1 + (seq DIV 3) MOD 2, 0, 65535), ELT(1 + (seq DIV 6) MOD 2, -8388608, 8388607), ELT(1 + (seq DIV 12) MOD 2, 0, 4294967295), ELT(1 + (seq DIV 24) MOD 2, -2147483648, 2147483647), IF(seq MOD 2, NULL, 7), seq FROM seq_0_to_239;
+INSERT INTO ix SELECT '2026-03-02 00:00:00' + INTERVAL seq SECOND, ELT(1 + seq MOD 6, '0', '1', '18446744073709551615', '123', '9007199254740993', '5'), CONCAT('h', seq MOD 4), ELT(1 + seq MOD 3, -128, 0, 127), ELT(1 + (seq DIV 3) MOD 2, 0, 65535), ELT(1 + (seq DIV 6) MOD 2, -8388608, 8388607), ELT(1 + (seq DIV 12) MOD 2, 0, 4294967295), ELT(1 + (seq DIV 24) MOD 2, -2147483648, 2147483647), IF(seq MOD 2, NULL, 7), seq FROM seq_0_to_239;
+SELECT COUNT(*), COUNT(DISTINCT itemid, host, tiny, usmall, med, uint, sint, nul) FROM mx;
+COUNT(*)	COUNT(DISTINCT itemid, host, tiny, usmall, med, uint, sint, nul)
+240	24
+# Range edges of each column type (in range -> pushed; just outside -> matches nothing -> 1)
+# WHERE tiny = -128
+Variable_name	Value
+Handler_read_rnd_next	81
+a	b	c	vs_innodb
+80	9480	3247669459	SAME
+# WHERE tiny = 127
+Variable_name	Value
+Handler_read_rnd_next	81
+a	b	c	vs_innodb
+80	9640	2035629091	SAME
+# WHERE tiny = 128
+Variable_name	Value
+Handler_read_rnd_next	1
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# WHERE tiny = -129
+Variable_name	Value
+Handler_read_rnd_next	1
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# WHERE tiny IN (-128, 127, 200, -200)
+Variable_name	Value
+Handler_read_rnd_next	161
+a	b	c	vs_innodb
+160	19120	3100032240	SAME
+# WHERE tiny = '127'
+Variable_name	Value
+Handler_read_rnd_next	81
+a	b	c	vs_innodb
+80	9640	2035629091	SAME
+# WHERE tiny = 127.0
+Variable_name	Value
+Handler_read_rnd_next	81
+a	b	c	vs_innodb
+80	9640	2035629091	SAME
+# WHERE usmall = 65535
+Variable_name	Value
+Handler_read_rnd_next	121
+a	b	c	vs_innodb
+120	14520	3592858853	SAME
+# WHERE usmall = 65536
+Variable_name	Value
+Handler_read_rnd_next	1
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# WHERE usmall = -1
+Variable_name	Value
+Handler_read_rnd_next	1
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# WHERE med = -8388608
+Variable_name	Value
+Handler_read_rnd_next	121
+a	b	c	vs_innodb
+120	13980	1458347062	SAME
+# WHERE med = -8388609
+Variable_name	Value
+Handler_read_rnd_next	1
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# WHERE med = 8388607
+Variable_name	Value
+Handler_read_rnd_next	121
+a	b	c	vs_innodb
+120	14700	1508716783	SAME
+# WHERE med = 8388608
+Variable_name	Value
+Handler_read_rnd_next	1
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# WHERE uint = 4294967295
+Variable_name	Value
+Handler_read_rnd_next	121
+a	b	c	vs_innodb
+120	15060	2990417716	SAME
+# WHERE uint = 4294967296
+Variable_name	Value
+Handler_read_rnd_next	1
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# WHERE uint = -1
+Variable_name	Value
+Handler_read_rnd_next	1
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# WHERE sint = -2147483648
+Variable_name	Value
+Handler_read_rnd_next	121
+a	b	c	vs_innodb
+120	12900	508236586	SAME
+# WHERE sint = 2147483647
+Variable_name	Value
+Handler_read_rnd_next	121
+a	b	c	vs_innodb
+120	15780	290111475	SAME
+# WHERE sint = 2147483648
+Variable_name	Value
+Handler_read_rnd_next	1
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# WHERE sint = -2147483649
+Variable_name	Value
+Handler_read_rnd_next	1
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# Several tags at once, integer and VARCHAR
+# WHERE itemid IN (1, 123) AND host = 'h1'
+Variable_name	Value
+Handler_read_rnd_next	41
+a	b	c	vs_innodb
+40	4760	588893665	SAME
+# WHERE host = 'h1' AND tiny = 0 AND usmall = 65535 AND itemid = 5
+Variable_name	Value
+Handler_read_rnd_next	1
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# WHERE itemid = 18446744073709551615 AND sint = -2147483648 AND med = 8388607
+Variable_name	Value
+Handler_read_rnd_next	11
+a	b	c	vs_innodb
+10	1100	3601219392	SAME
+# String constants on INT columns: the server compares them as DOUBLE, so the engine sees the text.
+# Clean integers are pushed (121 = 120 rows + 1), anything else is left to the server (241)
+# WHERE uint = '4294967295'
+Variable_name	Value
+Handler_read_rnd_next	121
+a	b	c	vs_innodb
+120	15060	2990417716	SAME
+# WHERE uint = '0'
+Variable_name	Value
+Handler_read_rnd_next	121
+a	b	c	vs_innodb
+120	13620	3175058413	SAME
+# WHERE uint = '-1'
+Variable_name	Value
+Handler_read_rnd_next	1
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# WHERE uint = '4294967296'
+Variable_name	Value
+Handler_read_rnd_next	1
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# WHERE sint = '-2147483648'
+Variable_name	Value
+Handler_read_rnd_next	121
+a	b	c	vs_innodb
+120	12900	508236586	SAME
+# WHERE sint IN ('2147483647', 5, 7.0)
+Variable_name	Value
+Handler_read_rnd_next	121
+a	b	c	vs_innodb
+120	15780	290111475	SAME
+# WHERE uint = '04294967295'
+Variable_name	Value
+Handler_read_rnd_next	241
+a	b	c	vs_innodb
+120	15060	2990417716	SAME
+# WHERE uint = ' 4294967295'
+Variable_name	Value
+Handler_read_rnd_next	241
+a	b	c	vs_innodb
+120	15060	2990417716	SAME
+# WHERE uint = '4294967295 '
+Variable_name	Value
+Handler_read_rnd_next	241
+a	b	c	vs_innodb
+120	15060	2990417716	SAME
+# WHERE uint = '4294967295abc'
+Variable_name	Value
+Handler_read_rnd_next	241
+a	b	c	vs_innodb
+120	15060	2990417716	SAME
+# WHERE uint = '4.294967295e9'
+Variable_name	Value
+Handler_read_rnd_next	241
+a	b	c	vs_innodb
+120	15060	2990417716	SAME
+# WHERE uint = '+4294967295'
+Variable_name	Value
+Handler_read_rnd_next	241
+a	b	c	vs_innodb
+120	15060	2990417716	SAME
+# WHERE uint = '-0'
+Variable_name	Value
+Handler_read_rnd_next	241
+a	b	c	vs_innodb
+120	13620	3175058413	SAME
+# WHERE uint = ''
+Variable_name	Value
+Handler_read_rnd_next	241
+a	b	c	vs_innodb
+120	13620	3175058413	SAME
+# WHERE uint = 'abc'
+Variable_name	Value
+Handler_read_rnd_next	241
+a	b	c	vs_innodb
+120	13620	3175058413	SAME
+# WHERE sint = '-02147483648'
+Variable_name	Value
+Handler_read_rnd_next	241
+a	b	c	vs_innodb
+120	12900	508236586	SAME
+# WHERE usmall = '65535.0'
+Variable_name	Value
+Handler_read_rnd_next	241
+a	b	c	vs_innodb
+120	14520	3592858853	SAME
+# WHERE tiny = '1e2'
+Variable_name	Value
+Handler_read_rnd_next	241
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# WHERE sint IN ('2147483647', 'x')
+Variable_name	Value
+Handler_read_rnd_next	241
+a	b	c	vs_innodb
+120	15780	290111475	SAME
+# WHERE uint = '9007199254740993'
+Variable_name	Value
+Handler_read_rnd_next	241
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# WHERE uint = _utf16 '4294967295'
+Variable_name	Value
+Handler_read_rnd_next	241
+a	b	c	vs_innodb
+120	13620	3175058413	SAME
+# WHERE uint = x'31'
+Variable_name	Value
+Handler_read_rnd_next	241
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# DECIMAL and DOUBLE constants on INT columns
+# WHERE uint = 4294967295.0
+Variable_name	Value
+Handler_read_rnd_next	121
+a	b	c	vs_innodb
+120	15060	2990417716	SAME
+# WHERE uint = 4294967295.5
+Variable_name	Value
+Handler_read_rnd_next	1
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# WHERE uint = 4.294967295e9
+Variable_name	Value
+Handler_read_rnd_next	121
+a	b	c	vs_innodb
+120	15060	2990417716	SAME
+# WHERE uint = 4.2949672955e9
+Variable_name	Value
+Handler_read_rnd_next	1
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# WHERE sint = -2147483648.0
+Variable_name	Value
+Handler_read_rnd_next	121
+a	b	c	vs_innodb
+120	12900	508236586	SAME
+# WHERE sint = -2147483648.1
+Variable_name	Value
+Handler_read_rnd_next	1
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# WHERE tiny = 1e308
+Variable_name	Value
+Handler_read_rnd_next	241
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# Nullable integer TAG
+# WHERE nul = 7
+Variable_name	Value
+Handler_read_rnd_next	121
+a	b	c	vs_innodb
+120	14280	1860177941	SAME
+# WHERE nul IS NULL
+Variable_name	Value
+Handler_read_rnd_next	241
+a	b	c	vs_innodb
+120	14400	1642183884	SAME
+# WHERE nul = NULL
+Variable_name	Value
+Handler_read_rnd_next	1
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# WHERE nul IN (7, NULL)
+Variable_name	Value
+Handler_read_rnd_next	121
+a	b	c	vs_innodb
+120	14280	1860177941	SAME
+# WHERE nul = 8
+Variable_name	Value
+Handler_read_rnd_next	1
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# A VARCHAR TAG compared with a number is NOT pushed: the server compares as DOUBLE ('h1' = 0)
+# WHERE host = 0
+Variable_name	Value
+Handler_read_rnd_next	241
+a	b	c	vs_innodb
+240	28680	251768025	SAME
+# WHERE host = 1
+Variable_name	Value
+Handler_read_rnd_next	241
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# WHERE host IN (0, 1)
+Variable_name	Value
+Handler_read_rnd_next	241
+a	b	c	vs_innodb
+240	28680	251768025	SAME
+# ... while a string constant on it is still pushed
+# WHERE host = 'h1'
+Variable_name	Value
+Handler_read_rnd_next	61
+a	b	c	vs_innodb
+60	7140	3121823042	SAME
+# Combined with the timestamp index
+# WHERE itemid = 123 AND ts BETWEEN '2026-03-02 00:00:30' AND '2026-03-02 00:02:00'
+Variable_name	Value
+Handler_read_rnd_next	0
+a	b	c	vs_innodb
+15	1125	1252027369	SAME
+DROP TABLE mx, ix;
+##################################################################
+# VARCHAR TAG holding numeric-looking text, compared with numbers
+##################################################################
+CREATE TABLE vt (ts DATETIME NOT NULL, tagv VARCHAR(16) NOT NULL COMMENT 'TAG', v INT NOT NULL, INDEX(ts))
+ENGINE=MooseDB DEFAULT CHARSET=latin1;
+CREATE TABLE vi (ts DATETIME NOT NULL, tagv VARCHAR(16) NOT NULL, v INT NOT NULL, KEY(ts))
+ENGINE=InnoDB DEFAULT CHARSET=latin1;
+INSERT INTO vt SELECT '2026-03-03 00:00:00' + INTERVAL seq SECOND, ELT(1 + seq MOD 12, '123', '0123', ' 12', '12abc', 'abc', '', '0', '1e2', '100', '123.0', '-5', '5'), seq FROM seq_0_to_59;
+INSERT INTO vi SELECT '2026-03-03 00:00:00' + INTERVAL seq SECOND, ELT(1 + seq MOD 12, '123', '0123', ' 12', '12abc', 'abc', '', '0', '1e2', '100', '123.0', '-5', '5'), seq FROM seq_0_to_59;
+# '0123' = 123 and '123.0' = 123 for the server: no numeric pushdown on VARCHAR (61 rows read)
+# WHERE tagv = 123
+Variable_name	Value
+Handler_read_rnd_next	61
+a	b	c	vs_innodb
+15	410	2162161538	SAME
+# WHERE tagv = 0
+Variable_name	Value
+Handler_read_rnd_next	61
+a	b	c	vs_innodb
+15	435	3567198301	SAME
+# WHERE tagv = 100
+Variable_name	Value
+Handler_read_rnd_next	61
+a	b	c	vs_innodb
+10	315	2742896811	SAME
+# WHERE tagv = 12
+Variable_name	Value
+Handler_read_rnd_next	61
+a	b	c	vs_innodb
+10	265	3132786055	SAME
+# WHERE tagv IN (5, 123)
+Variable_name	Value
+Handler_read_rnd_next	61
+a	b	c	vs_innodb
+20	585	2732408451	SAME
+# WHERE tagv = 123.0
+Variable_name	Value
+Handler_read_rnd_next	61
+a	b	c	vs_innodb
+15	410	2162161538	SAME
+# String constant: string comparison, pushed
+# WHERE tagv = '123'
+Variable_name	Value
+Handler_read_rnd_next	6
+a	b	c	vs_innodb
+5	120	3918022312	SAME
+# WHERE tagv = '0123'
+Variable_name	Value
+Handler_read_rnd_next	6
+a	b	c	vs_innodb
+5	125	3977586477	SAME
+DROP TABLE vt, vi;
+##################################################################
+# ZEROFILL integer TAG: stored text is padded, never pushed (all rows read) but answers stay right
+##################################################################
+CREATE TABLE zm (ts DATETIME NOT NULL, zf INT(6) UNSIGNED ZEROFILL NOT NULL COMMENT 'TAG', v INT NOT NULL, INDEX(ts))
+ENGINE=MooseDB;
+CREATE TABLE zi (ts DATETIME NOT NULL, zf INT(6) UNSIGNED ZEROFILL NOT NULL, v INT NOT NULL, KEY(ts))
+ENGINE=InnoDB;
+INSERT INTO zm SELECT '2026-03-04 00:00:00' + INTERVAL seq SECOND, ELT(1 + seq MOD 4, 0, 7, 123, 4294967295), seq FROM seq_0_to_11;
+INSERT INTO zi SELECT '2026-03-04 00:00:00' + INTERVAL seq SECOND, ELT(1 + seq MOD 4, 0, 7, 123, 4294967295), seq FROM seq_0_to_11;
+SELECT zf, COUNT(*) FROM zm GROUP BY zf ORDER BY zf;
+zf	COUNT(*)
+000000	3
+000007	3
+000123	3
+4294967295	3
+# WHERE zf = 123
+Variable_name	Value
+Handler_read_rnd_next	13
+a	b	c	vs_innodb
+3	18	2848794817	SAME
+# WHERE zf = '000123'
+Variable_name	Value
+Handler_read_rnd_next	13
+a	b	c	vs_innodb
+3	18	2848794817	SAME
+# WHERE zf IN (7, 123)
+Variable_name	Value
+Handler_read_rnd_next	13
+a	b	c	vs_innodb
+6	33	1324863475	SAME
+# WHERE zf = 4294967295
+Variable_name	Value
+Handler_read_rnd_next	13
+a	b	c	vs_innodb
+3	21	1092530099	SAME
+DROP TABLE zm, zi;
+##################################################################
+# Large IN list (3000 values) on 2000 series
+##################################################################
+SET @thr_save= @@in_predicate_conversion_threshold;
+SET in_predicate_conversion_threshold= 0;
+CREATE TABLE bm (ts DATETIME NOT NULL, itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG', v INT NOT NULL, INDEX(ts))
+ENGINE=MooseDB;
+CREATE TABLE bi (ts DATETIME NOT NULL, itemid BIGINT UNSIGNED NOT NULL, v INT NOT NULL, KEY(ts))
+ENGINE=InnoDB;
+INSERT INTO bm SELECT '2026-03-05 00:00:00' + INTERVAL seq SECOND, seq DIV 2 * 3 + 1, seq FROM seq_0_to_3999;
+INSERT INTO bi SELECT * FROM bm;
+SELECT COUNT(*), COUNT(DISTINCT itemid) FROM bm;
+COUNT(*)	COUNT(DISTINCT itemid)
+4000	2000
+SELECT GROUP_CONCAT(seq) INTO @list FROM seq_1_to_3000;
+SET @in= CONCAT('WHERE itemid IN (', @list, ')');
+Variable_name	Value
+Handler_read_rnd_next	2001
+SELECT @a1 AS a, @b1 AS b, IF(@a1 <=> @a2 AND @b1 <=> @b2 AND @c1 <=> @c2, 'SAME', 'DIFFERENT') AS vs_innodb;
+a	b	vs_innodb
+2000	1999000	SAME
+# Same list with some strings and fractions mixed in
+Variable_name	Value
+Handler_read_rnd_next	2005
+SELECT @a1 AS a, @b1 AS b, IF(@a1 <=> @a2 AND @b1 <=> @b2 AND @c1 <=> @c2, 'SAME', 'DIFFERENT') AS vs_innodb;
+a	b	vs_innodb
+2004	2009670	SAME
+SET in_predicate_conversion_threshold= @thr_save;
+DROP TABLE bm, bi;
+##################################################################
+# More distinct (column, collation) indexes than the TAG cache holds (32):
+# the 33rd column falls back to the direct comparison; answers must agree
+##################################################################
+# (DDL and INSERT of the 33-column tables not echoed)
+CREATE TABLE verdicts (tag VARCHAR(100), same INT);
+SELECT COUNT(*) AS queries, SUM(same) AS identical_to_innodb FROM verdicts;
+queries	identical_to_innodb
+66	66
+# Column 1 (cached) and column 33 (direct comparison) prune the same way (20 rows -> 21)
+# WHERE c1 = 0
+Variable_name	Value
+Handler_read_rnd_next	21
+a	b	c	vs_innodb
+20	1370	842424962	SAME
+# WHERE c33 = 0
+Variable_name	Value
+Handler_read_rnd_next	21
+a	b	c	vs_innodb
+20	1350	1641983168	SAME
+DROP TABLE wm, wi, verdicts;

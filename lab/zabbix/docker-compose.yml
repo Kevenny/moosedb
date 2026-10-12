@@ -1,0 +1,112 @@
+# Laboratório Zabbix 7.0 LTS + MariaDB 11.4.13 com a engine MooseDB carregada.
+#
+#   cd lab/zabbix
+#   docker compose up -d            # sobe MariaDB, Zabbix server e frontend
+#   docker compose --profile tools run --rm tools python /lab/scripts/create_items.py
+#
+# Veja README.md para carga, medição e limpeza. Dados ficam em volumes
+# nomeados zbxlab-* (nunca no repositório).
+name: zbxlab
+
+x-db-env: &db-env
+  DB_SERVER_HOST: mariadb
+  MYSQL_DATABASE: zabbix
+  MYSQL_USER: zabbix
+  MYSQL_PASSWORD: ${ZBX_DB_PASSWORD:-zabbix}
+  MYSQL_ROOT_PASSWORD: ${ROOT_PASSWORD:-zbxlab}
+
+services:
+  mariadb:
+    # O ha_moosedb.so de build/ foi compilado contra 11.4.13: não troque a tag
+    # sem recompilar o plugin.
+    image: ${MARIADB_IMAGE:-mariadb:11.4.13}
+    container_name: zbxlab-mariadb
+    command:
+      - --plugin-maturity=experimental
+      - --plugin-load-add=ha_moosedb
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_bin
+      # o esquema do Zabbix 7.0 cria triggers/funções sem SUPER
+      - --log-bin-trust-function-creators=1
+      - --innodb-buffer-pool-size=${INNODB_BUFFER_POOL:-4G}
+      - --innodb-log-file-size=1G
+      - --max-allowed-packet=256M
+      - --moosedb-chunk-cache-size=${MOOSEDB_CACHE:-1073741824}
+      - --max-connections=500
+    environment:
+      MARIADB_ROOT_PASSWORD: ${ROOT_PASSWORD:-zbxlab}
+    ports:
+      - "${MARIADB_PORT:-13306}:3306"
+    volumes:
+      - zbxlab-mariadb:/var/lib/mysql
+      # Cópia própria do plugin (cp ../../build/ha_moosedb.so plugin/ com o
+      # mariadb parado): montar build/ direto faz um rebuild concorrente
+      # sobrescrever o .so mapeado pelo mariadbd em execução => SIGBUS.
+      - ./plugin/ha_moosedb.so:/usr/lib/mysql/plugin/ha_moosedb.so:ro
+      - ../../storage/moosedb/sql:/moosedb-sql:ro
+      - ./sql:/lab/sql:ro
+      - ./scripts:/lab/scripts:ro
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+    shm_size: 1g
+
+  zabbix-server:
+    image: ${ZBX_SERVER_IMAGE:-zabbix/zabbix-server-mysql:alpine-7.0-latest}
+    container_name: zbxlab-server
+    depends_on:
+      mariadb:
+        condition: service_healthy
+    environment:
+      <<: *db-env
+      # MariaDB 11.4 está na faixa suportada do 7.0; deixe 1 só se o server
+      # recusar a versão (ver README §Versão do MariaDB).
+      ZBX_ALLOWUNSUPPORTEDDBVERSIONS: ${ZBX_ALLOWUNSUPPORTEDDBVERSIONS:-0}
+      ZBX_STARTTRAPPERS: ${ZBX_STARTTRAPPERS:-10}
+      ZBX_STARTDBSYNCERS: ${ZBX_STARTDBSYNCERS:-4}
+      ZBX_HISTORYCACHESIZE: ${ZBX_HISTORYCACHESIZE:-256M}
+      ZBX_HISTORYINDEXCACHESIZE: 64M
+      ZBX_TRENDCACHESIZE: 64M
+      ZBX_VALUECACHESIZE: 256M
+      ZBX_CACHESIZE: 256M
+      ZBX_DEBUGLEVEL: ${ZBX_DEBUGLEVEL:-3}
+    ports:
+      - "${ZBX_TRAPPER_PORT:-10051}:10051"
+    volumes:
+      - zbxlab-server:/var/lib/zabbix
+
+  zabbix-web:
+    image: ${ZBX_WEB_IMAGE:-zabbix/zabbix-web-nginx-mysql:alpine-7.0-latest}
+    container_name: zbxlab-web
+    depends_on:
+      - zabbix-server
+    environment:
+      <<: *db-env
+      ZBX_SERVER_HOST: zabbix-server
+      PHP_TZ: UTC
+    ports:
+      - "${ZBX_WEB_PORT:-8088}:8080"
+
+  # Ferramentas (criação de itens via API, gerador trapper, benchmarks).
+  # Só sobe sob demanda: docker compose --profile tools run --rm tools ...
+  tools:
+    image: ${TOOLS_IMAGE:-python:3.12-slim}
+    profiles: ["tools"]
+    working_dir: /lab
+    environment:
+      ZBX_API_URL: http://zabbix-web:8080/api_jsonrpc.php
+      ZBX_API_USER: Admin
+      ZBX_API_PASSWORD: zabbix
+      ZBX_TRAPPER_HOST: zabbix-server
+      ZBX_TRAPPER_PORT: "10051"
+    volumes:
+      - ./scripts:/lab/scripts:ro
+      - ./results:/lab/results
+
+volumes:
+  zbxlab-mariadb:
+    name: zbxlab-mariadb
+  zbxlab-server:
+    name: zbxlab-server

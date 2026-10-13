@@ -15,6 +15,8 @@
 #include <algorithm>
 #include <cctype>
 #include <climits>
+#include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -96,6 +98,31 @@ void micros_to_time(longlong us, MYSQL_TIME *lt)
   lt->time_type= MYSQL_TIMESTAMP_DATETIME;
 }
 
+/*
+  micros_to_time() with a one-day cache: consecutive rows of a scan usually
+  share the day, which saves civil_from_days() (a dozen divisions) per row.
+*/
+void micros_to_time_cached(longlong us, MYSQL_TIME *lt, longlong *cday,
+                           longlong *cy, unsigned *cm, unsigned *cd)
+{
+  const longlong days= floor_div(us, MICROS_PER_DAY);
+  const longlong tod= us - days * MICROS_PER_DAY;
+  if (days != *cday)
+  {
+    civil_from_days(days, cy, cm, cd);
+    *cday= days;
+  }
+  memset(lt, 0, sizeof(*lt));
+  lt->year= (uint) *cy;
+  lt->month= *cm;
+  lt->day= *cd;
+  lt->hour= (uint) (tod / (3600 * MICROS_PER_SEC));
+  lt->minute= (uint) (tod / (60 * MICROS_PER_SEC) % 60);
+  lt->second= (uint) (tod / MICROS_PER_SEC % 60);
+  lt->second_part= (ulong) (tod % MICROS_PER_SEC);
+  lt->time_type= MYSQL_TIMESTAMP_DATETIME;
+}
+
 bool is_tag_comment(const LEX_CSTRING &c)
 {
   const char *s= c.str, *e= c.str + c.length;
@@ -117,6 +144,60 @@ bool is_temporal(const Field *f)
   default:
     return false;
   }
+}
+
+/* INT / BIGINT (signed or unsigned): usable as a seconds-since-epoch axis. */
+bool is_int_axis(const Field *f)
+{
+  switch (f->real_type()) {
+  case MYSQL_TYPE_LONG:
+  case MYSQL_TYPE_LONGLONG:
+    return true;
+  default:
+    return false;
+  }
+}
+
+/* TINYINT..BIGINT: a TAG of these types is stored as val_str()'s text. */
+bool is_int_tag_field(const Field *f)
+{
+  switch (f->real_type()) {
+  case MYSQL_TYPE_TINY:
+  case MYSQL_TYPE_SHORT:
+  case MYSQL_TYPE_INT24:
+  case MYSQL_TYPE_LONG:
+  case MYSQL_TYPE_LONGLONG:
+    return true;
+  default:
+    return false;
+  }
+}
+
+/*
+  A collation under which two strings are equal only when their bytes are:
+  binary, or a binary-sorted NO PAD one. A UNIQUE key may only hold TAG
+  columns of these, since the series (one per distinct byte string) are what
+  the uniqueness is checked inside.
+*/
+bool tag_cs_exact(const CHARSET_INFO *cs)
+{
+  return cs == &my_charset_bin ||
+         ((cs->state & MY_CS_BINSORT) && (cs->state & MY_CS_NOPAD));
+}
+
+/*
+  Seconds -> µs for a range bound taken from an index key: saturates instead
+  of wrapping (a bound beyond what can be stored selects nothing / everything,
+  exactly like the unbounded side).
+*/
+longlong secs_to_micros_saturating(longlong secs, bool field_unsigned)
+{
+  if (field_unsigned && secs < 0)       /* BIGINT UNSIGNED above LONGLONG_MAX */
+    return LONGLONG_MAX;
+  longlong us;
+  if (__builtin_mul_overflow(secs, MICROS_PER_SEC, &us))
+    return secs < 0 ? LONGLONG_MIN : LONGLONG_MAX;
+  return us;
 }
 
 /* Message of the last Rust error on this thread ("" if none). */
@@ -277,6 +358,7 @@ static double srv_bloom_fpr= 0.01;
 static ulonglong srv_chunk_cache_size= 128ULL << 20;
 static uint srv_max_open_chunks= 100;
 static ulonglong srv_batch_memory_budget= 1ULL << 30;
+static uint srv_unique_lock_wait_timeout= 50;
 
 /* Mirrors the current values into the Rust core. */
 static void push_globals()
@@ -352,6 +434,13 @@ static MYSQL_SYSVAR_ULONGLONG(batch_memory_budget, srv_batch_memory_budget,
   "above it, batches holding at least 1 MiB spill to disk early",
   NULL, update_global<ulonglong>, 1ULL << 30, 16ULL << 20, 1ULL << 40, 0);
 
+static MYSQL_SYSVAR_UINT(unique_lock_wait_timeout, srv_unique_lock_wait_timeout,
+  PLUGIN_VAR_RQCMDARG,
+  "Seconds an INSERT into a table with a UNIQUE/PRIMARY key waits for another "
+  "statement that is inserting into the same series before failing with a "
+  "lock wait timeout (0 = fail at once)",
+  NULL, NULL, 50, 0, 86400, 0);
+
 static struct st_mysql_sys_var *moosedb_system_variables[]= {
   MYSQL_SYSVAR(wal_sync_mode),
   MYSQL_SYSVAR(memtable_flush_threshold),
@@ -362,6 +451,7 @@ static struct st_mysql_sys_var *moosedb_system_variables[]= {
   MYSQL_SYSVAR(chunk_cache_size),
   MYSQL_SYSVAR(max_open_chunks),
   MYSQL_SYSVAR(batch_memory_budget),
+  MYSQL_SYSVAR(unique_lock_wait_timeout),
   NULL
 };
 
@@ -457,10 +547,16 @@ bool build_layout(TABLE_SHARE *s, tf_layout *out, std::string *err)
           "(INDEX ts_idx (ts)) or TIMESTAMP_COLUMN = '<column>'";
     return true;
   }
-  if (!is_temporal(ts_field) || !ts_field->stored_in_db())
+  /*
+    An INT/BIGINT axis (seconds since 1970 UTC) is accepted only when named
+    explicitly by TIMESTAMP_COLUMN: a plain integer index must never silently
+    turn an existing table definition into a time axis.
+  */
+  if (!(is_temporal(ts_field) || is_int_axis(ts_field)) ||
+      !ts_field->stored_in_db())
   {
     *err= std::string("timestamp column '") + ts_field->field_name.str +
-          "' must be a stored DATETIME or TIMESTAMP column";
+          "' must be a stored DATETIME, TIMESTAMP, INT or BIGINT column";
     return true;
   }
   if (ts_field->real_maybe_null())
@@ -470,27 +566,158 @@ bool build_layout(TABLE_SHARE *s, tf_layout *out, std::string *err)
     return true;
   }
 
-  /* Indexes: only plain, single-part indexes on the timestamp column. */
+  /*
+    Indexes: the timestamp column alone, and composite indexes
+    (tag_1, ..., tag_k [, timestamp]) over TAG columns (see index_flags()).
+
+    One UNIQUE / PRIMARY KEY is accepted, in the form
+    (every TAG column of the table, the timestamp column [, 1-2 integer
+    NOT NULL columns]) -- the series plus the time (plus a tie-breaker such as
+    Zabbix's ns) identify a row, which the core can check without any index
+    structure (see unique.rs). Without TAG columns only UNIQUE (timestamp).
+    TAG columns of a UNIQUE key must compare byte for byte (integers, or
+    strings with a binary NO PAD collation), because the series that the key
+    values select are compared byte for byte too.
+  */
+  size_t n_tag_cols= 0;
+  for (uint i= 0; i < s->fields; i++)
+    if (s->field[i]->stored_in_db() && is_tag_comment(s->field[i]->comment))
+      n_tag_cols++;
+  l.indexes.assign(s->keys, tf_index_def());
   for (uint k= 0; k < s->keys; k++)
   {
     const KEY &key= s->key_info[k];
-    if (key.user_defined_key_parts != 1 ||
-        key.key_part[0].field != ts_field)
+    const uint np= key.user_defined_key_parts;
+    tf_index_def &def= l.indexes[k];
+    const std::string head= std::string("index '") + key.name.str + "' ";
+    const bool unique= (key.flags & HA_NOSAME) != 0;
+    const char *const unique_form=
+      ". A MooseDB UNIQUE/PRIMARY key is (every TAG column, the timestamp "
+      "column [, up to 2 integer NOT NULL columns]), e.g. PRIMARY KEY "
+      "(itemid, clock, ns)";
+    if (unique)
     {
-      *err= std::string("index '") + key.name.str +
-            "' is not supported: MooseDB only indexes the timestamp column "
-            "(TAG columns are indexed implicitly)";
-      return true;
+      def.unique= true;
+      if (l.unique_key != MAX_KEY)
+      {
+        *err= head + "is not supported: a MooseDB table takes at most one "
+              "UNIQUE/PRIMARY key";
+        return true;
+      }
+      l.unique_key= k;
     }
-    if (key.flags & HA_NOSAME)
+    if (np == 1 && key.key_part[0].field == ts_field)
     {
-      *err= std::string("index '") + key.name.str +
-            "' cannot be UNIQUE/PRIMARY: time-series rows are not unique by time";
-      return true;
+      def.simple_ts= true;
+      if (key.key_part[0].key_part_flag & HA_REVERSE_SORT)
+      {
+        *err= head + "is not supported: descending index parts";
+        return true;
+      }
+      if (unique && n_tag_cols != 0)
+      {
+        *err= head + "is not supported: the table has TAG columns, so its "
+              "UNIQUE/PRIMARY key must list all of them before the timestamp" +
+              unique_form;
+        return true;
+      }
     }
-    l.ts_key= k;
+    else
+    {
+      if (key.flags & (HA_FULLTEXT | HA_SPATIAL))
+      {
+        *err= head + "is not supported: only ordinary indexes";
+        return true;
+      }
+      for (uint p= 0; p < np; p++)
+      {
+        const KEY_PART_INFO &kp= key.key_part[p];
+        const Field *f= kp.field;
+        const bool last= p + 1 == np;
+        const std::string col= std::string("column '") +
+                               (f ? f->field_name.str : "?") + "'";
+        std::string why;
+        if (!f || !f->stored_in_db())
+          why= col + " is not a stored column";
+        else if (def.has_time)
+        {
+          /* a part after the timestamp: only a UNIQUE key has them */
+          if (!unique)
+            why= col + " follows the timestamp, which must be the last part";
+          else if (is_tag_comment(f->comment))
+            why= "TAG " + col + " comes after the timestamp (list the TAG "
+                 "columns first)";
+          else if (f->real_maybe_null())
+            why= col + " must be NOT NULL in a UNIQUE key";
+          else if (!is_int_tag_field(f))
+            why= col + " must be an integer column (TINYINT..BIGINT) to "
+                 "follow the timestamp in a UNIQUE key";
+          else if (def.extra_fields.size() >= 2)
+            why= "at most 2 columns may follow the timestamp";
+        }
+        else if (f == ts_field)
+          why= (last || unique) ? ""
+                                : col + " (the timestamp) must be the last part";
+        else if (!is_tag_comment(f->comment))
+          why= col + " is not a TAG column or the timestamp column";
+        else if (f->real_maybe_null())
+          why= "TAG " + col + " must be NOT NULL to be indexed";
+        else if (!is_int_tag_field(f) &&
+                 f->real_type() != MYSQL_TYPE_VARCHAR &&
+                 f->real_type() != MYSQL_TYPE_STRING)
+          why= "TAG " + col + " must be an integer, CHAR or VARCHAR to be "
+               "indexed";
+        else if (unique && !is_int_tag_field(f) && !tag_cs_exact(f->charset()))
+          why= "TAG " + col + " needs a binary NO PAD collation (e.g. "
+               "utf8mb4_nopad_bin, or BINARY/VARBINARY) in a UNIQUE key, "
+               "because rows of series that only differ by case or trailing "
+               "spaces would not be detected as duplicates";
+        if (why.empty() && f && kp.length != f->key_length())
+          why= col + ": index prefixes are not supported";
+        if (why.empty() && (kp.key_part_flag & HA_REVERSE_SORT))
+          why= col + ": descending index parts are not supported";
+        if (why.empty())
+          for (uint q= 0; q < p; q++)
+            if (key.key_part[q].field == f)
+              why= col + " appears twice";
+        if (!why.empty())
+        {
+          *err= head + "is not supported: " + why + ". MooseDB indexes the "
+                "timestamp column alone, or TAG columns optionally followed "
+                "by the timestamp (INDEX (itemid, clock))" +
+                (unique ? std::string(unique_form) : std::string());
+          return true;
+        }
+        if (def.has_time)
+          def.extra_fields.push_back(f->field_index);
+        else if (f == ts_field)
+          def.has_time= true;
+        else
+          def.tag_fields.push_back(f->field_index);
+      }
+      if (unique)
+      {
+        std::string why;
+        if (!def.has_time)
+          why= "must include the timestamp column after the TAG columns";
+        else if (def.tag_fields.empty())
+          why= "needs TAG columns (a table without any only takes UNIQUE "
+               "on the timestamp column alone)";
+        else if (def.tag_fields.size() != n_tag_cols)
+          why= "must list every TAG column of the table (the series identity)";
+        if (!why.empty())
+        {
+          *err= head + "is not supported: " + why + unique_form;
+          return true;
+        }
+      }
+    }
+    if (def.simple_ts)
+      l.ts_key= k;
   }
-  if (l.ts_key == MAX_KEY)
+  /* A UNIQUE key (which contains the timestamp) can stand in for the index on
+     the timestamp column alone. */
+  if (l.ts_key == MAX_KEY && l.unique_key == MAX_KEY)
   {
     *err= std::string("missing index on the timestamp column: add INDEX (") +
           ts_field->field_name.str + ")";
@@ -520,6 +747,14 @@ bool build_layout(TABLE_SHARE *s, tf_layout *out, std::string *err)
       }
       c.type= TF_COL_TAG;
       c.conv= tf_conv::TAG;
+      l.columns.push_back(c);
+      continue;
+    }
+    if (f == ts_field && !is_temporal(f))
+    {
+      /* integer axis: seconds since 1970 UTC, stored as µs (secs * 1e6) */
+      c.type= TF_COL_TIMESTAMP;
+      c.conv= tf_conv::INT_SECS;
       l.columns.push_back(c);
       continue;
     }
@@ -554,6 +789,30 @@ bool build_layout(TABLE_SHARE *s, tf_layout *out, std::string *err)
     }
     l.columns.push_back(c);
   }
+  for (tf_index_def &d : l.indexes)
+    for (const uint fi : d.tag_fields)
+    {
+      const int pos= l.tag_position(fi);
+      if (pos < 0)
+      {
+        *err= "an indexed column is not a stored TAG column";
+        return true;
+      }
+      d.tag_pos.push_back(pos);
+    }
+  if (l.unique_key != MAX_KEY)
+    for (const uint fi : l.indexes[l.unique_key].extra_fields)
+    {
+      uint pos= 0;
+      while (pos < l.columns.size() && l.columns[pos].field_index != fi)
+        pos++;
+      if (pos >= l.columns.size())
+      {
+        *err= "a UNIQUE key column is not a stored column";
+        return true;
+      }
+      l.unique_extra_cols.push_back(pos);
+    }
   *out= std::move(l);
   return false;
 }
@@ -563,6 +822,7 @@ struct tf_config_holder
 {
   std::vector<const char *> names;
   std::vector<uint8_t> types;
+  std::vector<uint32_t> unique_extra;
   TFTableConfig cfg{};
 
   tf_config_holder(TABLE_SHARE *s, const tf_layout &l)
@@ -588,6 +848,10 @@ struct tf_config_holder
     cfg.column_types= types.data();
     cfg.encryption_key_id= opt && opt->encryption
                              ? (uint32_t) opt->encryption_key_id : 0;
+    unique_extra= l.unique_extra_cols;
+    cfg.unique= l.unique_key != MAX_KEY;
+    cfg.unique_extra_count= (uint32_t) unique_extra.size();
+    cfg.unique_extra_cols= unique_extra.data();
   }
 };
 
@@ -674,6 +938,9 @@ int ha_moosedb::map_status(TFStatus status, const char *name)
   case TF_ERR_OOM:       return HA_ERR_OUT_OF_MEM;
   case TF_ERR_NOT_FOUND: return HA_ERR_NO_SUCH_TABLE;
   case TF_ERR_CRYPTO:    return HA_ERR_DECRYPTION_FAILED;
+  case TF_ERR_DUPLICATE: return HA_ERR_FOUND_DUPP_KEY;
+  case TF_ERR_DEADLOCK:  return HA_ERR_LOCK_DEADLOCK;
+  case TF_ERR_BUSY:      return HA_ERR_LOCK_WAIT_TIMEOUT;
   default:               return HA_ERR_MOOSEDB_BASE + (int) status;
   }
 }
@@ -881,6 +1148,23 @@ int ha_moosedb::write_row(const uchar *buf)
         v.data.ts_us= (longlong) secs * MICROS_PER_SEC + (longlong) usec;
         break;
       }
+      case tf_conv::INT_SECS:
+      {
+        const longlong secs= f->val_int();
+        longlong us= 0;
+        /* a BIGINT UNSIGNED above LONGLONG_MAX reads back negative */
+        if ((f->is_unsigned() && secs < 0) ||
+            __builtin_mul_overflow(secs, MICROS_PER_SEC, &us))
+        {
+          last_error_= std::string("column '") + f->field_name.str +
+                       "': time value outside the supported range "
+                       "(+/-9223372036854 seconds since 1970)";
+          error= HA_ERR_MOOSEDB_BASE + TF_ERR_INVALID_ARG;
+          break;
+        }
+        v.data.ts_us= us;
+        break;
+      }
       case tf_conv::INT:
         v.data.int_val= f->val_int();
         break;
@@ -927,8 +1211,10 @@ int ha_moosedb::write_row(const uchar *buf)
   /* a bulk flag left over from an earlier statement is stale */
   if (in_bulk_insert_ && bulk_query_id_ != thd->query_id)
     in_bulk_insert_= false;
-  if (!batch_ && !in_bulk_insert_ &&
-      thd->locked_tables_mode == LTM_LOCK_TABLES)
+  const bool unique= share_->layout.unique_key != MAX_KEY;
+  const bool lone= !batch_ && !in_bulk_insert_ &&
+                   thd->locked_tables_mode == LTM_LOCK_TABLES;
+  if (lone && !unique)
   {
     if (!(error= map_status(moosedb_write_row(share_->table.get(), &row))))
       error= map_status(moosedb_sync_wal(share_->table.get(),
@@ -943,9 +1229,68 @@ int ha_moosedb::write_row(const uchar *buf)
     if (!b)
       DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
     batch_.reset(b);
+    /* unique_checks=0: the statement stores rows without checking the key */
+    if (unique && (thd->variables.option_bits & OPTION_RELAXED_UNIQUE_CHECKS) &&
+        moosedb_batch_set_unique_checks(batch_.get(), false) != TF_OK)
+      take_last_error();
   }
-  error= map_status(moosedb_batch_write(batch_.get(), &row));
+  error= write_batch_row(row);
+  if (error == HA_ERR_FOUND_DUPP_KEY)
+    dup_key_= share_->layout.unique_key;
+  if (lone)
+  {
+    /* UNIQUE table under LOCK TABLES: a one-row statement, committed now */
+    const int ce= commit_batch();
+    if (!error)
+      error= ce;
+  }
   DBUG_RETURN(error);
+}
+
+/*
+  Adds one row to the statement batch. On a table with a UNIQUE key the core
+  may report that another statement holds the row's series (TF_ERR_BUSY after
+  a short wait): nothing changed, so the same row is offered again until the
+  series is free, the statement is killed or the wait times out.
+*/
+int ha_moosedb::write_batch_row(const TFRow &row)
+{
+  THD *thd= ha_thd();
+  ulonglong waited_from= 0;
+  bool waiting= false;
+  int error= 0;
+  for (;;)
+  {
+    const TFStatus st= moosedb_batch_write(batch_.get(), &row);
+    if (st != TF_ERR_BUSY)
+    {
+      error= map_status(st);
+      break;
+    }
+    take_last_error();
+    if (!waiting)
+    {
+      waiting= true;
+      waited_from= microsecond_interval_timer();
+      if (thd)
+        thd_wait_begin(thd, THD_WAIT_ROW_LOCK);
+    }
+    if (thd && thd_killed(thd))
+    {
+      error= HA_ERR_QUERY_INTERRUPTED;
+      break;
+    }
+    if (microsecond_interval_timer() - waited_from >=
+        (ulonglong) srv_unique_lock_wait_timeout * 1000000ULL)
+    {
+      last_error_= "another statement is inserting into the same series";
+      error= HA_ERR_LOCK_WAIT_TIMEOUT;
+      break;
+    }
+  }
+  if (waiting && thd)
+    thd_wait_end(thd);
+  return error;
 }
 
 int ha_moosedb::fill_record(uchar *buf, const TFRow &row)
@@ -997,6 +1342,9 @@ int ha_moosedb::fill_record(uchar *buf, const TFRow &row)
         f->store_timestamp((my_time_t) secs, (ulong) (us - secs * MICROS_PER_SEC));
         break;
       }
+      case tf_conv::INT_SECS:
+        f->store(floor_div(v.data.ts_us, MICROS_PER_SEC), f->is_unsigned());
+        break;
       case tf_conv::INT:
         f->store(v.data.int_val, f->is_unsigned());
         break;
@@ -1018,6 +1366,150 @@ int ha_moosedb::fill_record(uchar *buf, const TFRow &row)
   }
   dbug_tmp_restore_column_map(&table->write_set, old_map);
   return 0;
+}
+
+/*
+  Fills the record from row `row` of the current batch. Only the columns the
+  scan was asked for (`active_cols_`) are written; the null bits of the
+  others come from `null_template_` (unrequested nullable fields read NULL).
+*/
+int ha_moosedb::fill_from_batch(uchar *buf, uint32_t row)
+{
+  assert(table);
+  if (!table || !share_ || !buf)
+    return HA_ERR_INTERNAL_ERROR;
+  const tf_layout &l= share_->layout;
+  if (row >= bat_rows_ || !bat_.columns || bat_.col_count != l.columns.size())
+    return HA_ERR_INTERNAL_ERROR;
+  const size_t nb= table->s->null_bytes;
+  if (null_template_.size() == nb)
+    memcpy(buf, null_template_.data(), nb);
+  else
+    memset(buf, 0, nb);
+  const my_ptrdiff_t diff= buf - table->record[0];
+  if (buf != tag_buf_)
+  {
+    std::fill(tag_last_ok_.begin(), tag_last_ok_.end(), 0);
+    tag_buf_= buf;
+  }
+  MY_BITMAP *old_map= dbug_tmp_use_all_columns(table, &table->write_set);
+  int rc= 0;
+
+  for (const uint32_t ci : active_cols_)
+  {
+    if (ci >= l.columns.size() || ci >= tag_last_ok_.size() ||
+        ci >= tag_last_start_.size() || ci >= tag_last_len_.size() || ci >= tag_snap_.size())
+    {
+      rc= HA_ERR_INTERNAL_ERROR;
+      break;
+    }
+    const tf_column &c= l.columns[ci];
+    const TFColumnBatch &cb= bat_.columns[ci];
+    if (c.field_index >= table->s->fields || !table->field[c.field_index])
+    {
+      rc= HA_ERR_INTERNAL_ERROR;
+      break;
+    }
+    Field *f= table->field[c.field_index];
+    f->move_field_offset(diff);
+    if (cb.nulls && cb.nulls[row])
+    {
+      f->set_null();
+      f->reset();
+      tag_last_ok_[ci]= 0;
+      f->move_field_offset(-diff);
+      continue;
+    }
+    f->set_notnull();
+    switch (c.conv) {
+    case tf_conv::DATETIME:
+    case tf_conv::TIMESTAMP:
+    case tf_conv::INT_SECS:
+    case tf_conv::INT:
+    {
+      if (!cb.values)
+      {
+        rc= HA_ERR_INTERNAL_ERROR;
+        break;
+      }
+      const int64_t x= static_cast<const int64_t *>(cb.values)[row];
+      if (c.conv == tf_conv::DATETIME)
+      {
+        MYSQL_TIME lt;
+        micros_to_time_cached(x, &lt, &cached_day_, &cached_y_, &cached_m_,
+                              &cached_d_);
+        f->store_time_dec(&lt, f->decimals());
+      }
+      else if (c.conv == tf_conv::TIMESTAMP)
+      {
+        const longlong secs= floor_div(x, MICROS_PER_SEC);
+        f->store_timestamp((my_time_t) secs, (ulong) (x - secs * MICROS_PER_SEC));
+      }
+      else if (c.conv == tf_conv::INT_SECS)
+        f->store(floor_div(x, MICROS_PER_SEC), f->is_unsigned());
+      else
+        f->store(x, f->is_unsigned());
+      break;
+    }
+    case tf_conv::FLOAT:
+      if (!cb.values)
+        rc= HA_ERR_INTERNAL_ERROR;
+      else
+        f->store((double) static_cast<const float *>(cb.values)[row]);
+      break;
+    case tf_conv::DOUBLE:
+      if (!cb.values)
+        rc= HA_ERR_INTERNAL_ERROR;
+      else
+        f->store(static_cast<const double *>(cb.values)[row]);
+      break;
+    case tf_conv::DECIMAL:
+    case tf_conv::STRING:
+    case tf_conv::TAG:
+    {
+      if (!cb.starts || !cb.lens)
+      {
+        rc= HA_ERR_INTERNAL_ERROR;
+        break;
+      }
+      const uint32_t st= cb.starts[row], len= cb.lens[row];
+      if (len != 0 && !cb.data)
+      {
+        rc= HA_ERR_INTERNAL_ERROR;
+        break;
+      }
+      /*
+        TAG rows of one series run share `starts`. The store is skipped only
+        when the Field in *this* record buffer still holds exactly the bytes
+        the previous store produced (checked against a snapshot of them), so
+        a server that overwrote the buffer in between (outer-join NULL row,
+        restore_record, ...) always gets a fresh store.
+      */
+      const enum_field_types rt= f->real_type();
+      const bool memo= c.conv == tf_conv::TAG &&
+                       (rt == MYSQL_TYPE_VARCHAR || rt == MYSQL_TYPE_STRING) &&
+                       f->pack_length() <= 1024;
+      if (memo && tag_last_ok_[ci] && tag_last_start_[ci] == st && tag_last_len_[ci] == len &&
+          tag_snap_[ci].size() == f->pack_length() &&
+          memcmp(tag_snap_[ci].data(), f->ptr, tag_snap_[ci].size()) == 0)
+        break;
+      f->store(len ? (const char *) cb.data + st : "", len, f->charset());
+      if (memo)
+      {
+        tag_snap_[ci].assign((const char *) f->ptr, f->pack_length());
+        tag_last_start_[ci]= st;
+        tag_last_len_[ci]= len;
+        tag_last_ok_[ci]= 1;
+      }
+      break;
+    }
+    }
+    f->move_field_offset(-diff);
+    if (rc)
+      break;
+  }
+  dbug_tmp_restore_column_map(&table->write_set, old_map);
+  return rc;
 }
 
 /* ── Statement end / durability ───────────────────────────────────────── */
@@ -1241,6 +1733,188 @@ bool const_string(Item *item, CHARSET_INFO *cs, std::string *out,
   return true;
 }
 
+/*
+  Numeric pushdown for integer TAG columns.
+
+  A series of such a column carries the canonical decimal text of the value
+  (Field::val_str: no padding, no '+', '-' only for negatives, unsigned
+  columns printed unsigned). A comparison `col = K` is turned into "the
+  series text equals the canonical text of K" -- but only where that is
+  provably what the server's own comparison decides, because the server
+  evaluates the whole WHERE again and a series dropped here is gone for good:
+
+  * INT constant: the server compares exactly (signed/unsigned aware).
+  * DECIMAL constant: exact too. A fractional value (123.5) equals no integer
+    column value; an integral one (123.0) is the integer itself.
+  * REAL constant: compared as DOUBLE. Safe only while |K| < 2^53 (every
+    integer there is a double, so (double) c == K  <=>  c == K); a fractional
+    double equals no integer; a bigger one is not pushed (c = 2^53 + 1 would
+    compare equal to 2^53).
+  * String constant: the server compares it as DOUBLE (or as an exact integer
+    when it converts cleanly); either way a *clean* integer text -- optional
+    '-', no leading zeros, no sign '+', no spaces, no exponent, not "-0" --
+    with |K| < 2^53 behaves like the integer K. Anything else ('0123', ' 12',
+    '12abc', '1e3', '', 'abc', binary strings such as x'3132') is not pushed:
+    the server would compare the number it parses, not the text.
+  * A value outside the column's range matches no series.
+  * ZEROFILL columns are never pushed (their stored text is padded).
+*/
+enum class num_const { PUSH, NO_MATCH, IS_NULL, REFUSE };
+
+constexpr uint64_t EXACT_DOUBLE_LIMIT= 1ULL << 53;
+
+/* Does -mag / +mag fit the integer Field `f`? (neg implies mag != 0) */
+bool int_fits_field(const Field *f, bool neg, uint64_t mag)
+{
+  const unsigned bits= (unsigned) f->pack_length() * 8;
+  if (bits == 0 || bits > 64)
+    return false;
+  if (f->is_unsigned())
+    return !neg && (bits == 64 || mag <= ((uint64_t) 1 << bits) - 1);
+  const uint64_t lim= (uint64_t) 1 << (bits - 1);
+  return neg ? mag <= lim : mag < lim;
+}
+
+std::string canonical_int_text(bool neg, uint64_t mag)
+{
+  char buf[32];
+  snprintf(buf, sizeof(buf), "%s%llu", neg ? "-" : "",
+           (unsigned long long) mag);
+  return buf;
+}
+
+/* Digits [from, to) -> value; false on overflow of uint64_t. */
+bool digits_to_u64(const char *p, size_t from, size_t to, uint64_t *out)
+{
+  uint64_t v= 0;
+  for (size_t i= from; i < to; i++)
+  {
+    const unsigned d= (unsigned) (p[i] - '0');
+    if (v > (UINT64_MAX - d) / 10)
+      return false;
+    v= v * 10 + d;
+  }
+  *out= v;
+  return true;
+}
+
+num_const numeric_const(Item *item, const Field *fld, std::string *text,
+                       bool *big)
+{
+  assert(fld);
+  assert(big);
+  if (!fld || !big)
+    return num_const::REFUSE;
+  /* set when the value is >= 2^53 in magnitude (or overflows): see add() */
+  *big= false;
+  if (item->type() == Item::NULL_ITEM)
+    return num_const::IS_NULL;
+  if (!item->const_item() || item->is_expensive())
+    return num_const::REFUSE;
+
+  bool neg= false;
+  uint64_t mag= 0;
+  switch (item->cmp_type()) {
+  case INT_RESULT:
+  {
+    const longlong v= item->val_int();
+    if (item->null_value)
+      return num_const::IS_NULL;
+    if (item->unsigned_flag || v >= 0)
+      mag= (uint64_t) v;
+    else
+    {
+      neg= true;
+      mag= (uint64_t) 0 - (uint64_t) v;
+    }
+    *big= mag >= EXACT_DOUBLE_LIMIT;
+    break;
+  }
+  case DECIMAL_RESULT:
+  {
+    StringBuffer<MAX_FIELD_WIDTH> buf;
+    String *s= item->val_str(&buf);
+    if (!s || item->null_value)
+      return num_const::IS_NULL;
+    const char *p= s->ptr();
+    const size_t n= s->length();
+    size_t i= 0;
+    if (i < n && p[i] == '-')
+      neg= true, i++;
+    const size_t int_from= i;
+    while (i < n && p[i] >= '0' && p[i] <= '9')
+      i++;
+    const size_t int_to= i;
+    size_t frac_from= i, frac_to= i;
+    if (i < n && p[i] == '.')
+    {
+      frac_from= ++i;
+      while (i < n && p[i] >= '0' && p[i] <= '9')
+        i++;
+      frac_to= i;
+    }
+    if (i != n || (int_to == int_from && frac_to == frac_from))
+      return num_const::REFUSE;
+    const bool fits= digits_to_u64(p, int_from, int_to, &mag);
+    *big= !fits || mag >= EXACT_DOUBLE_LIMIT;
+    for (size_t k= frac_from; k < frac_to; k++)
+      if (p[k] != '0')
+        return num_const::NO_MATCH;       /* exact fraction: equals no integer */
+    if (!fits)
+      return num_const::NO_MATCH;         /* beyond any column, exact compare */
+    break;
+  }
+  case REAL_RESULT:
+  {
+    const double d= item->val_real();
+    if (item->null_value)
+      return num_const::IS_NULL;
+    if (!std::isfinite(d) || std::fabs(d) >= (double) EXACT_DOUBLE_LIMIT)
+      return num_const::REFUSE;
+    if (d != std::trunc(d))
+      return num_const::NO_MATCH;
+    neg= d < 0;
+    mag= (uint64_t) std::fabs(d);
+    break;
+  }
+  case STRING_RESULT:
+  {
+    if (item->collation.collation == &my_charset_bin)
+      return num_const::REFUSE;
+    StringBuffer<MAX_FIELD_WIDTH> buf;
+    String *s= item->val_str(&buf);
+    if (!s || item->null_value)
+      return num_const::IS_NULL;
+    if (s->charset()->mbminlen != 1)
+      return num_const::REFUSE;
+    const char *p= s->ptr();
+    const size_t n= s->length();
+    size_t i= 0;
+    if (i < n && p[i] == '-')
+      neg= true, i++;
+    const size_t from= i;
+    if (n - from == 0 || n - from > 16)        /* 16 digits < 2^53 ~ 9.0e15 */
+      return num_const::REFUSE;
+    for (size_t k= from; k < n; k++)
+      if (p[k] < '0' || p[k] > '9')
+        return num_const::REFUSE;
+    if (p[from] == '0' && (n - from > 1 || neg))   /* '0123', '-0' */
+      return num_const::REFUSE;
+    if (!digits_to_u64(p, from, n, &mag) || mag >= EXACT_DOUBLE_LIMIT)
+      return num_const::REFUSE;
+    break;
+  }
+  default:
+    return num_const::REFUSE;
+  }
+  if (mag == 0)
+    neg= false;
+  if (!int_fits_field(fld, neg, mag))
+    return num_const::NO_MATCH;
+  *text= canonical_int_text(neg, mag);
+  return num_const::PUSH;
+}
+
 } // namespace
 
 void ha_moosedb::collect_tag_predicates(const Item *cond,
@@ -1265,7 +1939,52 @@ void ha_moosedb::collect_tag_predicates(const Item *cond,
   auto add= [&](const Item_field *f, CHARSET_INFO *cmp_cs, Item **consts,
                 uint n) {
     const int pos= share_->layout.tag_position(f->field->field_index);
-    if (pos < 0 || f->field->cmp_type() != STRING_RESULT)
+    if (pos < 0)
+      return;
+    if (is_int_tag_field(f->field))
+    {
+      /* Integer TAG: compare canonical decimal text, byte for byte. */
+      if (f->field->flags & ZEROFILL_FLAG)
+        return;
+      tf_tag_predicate p{pos, &my_charset_bin, {}};
+      p.values.reserve(n);
+      /*
+        The server may compare a whole IN list with one aggregated type. If
+        any constant is DOUBLE or string (or the types are otherwise not just
+        INT/DECIMAL), the comparison can be inexact, and then a constant of
+        magnitude >= 2^53 can equal column values that differ from it (2^53
+        and 2^53+1 are the same double). So: only INT/DECIMAL-only lists may
+        carry such magnitudes; otherwise any big constant refuses the whole
+        predicate.
+      */
+      bool exact= true;
+      for (uint i= 0; i < n; i++)
+        if (consts[i]->type() != Item::NULL_ITEM &&
+            consts[i]->cmp_type() != INT_RESULT &&
+            consts[i]->cmp_type() != DECIMAL_RESULT)
+          exact= false;
+      for (uint i= 0; i < n; i++)
+      {
+        std::string v;
+        bool big= false;
+        const num_const r= numeric_const(consts[i], f->field, &v, &big);
+        if (big && !exact)
+          return;
+        switch (r) {
+        case num_const::PUSH:
+          p.values.push_back(std::move(v));
+          break;
+        case num_const::NO_MATCH:     /* equals no value of the column */
+        case num_const::IS_NULL:      /* "col = NULL" never matches    */
+          break;
+        case num_const::REFUSE:
+          return;                     /* the server decides this one   */
+        }
+      }
+      out->push_back(std::move(p));
+      return;
+    }
+    if (f->field->cmp_type() != STRING_RESULT)
       return;
     tf_tag_predicate p{pos, cmp_cs ? cmp_cs : f->field->charset(), {}};
     for (uint i= 0; i < n; i++)
@@ -1298,10 +2017,32 @@ void ha_moosedb::collect_tag_predicates(const Item *cond,
     Item *c= eq->get_const();
     if (!c)
       return;
+    /*
+      For an integer TAG, every member must itself be an integer column: with
+      a DOUBLE, DECIMAL or string member the equality is evaluated under
+      another comparison type (e.g. DOUBLE, where 2^53 and 2^53+1 are equal),
+      not exactly. String TAGs are not affected by this.
+    */
+    bool all_int= true;
+    {
+      Item_equal_fields_iterator chk(*eq);
+      while (Item *m= chk++)
+      {
+        Item *r= m->real_item();
+        const Field *mf= r->type() == Item::FIELD_ITEM
+                           ? static_cast<Item_field *>(r)->field : nullptr;
+        if (!mf || !is_int_tag_field(mf))
+          all_int= false;
+      }
+    }
     Item_equal_fields_iterator it(*eq);
     while (Item *fi= it++)
       if (const Item_field *f= field_of(fi, table))
+      {
+        if (is_int_tag_field(f->field) && !all_int)
+          continue;
         add(f, eq->compare_collation(), &c, 1);
+      }
     return;
   }
   case Item_func::IN_FUNC:
@@ -1358,7 +2099,10 @@ int ha_moosedb::reset()
   pushed_.clear();
   pushed_valid_= false;
   scan_.reset();
+  reset_batch_state();
   snapshots_.clear();
+  idx_req_= idx_request();
+  idx_ids_.clear();
   scan_snapshot_saved_= false;
   return error;
 }
@@ -1381,50 +2125,59 @@ bool ha_moosedb::pushed_series(const std::vector<uint64_t> **ids)
   pushed_filter_= !preds.empty();
   if (!pushed_filter_)
     return false;
-
-  if (!share_ || !share_->table)
+  if (!resolve_series(preds, &pushed_ids_))
   {
+    pushed_ids_.clear();
     pushed_filter_= false;
     return false;
   }
+  return true;
+}
+
+/*
+  Series satisfying every predicate (sorted ids). false = could not be
+  resolved (the caller decides: a pushdown falls back to an unfiltered scan,
+  an index lookup cannot).
+*/
+bool ha_moosedb::resolve_series(
+    const std::vector<const tf_tag_predicate *> &preds,
+    std::vector<uint64_t> *out)
+{
+  out->clear();
+  if (!share_ || !share_->table)
+    return false;
   assert(table);
   if (!table)
-  {
-    pushed_filter_= false;
     return false;
-  }
   /* Character sets of the TAG columns, in TAG order. */
   std::vector<CHARSET_INFO *> tag_cs;
   for (const tf_column &c : share_->layout.columns)
     if (c.conv == tf_conv::TAG)
     {
       if (c.field_index >= table->s->fields || !table->field[c.field_index])
-      {
-        pushed_filter_= false;
         return false;
-      }
-      tag_cs.push_back(table->field[c.field_index]->charset());
+      /* Integer TAGs are matched on their decimal text, byte for byte. */
+      tag_cs.push_back(is_int_tag_field(table->field[c.field_index])
+                         ? &my_charset_bin
+                         : table->field[c.field_index]->charset());
     }
   for (const tf_tag_predicate *p : preds)
-    if (p->tag_pos < 0 || (size_t) p->tag_pos >= tag_cs.size() || !p->cs)
-    {
-      pushed_filter_= false;
+    if (!p || p->tag_pos < 0 || (size_t) p->tag_pos >= tag_cs.size() || !p->cs)
       return false;
-    }
 
-  if (pushed_series_cached(preds, tag_cs))
+  if (pushed_series_cached(preds, tag_cs, out))
     return true;
 
   /* Fallback: compare every series (also used past the cache limits). */
   MooseDBSeriesList *list= nullptr;
   if (moosedb_series_list(share_->table.get(), &list) != TF_OK)
   {
-    sql_print_warning("MooseDB: TAG pushdown disabled: %s",
+    sql_print_warning("MooseDB: TAG lookup unavailable: %s",
                       take_last_error().c_str());
-    pushed_filter_= false;
     return false;
   }
-  const bool ok= pushed_series_scan(list, preds, tag_cs);
+  out->clear();
+  const bool ok= pushed_series_scan(list, preds, tag_cs, out);
   moosedb_series_list_close(list);
   return ok;
 }
@@ -1472,7 +2225,7 @@ constexpr size_t TAG_CACHE_GROUP_OVERHEAD= 96;
 /* Reference implementation: one strnncollsp per series and value. */
 bool ha_moosedb::pushed_series_scan(
     MooseDBSeriesList *list, const std::vector<const tf_tag_predicate *> &preds,
-    const std::vector<CHARSET_INFO *> &tag_cs)
+    const std::vector<CHARSET_INFO *> &tag_cs, std::vector<uint64_t> *out)
 {
   const uint64_t n= moosedb_series_list_len(list);
   String conv;
@@ -1508,9 +2261,9 @@ bool ha_moosedb::pushed_series_scan(
       }
     }
     if (match)
-      pushed_ids_.push_back(id);
+      out->push_back(id);
   }
-  std::sort(pushed_ids_.begin(), pushed_ids_.end());
+  std::sort(out->begin(), out->end());
   return true;
 }
 
@@ -1533,7 +2286,7 @@ bool ha_moosedb::pushed_series_scan(
 */
 bool ha_moosedb::pushed_series_cached(
     const std::vector<const tf_tag_predicate *> &preds,
-    const std::vector<CHARSET_INFO *> &tag_cs)
+    const std::vector<CHARSET_INFO *> &tag_cs, std::vector<uint64_t> *out)
 {
   for (const tf_tag_predicate *p : preds)
     if (!p->cs->coll || !p->cs->coll->hash_sort)
@@ -1686,18 +2439,174 @@ bool ha_moosedb::pushed_series_cached(
     if (result.empty())
       break;
   }
-  pushed_ids_= std::move(result);
+  *out= std::move(result);
   return true;
 }
 
 /* ── Scans ────────────────────────────────────────────────────────────── */
 
-int ha_moosedb::open_scan(longlong lo, longlong hi, bool sorted)
+void ha_moosedb::reset_batch_state()
+{
+  bat_= TFBatch{0, 0, nullptr, nullptr};
+  bat_rows_= 0;
+  bat_pos_= 0;
+  bat_dir_= 0;
+  bat_hint_= 16;
+  bat_skip_= 0;
+  bat_ended_= false;
+  bitmaps_dirty_= false;
+  degraded_= false;
+  degraded_snap_.reset();
+  active_cols_.clear();
+  tag_buf_= nullptr;
+}
+
+/*
+  Decides which columns the scan decodes (proj_mask_ / proj_all_). The mask
+  follows table->read_set; everything else the server might read without
+  declaring it asks for all columns:
+   - statements other than SELECT / INSERT..SELECT / REPLACE..SELECT (UPDATE,
+     DELETE, CREATE..SELECT, ALTER, CHECK, ...), and no THD or no read_set;
+   - the table has virtual columns (their inputs are computed by the server).
+  Index scans always include the timestamp: the server compares the row's
+  key against end_range (handler::compare_key) reading it from the record.
+  If read_set grows after the scan opened (column_bitmaps_signal), rows are
+  fetched whole instead (degraded_), see read_from_scan().
+*/
+void ha_moosedb::build_projection(bool index_scan)
+{
+  proj_all_= true;
+  proj_mask_.clear();
+  if (!table || !share_ || !table->read_set || table->vfield)
+    return;
+  THD *thd= ha_thd();
+  if (!thd)
+    return;
+  switch (thd_sql_command(thd)) {
+  case SQLCOM_SELECT:
+  case SQLCOM_INSERT_SELECT:
+  case SQLCOM_REPLACE_SELECT:
+    break;
+  default:
+    return;
+  }
+  const tf_layout &l= share_->layout;
+  std::vector<uint8_t> mask(l.columns.size(), 0);
+  bool any_off= false;
+  /*
+    The server compares a row's key parts with end_range / the ref key
+    (compare_key, key_cmp_if_same) reading them from the record, so every
+    part of the index being scanned must be decoded, requested or not.
+  */
+  std::vector<uint8_t> key_field(table->s->fields, 0);
+  if (index_scan && active_index < table->s->keys && table->key_info)
+  {
+    const KEY &ki= table->key_info[active_index];
+    for (uint p= 0; ki.key_part && p < ki.user_defined_key_parts; p++)
+      if (ki.key_part[p].field && ki.key_part[p].field->field_index < key_field.size())
+        key_field[ki.key_part[p].field->field_index]= 1;
+  }
+  for (size_t i= 0; i < l.columns.size(); i++)
+  {
+    const uint fi= l.columns[i].field_index;
+    if (fi >= table->s->fields)
+      return;
+    if (bitmap_is_set(table->read_set, fi) ||
+        (index_scan && i == l.ts_column) || key_field[fi])
+      mask[i]= 1;
+    else
+      any_off= true;
+  }
+  if (!any_off || mask.empty())
+    return;
+  proj_mask_= std::move(mask);
+  proj_all_= false;
+}
+
+/* Switches to whole-row reads if read_set asks for an undecoded column. */
+void ha_moosedb::recheck_projection()
+{
+  bitmaps_dirty_= false;
+  if (proj_all_ || degraded_)
+    return;
+  if (!table || !table->read_set || !share_)
+  {
+    degraded_= true;
+    return;
+  }
+  const tf_layout &l= share_->layout;
+  for (size_t i= 0; i < l.columns.size() && i < proj_mask_.size(); i++)
+    if (!proj_mask_[i] && l.columns[i].field_index < table->s->fields &&
+        bitmap_is_set(table->read_set, l.columns[i].field_index))
+    {
+      degraded_= true;
+      if (bat_pos_ > 0 && !warned_degraded_)
+      {
+        warned_degraded_= true;
+        sql_print_warning("MooseDB: read_set grew after rows were served from "
+                          "a projected scan of %s; falling back to whole rows",
+                          share_ ? share_->display.c_str() : "?");
+      }
+      return;
+    }
+}
+
+void ha_moosedb::column_bitmaps_signal(bool mark_for_update)
+{
+  bitmaps_dirty_= true;
+  handler::column_bitmaps_signal(mark_for_update);
+}
+
+int ha_moosedb::open_scan(longlong lo, longlong hi, bool sorted,
+                          bool index_scan)
 {
   scan_.reset();
   scan_snapshot_saved_= false;
+  reset_batch_state();
   if (!share_ || !share_->table)
     return HA_ERR_INTERNAL_ERROR;
+  build_projection(index_scan);
+  if (index_scan && idx_req_.active)
+  {
+    /*
+      Composite-index read: the series set is part of the *meaning* of the
+      read (the key's tags), so unlike a pushdown it can never be dropped --
+      if the series version keeps moving there is no unfiltered fallback.
+      Same protocol as below: resolve the ids, open the scan (which takes the
+      snapshot), and redo both if a series appeared in between.
+    */
+    for (int attempt= 0; attempt < 64; attempt++)
+    {
+      uint64_t v0= 0, v1= 0;
+      if (moosedb_series_version(share_->table.get(), &v0) != TF_OK)
+      {
+        last_error_= take_last_error();
+        return HA_ERR_INTERNAL_ERROR;
+      }
+      const std::vector<uint64_t> *ids= nullptr;
+      if (!series_for_index(&ids) || !ids)
+      {
+        last_error_= "cannot resolve the TAG values of the index key";
+        return HA_ERR_INTERNAL_ERROR;
+      }
+      MooseDBScan *s= nullptr;
+      if (int error= map_status(moosedb_scan_open_projected(
+              share_->table.get(), lo, hi, ids->data(),
+              (int64_t) ids->size(), sorted,
+              proj_all_ ? nullptr : proj_mask_.data(),
+              proj_all_ ? 0 : (uint32_t) proj_mask_.size(), &s)))
+        return error;
+      tf_scan_ptr opened(s);
+      if (moosedb_series_version(share_->table.get(), &v1) == TF_OK && v1 == v0)
+      {
+        scan_= std::move(opened);
+        return 0;
+      }
+      take_last_error();
+    }
+    last_error_= "the set of series kept changing while the index was read";
+    return HA_ERR_LOCK_WAIT_TIMEOUT;
+  }
   /*
     The ids of a TAG filter and the scan are two separate calls: a statement
     that commits between them with a brand-new series would be seen only
@@ -1730,9 +2639,11 @@ int ha_moosedb::open_scan(longlong lo, longlong hi, bool sorted)
     if (filtered)
       pushed_version_= v0;
     s= nullptr;
-    error= map_status(moosedb_scan_open_filtered(
+    error= map_status(moosedb_scan_open_projected(
         share_->table.get(), lo, hi, filtered ? ids->data() : nullptr,
-        filtered ? (int64_t) ids->size() : -1, sorted, &s));
+        filtered ? (int64_t) ids->size() : -1, sorted,
+        proj_all_ ? nullptr : proj_mask_.data(),
+        proj_all_ ? 0 : (uint32_t) proj_mask_.size(), &s));
     if (error || !filtered)
       break;
     uint64_t v1= 0;
@@ -1760,22 +2671,192 @@ int ha_moosedb::rnd_init(bool scan)
   DBUG_ENTER("ha_moosedb::rnd_init");
   /* scan == false: only rnd_pos() follows; positions resolve through the
      snapshots kept by position(). */
-  DBUG_RETURN(scan ? open_scan(LONGLONG_MIN, LONGLONG_MAX, false) : 0);
+  DBUG_RETURN(scan ? open_scan(LONGLONG_MIN, LONGLONG_MAX, false, false) : 0);
+}
+
+/*
+  Reads the next batch (returns 0), or -1 at the end of the scan. After a
+  direction switch `bat_skip_` rows are dropped first: the core cursor sits
+  on the last row of the previous batch, so the rows between it and the row
+  last served (read ahead, already decoded) would otherwise be repeated.
+*/
+int ha_moosedb::refill_batch(bool backward)
+{
+  if (!scan_ || !share_)
+    return HA_ERR_INTERNAL_ERROR;
+  const tf_layout &l= share_->layout;
+  for (;;)
+  {
+    const uint32_t want= std::min<uint32_t>(bat_hint_ + bat_skip_, 65536);
+    TFBatch b{0, 0, nullptr, nullptr};
+    bool end= false;
+    bat_rows_= 0;
+    bat_pos_= 0;
+    active_cols_.clear();
+    TFStatus st= backward
+        ? moosedb_scan_prev_batch(scan_.get(), want, &b, &end)
+        : moosedb_scan_next_batch(scan_.get(), want, &b, &end);
+    if (st != TF_OK)
+    {
+      bat_dir_= 0;
+      bat_skip_= 0;
+      return map_status(st);
+    }
+    if (b.row_count == 0)
+    {
+      bat_skip_= 0;
+      bat_ended_= true;
+      return -1;
+    }
+    if (!b.columns || !b.positions || b.col_count != l.columns.size())
+    {
+      bat_dir_= 0;
+      bat_skip_= 0;
+      last_error_= "batch shape does not match the table definition";
+      return HA_ERR_MOOSEDB_BASE + TF_ERR_CORRUPT;
+    }
+    /* Validate the batch against the layout and the projection. */
+    for (size_t i= 0; i < l.columns.size(); i++)
+    {
+      const TFColumnBatch &cb= b.columns[i];
+      const bool wanted= proj_all_ || (i < proj_mask_.size() && proj_mask_[i]);
+      if (!cb.present)
+      {
+        if (wanted)
+          goto bad_batch;
+        continue;
+      }
+      if (cb.kind != (uint8_t) l.columns[i].type)
+        goto bad_batch;
+      switch (l.columns[i].conv) {
+      case tf_conv::DECIMAL:
+      case tf_conv::STRING:
+      case tf_conv::TAG:
+        if (!cb.starts || !cb.lens || (!cb.data && cb.data_len))
+          goto bad_batch;
+        for (uint32_t r= 0; r < b.row_count; r++)
+          if ((uint64_t) cb.starts[r] + (uint64_t) cb.lens[r] > cb.data_len)
+            goto bad_batch;
+        break;
+      default:
+        if (!cb.values)
+          goto bad_batch;
+        break;
+      }
+    }
+    goto batch_ok;
+  bad_batch:
+    bat_dir_= 0;
+    bat_skip_= 0;
+    last_error_= "batch does not match the table definition or projection";
+    return HA_ERR_MOOSEDB_BASE + TF_ERR_CORRUPT;
+  batch_ok:
+    uint32_t take= 0;
+    if (bat_skip_)
+    {
+      take= std::min(bat_skip_, b.row_count);
+      bat_skip_-= take;
+      if (take == b.row_count)
+        continue;               /* still dropping: read the next batch */
+    }
+    bat_ended_= false;
+    bat_= b;
+    bat_rows_= b.row_count;
+    bat_pos_= take;
+    break;
+  }
+  if (bat_hint_ < 1024)
+    bat_hint_= std::min<uint32_t>(bat_hint_ * 2, 1024);
+
+  /* Per-batch column plan; the TAG store-skip memo is per batch (starts). */
+  const size_t n= l.columns.size();
+  tag_last_ok_.assign(n, 0);
+  tag_last_start_.assign(n, 0);
+  tag_last_len_.assign(n, 0);
+  tag_snap_.resize(n);
+  const size_t nb= table ? table->s->null_bytes : 0;
+  null_template_.assign(nb, 0);
+  for (size_t i= 0; i < n; i++)
+  {
+    if (bat_.columns[i].present)
+    {
+      active_cols_.push_back((uint32_t) i);
+      continue;
+    }
+    /* unrequested: make a nullable field read NULL */
+    const uint fi= l.columns[i].field_index;
+    if (table && fi < table->s->fields && table->field[fi])
+    {
+      const Field *f= table->field[fi];
+      if (f->null_ptr && table->record[0])
+      {
+        const my_ptrdiff_t off= f->null_ptr - table->record[0];
+        if (off >= 0 && (size_t) off < nb)
+          null_template_[(size_t) off]|= f->null_bit;
+      }
+    }
+  }
+  return 0;
 }
 
 int ha_moosedb::read_from_scan(uchar *buf, bool backward, int end_error)
 {
-  if (!scan_)
+  if (!scan_ || !buf || !table)
     return HA_ERR_INTERNAL_ERROR;
-  TFRow row{0, nullptr};
-  bool end= false;
-  TFStatus st= backward ? moosedb_scan_prev(scan_.get(), &row, &end)
-                        : moosedb_scan_next(scan_.get(), &row, &end);
-  if (int error= map_status(st))
+  const int dir= backward ? 2 : 1;
+  if (bat_dir_ != 0 && bat_dir_ != dir)
+  {
+    /* Rows read ahead but not served: n - bat_pos_ (0 once the scan ended). */
+    bat_skip_= bat_rows_ > bat_pos_ ? bat_rows_ - bat_pos_ : 0;
+    bat_rows_= 0;
+    bat_pos_= 0;
+    if (bat_ended_)
+    {
+      /*
+        The core cursor is not reliable after an empty (EOF/BOF) batch:
+        reposition explicitly. Forward EOF -> backward starts from the end;
+        backward BOF -> forward uses moosedb_scan_seek_start (same snapshot).
+      */
+      bat_skip_= 0;
+      if (int error= map_status(backward ? moosedb_scan_seek_end(scan_.get())
+                                         : moosedb_scan_seek_start(scan_.get())))
+        return error;
+      bat_ended_= false;
+    }
+  }
+  else if (bat_ended_ && bat_dir_ == dir)
+    return end_error;   /* the core cursor is not usable after an empty batch */
+  bat_dir_= dir;
+  if (bitmaps_dirty_)
+    recheck_projection();
+  if (bat_pos_ >= bat_rows_)
+  {
+    const int r= refill_batch(backward);
+    if (r < 0)
+      return end_error;
+    if (r)
+      return r;
+  }
+  if (bat_pos_ >= bat_rows_)
+    return HA_ERR_INTERNAL_ERROR;
+  const uint32_t row= bat_pos_++;
+  if (!degraded_)
+    return fill_from_batch(buf, row);
+
+  /* read_set outgrew the projection: serve whole rows by position */
+  if (!degraded_snap_)
+  {
+    MooseDBSnapshot *snap= nullptr;
+    if (int error= map_status(moosedb_scan_snapshot(scan_.get(), &snap)))
+      return error;
+    degraded_snap_.reset(snap);
+  }
+  TFRow full{0, nullptr};
+  if (int error= map_status(moosedb_snapshot_fetch(
+          degraded_snap_.get(), bat_.positions + (size_t) row * TF_POSITION_LEN,
+          &full)))
     return error;
-  if (end)
-    return end_error;
-  return fill_record(buf, row);
+  return fill_record(buf, full);
 }
 
 int ha_moosedb::rnd_next(uchar *buf)
@@ -1788,13 +2869,18 @@ int ha_moosedb::rnd_end()
 {
   DBUG_ENTER("ha_moosedb::rnd_end");
   scan_.reset();
+  reset_batch_state();
   DBUG_RETURN(0);
 }
 
 void ha_moosedb::position(const uchar *)
 {
   DBUG_ENTER("ha_moosedb::position");
-  if (!scan_ || moosedb_scan_position(scan_.get(), ref) != TF_OK)
+  if (scan_ && bat_dir_ != 0 && bat_pos_ > 0 && bat_pos_ <= bat_rows_ &&
+      bat_.positions)
+    memcpy(ref, bat_.positions + (size_t) (bat_pos_ - 1) * TF_POSITION_LEN,
+           TF_POSITION_LEN);
+  else if (!scan_ || moosedb_scan_position(scan_.get(), ref) != TF_OK)
   {
     take_last_error();
     memset(ref, 0xff, ref_length);
@@ -1860,11 +2946,21 @@ int ha_moosedb::rnd_pos(uchar *buf, uchar *pos)
 
 /* ── Index scans ──────────────────────────────────────────────────────── */
 
+const tf_index_def *ha_moosedb::index_def(uint idx) const
+{
+  if (!share_)
+    return nullptr;
+  const tf_layout &l= share_->layout;
+  return idx < l.indexes.size() ? &l.indexes[idx] : nullptr;
+}
+
 int ha_moosedb::index_init(uint idx, bool)
 {
   DBUG_ENTER("ha_moosedb::index_init");
   active_index= idx;
   scan_.reset();
+  reset_batch_state();
+  idx_req_= idx_request();
   DBUG_RETURN(0);
 }
 
@@ -1872,21 +2968,32 @@ int ha_moosedb::index_end()
 {
   DBUG_ENTER("ha_moosedb::index_end");
   scan_.reset();
+  reset_batch_state();
+  idx_req_= idx_request();
   active_index= MAX_KEY;
   DBUG_RETURN(0);
 }
 
-int ha_moosedb::key_to_ts(uint idx, const uchar *key, longlong *out)
+/*
+  Time value of key part `part` of `key` (a key image of index `idx`), in µs.
+  Parts before it are restored too (key_restore reads the key from its start).
+*/
+int ha_moosedb::key_to_ts(uint idx, const uchar *key, uint part, longlong *out)
 {
   assert(table && key);
   if (!table || !key || !out || !table->key_info || idx >= table->s->keys)
     return HA_ERR_INTERNAL_ERROR;
   KEY *ki= &table->key_info[idx];
-  Field *f= ki->key_part ? ki->key_part[0].field : nullptr;
+  if (!ki->key_part || part >= ki->user_defined_key_parts)
+    return HA_ERR_INTERNAL_ERROR;
+  Field *f= ki->key_part[part].field;
   if (!f)
     return HA_ERR_INTERNAL_ERROR;
+  uint len= 0;
+  for (uint p= 0; p <= part; p++)
+    len+= ki->key_part[p].store_length;
   /* Decode through the field itself, using record[1] as scratch space. */
-  key_restore(table->record[1], key, ki, ki->key_part[0].store_length);
+  key_restore(table->record[1], key, ki, len);
   const my_ptrdiff_t diff= table->record[1] - table->record[0];
   f->move_field_offset(diff);
   longlong ts;
@@ -1895,6 +3002,11 @@ int ha_moosedb::key_to_ts(uint idx, const uchar *key, longlong *out)
   {
     ulong usec= 0;
     ts= (longlong) f->get_timestamp(&usec) * MICROS_PER_SEC + (longlong) usec;
+  }
+  else if (is_int_axis(f))
+  {
+    /* integer axis: key image -> seconds -> µs (saturating, see above) */
+    ts= secs_to_micros_saturating(f->val_int(), f->is_unsigned());
   }
   else
   {
@@ -1912,12 +3024,778 @@ int ha_moosedb::key_to_ts(uint idx, const uchar *key, longlong *out)
 int ha_moosedb::open_range_scan(longlong lo, longlong hi, bool backward,
                                  uchar *buf, int not_found_error)
 {
-  if (int error= open_scan(lo, hi, true))
+  if (int error= open_scan(lo, hi, true, true))
     return error;
   if (backward)
     if (int error= map_status(moosedb_scan_seek_end(scan_.get())))
       return error;
   return read_from_scan(buf, backward, not_found_error);
+}
+
+/*
+  ── Composite indexes (TAG_1 .. TAG_k [, time]) ──
+
+  The engine keeps no index structure: an index read is "which series match
+  the TAG equalities of the key" (O(1) per value through the TAG cache) plus
+  a time range, served by the same k-way merge as the time index. The order
+  the server may rely on is therefore only the one this gives for free:
+
+    * all k tags fixed (ref, eq_range, MIN/MAX of the time part): rows come
+      in time order, ascending or descending;
+    * fewer tags fixed with KEY_EXACT (ref on a prefix): all matching series
+      merged in time order -- index_flags() does not announce an order on a
+      TAG part, so the server never expects (tag_j, time) order from it.
+
+  A read that does depend on the order BETWEEN tag values -- MIN/MAX(tag)
+  (opt_sum announces those through index_flags(idx, part, 0)), index_first,
+  index_last, a KEY_OR_NEXT/PREV on a partial tag prefix -- is "ordered":
+  the series whose remaining tag tuple is the extreme (under the column's
+  own comparison: numeric for integer TAGs, the collation for strings) are
+  scanned, and index_next/prev move to the neighbouring tuple when they run
+  out. Equality of tags is always the column collation's, never a byte
+  compare. Ranges on a TAG part (itemid > 5) are not announced
+  (HA_READ_RANGE), so the optimizer never builds one.
+*/
+
+/*
+  TAG equalities of the first `ntags` parts of an index key, as predicates on
+  the canonical text the series store (the text write_row() derived from the
+  same field type).
+*/
+int ha_moosedb::key_tag_predicates(uint idx, const uchar *key, uint ntags,
+                                   std::vector<tf_tag_predicate> *out)
+{
+  assert(table && key && out);
+  const tf_index_def *def= index_def(idx);
+  if (!table || !key || !out || !def || !table->key_info ||
+      idx >= table->s->keys || def->tag_pos.size() < ntags)
+    return HA_ERR_INTERNAL_ERROR;
+  KEY *ki= &table->key_info[idx];
+  if (!ki->key_part || ntags > ki->user_defined_key_parts)
+    return HA_ERR_INTERNAL_ERROR;
+  uint len= 0;
+  for (uint p= 0; p < ntags; p++)
+    len+= ki->key_part[p].store_length;
+  key_restore(table->record[1], key, ki, len);
+  const my_ptrdiff_t diff= table->record[1] - table->record[0];
+  MY_BITMAP *old_map= dbug_tmp_use_all_columns(table, &table->read_set);
+  int rc= 0;
+  for (uint p= 0; p < ntags && !rc; p++)
+  {
+    Field *f= ki->key_part[p].field;
+    if (!f)
+    {
+      rc= HA_ERR_INTERNAL_ERROR;
+      break;
+    }
+    f->move_field_offset(diff);
+    StringBuffer<128> sb;
+    String *v= f->val_str(&sb);
+    tf_tag_predicate pr{def->tag_pos[p],
+                        is_int_tag_field(f) ? &my_charset_bin : f->charset(),
+                        {}};
+    if (v)
+      pr.values.emplace_back(v->ptr(), v->length());
+    else
+      rc= HA_ERR_INTERNAL_ERROR;
+    f->move_field_offset(-diff);
+    if (!rc)
+      out->push_back(std::move(pr));
+  }
+  dbug_tmp_restore_column_map(&table->read_set, old_map);
+  return rc;
+}
+
+namespace {
+
+/* Order of two stored TAG texts under the semantics of the column. */
+int cmp_tag_text(const Field *f, const std::string &a, const std::string &b)
+{
+  if (is_int_tag_field(f))
+  {
+    if (f->is_unsigned())
+    {
+      const unsigned long long x= strtoull(a.c_str(), nullptr, 10);
+      const unsigned long long y= strtoull(b.c_str(), nullptr, 10);
+      return x < y ? -1 : (x > y ? 1 : 0);
+    }
+    const long long x= strtoll(a.c_str(), nullptr, 10);
+    const long long y= strtoll(b.c_str(), nullptr, 10);
+    return x < y ? -1 : (x > y ? 1 : 0);
+  }
+  return f->charset()->strnncollsp((const uchar *) a.data(), a.size(),
+                                   (const uchar *) b.data(), b.size());
+}
+
+/* Lexicographic order of the first `n` parts of two tag tuples. */
+int cmp_tuple_n(const std::vector<const Field *> &fld,
+                const std::vector<std::string> &a,
+                const std::vector<std::string> &b, size_t n)
+{
+  for (size_t i= 0; i < n && i < fld.size() && i < a.size() && i < b.size();
+       i++)
+    if (int c= cmp_tag_text(fld[i], a[i], b[i]))
+      return c;
+  return 0;
+}
+
+/*
+  Heap all sorted tuple indexes of the process (every table, every key) may
+  hold together, estimated honestly (each String as its header + bytes + a
+  malloc rounding, each entry's vectors), and charged twice while one is being
+  built (the unsorted rows and the merged entries coexist). Over it the
+  ordered read fails with an error -- it never returns a wrong order.
+*/
+constexpr size_t TUPLE_INDEX_GLOBAL_MAX_BYTES= 512ULL << 20;
+std::atomic<size_t> g_tuple_index_bytes{0};
+
+/* Holds a share of the budget until it goes out of scope. */
+struct tuple_budget
+{
+  size_t held= 0;
+  bool take(size_t n)
+  {
+    if (g_tuple_index_bytes.fetch_add(n) + n > TUPLE_INDEX_GLOBAL_MAX_BYTES)
+    {
+      g_tuple_index_bytes.fetch_sub(n);
+      return false;
+    }
+    held+= n;
+    return true;
+  }
+  ~tuple_budget() { g_tuple_index_bytes.fetch_sub(held); }
+};
+
+} // namespace
+
+tf_tuple_index::~tf_tuple_index()
+{
+  g_tuple_index_bytes.fetch_sub(bytes);
+}
+
+/*
+  Ordered view of the series of a composite index (see composite_read()):
+  every series' tag tuple, sorted like the index, tuple-equal series merged
+  into one entry. Rebuilt O(S log S) when the series version moves, shared by
+  all handlers of the table; nullptr when it would not fit the global budget.
+  The (long) build runs outside the share mutex, so other handlers keep
+  working; two handlers may build the same version, the budget covers both.
+  The version compared is moosedb_series_version(), the very counter that
+  moosedb_series_list_version() reports for the list the index is built from.
+*/
+std::shared_ptr<const tf_tuple_index> ha_moosedb::tuple_index(uint idx)
+{
+  const tf_index_def *def= index_def(idx);
+  if (!def || def->simple_ts || !table || !table->key_info ||
+      idx >= table->s->keys || !share_ || !share_->table)
+    return nullptr;
+  KEY *ki= &table->key_info[idx];
+  const size_t k= def->tag_pos.size();
+  std::vector<const Field *> fld;
+  for (size_t p= 0; p < k; p++)
+  {
+    if (!ki->key_part || p >= ki->user_defined_key_parts ||
+        !ki->key_part[p].field)
+      return nullptr;
+    fld.push_back(ki->key_part[p].field);
+  }
+  uint64_t cur= 0;
+  if (moosedb_series_version(share_->table.get(), &cur) != TF_OK)
+  {
+    take_last_error();
+    return nullptr;
+  }
+  {
+    std::lock_guard<std::mutex> guard(share_->tuple_mutex);
+    const auto found= share_->tuples.find(idx);
+    if (found != share_->tuples.end() && found->second &&
+        found->second->version == cur)
+      return found->second;
+  }
+
+  MooseDBSeriesList *list= nullptr;
+  if (moosedb_series_list(share_->table.get(), &list) != TF_OK)
+  {
+    take_last_error();
+    return nullptr;
+  }
+  struct row
+  {
+    std::vector<std::string> t;
+    uint64_t id;
+  };
+  const uint64_t n= moosedb_series_list_len(list);
+  const uint64_t lv= moosedb_series_list_version(list);
+  std::vector<row> rows;
+  tuple_budget budget;
+  size_t est= 0;                     /* one copy of the data */
+  bool ok= true;
+  for (uint64_t i= 0; i < n && ok; i++)
+  {
+    uint64_t id= 0;
+    TFRow tags{0, nullptr};
+    if (moosedb_series_list_get(list, i, &id, &tags) != TF_OK)
+    {
+      take_last_error();
+      ok= false;
+      break;
+    }
+    row r{{}, id};
+    bool usable= tags.values != nullptr;
+    size_t cost= sizeof(row) + sizeof(tf_tuple_entry) + sizeof(uint64_t) + 32;
+    for (size_t p= 0; usable && p < k; p++)
+    {
+      const int pos= def->tag_pos[p];
+      if (pos < 0 || (uint) pos >= tags.col_count || tags.values[pos].is_null)
+        usable= false;
+      else
+      {
+        const TFStr s= tags.values[pos].data.str_val;
+        r.t.emplace_back(s.ptr ? s.ptr : "", s.len);
+        cost+= sizeof(std::string) + s.len + 32;
+      }
+    }
+    if (!usable)
+      continue;
+    est+= cost;
+    /* rows + merged entries exist together while building: charge both */
+    if (!budget.take(2 * cost))
+    {
+      ok= false;
+      break;
+    }
+    rows.push_back(std::move(r));
+  }
+  moosedb_series_list_close(list);
+  if (!ok)
+    return nullptr;
+  std::sort(rows.begin(), rows.end(), [&fld, k](const row &a, const row &b) {
+    const int c= cmp_tuple_n(fld, a.t, b.t, k);
+    return c ? c < 0 : a.id < b.id;
+  });
+  auto ix= std::make_shared<tf_tuple_index>();
+  ix->version= lv;
+  for (row &r : rows)
+  {
+    if (!ix->entries.empty() &&
+        cmp_tuple_n(fld, ix->entries.back().tuple, r.t, k) == 0)
+    {
+      ix->entries.back().ids.push_back(r.id);
+      continue;
+    }
+    tf_tuple_entry e;
+    e.tuple= std::move(r.t);
+    e.ids.push_back(r.id);
+    ix->entries.push_back(std::move(e));
+  }
+  rows.clear();
+  rows.shrink_to_fit();
+  /* what stays: the index; the budget keeps counting it until it is freed */
+  if (!budget.take(est))
+    return nullptr;
+  ix->bytes= est;
+  budget.held-= est;                 /* ownership moves to the index object */
+  std::lock_guard<std::mutex> guard(share_->tuple_mutex);
+  auto &slot= share_->tuples[idx];
+  if (!slot || slot->version <= lv)
+    slot= ix;
+  return ix;
+}
+
+/*
+  Makes the series of entry `entry` of the tuple index -- or, moving in
+  `backward` direction, the first entry from there on that still has series
+  satisfying the pushed WHERE (`filter`, sorted ids, or nullptr) -- the
+  series of the request. Empty when the end of the index is reached.
+*/
+bool ha_moosedb::pick_entry(const std::vector<uint64_t> *filter, int64_t entry,
+                            bool backward)
+{
+  idx_ids_.clear();
+  idx_req_.have_cur= false;
+  const tf_tuple_index *tix= idx_req_.tix.get();
+  if (!tix)
+    return false;
+  const int64_t n= (int64_t) tix->entries.size();
+  for (int64_t e= entry; e >= 0 && e < n; e+= backward ? -1 : 1)
+  {
+    const tf_tuple_entry &en= tix->entries[(size_t) e];
+    if (filter && en.ids.size() * 8 < filter->size())
+    {
+      /* few series, big filter: probe it instead of merging all of it */
+      for (const uint64_t id : en.ids)
+        if (std::binary_search(filter->begin(), filter->end(), id))
+          idx_ids_.push_back(id);
+    }
+    else if (filter)
+      std::set_intersection(en.ids.begin(), en.ids.end(), filter->begin(),
+                            filter->end(), std::back_inserter(idx_ids_));
+    else
+      idx_ids_= en.ids;
+    if (!idx_ids_.empty())
+    {
+      idx_req_.cur= en.tuple;
+      idx_req_.have_cur= true;
+      return true;
+    }
+  }
+  return true;
+}
+
+/* The neighbouring tag tuple of the one being scanned (idx_req_.cur). */
+bool ha_moosedb::walk_entry(const std::vector<uint64_t> *filter, bool backward)
+{
+  if (!idx_req_.have_cur)
+  {
+    idx_ids_.clear();
+    return true;
+  }
+  if (!idx_req_.tix)
+    idx_req_.tix= tuple_index(idx_req_.index);
+  const tf_tuple_index *tix= idx_req_.tix.get();
+  const tf_index_def *def= index_def(idx_req_.index);
+  if (!tix || !def || !table || idx_req_.index >= table->s->keys)
+    return false;
+  KEY *ki= &table->key_info[idx_req_.index];
+  std::vector<const Field *> fld;
+  for (size_t p= 0; p < def->tag_pos.size(); p++)
+  {
+    if (!ki->key_part || p >= ki->user_defined_key_parts ||
+        !ki->key_part[p].field)
+      return false;
+    fld.push_back(ki->key_part[p].field);
+  }
+  const size_t k= fld.size();
+  const std::vector<std::string> cur= idx_req_.cur;
+  /* forward: first tuple > cur; backward: last tuple < cur */
+  const auto it= std::partition_point(
+      tix->entries.begin(), tix->entries.end(),
+      [&](const tf_tuple_entry &e) {
+        const int c= cmp_tuple_n(fld, e.tuple, cur, k);
+        return backward ? c < 0 : c <= 0;
+      });
+  const int64_t pos= (int64_t) (it - tix->entries.begin());
+  return pick_entry(filter, backward ? pos - 1 : pos, backward);
+}
+
+/* Series of the current composite-index request (see open_scan()). */
+bool ha_moosedb::series_for_index(const std::vector<uint64_t> **ids)
+{
+  *ids= &idx_ids_;
+  const tf_index_def *def= index_def(idx_req_.index);
+  if (!def || !table || idx_req_.index >= table->s->keys)
+    return false;
+  std::vector<const tf_tag_predicate *> preds;
+  for (const auto &level : pushed_)
+    for (const tf_tag_predicate &p : level)
+      preds.push_back(&p);
+  const size_t npushed= preds.size();
+  for (const tf_tag_predicate &p : idx_req_.preds)
+    preds.push_back(&p);
+  if (!idx_req_.ordered)
+  {
+    if (preds.empty())
+      return false;
+    return resolve_series(preds, &idx_ids_);
+  }
+
+  /* The WHERE's own TAG conditions still apply to every series picked. */
+  std::vector<uint64_t> filt;
+  const bool use_filter= npushed > 0;
+  if (use_filter)
+  {
+    std::vector<const tf_tag_predicate *> w(preds.begin(),
+                                            preds.begin() + npushed);
+    if (!resolve_series(w, &filt))
+      return false;
+  }
+  const std::vector<uint64_t> *f= use_filter ? &filt : nullptr;
+  if (idx_req_.walk)
+    return walk_entry(f, idx_req_.backward);
+
+  const size_t k= def->tag_pos.size();
+  const size_t nkey= idx_req_.preds.size();
+  const idx_op op= idx_req_.op;
+  /*
+    All tags given and an equal series exists (the common case: MAX(clock) of
+    one item, a descending range): that series is the answer, no need to look
+    at any other tuple.
+  */
+  if (nkey == k && nkey > 0 &&
+      (op == idx_op::EQ || op == idx_op::GE || op == idx_op::LE))
+  {
+    if (!resolve_series(preds, &idx_ids_))
+      return false;
+    if (!idx_ids_.empty())
+    {
+      idx_req_.cur.clear();
+      for (const tf_tag_predicate &p : idx_req_.preds)
+        idx_req_.cur.push_back(p.values.empty() ? std::string() : p.values[0]);
+      idx_req_.have_cur= true;
+      return true;
+    }
+    if (op == idx_op::EQ)
+    {
+      idx_req_.have_cur= false;
+      return true;
+    }
+  }
+
+  KEY *ki= &table->key_info[idx_req_.index];
+  std::vector<const Field *> fld;
+  for (size_t p= 0; p < k; p++)
+  {
+    if (!ki->key_part || p >= ki->user_defined_key_parts ||
+        !ki->key_part[p].field)
+      return false;
+    fld.push_back(ki->key_part[p].field);
+  }
+  idx_req_.tix= tuple_index(idx_req_.index);
+  if (!idx_req_.tix)
+  {
+    last_error_= "cannot build the ordered view of the series of this index";
+    return false;
+  }
+  const tf_tuple_index &tix= *idx_req_.tix;
+  std::vector<std::string> key;
+  for (const tf_tag_predicate &p : idx_req_.preds)
+    key.push_back(p.values.empty() ? std::string() : p.values[0]);
+  /* entries with prefix < key end at lb; with prefix <= key at ub */
+  const auto lb= std::partition_point(
+      tix.entries.begin(), tix.entries.end(), [&](const tf_tuple_entry &e) {
+        return cmp_tuple_n(fld, e.tuple, key, nkey) < 0;
+      }) - tix.entries.begin();
+  const auto ub= std::partition_point(
+      tix.entries.begin(), tix.entries.end(), [&](const tf_tuple_entry &e) {
+        return cmp_tuple_n(fld, e.tuple, key, nkey) <= 0;
+      }) - tix.entries.begin();
+  const int64_t size= (int64_t) tix.entries.size();
+  int64_t entry= -1;
+  bool backward= false;
+  switch (op) {
+  case idx_op::NONE:
+    backward= idx_req_.backward;
+    entry= backward ? size - 1 : 0;
+    break;
+  case idx_op::EQ:
+    backward= idx_req_.backward;
+    entry= lb < ub ? (backward ? ub - 1 : lb) : -1;
+    break;
+  case idx_op::GE:
+    entry= lb;
+    break;
+  case idx_op::GT:
+    entry= ub;
+    break;
+  case idx_op::LE:
+    backward= true;
+    entry= ub - 1;
+    break;
+  case idx_op::LT:
+    backward= true;
+    entry= lb - 1;
+    break;
+  }
+  return pick_entry(f, entry, backward);
+}
+
+/*
+  Moves an ordered read to the neighbouring tag tuple. Tuples whose series
+  hold no visible row (expired by retention, say) are passed over.
+*/
+int ha_moosedb::advance_group(uchar *buf, bool backward)
+{
+  for (;;)
+  {
+    idx_req_.walk= true;
+    idx_req_.backward= backward;
+    if (!idx_req_.have_cur)
+      return HA_ERR_END_OF_FILE;
+    if (int rc= open_scan(idx_req_.lo, idx_req_.hi, true, true))
+      return rc;
+    if (backward)
+      if (int rc= map_status(moosedb_scan_seek_end(scan_.get())))
+        return rc;
+    if (idx_ids_.empty())
+      return HA_ERR_END_OF_FILE;
+    const int rc= read_from_scan(buf, backward, HA_ERR_END_OF_FILE);
+    if (rc != HA_ERR_END_OF_FILE)
+      return rc;
+    /* the tuple has no visible rows: series_for_index() moves on from it */
+  }
+}
+
+/* index_first / index_last of a composite index */
+int ha_moosedb::composite_ends(uchar *buf, bool last)
+{
+  const tf_index_def *def= index_def(active_index);
+  if (!def || def->simple_ts || !table || active_index >= table->s->keys)
+    return HA_ERR_INTERNAL_ERROR;
+  idx_req_= idx_request();
+  idx_req_.active= true;
+  idx_req_.index= active_index;
+  idx_req_.ordered= true;
+  idx_req_.op= idx_op::NONE;
+  idx_req_.backward= last;
+  if (int rc= open_scan(LONGLONG_MIN, LONGLONG_MAX, true, true))
+    return rc;
+  if (last)
+    if (int rc= map_status(moosedb_scan_seek_end(scan_.get())))
+      return rc;
+  if (idx_ids_.empty())
+    return HA_ERR_END_OF_FILE;
+  const int rc= read_from_scan(buf, last, HA_ERR_END_OF_FILE);
+  return rc == HA_ERR_END_OF_FILE ? advance_group(buf, last) : rc;
+}
+
+/*
+  Values of key parts [from, to) of `key` (a key image of index `idx`): the
+  integer columns that follow the time part of a UNIQUE key. Decoded by the
+  fields themselves, in a private record (the caller's buffers stay intact).
+*/
+int ha_moosedb::key_extra_values(uint idx, const uchar *key, uint from,
+                                 uint to, std::vector<longlong> *out)
+{
+  assert(table && key && out);
+  if (!table || !key || !out || !table->key_info || idx >= table->s->keys)
+    return HA_ERR_INTERNAL_ERROR;
+  KEY *ki= &table->key_info[idx];
+  if (!ki->key_part || from > to || to > ki->user_defined_key_parts)
+    return HA_ERR_INTERNAL_ERROR;
+  uint len= 0;
+  for (uint p= 0; p < to; p++)
+    len+= ki->key_part[p].store_length;
+  std::vector<uchar> scratch(table->s->rec_buff_length, 0);
+  key_restore(scratch.data(), key, ki, len);
+  const my_ptrdiff_t diff= scratch.data() - table->record[0];
+  out->clear();
+  for (uint p= from; p < to; p++)
+  {
+    Field *f= ki->key_part[p].field;
+    if (!f)
+      return HA_ERR_INTERNAL_ERROR;
+    f->move_field_offset(diff);
+    out->push_back(f->val_int());
+    f->move_field_offset(-diff);
+  }
+  return 0;
+}
+
+/* Whether the row in `rec` has the extra key columns of idx_req_.extra_vals. */
+bool ha_moosedb::extras_equal(const uchar *rec) const
+{
+  const tf_index_def *def= index_def(idx_req_.index);
+  if (!def || !table || !rec || idx_req_.index >= table->s->keys ||
+      !table->key_info)
+    return false;
+  const KEY *ki= &table->key_info[idx_req_.index];
+  const uint first= (uint) def->tag_pos.size() + 1;
+  const my_ptrdiff_t diff= rec - table->record[0];
+  bool same= true;
+  for (size_t e= 0; e < idx_req_.extra_vals.size() && same; e++)
+  {
+    if (!ki->key_part || first + e >= ki->user_defined_key_parts ||
+        !ki->key_part[first + e].field)
+      return false;
+    Field *f= ki->key_part[first + e].field;
+    f->move_field_offset(diff);
+    same= f->val_int() == idx_req_.extra_vals[e];
+    f->move_field_offset(-diff);
+  }
+  return same;
+}
+
+int ha_moosedb::composite_read(uchar *buf, const uchar *key,
+                               key_part_map map,
+                               enum ha_rkey_function find_flag)
+{
+  const tf_index_def *def= index_def(active_index);
+  if (!def || def->simple_ts || !table || !key ||
+      active_index >= table->s->keys || !table->key_info)
+    return HA_ERR_INTERNAL_ERROR;
+  KEY *ki= &table->key_info[active_index];
+  const uint k= (uint) def->tag_pos.size();
+  uint nparts= 0;
+  while (nparts < 32 && ((map >> nparts) & 1))
+    nparts++;
+  if (nparts == 0 || map != (((key_part_map) 1 << nparts) - 1) ||
+      nparts > ki->user_defined_key_parts)
+  {
+    sql_print_warning("MooseDB: %s: index read with an unsupported key part "
+                      "map 0x%llx (flag %d)",
+                      share_ ? share_->display.c_str() : "?",
+                      (unsigned long long) map, (int) find_flag);
+    return HA_ERR_WRONG_COMMAND;
+  }
+  const uint ntag= std::min(nparts, k);
+  const bool time_given= def->has_time && nparts > k;
+  /* key parts given after the time part (a UNIQUE key: ns of Zabbix) */
+  const uint nextra= time_given ? nparts - k - 1 : 0;
+  const bool all_tags= ntag == k;
+
+  idx_req_= idx_request();
+  idx_req_.active= true;
+  idx_req_.index= active_index;
+  if (int rc= key_tag_predicates(active_index, key, ntag, &idx_req_.preds))
+  {
+    idx_req_= idx_request();
+    return rc;
+  }
+  longlong ts= 0, lo= LONGLONG_MIN, hi= LONGLONG_MAX;
+  if (time_given)
+    if (int rc= key_to_ts(active_index, key, k, &ts))
+    {
+      idx_req_= idx_request();
+      return rc;
+    }
+  if (nextra > 0)
+    if (int rc= key_extra_values(active_index, key, k + 1, nparts,
+                                 &idx_req_.extra_vals))
+    {
+      idx_req_= idx_request();
+      return rc;
+    }
+  uint tag_len= 0;
+  for (uint p= 0; p < ntag; p++)
+    tag_len+= ki->key_part[p].store_length;
+  /* the range being read ends on the same tags as it starts: it is confined
+     to the series of this key */
+  const bool confined= end_range && end_range->key &&
+                       end_range->length >= tag_len &&
+                       memcmp(key, end_range->key, tag_len) == 0;
+
+  bool backward= false, ordered= false, exact= false;
+  idx_op op= idx_op::NONE;
+  if (nextra > 0 && find_flag != HA_READ_KEY_EXACT &&
+      find_flag != HA_READ_PREFIX)
+    goto unsupported;       /* only the exact lookup of a UNIQUE key names them */
+  /*
+    With the time part given, the tags are equalities of a ref / range / MIN
+    or MAX(time) read: the rows are those of the key's series. (The server
+    only asks for "the next tag tuple" with tags alone.) Tags alone with a
+    range operator can be a MIN/MAX of the TAG itself, e.g.
+    MAX(itemid) WHERE itemid <= N: then the answer is the neighbouring tuple
+    if the key's own series do not exist, an ordered read.
+  */
+  switch (find_flag) {
+  case HA_READ_KEY_EXACT:
+  case HA_READ_PREFIX:
+    exact= true;
+    if (time_given)
+      lo= hi= ts;
+    break;
+  case HA_READ_KEY_OR_NEXT:
+    if (time_given)
+      lo= ts;
+    else if (!(all_tags && confined))
+    {
+      ordered= true;
+      op= idx_op::GE;
+    }
+    break;
+  case HA_READ_AFTER_KEY:
+    if (time_given)
+    {
+      if (ts == LONGLONG_MAX)
+        goto not_found;
+      lo= ts + 1;
+    }
+    else
+    {
+      ordered= true;
+      op= idx_op::GT;
+    }
+    break;
+  case HA_READ_KEY_OR_PREV:
+  case HA_READ_PREFIX_LAST_OR_PREV:
+    backward= true;
+    if (time_given)
+      hi= ts;
+    else
+    {
+      ordered= true;
+      op= idx_op::LE;
+    }
+    break;
+  case HA_READ_BEFORE_KEY:
+    backward= true;
+    if (time_given)
+    {
+      if (ts == LONGLONG_MIN)
+        goto not_found;
+      hi= ts - 1;
+    }
+    else
+    {
+      ordered= true;
+      op= idx_op::LT;
+    }
+    break;
+  case HA_READ_PREFIX_LAST:
+    backward= true;
+    if (time_given)
+      lo= hi= ts;
+    else if (!all_tags)
+    {
+      ordered= true;
+      op= idx_op::EQ;
+    }
+    break;
+  default:
+    goto unsupported;
+  }
+  /*
+    A forward range read knows where it ends (end_range): when it ends on the
+    same tags, its time bound tightens the merge. The server re-checks the
+    bound, so inclusive is always a safe superset.
+  */
+  if (!backward && !ordered && all_tags && def->has_time && confined &&
+      end_range->length > tag_len)
+  {
+    longlong end_ts;
+    if (int rc= key_to_ts(active_index, end_range->key, k, &end_ts))
+    {
+      idx_req_= idx_request();
+      return rc;
+    }
+    hi= std::min(hi, end_ts);
+  }
+  idx_req_.ordered= ordered;
+  idx_req_.exact= exact && nextra == 0;
+  idx_req_.op= op;
+  idx_req_.backward= backward;
+  idx_req_.lo= lo;
+  idx_req_.hi= hi;
+  {
+    if (int rc= open_scan(lo, hi, true, true))
+      return rc;
+    if (idx_ids_.empty() && ordered)
+      return HA_ERR_KEY_NOT_FOUND;
+    if (backward)
+      if (int rc= map_status(moosedb_scan_seek_end(scan_.get())))
+        return rc;
+    int rc= read_from_scan(buf, backward, HA_ERR_KEY_NOT_FOUND);
+    /* exact lookup of a full UNIQUE key: the rows of that time, filtered by the extra columns */
+    while (rc == 0 && !idx_req_.extra_vals.empty() && !extras_equal(buf))
+      rc= read_from_scan(buf, backward, HA_ERR_KEY_NOT_FOUND);
+    if (ordered && rc == HA_ERR_KEY_NOT_FOUND)
+    {
+      /* series without visible rows: the next tuple in that direction */
+      const int r2= advance_group(buf, backward);
+      return r2 == HA_ERR_END_OF_FILE ? HA_ERR_KEY_NOT_FOUND : r2;
+    }
+    return rc;
+  }
+unsupported:
+  sql_print_warning("MooseDB: %s: unsupported index read (key part map 0x%llx, "
+                    "flag %d)",
+                    share_ ? share_->display.c_str() : "?",
+                    (unsigned long long) map, (int) find_flag);
+  idx_req_= idx_request();
+  return HA_ERR_WRONG_COMMAND;
+not_found:
+  idx_req_= idx_request();
+  return HA_ERR_KEY_NOT_FOUND;
 }
 
 int ha_moosedb::index_read_map(uchar *buf, const uchar *key,
@@ -1932,8 +3810,16 @@ int ha_moosedb::index_read_map(uchar *buf, const uchar *key,
 
   if (!table || active_index >= table->s->keys)
     DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
+  const tf_index_def *def= index_def(active_index);
+  if (!def)
+    DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
+  /* HA_WHOLE_KEY (const / eq_ref lookups, ODKU and REPLACE) = every part */
+  if (keypart_map == HA_WHOLE_KEY && table->key_info)
+    keypart_map= ((key_part_map) 1 << table->key_info[active_index].user_defined_key_parts) - 1;
+  if (!def->simple_ts)
+    DBUG_RETURN(composite_read(buf, key, keypart_map, find_flag));
   longlong ts;
-  if (int error= key_to_ts(active_index, key, &ts))
+  if (int error= key_to_ts(active_index, key, 0, &ts))
     DBUG_RETURN(error);
   longlong lo= LONGLONG_MIN, hi= LONGLONG_MAX;
   bool backward= false;
@@ -1968,7 +3854,7 @@ int ha_moosedb::index_read_map(uchar *buf, const uchar *key,
   if (!backward && end_range && end_range->key)
   {
     longlong end_ts;
-    if (int error= key_to_ts(active_index, end_range->key, &end_ts))
+    if (int error= key_to_ts(active_index, end_range->key, 0, &end_ts))
       DBUG_RETURN(error);
     hi= std::min(hi, end_ts);
   }
@@ -1978,18 +3864,44 @@ int ha_moosedb::index_read_map(uchar *buf, const uchar *key,
 int ha_moosedb::index_next(uchar *buf)
 {
   DBUG_ENTER("ha_moosedb::index_next");
-  DBUG_RETURN(read_from_scan(buf, false, HA_ERR_END_OF_FILE));
+  const int rc= read_from_scan(buf, false, HA_ERR_END_OF_FILE);
+  if (rc == HA_ERR_END_OF_FILE && idx_req_.active && idx_req_.ordered)
+    DBUG_RETURN(advance_group(buf, false));
+  DBUG_RETURN(rc);
+}
+
+/*
+  The rows of a KEY_EXACT read on a composite index are the rows of the series
+  whose tags equal the key (under the column collation), at the key's time:
+  there is nothing left to compare. The generic version would re-compare the
+  key parts of every row it returns (correctly, but at a cost comparable to
+  decoding the row itself).
+*/
+int ha_moosedb::index_next_same(uchar *buf, const uchar *key, uint keylen)
+{
+  DBUG_ENTER("ha_moosedb::index_next_same");
+  const tf_index_def *def= index_def(active_index);
+  if (def && !def->simple_ts && idx_req_.active && idx_req_.exact &&
+      !idx_req_.ordered)
+    DBUG_RETURN(index_next(buf));
+  DBUG_RETURN(handler::index_next_same(buf, key, keylen));
 }
 
 int ha_moosedb::index_prev(uchar *buf)
 {
   DBUG_ENTER("ha_moosedb::index_prev");
-  DBUG_RETURN(read_from_scan(buf, true, HA_ERR_END_OF_FILE));
+  const int rc= read_from_scan(buf, true, HA_ERR_END_OF_FILE);
+  if (rc == HA_ERR_END_OF_FILE && idx_req_.active && idx_req_.ordered)
+    DBUG_RETURN(advance_group(buf, true));
+  DBUG_RETURN(rc);
 }
 
 int ha_moosedb::index_first(uchar *buf)
 {
   DBUG_ENTER("ha_moosedb::index_first");
+  const tf_index_def *def= index_def(active_index);
+  if (def && !def->simple_ts)
+    DBUG_RETURN(composite_ends(buf, false));
   DBUG_RETURN(open_range_scan(LONGLONG_MIN, LONGLONG_MAX, false, buf,
                               HA_ERR_END_OF_FILE));
 }
@@ -1997,15 +3909,67 @@ int ha_moosedb::index_first(uchar *buf)
 int ha_moosedb::index_last(uchar *buf)
 {
   DBUG_ENTER("ha_moosedb::index_last");
+  const tf_index_def *def= index_def(active_index);
+  if (def && !def->simple_ts)
+    DBUG_RETURN(composite_ends(buf, true));
   DBUG_RETURN(open_range_scan(LONGLONG_MIN, LONGLONG_MAX, true, buf,
                               HA_ERR_END_OF_FILE));
 }
 
 /* ── Statistics ───────────────────────────────────────────────────────── */
 
+/*
+  What the optimizer may assume about index order (see composite_read()).
+  Called on an unopened handler too (TABLE_SHARE setup), so it reads only the
+  key definition: a TAG part is a tag, the one non-TAG part is the time.
+
+    time part        next/prev, ordered, range    (rows of fixed tags come in
+                                                   time order, either way)
+    TAG part         next/prev, and ORDER only for single-part queries
+                     (all_parts == 0, which is what MIN/MAX(col) asks and is
+                     served by the ordered reads); with all_parts == 1 -- the
+                     question behind ORDER BY / GROUP BY on the key prefix --
+                     no order: rows of different tag values are not returned
+                     in tag order unless an ordered read was requested.
+                     No HA_READ_RANGE: only equalities (=, IN, <=>) are
+                     turned into key ranges on a TAG part.
+*/
+ulong ha_moosedb::index_flags(uint idx, uint part, bool all_parts) const
+{
+  constexpr ulong TIME= HA_READ_NEXT | HA_READ_PREV | HA_READ_ORDER |
+                        HA_READ_RANGE;
+  const TABLE_SHARE *s= table_share;
+  if (!s || !s->key_info || idx >= s->keys)
+    return TIME;
+  const KEY &key= s->key_info[idx];
+  if (!key.key_part || part >= key.user_defined_key_parts)
+    return 0;
+  const Field *f= key.key_part[part].field;
+  if (!f)
+    return 0;
+  /*
+    A part after the time column (UNIQUE key, e.g. ns): within one timestamp
+    the scans return rows ordered by it (the core sorts timestamp ties by the
+    key's extra columns), so ORDER BY clock DESC, ns DESC LIMIT 1 needs no
+    sort. No HA_READ_RANGE: only equalities become key ranges on it.
+  */
+  for (uint q= 0; q < part; q++)
+  {
+    const Field *g= key.key_part[q].field;
+    if (g && !is_tag_comment(g->comment))
+      return HA_READ_NEXT | HA_READ_PREV | HA_READ_ORDER;
+  }
+  if (!is_tag_comment(f->comment))
+    return TIME;
+  return all_parts ? (HA_READ_NEXT | HA_READ_PREV)
+                   : (HA_READ_NEXT | HA_READ_PREV | HA_READ_ORDER);
+}
+
 int ha_moosedb::info(uint flag)
 {
   DBUG_ENTER("ha_moosedb::info");
+  if (flag & HA_STATUS_ERRKEY)
+    errkey= dup_key_;   /* the key of the last HA_ERR_FOUND_DUPP_KEY */
   if (!share_ || !share_->table)
     DBUG_RETURN(0);
   if (flag & (HA_STATUS_VARIABLE | HA_STATUS_CONST))
@@ -2021,41 +3985,275 @@ int ha_moosedb::info(uint flag)
     stats.data_file_length= compressed;
     stats.index_file_length= 0;
     stats.mean_rec_length= rows ? (ulong) (data / rows) : 0;
+    update_rec_per_key(rows);
   }
   DBUG_RETURN(0);
+}
+
+/*
+  KEY::rec_per_key of the composite indexes: average rows per key prefix.
+  A series holds at most one row per timestamp in practice, so:
+    prefix of j tags : rows / distinct tuples of those tags, where distinct is
+                       min(series, product of the per-tag distinct values)
+    the time part    : series per full tag tuple (rows per (tags, time))
+  The cardinalities come from the TAG cache (one entry per value, kept in
+  step with the series list), recomputed only when the series version moves.
+*/
+void ha_moosedb::update_rec_per_key(uint64_t rows)
+{
+  if (!table || !table->s || !table->key_info || !share_ || !share_->table)
+    return;
+  const tf_layout &l= share_->layout;
+  bool any= false;
+  for (const tf_index_def &d : l.indexes)
+    any|= !d.simple_ts && !d.tag_pos.empty();
+  if (!any)
+    return;
+
+  std::vector<CHARSET_INFO *> tag_cs;
+  for (const tf_column &c : l.columns)
+    if (c.conv == tf_conv::TAG)
+    {
+      if (c.field_index >= table->s->fields || !table->field[c.field_index])
+        return;
+      tag_cs.push_back(is_int_tag_field(table->field[c.field_index])
+                         ? &my_charset_bin
+                         : table->field[c.field_index]->charset());
+    }
+
+  tf_index_stats &st= share_->index_stats;
+  std::lock_guard<std::mutex> guard(st.mutex);
+  uint64_t cur= 0;
+  if (moosedb_series_version(share_->table.get(), &cur) != TF_OK)
+  {
+    take_last_error();
+    return;
+  }
+  if (!st.valid || st.version != cur)
+  {
+    st.valid= false;
+    st.distinct.clear();
+    std::vector<tf_tag_predicate> wanted;
+    for (const tf_index_def &d : l.indexes)
+      if (!d.simple_ts)
+        for (const int pos : d.tag_pos)
+          if (pos >= 0 && (size_t) pos < tag_cs.size())
+            wanted.push_back({pos, tag_cs[pos], {}});
+    std::vector<const tf_tag_predicate *> preds;
+    for (const tf_tag_predicate &p : wanted)
+      preds.push_back(&p);
+    /* Builds/extends the cache index of every wanted column; no values:
+       the (empty) answer is not used. */
+    std::vector<uint64_t> unused;
+    if (!pushed_series_cached(preds, tag_cs, &unused))
+      return;                        /* too big to index: leave the estimates */
+    tf_tag_cache &cache= share_->tag_cache;
+    std::lock_guard<std::mutex> cg(cache.mutex);
+    if (!cache.valid)
+      return;
+    st.series= cache.len;
+    for (const tf_tag_predicate &p : wanted)
+    {
+      const auto it= cache.indexes.find({p.tag_pos, (const CHARSET_INFO *) p.cs});
+      if (it == cache.indexes.end())
+        return;
+      st.distinct[{p.tag_pos, (const CHARSET_INFO *) p.cs}]=
+          it->second.groups.size();
+    }
+    st.version= cur;
+    st.epoch= cache.epoch;
+    st.valid= true;
+  }
+  if (st.series == 0)
+    return;
+  for (uint idx= 0; idx < l.indexes.size() && idx < table->s->keys; idx++)
+  {
+    const tf_index_def &d= l.indexes[idx];
+    KEY &ki= table->key_info[idx];
+    if (d.simple_ts || !ki.rec_per_key)
+      continue;
+    double distinct= 1;
+    for (uint p= 0; p < ki.user_defined_key_parts && p < ki.ext_key_parts; p++)
+    {
+      double rpk;
+      if (p < d.tag_pos.size())
+      {
+        const int pos= d.tag_pos[p];
+        if (pos < 0 || (size_t) pos >= tag_cs.size())
+          break;
+        const auto it= st.distinct.find({pos, (const CHARSET_INFO *) tag_cs[pos]});
+        if (it == st.distinct.end())
+          break;
+        distinct= std::min<double>((double) st.series,
+                                   distinct * (double) std::max<uint64_t>(it->second, 1));
+        rpk= (double) rows / distinct;
+      }
+      else if (p == d.tag_pos.size())
+        /* the time part; the last part of a UNIQUE key is one row per value */
+        rpk= (ki.flags & HA_NOSAME) && p + 1 == ki.user_defined_key_parts
+               ? 1.0 : (double) st.series / distinct;
+      else
+        rpk= 1.0;                               /* extra UNIQUE columns */
+      ki.rec_per_key[p]= (ulong) std::max<double>(1.0, std::min(rpk, 4.0e9));
+    }
+  }
+}
+
+/*
+  Series matching TAG equalities, and how many the table has. false when the
+  matching could not be resolved.
+*/
+bool ha_moosedb::estimate_series(const std::vector<tf_tag_predicate> &preds,
+                                 uint64_t *matched, uint64_t *total)
+{
+  std::vector<const tf_tag_predicate *> pv;
+  for (const tf_tag_predicate &p : preds)
+    pv.push_back(&p);
+  std::vector<uint64_t> ids;
+  if (!resolve_series(pv, &ids))
+    return false;
+  /*
+    The series count: the TAG cache that just answered knows it (O(1)). Only
+    when it is not valid (past its limits) is the list asked, which is an
+    Arc clone plus its length -- no walk over the series either way.
+  */
+  {
+    tf_tag_cache &cache= share_->tag_cache;
+    std::lock_guard<std::mutex> guard(cache.mutex);
+    if (cache.valid)
+    {
+      *total= cache.len;
+      *matched= ids.size();
+      return true;
+    }
+  }
+  MooseDBSeriesList *list= nullptr;
+  if (moosedb_series_list(share_->table.get(), &list) != TF_OK)
+  {
+    take_last_error();
+    return false;
+  }
+  *total= moosedb_series_list_len(list);
+  moosedb_series_list_close(list);
+  *matched= ids.size();
+  return true;
 }
 
 ha_rows ha_moosedb::records_in_range(uint inx, const key_range *min_key,
                                       const key_range *max_key, page_range *)
 {
   DBUG_ENTER("ha_moosedb::records_in_range");
-  if (!table || !share_ || !share_->table || inx >= table->s->keys)
+  if (!table || !share_ || !share_->table || inx >= table->s->keys ||
+      !table->key_info)
     DBUG_RETURN(HA_POS_ERROR);
   if ((min_key && !min_key->key) || (max_key && !max_key->key))
     DBUG_RETURN(HA_POS_ERROR);
+  const tf_index_def *def= index_def(inx);
+  if (!def)
+    DBUG_RETURN(HA_POS_ERROR);
+  /* an equality on every part of the UNIQUE key matches at most one row */
+  {
+    const KEY &uk= table->key_info[inx];
+    if ((uk.flags & HA_NOSAME) && min_key && max_key &&
+        min_key->flag == HA_READ_KEY_EXACT &&
+        max_key->flag == HA_READ_AFTER_KEY &&
+        min_key->length == uk.key_length && max_key->length == uk.key_length)
+      DBUG_RETURN(1);
+  }
   longlong lo= LONGLONG_MIN, hi= LONGLONG_MAX;
-  if (min_key)
+
+  if (def->simple_ts)
   {
-    if (key_to_ts(inx, min_key->key, &lo))
+    if (min_key)
+    {
+      if (key_to_ts(inx, min_key->key, 0, &lo))
+        DBUG_RETURN(HA_POS_ERROR);
+      if (min_key->flag == HA_READ_AFTER_KEY && lo < LONGLONG_MAX)
+        lo++;
+    }
+    if (max_key)
+    {
+      if (key_to_ts(inx, max_key->key, 0, &hi))
+        DBUG_RETURN(HA_POS_ERROR);
+      if (max_key->flag == HA_READ_BEFORE_KEY && hi > LONGLONG_MIN)
+        hi--;
+    }
+    uint64_t rows= 0;
+    if (moosedb_estimate_rows(share_->table.get(), lo, hi, &rows) != TF_OK)
+    {
+      take_last_error();
       DBUG_RETURN(HA_POS_ERROR);
-    if (min_key->flag == HA_READ_AFTER_KEY && lo < LONGLONG_MAX)
-      lo++;
+    }
+    /* Never 0: the optimizer would treat the range as provably empty. */
+    DBUG_RETURN((ha_rows) std::max<uint64_t>(rows, 1));
   }
-  if (max_key)
+
+  /*
+    Composite index. The range is "these tags, this time window": the rows
+    of the window, scaled by the share of series the tags select. Series are
+    assumed to hold similar amounts of data (no per-series row counts exist).
+  */
+  KEY *ki= &table->key_info[inx];
+  if (!ki->key_part)
+    DBUG_RETURN(HA_POS_ERROR);
+  const uint k= (uint) def->tag_pos.size();
+  const auto parts_of= [ki](const key_range *kr) -> uint {
+    if (!kr || !kr->key)
+      return 0;
+    uint acc= 0, n= 0;
+    while (n < ki->user_defined_key_parts && acc < kr->length)
+      acc+= ki->key_part[n++].store_length;
+    return n;
+  };
+  const uint nmin= parts_of(min_key), nmax= parts_of(max_key);
+  const key_range *src= nmin >= nmax ? min_key : max_key;
+  const uint nsrc= std::max(nmin, nmax);
+  if (nmin > 0 && nmax > 0)
   {
-    if (key_to_ts(inx, max_key->key, &hi))
+    /* both ends must name the same tags, else this is a range over tags */
+    uint len= 0;
+    for (uint p= 0; p < std::min(std::min(nmin, nmax), k); p++)
+      len+= ki->key_part[p].store_length;
+    if (memcmp(min_key->key, max_key->key, len) != 0)
       DBUG_RETURN(HA_POS_ERROR);
-    if (max_key->flag == HA_READ_BEFORE_KEY && hi > LONGLONG_MIN)
-      hi--;
   }
-  uint64_t rows= 0;
-  if (moosedb_estimate_rows(share_->table.get(), lo, hi, &rows) != TF_OK)
+  if (def->has_time)
+  {
+    if (nmin > k)
+    {
+      if (key_to_ts(inx, min_key->key, k, &lo))
+        DBUG_RETURN(HA_POS_ERROR);
+      if (min_key->flag == HA_READ_AFTER_KEY && lo < LONGLONG_MAX)
+        lo++;
+    }
+    if (nmax > k)
+    {
+      if (key_to_ts(inx, max_key->key, k, &hi))
+        DBUG_RETURN(HA_POS_ERROR);
+      if (max_key->flag == HA_READ_BEFORE_KEY && hi > LONGLONG_MIN)
+        hi--;
+    }
+  }
+  uint64_t window= 0;
+  if (moosedb_estimate_rows(share_->table.get(), lo, hi, &window) != TF_OK)
   {
     take_last_error();
     DBUG_RETURN(HA_POS_ERROR);
   }
+  uint64_t matched= 0, total= 0;
+  const uint ntag= std::min(nsrc, k);
+  if (ntag > 0)
+  {
+    std::vector<tf_tag_predicate> preds;
+    if (key_tag_predicates(inx, src->key, ntag, &preds) ||
+        !estimate_series(preds, &matched, &total))
+      DBUG_RETURN(HA_POS_ERROR);
+    if (total > 0)
+      window= (uint64_t) std::ceil((double) window * (double) matched /
+                                   (double) total);
+  }
   /* Never 0: the optimizer would treat the range as provably empty. */
-  DBUG_RETURN((ha_rows) std::max<uint64_t>(rows, 1));
+  DBUG_RETURN((ha_rows) std::max<uint64_t>(window, 1));
 }
 
 /* ── INFORMATION_SCHEMA ───────────────────────────────────────────────── */

@@ -1,0 +1,266 @@
+#
+# Projected / batched reads: every query shape is run against the MooseDB
+# table and a MyISAM oracle holding the same rows, in three phases (memtable,
+# after FLUSH, after OPTIMIZE). Each query yields exactly 3 columns; the
+# procedure materializes both results in order and reports the row count and
+# the number of mismatching (position, values) tuples, which must be 0.
+#
+--source include/not_embedded.inc
+--source include/have_sequence.inc
+--source suite/moosedb/include/have_moosedb.inc
+
+call mtr.add_suppression("MooseDB");
+call mtr.add_suppression("marked as crashed");
+call mtr.add_suppression("Checking table");
+call mtr.add_suppression("Got error");
+let MYSQLD_DATADIR= `SELECT @@datadir`;
+
+CREATE TABLE m (
+    ts     DATETIME(6) NOT NULL,
+    host   VARCHAR(16) NOT NULL COMMENT 'TAG',
+    region VARCHAR(16) COMMENT 'TAG',
+    k      INT NOT NULL,
+    v      DOUBLE,
+    d      DECIMAL(12,3),
+    note   VARCHAR(40),
+    doc    TEXT,
+    INDEX(ts)
+) ENGINE=MooseDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE o (
+    ts     DATETIME(6) NOT NULL,
+    host   VARCHAR(16) NOT NULL,
+    region VARCHAR(16),
+    k      INT NOT NULL,
+    v      DOUBLE,
+    d      DECIMAL(12,3),
+    note   VARCHAR(40),
+    doc    TEXT,
+    INDEX(ts)
+) ENGINE=MyISAM DEFAULT CHARSET=utf8mb4;
+
+# 3000 rows, unique ts, one minute apart (spans several days), 5 hosts,
+# NULLs in region/v/d/note
+INSERT INTO m
+SELECT '2026-01-01 00:00:00.000123' + INTERVAL seq MINUTE,
+       ELT(1 + seq MOD 5, 'h1', 'h2', 'h3', 'h4', 'h5'),
+       IF(seq MOD 7 = 0, NULL, ELT(1 + seq MOD 3, 'east', 'west', 'north')),
+       seq,
+       IF(seq MOD 11 = 0, NULL, seq * 1.5),
+       IF(seq MOD 13 = 0, NULL, seq / 8),
+       IF(seq MOD 9 = 0, NULL, CONCAT('n', seq MOD 100)),
+       CONCAT('doc-', seq, REPEAT('x', seq MOD 50))
+  FROM seq_0_to_2999;
+INSERT INTO o SELECT * FROM m;
+
+--delimiter |
+CREATE PROCEDURE cmp(IN q TEXT)
+BEGIN
+  DECLARE nm, no, bad BIGINT;
+  DROP TEMPORARY TABLE IF EXISTS rm;
+  DROP TEMPORARY TABLE IF EXISTS ro;
+  CREATE TEMPORARY TABLE rm (rn INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+                             c1 TEXT, c2 TEXT, c3 TEXT) ENGINE=MyISAM;
+  CREATE TEMPORARY TABLE ro LIKE rm;
+  SET @q1= CONCAT('INSERT INTO rm (c1,c2,c3) ', REPLACE(q, '@T', 'm'));
+  SET @q2= CONCAT('INSERT INTO ro (c1,c2,c3) ', REPLACE(q, '@T', 'o'));
+  PREPARE s1 FROM @q1;
+  EXECUTE s1;
+  DEALLOCATE PREPARE s1;
+  PREPARE s2 FROM @q2;
+  EXECUTE s2;
+  DEALLOCATE PREPARE s2;
+  SELECT COUNT(*) INTO nm FROM rm;
+  SELECT COUNT(*) INTO no FROM ro;
+  SELECT COUNT(*) INTO bad FROM (
+    (SELECT * FROM rm EXCEPT ALL SELECT * FROM ro) UNION ALL
+    (SELECT * FROM ro EXCEPT ALL SELECT * FROM rm)) x;
+  SELECT nm AS rows_moosedb, no AS rows_oracle, bad AS mismatches;
+END|
+
+CREATE PROCEDURE run_all()
+BEGIN
+  SELECT 'only k' AS q;
+  CALL cmp('SELECT k, NULL, NULL FROM @T ORDER BY k');
+  SELECT 'count(*)' AS q;
+  CALL cmp('SELECT COUNT(*), NULL, NULL FROM @T');
+  SELECT 'only ts (min/max/count)' AS q;
+  CALL cmp('SELECT COUNT(ts), MIN(ts), MAX(ts) FROM @T');
+  SELECT 'only ts ordered' AS q;
+  CALL cmp('SELECT ts, NULL, NULL FROM @T ORDER BY ts');
+  SELECT 'only TAG, group by' AS q;
+  CALL cmp('SELECT host, COUNT(*), NULL FROM @T GROUP BY host ORDER BY host');
+  SELECT 'only TAG nullable' AS q;
+  CALL cmp('SELECT region, COUNT(*), SUM(k) FROM @T GROUP BY region ORDER BY region');
+  SELECT 'two TAGs + one value' AS q;
+  CALL cmp('SELECT host, region, SUM(v) FROM @T GROUP BY host, region ORDER BY host, region');
+  SELECT 'where on unprojected value/note' AS q;
+  CALL cmp('SELECT k, NULL, NULL FROM @T WHERE v > 3000 AND note LIKE \'n1%\' ORDER BY k');
+  SELECT 'where on unprojected TAG' AS q;
+  CALL cmp('SELECT k, v, NULL FROM @T WHERE host = \'h2\' AND region IS NULL ORDER BY k');
+  SELECT 'where on decimal, project ts' AS q;
+  CALL cmp('SELECT ts, NULL, NULL FROM @T WHERE d BETWEEN 100 AND 110 ORDER BY ts');
+  SELECT 'ts range, project note' AS q;
+  CALL cmp('SELECT note, k, NULL FROM @T WHERE ts >= \'2026-01-02 03:00:00\' AND ts < \'2026-01-02 09:30:00\' ORDER BY ts');
+  SELECT 'ts range only count' AS q;
+  CALL cmp('SELECT COUNT(*), NULL, NULL FROM @T WHERE ts >= \'2026-01-03\' AND ts < \'2026-01-04\'');
+  SELECT 'order by ts desc limit (index_last + index_prev)' AS q;
+  CALL cmp('SELECT k, NULL, NULL FROM @T ORDER BY ts DESC LIMIT 25');
+  SELECT 'order by ts desc, large limit across batches' AS q;
+  CALL cmp('SELECT k, v, NULL FROM @T ORDER BY ts DESC LIMIT 2500');
+  SELECT 'order by ts desc limit offset' AS q;
+  CALL cmp('SELECT k, ts, NULL FROM @T ORDER BY ts DESC LIMIT 7 OFFSET 1500');
+  SELECT 'ts range desc' AS q;
+  CALL cmp('SELECT k, NULL, NULL FROM @T WHERE ts < \'2026-01-02 12:00:00\' ORDER BY ts DESC LIMIT 40');
+  SELECT 'ts <= key desc project note' AS q;
+  CALL cmp('SELECT note, NULL, NULL FROM @T WHERE ts <= \'2026-01-01 10:00:00.000123\' ORDER BY ts DESC');
+  SELECT 'order by ts asc limit' AS q;
+  CALL cmp('SELECT k, region, NULL FROM @T ORDER BY ts LIMIT 100');
+  SELECT 'max/min ts' AS q;
+  CALL cmp('SELECT MAX(ts), MIN(ts), NULL FROM @T');
+  SELECT 'order by non-index value limit' AS q;
+  CALL cmp('SELECT k, v, NULL FROM @T ORDER BY v DESC, k LIMIT 30');
+  SET SESSION max_length_for_sort_data= 4;
+  SELECT 'filesort with TEXT (rowid sort, rnd_pos)' AS q;
+  CALL cmp('SELECT k, doc, note FROM @T ORDER BY note DESC, k LIMIT 200');
+  SELECT 'filesort with TEXT, everything' AS q;
+  CALL cmp('SELECT CONCAT(k,doc), host, region FROM @T ORDER BY host, region, k');
+  SET SESSION max_length_for_sort_data= DEFAULT;
+  SELECT 'self join' AS q;
+  CALL cmp('SELECT a.k, b.k, a.host FROM @T a JOIN @T b ON a.k = b.k + 1 WHERE a.v > 4000 ORDER BY a.k');
+  SELECT 'self join on TAG, outer' AS q;
+  CALL cmp('SELECT a.k, b.k, b.note FROM @T a LEFT JOIN @T b ON b.k = a.k * 1000 WHERE a.k < 6 ORDER BY a.k');
+  SELECT 'subquery' AS q;
+  CALL cmp('SELECT k, NULL, NULL FROM @T WHERE v > (SELECT AVG(v) FROM @T) AND k MOD 97 = 0 ORDER BY k');
+  SELECT 'distinct' AS q;
+  CALL cmp('SELECT DISTINCT host, region, NULL FROM @T ORDER BY host, region');
+  SELECT 'window' AS q;
+  CALL cmp('SELECT k, SUM(v) OVER (PARTITION BY host ORDER BY ts ROWS 2 PRECEDING), NULL FROM @T WHERE k < 50 ORDER BY k');
+  SELECT 'all columns' AS q;
+  CALL cmp('SELECT CONCAT_WS(\'|\', ts, host, region, k, v), CONCAT_WS(\'|\', d, note), doc FROM @T ORDER BY ts');
+END|
+--delimiter ;
+
+--echo # ==== Phase 1: memtable
+CALL run_all();
+
+--echo # ==== Phase 2: after FLUSH
+FLUSH TABLES m;
+CALL run_all();
+
+--echo # ==== Phase 3: after OPTIMIZE (data + a second memtable batch beforehand)
+INSERT INTO m SELECT '2026-02-01 00:00:00.000123' + INTERVAL seq MINUTE,
+       ELT(1 + seq MOD 5, 'h1', 'h2', 'h3', 'h4', 'h5'),
+       IF(seq MOD 7 = 0, NULL, ELT(1 + seq MOD 3, 'east', 'west', 'north')),
+       seq + 3000, seq * 0.5, seq / 4, CONCAT('m', seq), CONCAT('d', seq)
+  FROM seq_0_to_499;
+INSERT INTO o SELECT * FROM m WHERE ts >= '2026-02-01';
+--disable_result_log
+OPTIMIZE TABLE m;
+--enable_result_log
+CALL run_all();
+
+--echo # ==== Phase 4: statement shapes (views, functions, triggers, CTAS, ...)
+CREATE VIEW vm AS SELECT k, host, note, ts FROM m WHERE v IS NOT NULL;
+CREATE VIEW vo AS SELECT k, host, note, ts FROM o WHERE v IS NOT NULL;
+CREATE FUNCTION fm(x INT) RETURNS DOUBLE READS SQL DATA RETURN (SELECT v FROM m WHERE k = x);
+CREATE FUNCTION fo(x INT) RETURNS DOUBLE READS SQL DATA RETURN (SELECT v FROM o WHERE k = x);
+
+--echo # view over the table (project one column, filter on another)
+CALL cmp('SELECT note, NULL, NULL FROM v@T WHERE host = \'h3\' AND k < 400 ORDER BY k');
+CALL cmp('SELECT COUNT(*), MAX(ts), NULL FROM v@T');
+--echo # stored function that SELECTs from the table inside a query
+CALL cmp('SELECT k, ROUND(f@T(k), 3), NULL FROM @T WHERE k < 40 ORDER BY k');
+CALL cmp('SELECT k, NULL, NULL FROM @T WHERE ROUND(f@T(k + 1), 2) > 100 AND k < 200 ORDER BY k');
+
+--echo # triggers (BEFORE and AFTER INSERT) on the target of INSERT..SELECT
+CREATE TABLE tgm (k INT, note VARCHAR(41)) ENGINE=MyISAM;
+CREATE TABLE tgo LIKE tgm;
+CREATE TABLE audm (n INT) ENGINE=MyISAM;
+CREATE TABLE audo LIKE audm;
+CREATE TRIGGER tbm BEFORE INSERT ON tgm FOR EACH ROW SET NEW.note= CONCAT('b:', IFNULL(NEW.note, '~'));
+CREATE TRIGGER tbo BEFORE INSERT ON tgo FOR EACH ROW SET NEW.note= CONCAT('b:', IFNULL(NEW.note, '~'));
+CREATE TRIGGER tam AFTER INSERT ON tgm FOR EACH ROW INSERT INTO audm VALUES (NEW.k MOD 10);
+CREATE TRIGGER tao AFTER INSERT ON tgo FOR EACH ROW INSERT INTO audo VALUES (NEW.k MOD 10);
+INSERT INTO tgm SELECT k, note FROM m WHERE k < 150;
+INSERT INTO tgo SELECT k, note FROM o WHERE k < 150;
+SELECT (SELECT COUNT(*) FROM tgm) AS rows_moosedb, (SELECT COUNT(*) FROM tgo) AS rows_oracle,
+       (SELECT COUNT(*) FROM ((SELECT * FROM tgm EXCEPT ALL SELECT * FROM tgo) UNION ALL
+                              (SELECT * FROM tgo EXCEPT ALL SELECT * FROM tgm)) x) AS mismatches,
+       (SELECT SUM(n) FROM audm) AS audit_moosedb, (SELECT SUM(n) FROM audo) AS audit_oracle;
+DROP TABLE tgm, tgo, audm, audo;
+
+--echo # CREATE..SELECT and REPLACE..SELECT read the whole row
+CREATE TABLE c1 ENGINE=MyISAM SELECT k, host, v, ts FROM m WHERE k < 200;
+CREATE TABLE c2 ENGINE=MyISAM SELECT k, host, v, ts FROM o WHERE k < 200;
+CREATE TABLE r1 (k INT PRIMARY KEY, note VARCHAR(40), host VARCHAR(16)) ENGINE=MyISAM;
+CREATE TABLE r2 LIKE r1;
+INSERT INTO r1 VALUES (5, 'old', 'x'), (500, 'keep', 'y');
+INSERT INTO r2 VALUES (5, 'old', 'x'), (500, 'keep', 'y');
+REPLACE INTO r1 SELECT k, note, host FROM m WHERE k < 300;
+REPLACE INTO r2 SELECT k, note, host FROM o WHERE k < 300;
+SELECT (SELECT COUNT(*) FROM c1) AS ctas_rows, (SELECT COUNT(*) FROM c2) AS ctas_oracle,
+       (SELECT COUNT(*) FROM ((SELECT * FROM c1 EXCEPT ALL SELECT * FROM c2) UNION ALL
+                              (SELECT * FROM c2 EXCEPT ALL SELECT * FROM c1)) x) AS ctas_mismatch,
+       (SELECT COUNT(*) FROM r1) AS repl_rows, (SELECT COUNT(*) FROM r2) AS repl_oracle,
+       (SELECT COUNT(*) FROM ((SELECT * FROM r1 EXCEPT ALL SELECT * FROM r2) UNION ALL
+                              (SELECT * FROM r2 EXCEPT ALL SELECT * FROM r1)) x) AS repl_mismatch;
+DROP TABLE c1, c2, r1, r2;
+
+--echo # LOCK TABLES
+LOCK TABLES m READ, o READ;
+CALL cmp('SELECT k, NULL, NULL FROM @T WHERE note IS NULL ORDER BY ts DESC LIMIT 60');
+CALL cmp('SELECT host, COUNT(*), MAX(k) FROM @T GROUP BY host ORDER BY host');
+UNLOCK TABLES;
+
+--echo # prepared statements re-executed
+--delimiter |
+CREATE PROCEDURE prep_loop()
+BEGIN
+  DECLARE i INT DEFAULT 0;
+  DECLARE bad INT DEFAULT 0;
+  PREPARE pm FROM 'SELECT COUNT(*), SUM(k), MAX(ts) INTO @a1, @a2, @a3 FROM m WHERE host = ? AND k > ?';
+  PREPARE po FROM 'SELECT COUNT(*), SUM(k), MAX(ts) INTO @b1, @b2, @b3 FROM o WHERE host = ? AND k > ?';
+  WHILE i < 12 DO
+    SET @h= CONCAT('h', 1 + i MOD 5), @kk= i * 200;
+    EXECUTE pm USING @h, @kk;
+    EXECUTE po USING @h, @kk;
+    IF NOT (@a1 <=> @b1 AND @a2 <=> @b2 AND @a3 <=> @b3) THEN SET bad= bad + 1; END IF;
+    SET i= i + 1;
+  END WHILE;
+  DEALLOCATE PREPARE pm;
+  DEALLOCATE PREPARE po;
+  SELECT i AS executions, bad AS mismatches;
+END|
+--delimiter ;
+CALL prep_loop();
+DROP PROCEDURE prep_loop;
+DROP VIEW vm, vo;
+DROP FUNCTION fm;
+DROP FUNCTION fo;
+
+DROP PROCEDURE run_all;
+DROP PROCEDURE cmp;
+DROP TABLE m, o;
+
+--echo # ==== Partial corruption: a healthy column still reads, the corrupt one does not
+CREATE TABLE t (ts DATETIME NOT NULL, v INT, INDEX(ts)) ENGINE=MooseDB CHUNK_INTERVAL='1 DAY';
+INSERT INTO t VALUES ('2026-01-01 01:00:00', 1);
+FLUSH TABLES t;
+INSERT INTO t VALUES ('2026-01-01 02:00:00', 2);
+FLUSH TABLES t;
+INSERT INTO t VALUES ('2026-01-01 03:00:00', 3);
+FLUSH TABLES t;
+--let CORRUPT_WHICH= 0
+--source suite/moosedb/include/corrupt_chunk.inc
+--echo # v alone does not touch the corrupted ts block
+SELECT SUM(v) FROM t;
+--echo # reading ts fails
+--error ER_CRASHED_ON_USAGE
+SELECT MIN(ts) FROM t;
+--error ER_CRASHED_ON_USAGE
+SELECT * FROM t;
+--echo # CHECK TABLE reports it
+--replace_regex /chunk_[0-9T_]+.tfl/chunk_X.tfl/
+CHECK TABLE t;
+DROP TABLE t;

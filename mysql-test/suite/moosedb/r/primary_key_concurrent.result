@@ -1,0 +1,148 @@
+CREATE TABLE t (itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG', clock INT NOT NULL, value DOUBLE NOT NULL, ns INT NOT NULL,
+PRIMARY KEY (itemid, clock, ns)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+connect  holder, localhost, root,,;
+connect  waiter, localhost, root,,;
+connect  other, localhost, root,,;
+##################################################################
+# One statement holds series 7 for 3 seconds (its second row is slow)
+##################################################################
+connection holder;
+INSERT INTO t SELECT 7, 500 + seq, SLEEP(IF(seq = 2, 3, 0)), 1 FROM seq_1_to_2;
+connection default;
+# (wait until the first row of the holder is written and its statement is sleeping)
+# Another series is not held up
+connection other;
+INSERT INTO t VALUES (8, 501, 1, 1);
+SELECT COUNT(*) AS rows_visible_now FROM t;
+rows_visible_now
+1
+# The same key as the holder's first row: waits for it, then is a duplicate
+connection waiter;
+INSERT INTO t VALUES (7, 501, 2, 1);
+# A different key of the same series also waits, and then succeeds
+connection other;
+INSERT INTO t VALUES (7, 900, 3, 1);
+connection holder;
+connection waiter;
+ERROR 23000: Duplicate entry '7-501-1' for key 'PRIMARY'
+# (a duplicate of a row nobody could see yet: the statement did wait for the holder)
+connection other;
+connection default;
+SELECT itemid, clock, value, ns FROM t ORDER BY itemid, clock, ns;
+itemid	clock	value	ns
+7	501	0	1
+7	502	0	1
+7	900	3	1
+8	501	1	1
+##################################################################
+# Lock wait timeout
+##################################################################
+SET @old_timeout = @@GLOBAL.moosedb_unique_lock_wait_timeout;
+SET GLOBAL moosedb_unique_lock_wait_timeout = 1;
+connection holder;
+INSERT INTO t SELECT 20, 100 + seq, SLEEP(IF(seq = 2, 4, 0)), 1 FROM seq_1_to_2;
+connection default;
+connection waiter;
+INSERT INTO t VALUES (20, 999, 1, 1);
+ERROR HY000: Lock wait timeout exceeded; try restarting transaction
+connection holder;
+connection default;
+SET GLOBAL moosedb_unique_lock_wait_timeout = @old_timeout;
+SELECT COUNT(*) FROM t WHERE itemid = 20;
+COUNT(*)
+2
+# With the timeout at 0 a busy series fails at once
+SET GLOBAL moosedb_unique_lock_wait_timeout = 0;
+connection holder;
+INSERT INTO t SELECT 21, 100 + seq, SLEEP(IF(seq = 2, 2, 0)), 1 FROM seq_1_to_2;
+connection default;
+connection waiter;
+INSERT INTO t VALUES (21, 999, 1, 1);
+ERROR HY000: Lock wait timeout exceeded; try restarting transaction
+connection holder;
+connection default;
+SET GLOBAL moosedb_unique_lock_wait_timeout = @old_timeout;
+##################################################################
+# KILL QUERY of a statement that waits for a series
+##################################################################
+connection holder;
+INSERT INTO t SELECT 30, 100 + seq, SLEEP(IF(seq = 2, 4, 0)), 1 FROM seq_1_to_2;
+connection default;
+connection waiter;
+INSERT INTO t VALUES (30, 999, 1, 1);
+connection default;
+KILL QUERY <waiter>;
+connection waiter;
+ERROR 70100: Query execution was interrupted
+connection holder;
+connection default;
+SELECT COUNT(*) AS rows_of_30 FROM t WHERE itemid = 30;
+rows_of_30
+2
+INSERT INTO t VALUES (30, 999, 1, 1);
+##################################################################
+# Two statements that each hold the series the other one needs
+##################################################################
+connection holder;
+INSERT INTO t SELECT 40 + seq - 1, 100, SLEEP(IF(seq = 2, 6, 0)), 1 FROM seq_1_to_2;
+connection waiter;
+INSERT INTO t SELECT 42 - seq, 200, SLEEP(IF(seq = 2, 6, 0)), 1 FROM seq_1_to_2;
+connection default;
+connection holder;
+connection waiter;
+connection default;
+# (each statement wrote its first row; the one that closed the cycle lost its second row)
+SELECT COUNT(*) AS rows_written FROM t WHERE itemid IN (40, 41);
+rows_written
+3
+##################################################################
+# unique_checks = 0 does not wait for anybody
+##################################################################
+connection holder;
+INSERT INTO t SELECT 50, 100 + seq, SLEEP(IF(seq = 2, 6, 0)), 1 FROM seq_1_to_2;
+connection default;
+connection waiter;
+SET unique_checks = 0;
+INSERT INTO t VALUES (50, 999, 1, 1);
+# the holder is still asleep: this insert did not wait for it
+SELECT COUNT(*) AS holder_still_sleeping FROM information_schema.PROCESSLIST WHERE INFO LIKE 'INSERT INTO t SELECT 50,%' AND STATE = 'User sleep';
+holder_still_sleeping
+1
+SET unique_checks = 1;
+connection holder;
+connection default;
+SELECT COUNT(*) AS rows_of_50 FROM t WHERE itemid = 50;
+rows_of_50
+3
+##################################################################
+# Three sessions inserting overlapping keys, all starting on the same series: each key is stored once
+##################################################################
+connection default;
+CREATE TABLE ov (itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG', clock INT NOT NULL, ns INT NOT NULL,
+PRIMARY KEY (itemid, clock, ns)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock' MEMTABLE_SIZE=1048576;
+CREATE TABLE ov_i (itemid BIGINT UNSIGNED NOT NULL, clock INT NOT NULL, ns INT NOT NULL, PRIMARY KEY (itemid, clock, ns)) ENGINE=InnoDB;
+connection holder;
+INSERT IGNORE INTO ov SELECT 1 + seq MOD 5, 1000 + seq DIV 5, 1 FROM seq_1_to_40000;
+connection waiter;
+INSERT IGNORE INTO ov SELECT 1 + seq MOD 5, 1000 + (40001 - seq) DIV 5, 1 FROM seq_1_to_40000;
+connection other;
+INSERT IGNORE INTO ov SELECT 1 + seq MOD 5, 1000 + (seq * 7) MOD 8000, 1 FROM seq_1_to_40000;
+connection holder;
+connection waiter;
+connection default;
+SELECT COUNT(*) AS rows_stored, COUNT(DISTINCT itemid, clock, ns) AS distinct_keys FROM ov;
+rows_stored	distinct_keys
+40002	40002
+# the same three statements, one after the other, on InnoDB
+INSERT IGNORE INTO ov_i SELECT 1 + seq MOD 5, 1000 + seq DIV 5, 1 FROM seq_1_to_40000;
+INSERT IGNORE INTO ov_i SELECT 1 + seq MOD 5, 1000 + (40001 - seq) DIV 5, 1 FROM seq_1_to_40000;
+INSERT IGNORE INTO ov_i SELECT 1 + seq MOD 5, 1000 + (seq * 7) MOD 8000, 1 FROM seq_1_to_40000;
+SELECT (SELECT COUNT(*) FROM ov) = (SELECT COUNT(*) FROM ov_i) AS same_row_count,
+(SELECT BIT_XOR(CRC32(CONCAT(itemid, '|', clock, '|', ns))) FROM ov) = (SELECT BIT_XOR(CRC32(CONCAT(itemid, '|', clock, '|', ns))) FROM ov_i) AS same_keys;
+same_row_count	same_keys
+1	1
+disconnect holder;
+disconnect waiter;
+disconnect other;
+connection default;
+DROP TABLE t, ov, ov_i;

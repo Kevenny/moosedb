@@ -348,17 +348,28 @@ pub struct TableConfig {
     pub dir: PathBuf,
     pub schema: Schema,
     pub opts: TableOptions,
+    /// UNIQUE / PRIMARY key `(TAG..., time, extras)`, if the table declares one.
+    /// Not persisted: the SQL definition supplies it at every open.
+    pub unique: Option<crate::unique::UniqueSpec>,
 }
 
 impl TableConfig {
     pub fn new(dir: impl Into<PathBuf>, schema: Schema, raw: &RawOptions<'_>) -> Result<TableConfig> {
-        Ok(TableConfig { dir: dir.into(), schema, opts: TableOptions::parse(raw)? })
+        Ok(TableConfig { dir: dir.into(), schema, opts: TableOptions::parse(raw)?, unique: None })
     }
 
     /// Like [`TableConfig::new`] for tables that already exist: limits
     /// introduced later clamp old values instead of making the table unopenable.
     pub fn for_existing(dir: impl Into<PathBuf>, schema: Schema, raw: &RawOptions<'_>) -> Result<TableConfig> {
-        Ok(TableConfig { dir: dir.into(), schema, opts: TableOptions::parse_existing(raw)? })
+        Ok(TableConfig { dir: dir.into(), schema, opts: TableOptions::parse_existing(raw)?, unique: None })
+    }
+
+    /// Declares the table's UNIQUE key: the TAG columns, the time column and
+    /// then `extras` (schema indexes of the integer columns that follow the time
+    /// column in the key).
+    pub fn with_unique(mut self, extras: Vec<usize>) -> Result<TableConfig> {
+        self.unique = Some(crate::unique::UniqueSpec::new(&self.schema, extras)?);
+        Ok(self)
     }
 }
 

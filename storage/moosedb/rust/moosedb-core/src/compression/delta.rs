@@ -37,12 +37,18 @@ fn encode(values: &[i64], order: u8, out: &mut Vec<u8>) {
     simple8b::encode(&residuals, out);
 }
 
+#[cfg(test)]
 fn decode(r: &mut ByteReader<'_>, count: usize, order: u8) -> Result<Vec<i64>> {
-    if count == 0 {
+    decode_prefix(r, count, count, order)
+}
+
+/// Decodes the first `upto` of `count` values (`upto >= count` = all).
+fn decode_prefix(r: &mut ByteReader<'_>, count: usize, upto: usize, order: u8) -> Result<Vec<i64>> {
+    if count == 0 || upto == 0 {
         return Ok(Vec::new());
     }
     let first = r.i64()?;
-    let residuals = simple8b::decode(r, count - 1)?;
+    let residuals = simple8b::decode_prefix(r, count - 1, upto.min(count) - 1)?;
     // `residuals` is as long as the stream really holds: never reserve from `count`.
     let mut out = Vec::with_capacity(residuals.len() + 1);
     out.push(first);
@@ -61,14 +67,24 @@ pub(crate) fn encode_delta(values: &[i64], out: &mut Vec<u8>) {
     encode(values, 1, out);
 }
 
+#[cfg(test)]
 pub(crate) fn decode_delta(r: &mut ByteReader<'_>, count: usize) -> Result<Vec<i64>> {
     decode(r, count, 1)
+}
+
+pub(crate) fn decode_delta_prefix(r: &mut ByteReader<'_>, count: usize, upto: usize) -> Result<Vec<i64>> {
+    decode_prefix(r, count, upto, 1)
+}
+
+pub(crate) fn decode_delta_of_delta_prefix(r: &mut ByteReader<'_>, count: usize, upto: usize) -> Result<Vec<i64>> {
+    decode_prefix(r, count, upto, 2)
 }
 
 pub(crate) fn encode_delta_of_delta(values: &[i64], out: &mut Vec<u8>) {
     encode(values, 2, out);
 }
 
+#[cfg(test)]
 pub(crate) fn decode_delta_of_delta(r: &mut ByteReader<'_>, count: usize) -> Result<Vec<i64>> {
     decode(r, count, 2)
 }
@@ -106,6 +122,19 @@ mod tests {
         }
         assert!(decode_delta(&mut ByteReader::new(&buf), count).is_err());
         assert!(decode_delta_of_delta(&mut ByteReader::new(&buf), usize::MAX).is_err());
+    }
+
+    #[test]
+    fn prefixes_match_the_full_decode() {
+        let vals: Vec<i64> = (0..700).map(|i| i * i * 3 - 5000 + (i % 5)).collect();
+        for order in [1u8, 2] {
+            let mut buf = Vec::new();
+            encode(&vals, order, &mut buf);
+            for upto in [0, 1, 2, 240, 241, 699, 700, 900] {
+                let got = decode_prefix(&mut ByteReader::new(&buf), vals.len(), upto, order).unwrap();
+                assert_eq!(got, vals[..upto.min(vals.len())], "order {order} upto {upto}");
+            }
+        }
     }
 
     #[test]

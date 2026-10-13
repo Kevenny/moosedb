@@ -21,7 +21,7 @@ Table	Op	Msg_type	Msg_text
 test.t	optimize	Warning	MooseDB: corrupt data: test.t/chunk_20260101T000000_20260102T000000_000001.tfl at offset 64: corrupt data: column block checksum mismatch (corrupt data or wrong key)
 test.t	optimize	status	Operation failed
 # Read through the handler: generic error, no path
-SELECT SUM(v) FROM t;
+SELECT SUM(v), MIN(ts) FROM t;
 ERROR HY000: Table 't' is marked as crashed and should be repaired
 # UDF behind CALL moosedb_compact: the error text is scrubbed
 CALL moosedb_compact('test.t', NULL, NULL);

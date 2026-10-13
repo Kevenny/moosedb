@@ -39,7 +39,8 @@ OPTIMIZE TABLE t;
 
 --echo # Read through the handler: generic error, no path
 --error ER_CRASHED_ON_USAGE
-SELECT SUM(v) FROM t;
+# reads ts too: a projected read of v alone never touches the corrupted ts block
+SELECT SUM(v), MIN(ts) FROM t;
 
 --echo # UDF behind CALL moosedb_compact: the error text is scrubbed
 --error ER_UNKNOWN_ERROR

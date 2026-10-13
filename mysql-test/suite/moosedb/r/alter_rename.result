@@ -70,7 +70,7 @@ ERROR HY000: MooseDB: invalid argument: CHUNK_INTERVAL '3 DAY' not supported; us
 ALTER TABLE m COMPRESSION='RAR';
 ERROR HY000: MooseDB: invalid argument: COMPRESSION 'RAR' not supported; use ZSTD, LZ4 or NONE
 ALTER TABLE m TIMESTAMP_COLUMN='host';
-ERROR HY000: MooseDB: timestamp column 'host' must be a stored DATETIME or TIMESTAMP column
+ERROR HY000: MooseDB: timestamp column 'host' must be a stored DATETIME, TIMESTAMP, INT or BIGINT column
 ALTER TABLE m ENCRYPTION='YES' ENCRYPTION_KEY_ID=77;
 ERROR HY000: MooseDB: invalid argument: encryption key 77 is not available: encryption: encryption key 77 (version latest) is not available
 SELECT CHUNK_INTERVAL, RETENTION, COMPRESSION, ENCRYPTED FROM information_schema.MOOSEDB_TABLES WHERE TABLE_NAME = 'm';
@@ -193,11 +193,12 @@ ERROR HY000: MooseDB: a MooseDB table needs a DATETIME/TIMESTAMP column with an 
 ALTER TABLE m MODIFY t2 DATETIME(6) NULL;
 ERROR 42000: Table handler doesn't support NULL in given index. Please change column 't2' to be NOT NULL or use another handler
 ALTER TABLE m ADD PRIMARY KEY (t2);
-ERROR HY000: MooseDB: index 'PRIMARY' cannot be UNIQUE/PRIMARY: time-series rows are not unique by time
+ERROR HY000: MooseDB: index 'PRIMARY' is not supported: the table has TAG columns, so its UNIQUE/PRIMARY key must list all of them before the timestamp. A MooseDB UNIQUE/PRIMARY key is (every TAG column, the timestamp column [, up to 2 integer NOT NULL columns]), e.g. PRIMARY KEY (itemid, clock, ns)
 ALTER TABLE m ADD UNIQUE (v);
 ERROR 42000: Table handler doesn't support NULL in given index. Please change column 'v' to be NOT NULL or use another handler
+# An index on a TAG column is accepted (it serves ref lookups); it can be dropped again
 ALTER TABLE m ADD INDEX (host);
-ERROR HY000: MooseDB: index 'host' is not supported: MooseDB only indexes the timestamp column (TAG columns are indexed implicitly)
+ALTER TABLE m DROP INDEX host;
 ALTER TABLE m ADD COLUMN g GEOMETRY;
 ERROR 42000: The storage engine for the table doesn't support GEOMETRY
 ALTER TABLE m ADD COLUMN id INT NOT NULL AUTO_INCREMENT, ADD KEY (id);

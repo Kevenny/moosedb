@@ -1,8 +1,8 @@
 # ---- Which column is the time axis ----
 CREATE TABLE a1 (t1 DATETIME NOT NULL, t2 DATETIME NOT NULL, v INT, INDEX(t1), INDEX(t2)) ENGINE=MooseDB;
-ERROR HY000: MooseDB: index 't2' is not supported: MooseDB only indexes the timestamp column (TAG columns are indexed implicitly)
+ERROR HY000: MooseDB: index 't2' is not supported: column 't2' is not a TAG column or the timestamp column. MooseDB indexes the timestamp column alone, or TAG columns optionally followed by the timestamp (INDEX (itemid, clock))
 CREATE TABLE a2 (t1 DATETIME NOT NULL, t2 DATETIME NOT NULL, v INT, INDEX(t1)) ENGINE=MooseDB TIMESTAMP_COLUMN='t2';
-ERROR HY000: MooseDB: index 't1' is not supported: MooseDB only indexes the timestamp column (TAG columns are indexed implicitly)
+ERROR HY000: MooseDB: index 't1' is not supported: column 't1' is not a TAG column or the timestamp column. MooseDB indexes the timestamp column alone, or TAG columns optionally followed by the timestamp (INDEX (itemid, clock))
 CREATE TABLE a3 (t1 DATETIME NOT NULL, t2 DATETIME NOT NULL, v INT, INDEX(t1)) ENGINE=MooseDB TIMESTAMP_COLUMN='t1';
 INSERT INTO a3 VALUES ('2026-01-01', '2020-01-01', 1), ('2026-01-01', '2030-06-01', 2);
 FLUSH TABLES a3;
@@ -42,7 +42,7 @@ ERROR 42000: Table handler doesn't support NULL in given index. Please change co
 CREATE TABLE pf (ts DATETIME NOT NULL, v INT, INDEX(ts(1))) ENGINE=MooseDB;
 ERROR HY000: Incorrect prefix key; the used key part isn't a string, the used length is longer than the key part, or the storage engine doesn't support unique prefix keys
 CREATE TABLE sp (ts DATETIME NOT NULL, v INT NOT NULL, INDEX a(ts), INDEX c(ts, v)) ENGINE=MooseDB;
-ERROR 42000: Too many key parts specified; max 1 parts allowed
+ERROR HY000: MooseDB: index 'c' is not supported: column 'ts' (the timestamp) must be the last part. MooseDB indexes the timestamp column alone, or TAG columns optionally followed by the timestamp (INDEX (itemid, clock))
 CREATE TABLE sq SEQUENCE=1 ENGINE=MooseDB;
 ERROR 42000: A table must have at least 1 column
 CREATE SEQUENCE s1 ENGINE=MooseDB;

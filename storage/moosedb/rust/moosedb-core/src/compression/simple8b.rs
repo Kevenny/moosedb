@@ -116,9 +116,69 @@ pub(crate) fn decode(r: &mut ByteReader<'_>, count: usize) -> Result<Vec<u64>> {
     }
 }
 
+/// Decodes the first `upto` of `count` values. The rest of the stream is not
+/// examined (no trailing-bytes check): callers use it to read a leading part
+/// of a column whose block was already CRC-verified. `upto >= count` is the
+/// strict [`decode`].
+pub(crate) fn decode_prefix(r: &mut ByteReader<'_>, count: usize, upto: usize) -> Result<Vec<u64>> {
+    if upto >= count {
+        return decode(r, count);
+    }
+    if count > super::MAX_DECODE_BYTES / 8 {
+        return Err(corrupt(format!("integer stream claims {count} values")));
+    }
+    match r.u8()? {
+        MODE_RAW => {
+            if count.checked_mul(8) != Some(r.remaining()) {
+                return Err(corrupt("raw integer stream length mismatch"));
+            }
+            (0..upto).map(|_| r.u64()).collect()
+        }
+        MODE_PACKED => {
+            if r.remaining() % 8 != 0 {
+                return Err(corrupt("simple8b stream is not word aligned"));
+            }
+            let mut out = Vec::with_capacity(upto.min(r.remaining() / 8 * 240));
+            let mut total = 0usize;
+            while out.len() < upto {
+                let word = r.u64()?;
+                let (n, bits) = SELECTORS[(word >> 60) as usize];
+                total += n;
+                if total > count {
+                    return Err(corrupt("simple8b stream holds more values than expected"));
+                }
+                if bits == 0 {
+                    out.resize(out.len() + n, 0);
+                } else {
+                    let mask = (1u64 << bits) - 1;
+                    out.extend((0..n).map(|k| (word >> (k as u32 * bits)) & mask));
+                }
+            }
+            out.truncate(upto);
+            Ok(out)
+        }
+        m => Err(corrupt(format!("unknown integer stream mode {m}"))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prefix_decoding_matches_the_full_decode() {
+        let values: Vec<u64> = (0..1000u64).map(|i| if i % 7 == 0 { 0 } else { i * 31 % 1000 }).collect();
+        let mut buf = Vec::new();
+        encode(&values, &mut buf);
+        let mut raw = Vec::new();
+        encode(&[u64::MAX, 3, 4, 5], &mut raw);
+        for upto in [0, 1, 239, 240, 241, 999, 1000] {
+            let got = decode_prefix(&mut ByteReader::new(&buf), values.len(), upto).unwrap();
+            assert_eq!(got, values[..upto], "upto {upto}");
+        }
+        assert_eq!(decode_prefix(&mut ByteReader::new(&raw), 4, 2).unwrap(), vec![u64::MAX, 3]);
+        assert!(decode_prefix(&mut ByteReader::new(&buf), 3, 2).is_err(), "count smaller than the stream");
+    }
 
     fn roundtrip(values: &[u64]) -> usize {
         let mut buf = Vec::new();

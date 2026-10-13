@@ -1,0 +1,778 @@
+##################################################################
+# DDL: the Zabbix 7.0 history tables as shipped, plus COMMENT 'TAG'
+# on itemid and TIMESTAMP_COLUMN='clock'
+##################################################################
+CREATE DATABASE moo;
+CREATE TABLE moo.history (
+itemid                   bigint unsigned                           NOT NULL COMMENT 'TAG',
+clock                    integer         DEFAULT '0'               NOT NULL,
+value                    DOUBLE PRECISION DEFAULT '0.0000'         NOT NULL,
+ns                       integer         DEFAULT '0'               NOT NULL,
+PRIMARY KEY (itemid,clock,ns)
+) ENGINE=MooseDB TIMESTAMP_COLUMN='clock' CHUNK_INTERVAL='1 DAY' RETENTION_PERIOD='31 DAYS' HOT_THRESHOLD='1 DAY';
+CREATE TABLE moo.history_uint (
+itemid                   bigint unsigned                           NOT NULL COMMENT 'TAG',
+clock                    integer         DEFAULT '0'               NOT NULL,
+value                    bigint unsigned DEFAULT '0'               NOT NULL,
+ns                       integer         DEFAULT '0'               NOT NULL,
+PRIMARY KEY (itemid,clock,ns)
+) ENGINE=MooseDB TIMESTAMP_COLUMN='clock' CHUNK_INTERVAL='1 DAY' RETENTION_PERIOD='31 DAYS' HOT_THRESHOLD='1 DAY';
+CREATE TABLE moo.history_str (
+itemid                   bigint unsigned                           NOT NULL COMMENT 'TAG',
+clock                    integer         DEFAULT '0'               NOT NULL,
+value                    varchar(255)    DEFAULT ''                NOT NULL,
+ns                       integer         DEFAULT '0'               NOT NULL,
+PRIMARY KEY (itemid,clock,ns)
+) ENGINE=MooseDB TIMESTAMP_COLUMN='clock' CHUNK_INTERVAL='1 DAY' RETENTION_PERIOD='31 DAYS' HOT_THRESHOLD='1 DAY';
+CREATE TABLE moo.history_log (
+itemid                   bigint unsigned                           NOT NULL COMMENT 'TAG',
+clock                    integer         DEFAULT '0'               NOT NULL,
+timestamp                integer         DEFAULT '0'               NOT NULL,
+source                   varchar(64)     DEFAULT ''                NOT NULL,
+severity                 integer         DEFAULT '0'               NOT NULL,
+value                    text                                      NOT NULL,
+logeventid               integer         DEFAULT '0'               NOT NULL,
+ns                       integer         DEFAULT '0'               NOT NULL,
+PRIMARY KEY (itemid,clock,ns)
+) ENGINE=MooseDB TIMESTAMP_COLUMN='clock' CHUNK_INTERVAL='1 DAY' RETENTION_PERIOD='31 DAYS' HOT_THRESHOLD='1 DAY';
+CREATE TABLE moo.history_text (
+itemid                   bigint unsigned                           NOT NULL COMMENT 'TAG',
+clock                    integer         DEFAULT '0'               NOT NULL,
+value                    text                                      NOT NULL,
+ns                       integer         DEFAULT '0'               NOT NULL,
+PRIMARY KEY (itemid,clock,ns)
+) ENGINE=MooseDB TIMESTAMP_COLUMN='clock' CHUNK_INTERVAL='1 DAY' RETENTION_PERIOD='31 DAYS' HOT_THRESHOLD='1 DAY';
+CREATE TABLE moo.history_bin (
+itemid                   bigint unsigned                           NOT NULL COMMENT 'TAG',
+clock                    integer         DEFAULT '0'               NOT NULL,
+ns                       integer         DEFAULT '0'               NOT NULL,
+value                    longblob                                  NOT NULL,
+PRIMARY KEY (itemid,clock,ns)
+) ENGINE=MooseDB TIMESTAMP_COLUMN='clock' CHUNK_INTERVAL='1 DAY' RETENTION_PERIOD='31 DAYS' HOT_THRESHOLD='1 DAY';
+SHOW CREATE TABLE moo.history;
+Table	Create Table
+history	CREATE TABLE `history` (
+  `itemid` bigint(20) unsigned NOT NULL COMMENT 'TAG',
+  `clock` int(11) NOT NULL DEFAULT 0,
+  `value` double NOT NULL DEFAULT 0,
+  `ns` int(11) NOT NULL DEFAULT 0,
+  PRIMARY KEY (`itemid`,`clock`,`ns`)
+) ENGINE=MooseDB DEFAULT CHARSET=latin1 COLLATE=latin1_swedish_ci `TIMESTAMP_COLUMN`='clock' `CHUNK_INTERVAL`='1 DAY' `RETENTION_PERIOD`='31 DAYS' `HOT_THRESHOLD`='1 DAY'
+SHOW CREATE TABLE moo.history_bin;
+Table	Create Table
+history_bin	CREATE TABLE `history_bin` (
+  `itemid` bigint(20) unsigned NOT NULL COMMENT 'TAG',
+  `clock` int(11) NOT NULL DEFAULT 0,
+  `ns` int(11) NOT NULL DEFAULT 0,
+  `value` longblob NOT NULL,
+  PRIMARY KEY (`itemid`,`clock`,`ns`)
+) ENGINE=MooseDB DEFAULT CHARSET=latin1 COLLATE=latin1_swedish_ci `TIMESTAMP_COLUMN`='clock' `CHUNK_INTERVAL`='1 DAY' `RETENTION_PERIOD`='31 DAYS' `HOT_THRESHOLD`='1 DAY'
+# No separate index on clock is needed: the key supplies the time axis
+SELECT TABLE_NAME, INDEX_NAME, NON_UNIQUE, SEQ_IN_INDEX, COLUMN_NAME FROM information_schema.STATISTICS
+WHERE TABLE_SCHEMA = 'moo' ORDER BY TABLE_NAME, SEQ_IN_INDEX;
+TABLE_NAME	INDEX_NAME	NON_UNIQUE	SEQ_IN_INDEX	COLUMN_NAME
+history	PRIMARY	0	1	itemid
+history	PRIMARY	0	2	clock
+history	PRIMARY	0	3	ns
+history_bin	PRIMARY	0	1	itemid
+history_bin	PRIMARY	0	2	clock
+history_bin	PRIMARY	0	3	ns
+history_log	PRIMARY	0	1	itemid
+history_log	PRIMARY	0	2	clock
+history_log	PRIMARY	0	3	ns
+history_str	PRIMARY	0	1	itemid
+history_str	PRIMARY	0	2	clock
+history_str	PRIMARY	0	3	ns
+history_text	PRIMARY	0	1	itemid
+history_text	PRIMARY	0	2	clock
+history_text	PRIMARY	0	3	ns
+history_uint	PRIMARY	0	1	itemid
+history_uint	PRIMARY	0	2	clock
+history_uint	PRIMARY	0	3	ns
+# Every one of them enforces its key: same row twice, same key with another value, other ns accepted
+INSERT INTO moo.history (itemid, clock, value, ns) VALUES (42, 1700000000, 1.5, 7);
+INSERT INTO moo.history (itemid, clock, value, ns) VALUES (42, 1700000000, 1.5, 7);
+ERROR 23000: Duplicate entry '42-1700000000-7' for key 'PRIMARY'
+INSERT INTO moo.history (itemid, clock, value, ns) VALUES (42, 1700000000, 2.5, 7);
+ERROR 23000: Duplicate entry '42-1700000000-7' for key 'PRIMARY'
+INSERT INTO moo.history (itemid, clock, value, ns) VALUES (42, 1700000000, 3.5, 8);
+INSERT INTO moo.history_uint (itemid, clock, value, ns) VALUES (42, 1700000000, 18446744073709551615, 7);
+INSERT INTO moo.history_uint (itemid, clock, value, ns) VALUES (42, 1700000000, 1, 7);
+ERROR 23000: Duplicate entry '42-1700000000-7' for key 'PRIMARY'
+INSERT INTO moo.history_uint (itemid, clock, value, ns) VALUES (42, 1700000000, 2, 8);
+INSERT INTO moo.history_str (itemid, clock, value, ns) VALUES (42, 1700000000, 'first', 7);
+INSERT INTO moo.history_str (itemid, clock, value, ns) VALUES (42, 1700000000, 'second', 7);
+ERROR 23000: Duplicate entry '42-1700000000-7' for key 'PRIMARY'
+INSERT INTO moo.history_str (itemid, clock, value, ns) VALUES (42, 1700000000, 'third', 8);
+INSERT INTO moo.history_log (itemid, clock, timestamp, source, severity, value, logeventid, ns) VALUES (42, 1700000000, 1, 'src', 2, 'first', 3, 7);
+INSERT INTO moo.history_log (itemid, clock, timestamp, source, severity, value, logeventid, ns) VALUES (42, 1700000000, 9, 'other', 9, 'second', 9, 7);
+ERROR 23000: Duplicate entry '42-1700000000-7' for key 'PRIMARY'
+INSERT INTO moo.history_log (itemid, clock, timestamp, source, severity, value, logeventid, ns) VALUES (42, 1700000000, 9, 'other', 9, 'third', 9, 8);
+INSERT INTO moo.history_text (itemid, clock, value, ns) VALUES (42, 1700000000, 'first', 7);
+INSERT INTO moo.history_text (itemid, clock, value, ns) VALUES (42, 1700000000, 'second', 7);
+ERROR 23000: Duplicate entry '42-1700000000-7' for key 'PRIMARY'
+INSERT INTO moo.history_text (itemid, clock, value, ns) VALUES (42, 1700000000, 'third', 8);
+INSERT INTO moo.history_bin (itemid, clock, ns, value) VALUES (42, 1700000000, 7, 'first');
+INSERT INTO moo.history_bin (itemid, clock, ns, value) VALUES (42, 1700000000, 7, 'second');
+ERROR 23000: Duplicate entry '42-1700000000-7' for key 'PRIMARY'
+INSERT INTO moo.history_bin (itemid, clock, ns, value) VALUES (42, 1700000000, 8, 'third');
+SELECT 'history' AS t, COUNT(*) AS n FROM moo.history UNION ALL SELECT 'history_uint', COUNT(*) FROM moo.history_uint
+UNION ALL SELECT 'history_str', COUNT(*) FROM moo.history_str UNION ALL SELECT 'history_log', COUNT(*) FROM moo.history_log
+UNION ALL SELECT 'history_text', COUNT(*) FROM moo.history_text UNION ALL SELECT 'history_bin', COUNT(*) FROM moo.history_bin;
+t	n
+history	2
+history_uint	2
+history_str	2
+history_log	2
+history_text	2
+history_bin	2
+SELECT value FROM moo.history_uint WHERE itemid = 42 AND clock = 1700000000 AND ns = 7;
+value
+18446744073709551615
+SELECT value, ns FROM moo.history_text WHERE itemid = 42 ORDER BY clock DESC, ns DESC LIMIT 1;
+value	ns
+third	8
+DROP DATABASE moo;
+##################################################################
+# DDL: the accepted forms of the key
+##################################################################
+# (every TAG column in any order, the time column, 0-2 integer NOT NULL columns)
+CREATE TABLE a1 (clock INT NOT NULL, itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG', v DOUBLE,
+PRIMARY KEY (itemid, clock)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+CREATE TABLE a2 (clock INT NOT NULL, itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG', ns INT NOT NULL, v DOUBLE,
+UNIQUE KEY u_item (itemid, clock, ns), INDEX (clock), INDEX (itemid, clock)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+CREATE TABLE a3 (ts DATETIME(6) NOT NULL, host VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_nopad_bin NOT NULL COMMENT 'TAG',
+item SMALLINT NOT NULL COMMENT 'TAG', seq BIGINT UNSIGNED NOT NULL, other TINYINT NOT NULL, v INT,
+PRIMARY KEY (item, host, ts, seq, other)) ENGINE=MooseDB TIMESTAMP_COLUMN='ts';
+CREATE TABLE a4 (ts TIMESTAMP NOT NULL, tag VARBINARY(16) NOT NULL COMMENT 'TAG', v INT, PRIMARY KEY (tag, ts)) ENGINE=MooseDB TIMESTAMP_COLUMN='ts';
+CREATE TABLE a5 (ts DATETIME NOT NULL, v INT, PRIMARY KEY (ts)) ENGINE=MooseDB;
+SHOW CREATE TABLE a3;
+Table	Create Table
+a3	CREATE TABLE `a3` (
+  `ts` datetime(6) NOT NULL,
+  `host` varchar(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_nopad_bin NOT NULL COMMENT 'TAG',
+  `item` smallint(6) NOT NULL COMMENT 'TAG',
+  `seq` bigint(20) unsigned NOT NULL,
+  `other` tinyint(4) NOT NULL,
+  `v` int(11) DEFAULT NULL,
+  PRIMARY KEY (`item`,`host`,`ts`,`seq`,`other`)
+) ENGINE=MooseDB DEFAULT CHARSET=latin1 COLLATE=latin1_swedish_ci `TIMESTAMP_COLUMN`='ts'
+SELECT TABLE_NAME, INDEX_NAME, NON_UNIQUE, SEQ_IN_INDEX, COLUMN_NAME FROM information_schema.STATISTICS
+WHERE TABLE_SCHEMA = 'test' AND TABLE_NAME IN ('a2', 'a3') ORDER BY TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX;
+TABLE_NAME	INDEX_NAME	NON_UNIQUE	SEQ_IN_INDEX	COLUMN_NAME
+a2	clock	1	1	clock
+a2	itemid	1	1	itemid
+a2	itemid	1	2	clock
+a2	u_item	0	1	itemid
+a2	u_item	0	2	clock
+a2	u_item	0	3	ns
+a3	PRIMARY	0	1	item
+a3	PRIMARY	0	2	host
+a3	PRIMARY	0	3	ts
+a3	PRIMARY	0	4	seq
+a3	PRIMARY	0	5	other
+DROP TABLE a1, a2, a3, a4, a5;
+# Refused, with the reason
+# - a key that is not the series + time
+CREATE TABLE e (clock INT NOT NULL, itemid BIGINT NOT NULL COMMENT 'TAG', INDEX (clock), UNIQUE (itemid)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+ERROR HY000: MooseDB: index 'itemid' is not supported: must include the timestamp column after the TAG columns. A MooseDB UNIQUE/PRIMARY key is (every TAG column, the timestamp column [, up to 2 integer NOT NULL columns]), e.g. PRIMARY KEY (itemid, clock, ns)
+CREATE TABLE e (clock INT NOT NULL, itemid BIGINT NOT NULL COMMENT 'TAG', INDEX (clock), UNIQUE (clock)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+ERROR HY000: MooseDB: index 'clock_2' is not supported: the table has TAG columns, so its UNIQUE/PRIMARY key must list all of them before the timestamp. A MooseDB UNIQUE/PRIMARY key is (every TAG column, the timestamp column [, up to 2 integer NOT NULL columns]), e.g. PRIMARY KEY (itemid, clock, ns)
+CREATE TABLE e (clock INT NOT NULL, itemid BIGINT NOT NULL COMMENT 'TAG', PRIMARY KEY (clock, itemid)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+ERROR HY000: MooseDB: index 'PRIMARY' is not supported: TAG column 'itemid' comes after the timestamp (list the TAG columns first). MooseDB indexes the timestamp column alone, or TAG columns optionally followed by the timestamp (INDEX (itemid, clock)). A MooseDB UNIQUE/PRIMARY key is (every TAG column, the timestamp column [, up to 2 integer NOT NULL columns]), e.g. PRIMARY KEY (itemid, clock, ns)
+CREATE TABLE e (clock INT NOT NULL, itemid BIGINT NOT NULL COMMENT 'TAG', ns INT NOT NULL, PRIMARY KEY (itemid, ns, clock)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+ERROR HY000: MooseDB: index 'PRIMARY' is not supported: column 'ns' is not a TAG column or the timestamp column. MooseDB indexes the timestamp column alone, or TAG columns optionally followed by the timestamp (INDEX (itemid, clock)). A MooseDB UNIQUE/PRIMARY key is (every TAG column, the timestamp column [, up to 2 integer NOT NULL columns]), e.g. PRIMARY KEY (itemid, clock, ns)
+CREATE TABLE e (clock INT NOT NULL, itemid BIGINT NOT NULL COMMENT 'TAG', ns INT NOT NULL, PRIMARY KEY (itemid, ns)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+ERROR HY000: MooseDB: index 'PRIMARY' is not supported: column 'ns' is not a TAG column or the timestamp column. MooseDB indexes the timestamp column alone, or TAG columns optionally followed by the timestamp (INDEX (itemid, clock)). A MooseDB UNIQUE/PRIMARY key is (every TAG column, the timestamp column [, up to 2 integer NOT NULL columns]), e.g. PRIMARY KEY (itemid, clock, ns)
+# - not every TAG column is in the key
+CREATE TABLE e (clock INT NOT NULL, host INT NOT NULL COMMENT 'TAG', itemid BIGINT NOT NULL COMMENT 'TAG', PRIMARY KEY (itemid, clock)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+ERROR HY000: MooseDB: index 'PRIMARY' is not supported: must list every TAG column of the table (the series identity). A MooseDB UNIQUE/PRIMARY key is (every TAG column, the timestamp column [, up to 2 integer NOT NULL columns]), e.g. PRIMARY KEY (itemid, clock, ns)
+# - the columns after the time column
+CREATE TABLE e (clock INT NOT NULL, itemid BIGINT NOT NULL COMMENT 'TAG', ns INT NULL, UNIQUE (itemid, clock, ns)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+ERROR 42000: Table handler doesn't support NULL in given index. Please change column 'ns' to be NOT NULL or use another handler
+CREATE TABLE e (clock INT NOT NULL, itemid BIGINT NOT NULL COMMENT 'TAG', v DOUBLE NOT NULL, UNIQUE (itemid, clock, v)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+ERROR HY000: MooseDB: index 'itemid' is not supported: column 'v' must be an integer column (TINYINT..BIGINT) to follow the timestamp in a UNIQUE key. MooseDB indexes the timestamp column alone, or TAG columns optionally followed by the timestamp (INDEX (itemid, clock)). A MooseDB UNIQUE/PRIMARY key is (every TAG column, the timestamp column [, up to 2 integer NOT NULL columns]), e.g. PRIMARY KEY (itemid, clock, ns)
+CREATE TABLE e (clock INT NOT NULL, itemid BIGINT NOT NULL COMMENT 'TAG', s VARCHAR(10) NOT NULL, UNIQUE (itemid, clock, s)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+ERROR HY000: MooseDB: index 'itemid' is not supported: column 's' must be an integer column (TINYINT..BIGINT) to follow the timestamp in a UNIQUE key. MooseDB indexes the timestamp column alone, or TAG columns optionally followed by the timestamp (INDEX (itemid, clock)). A MooseDB UNIQUE/PRIMARY key is (every TAG column, the timestamp column [, up to 2 integer NOT NULL columns]), e.g. PRIMARY KEY (itemid, clock, ns)
+CREATE TABLE e (clock INT NOT NULL, itemid BIGINT NOT NULL COMMENT 'TAG', a INT NOT NULL, b INT NOT NULL, c INT NOT NULL, UNIQUE (itemid, clock, a, b, c)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+ERROR HY000: MooseDB: index 'itemid' is not supported: at most 2 columns may follow the timestamp. MooseDB indexes the timestamp column alone, or TAG columns optionally followed by the timestamp (INDEX (itemid, clock)). A MooseDB UNIQUE/PRIMARY key is (every TAG column, the timestamp column [, up to 2 integer NOT NULL columns]), e.g. PRIMARY KEY (itemid, clock, ns)
+# - TAG columns that do not compare byte for byte
+CREATE TABLE e (clock INT NOT NULL, n VARCHAR(10) NOT NULL COMMENT 'TAG', PRIMARY KEY (n, clock)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+ERROR HY000: MooseDB: index 'PRIMARY' is not supported: TAG column 'n' needs a binary NO PAD collation (e.g. utf8mb4_nopad_bin, or BINARY/VARBINARY) in a UNIQUE key, because rows of series that only differ by case or trailing spaces would not be detected as duplicates. MooseDB indexes the timestamp column alone, or TAG columns optionally followed by the timestamp (INDEX (itemid, clock)). A MooseDB UNIQUE/PRIMARY key is (every TAG column, the timestamp column [, up to 2 integer NOT NULL columns]), e.g. PRIMARY KEY (item
+CREATE TABLE e (clock INT NOT NULL, n VARCHAR(10) CHARACTER SET latin1 COLLATE latin1_bin NOT NULL COMMENT 'TAG', PRIMARY KEY (n, clock)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+ERROR HY000: MooseDB: index 'PRIMARY' is not supported: TAG column 'n' needs a binary NO PAD collation (e.g. utf8mb4_nopad_bin, or BINARY/VARBINARY) in a UNIQUE key, because rows of series that only differ by case or trailing spaces would not be detected as duplicates. MooseDB indexes the timestamp column alone, or TAG columns optionally followed by the timestamp (INDEX (itemid, clock)). A MooseDB UNIQUE/PRIMARY key is (every TAG column, the timestamp column [, up to 2 integer NOT NULL columns]), e.g. PRIMARY KEY (item
+CREATE TABLE e (clock INT NOT NULL, n CHAR(10) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci NOT NULL COMMENT 'TAG', PRIMARY KEY (n, clock)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+ERROR HY000: MooseDB: index 'PRIMARY' is not supported: TAG column 'n' needs a binary NO PAD collation (e.g. utf8mb4_nopad_bin, or BINARY/VARBINARY) in a UNIQUE key, because rows of series that only differ by case or trailing spaces would not be detected as duplicates. MooseDB indexes the timestamp column alone, or TAG columns optionally followed by the timestamp (INDEX (itemid, clock)). A MooseDB UNIQUE/PRIMARY key is (every TAG column, the timestamp column [, up to 2 integer NOT NULL columns]), e.g. PRIMARY KEY (item
+# - more than one, prefixes, descending parts, a missing time column
+CREATE TABLE e (clock INT NOT NULL, itemid BIGINT NOT NULL COMMENT 'TAG', PRIMARY KEY (itemid, clock), UNIQUE (itemid, clock)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+ERROR HY000: MooseDB: index 'itemid' is not supported: a MooseDB table takes at most one UNIQUE/PRIMARY key
+CREATE TABLE e (clock INT NOT NULL, n VARBINARY(10) NOT NULL COMMENT 'TAG', PRIMARY KEY (n(4), clock)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+ERROR HY000: MooseDB: index 'PRIMARY' is not supported: column 'n': index prefixes are not supported. MooseDB indexes the timestamp column alone, or TAG columns optionally followed by the timestamp (INDEX (itemid, clock)). A MooseDB UNIQUE/PRIMARY key is (every TAG column, the timestamp column [, up to 2 integer NOT NULL columns]), e.g. PRIMARY KEY (itemid, clock, ns)
+CREATE TABLE e (clock INT NOT NULL, itemid BIGINT NOT NULL COMMENT 'TAG', PRIMARY KEY (itemid, clock DESC)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+ERROR HY000: MooseDB: index 'PRIMARY' is not supported: column 'clock': descending index parts are not supported. MooseDB indexes the timestamp column alone, or TAG columns optionally followed by the timestamp (INDEX (itemid, clock)). A MooseDB UNIQUE/PRIMARY key is (every TAG column, the timestamp column [, up to 2 integer NOT NULL columns]), e.g. PRIMARY KEY (itemid, clock, ns)
+CREATE TABLE e (clock INT NOT NULL, itemid BIGINT NOT NULL COMMENT 'TAG', v INT NOT NULL, PRIMARY KEY (itemid, v)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+ERROR HY000: MooseDB: index 'PRIMARY' is not supported: column 'v' is not a TAG column or the timestamp column. MooseDB indexes the timestamp column alone, or TAG columns optionally followed by the timestamp (INDEX (itemid, clock)). A MooseDB UNIQUE/PRIMARY key is (every TAG column, the timestamp column [, up to 2 integer NOT NULL columns]), e.g. PRIMARY KEY (itemid, clock, ns)
+# - a non-unique index still ends at the time column
+CREATE TABLE e (clock INT NOT NULL, itemid BIGINT NOT NULL COMMENT 'TAG', ns INT NOT NULL, INDEX (clock), INDEX (itemid, clock, ns)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+ERROR HY000: MooseDB: index 'itemid' is not supported: column 'clock' (the timestamp) must be the last part. MooseDB indexes the timestamp column alone, or TAG columns optionally followed by the timestamp (INDEX (itemid, clock))
+##################################################################
+# Semantics against an InnoDB mirror (single-row statements)
+##################################################################
+CREATE TABLE um (itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG', clock INT NOT NULL DEFAULT 0, value DOUBLE NOT NULL DEFAULT 0, ns INT NOT NULL DEFAULT 0,
+PRIMARY KEY (itemid, clock, ns)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+CREATE TABLE ui (itemid BIGINT UNSIGNED NOT NULL, clock INT NOT NULL DEFAULT 0, value DOUBLE NOT NULL DEFAULT 0, ns INT NOT NULL DEFAULT 0,
+PRIMARY KEY (itemid, clock, ns)) ENGINE=InnoDB;
+# ---- um
+INSERT INTO um VALUES (1, 100, 1.5, 1), (1, 100, 2.5, 2), (1, 101, 3, 1), (2, 100, 4, 1);
+INSERT INTO um VALUES (1, 100, 9, 1);
+ERROR 23000: Duplicate entry '1-100-1' for key 'PRIMARY'
+INSERT INTO um VALUES (2, 100, 9, 1);
+ERROR 23000: Duplicate entry '2-100-1' for key 'PRIMARY'
+# same time, another ns / another item / a later and an earlier time: accepted
+INSERT INTO um VALUES (1, 100, 5, 3), (3, 100, 6, 1), (1, 102, 7, 1), (1, 99, 8, 1);
+# the key again, now below the highest time of the series
+INSERT INTO um VALUES (1, 99, 0, 1);
+ERROR 23000: Duplicate entry '1-99-1' for key 'PRIMARY'
+INSERT INTO um VALUES (1, 100, 0, 3);
+ERROR 23000: Duplicate entry '1-100-3' for key 'PRIMARY'
+# INSERT IGNORE: duplicates are skipped, with a warning each
+INSERT IGNORE INTO um VALUES (1, 100, 9, 1), (1, 103, 9, 1), (1, 103, 9, 1), (5, 5, 5, 5);
+Warnings:
+Warning	1062	Duplicate entry '1-100-1' for key 'PRIMARY'
+Warning	1062	Duplicate entry '1-103-1' for key 'PRIMARY'
+SELECT @@warning_count AS warnings;
+warnings
+2
+SHOW WARNINGS;
+Level	Code	Message
+Warning	1062	Duplicate entry '1-100-1' for key 'PRIMARY'
+Warning	1062	Duplicate entry '1-103-1' for key 'PRIMARY'
+# INSERT ... SELECT with duplicates inside the SELECT
+INSERT IGNORE INTO um SELECT 7, 100 + seq DIV 2, seq, 0 FROM seq_1_to_6;
+Warnings:
+Warning	1062	Duplicate entry '7-101-0' for key 'PRIMARY'
+Warning	1062	Duplicate entry '7-102-0' for key 'PRIMARY'
+SELECT @@warning_count AS warnings;
+warnings
+2
+# ---- ui
+INSERT INTO ui VALUES (1, 100, 1.5, 1), (1, 100, 2.5, 2), (1, 101, 3, 1), (2, 100, 4, 1);
+INSERT INTO ui VALUES (1, 100, 9, 1);
+ERROR 23000: Duplicate entry '1-100-1' for key 'PRIMARY'
+INSERT INTO ui VALUES (2, 100, 9, 1);
+ERROR 23000: Duplicate entry '2-100-1' for key 'PRIMARY'
+# same time, another ns / another item / a later and an earlier time: accepted
+INSERT INTO ui VALUES (1, 100, 5, 3), (3, 100, 6, 1), (1, 102, 7, 1), (1, 99, 8, 1);
+# the key again, now below the highest time of the series
+INSERT INTO ui VALUES (1, 99, 0, 1);
+ERROR 23000: Duplicate entry '1-99-1' for key 'PRIMARY'
+INSERT INTO ui VALUES (1, 100, 0, 3);
+ERROR 23000: Duplicate entry '1-100-3' for key 'PRIMARY'
+# INSERT IGNORE: duplicates are skipped, with a warning each
+INSERT IGNORE INTO ui VALUES (1, 100, 9, 1), (1, 103, 9, 1), (1, 103, 9, 1), (5, 5, 5, 5);
+Warnings:
+Warning	1062	Duplicate entry '1-100-1' for key 'PRIMARY'
+Warning	1062	Duplicate entry '1-103-1' for key 'PRIMARY'
+SELECT @@warning_count AS warnings;
+warnings
+2
+SHOW WARNINGS;
+Level	Code	Message
+Warning	1062	Duplicate entry '1-100-1' for key 'PRIMARY'
+Warning	1062	Duplicate entry '1-103-1' for key 'PRIMARY'
+# INSERT ... SELECT with duplicates inside the SELECT
+INSERT IGNORE INTO ui SELECT 7, 100 + seq DIV 2, seq, 0 FROM seq_1_to_6;
+Warnings:
+Warning	1062	Duplicate entry '7-101-0' for key 'PRIMARY'
+Warning	1062	Duplicate entry '7-102-0' for key 'PRIMARY'
+SELECT @@warning_count AS warnings;
+warnings
+2
+# 
+a	b	c	vs_innodb
+14	64	1168907469	SAME
+# ---- the message names the key and the values
+INSERT INTO um VALUES (123456789012, 1700000000, 1, 5), (123456789012, 1700000000, 1, 5);
+ERROR 23000: Duplicate entry '123456789012-1700000000-5' for key 'PRIMARY'
+SELECT COUNT(*) FROM um WHERE itemid = 123456789012;
+COUNT(*)
+1
+INSERT INTO ui VALUES (123456789012, 1700000000, 1, 5), (123456789012, 1700000000, 1, 5);
+ERROR 23000: Duplicate entry '123456789012-1700000000-5' for key 'PRIMARY'
+SELECT COUNT(*) FROM ui WHERE itemid = 123456789012;
+COUNT(*)
+0
+# (the rows before the duplicate stay in MooseDB, which has no multi-row rollback;
+#  InnoDB rolls the statement back)
+# ---- REPLACE and ON DUPLICATE KEY UPDATE need UPDATE/DELETE, which the engine does not have:
+#      a key that exists is an explicit error, not a silent wrong answer
+REPLACE INTO um VALUES (1, 100, 7, 1);
+ERROR HY000: Storage engine MooseDB of the table `test`.`um` doesn't have this option
+INSERT INTO um VALUES (1, 100, 7, 1) ON DUPLICATE KEY UPDATE value = 7;
+ERROR HY000: Storage engine MooseDB of the table `test`.`um` doesn't have this option
+INSERT INTO um VALUES (1, 100, 7, 1), (1, 777, 7, 1) ON DUPLICATE KEY UPDATE value = value + 1;
+ERROR HY000: Storage engine MooseDB of the table `test`.`um` doesn't have this option
+SELECT value FROM um WHERE itemid = 1 AND clock = 100 AND ns = 1;
+value
+1.5
+# ... and a key that does not exist is a plain insert
+REPLACE INTO um VALUES (1, 200, 7, 1);
+INSERT INTO um VALUES (1, 201, 7, 1) ON DUPLICATE KEY UPDATE value = 8;
+REPLACE INTO um SELECT 9, 9, 9, 9;
+SELECT itemid, clock, value, ns FROM um WHERE itemid = 1 AND clock >= 200 ORDER BY clock;
+itemid	clock	value	ns
+1	200	7	1
+1	201	7	1
+UPDATE um SET value = 1 WHERE itemid = 1;
+ERROR HY000: Storage engine MooseDB of the table `test`.`um` doesn't have this option
+DROP TABLE um, ui;
+##################################################################
+# Duplicates against every place a row can live
+##################################################################
+# old data (2023): sealed chunks are COLD (ZSTD); two flushes into the same day
+CREATE TABLE sp (itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG', clock INT NOT NULL DEFAULT 0, value DOUBLE NOT NULL DEFAULT 0, ns INT NOT NULL DEFAULT 0,
+PRIMARY KEY (itemid, clock, ns))
+ENGINE=MooseDB TIMESTAMP_COLUMN='clock' CHUNK_INTERVAL='1 DAY' HOT_THRESHOLD='1 HOUR' COMPRESSION='ZSTD';
+CREATE TABLE si (itemid BIGINT UNSIGNED NOT NULL, clock INT NOT NULL DEFAULT 0, value DOUBLE NOT NULL DEFAULT 0, ns INT NOT NULL DEFAULT 0,
+PRIMARY KEY (itemid, clock, ns)) ENGINE=InnoDB;
+CREATE TABLE pr (itemid BIGINT UNSIGNED NOT NULL, clock INT NOT NULL DEFAULT 0, value DOUBLE NOT NULL DEFAULT 0, ns INT NOT NULL DEFAULT 0) ENGINE=InnoDB;
+INSERT INTO sp SELECT 1 + a.seq, 1700000000 + b.seq * 10, a.seq * 100 + b.seq, b.seq MOD 3 FROM seq_0_to_19 a, seq_0_to_49 b;
+INSERT INTO si SELECT 1 + a.seq, 1700000000 + b.seq * 10, a.seq * 100 + b.seq, b.seq MOD 3 FROM seq_0_to_19 a, seq_0_to_49 b;
+FLUSH TABLES sp;
+INSERT INTO sp SELECT 1 + a.seq, 1700000000 + b.seq * 10 + 5, a.seq * 100 + b.seq + 0.5, 0 FROM seq_0_to_19 a, seq_0_to_49 b;
+INSERT INTO si SELECT 1 + a.seq, 1700000000 + b.seq * 10 + 5, a.seq * 100 + b.seq + 0.5, 0 FROM seq_0_to_19 a, seq_0_to_49 b;
+FLUSH TABLES sp;
+# a third batch stays in the MemTable (WAL only)
+INSERT INTO sp SELECT 1 + a.seq, 1700000000 + b.seq * 10 + 7, a.seq, 9 FROM seq_0_to_19 a, seq_0_to_49 b;
+INSERT INTO si SELECT 1 + a.seq, 1700000000 + b.seq * 10 + 7, a.seq, 9 FROM seq_0_to_19 a, seq_0_to_49 b;
+SELECT STATUS, COMPRESSION, COUNT(*) AS chunks FROM information_schema.MOOSEDB_CHUNKS WHERE TABLE_NAME = 'sp' GROUP BY STATUS, COMPRESSION;
+STATUS	COMPRESSION	chunks
+COLD	ZSTD	2
+SELECT PENDING_ROWS FROM information_schema.MOOSEDB_TABLES WHERE TABLE_NAME = 'sp';
+PENDING_ROWS
+1000
+# Probe keys: in a chunk, in the other chunk, in the MemTable, nowhere (older, newer,
+# same second other ns), and the same new key twice
+INSERT INTO pr VALUES
+(1, 1700000000, 0, 0),         # chunk 1 (ns = 0 for b = 0)
+(3, 1700000010, 0, 1),         # chunk 1
+(20, 1700000490, 0, 1),        # chunk 1 (b = 49 -> ns 1)
+(2, 1700000005, 0, 0),         # chunk 2
+(20, 1700000495, 0, 0),        # chunk 2
+(4, 1700000007, 0, 9),         # MemTable
+(19, 1700000487, 0, 9),        # MemTable
+(1, 1700000000, 0, 1),         # nowhere: same second as a chunk row, other ns
+(1, 1700000001, 0, 0),         # nowhere: between rows
+(1, 1699999999, 0, 0),         # nowhere: older than everything
+(1, 1800000000, 0, 0),         # nowhere: newer than everything (twice below)
+(1, 1800000000, 1, 0),
+(99, 1700000000, 0, 0);
+INSERT IGNORE INTO sp SELECT * FROM pr;
+SELECT 'sp' AS tbl, @@warning_count AS duplicates;
+tbl	duplicates
+sp	8
+INSERT IGNORE INTO si SELECT * FROM pr;
+SELECT 'si' AS tbl, @@warning_count AS duplicates;
+tbl	duplicates
+si	8
+# 
+a	b	c	vs_innodb
+3005	1959000	2172157497	SAME
+# Compaction merges the chunks: every key is still found
+OPTIMIZE TABLE sp;
+Table	Op	Msg_type	Msg_text
+test.sp	optimize	status	OK
+SELECT STATUS, COMPRESSION, COUNT(*) AS chunks FROM information_schema.MOOSEDB_CHUNKS WHERE TABLE_NAME = 'sp' GROUP BY STATUS, COMPRESSION;
+STATUS	COMPRESSION	chunks
+COLD	ZSTD	1
+HOT	LZ4	1
+TRUNCATE TABLE pr;
+INSERT INTO pr SELECT itemid, clock, 0, ns FROM si WHERE clock IN (1700000000, 1700000015, 1700000487, 1700000495) AND itemid IN (1, 5, 20)
+UNION ALL SELECT 21, 1700000000, 0, 0 UNION ALL SELECT 21, 1700000000, 0, 0;
+INSERT IGNORE INTO sp SELECT * FROM pr;
+SELECT 'sp' AS tbl, @@warning_count AS duplicates;
+tbl	duplicates
+sp	14
+INSERT IGNORE INTO si SELECT * FROM pr;
+SELECT 'si' AS tbl, @@warning_count AS duplicates;
+tbl	duplicates
+si	14
+# 
+a	b	c	vs_innodb
+3006	1959000	2817972063	SAME
+# A clean restart rebuilds the key state from the chunks
+INSERT INTO sp VALUES (30, 1700000100, 1, 1);
+INSERT INTO si VALUES (30, 1700000100, 1, 1);
+# restart
+INSERT INTO sp VALUES (30, 1700000100, 2, 1);
+ERROR 23000: Duplicate entry '30-1700000100-1' for key 'PRIMARY'
+INSERT INTO sp VALUES (1, 1700000000, 2, 0);
+ERROR 23000: Duplicate entry '1-1700000000-0' for key 'PRIMARY'
+INSERT INTO sp VALUES (4, 1700000007, 2, 9);
+ERROR 23000: Duplicate entry '4-1700000007-9' for key 'PRIMARY'
+INSERT INTO sp VALUES (30, 1700000100, 2, 2), (30, 1700000099, 2, 1), (30, 1700000101, 2, 1);
+INSERT INTO si VALUES (30, 1700000100, 2, 2), (30, 1700000099, 2, 1), (30, 1700000101, 2, 1);
+# 
+a	b	c	vs_innodb
+3010	1959007	2377197825	SAME
+# kill -9 with rows only in the WAL: replayed, and still protected
+INSERT INTO sp VALUES (31, 1700000200, 1, 1), (31, 1700000200, 1, 2), (31, 1700000199, 1, 1);
+INSERT INTO si VALUES (31, 1700000200, 1, 1), (31, 1700000200, 1, 2), (31, 1700000199, 1, 1);
+# Kill the server
+# restart
+INSERT INTO sp VALUES (31, 1700000200, 9, 2);
+ERROR 23000: Duplicate entry '31-1700000200-2' for key 'PRIMARY'
+INSERT INTO sp VALUES (31, 1700000199, 9, 1);
+ERROR 23000: Duplicate entry '31-1700000199-1' for key 'PRIMARY'
+INSERT INTO sp VALUES (30, 1700000101, 9, 1);
+ERROR 23000: Duplicate entry '30-1700000101-1' for key 'PRIMARY'
+INSERT INTO sp VALUES (31, 1700000200, 9, 3);
+INSERT INTO si VALUES (31, 1700000200, 9, 3);
+# 
+a	b	c	vs_innodb
+3014	1959019	2573197856	SAME
+CHECK TABLE sp;
+Table	Op	Msg_type	Msg_text
+test.sp	check	status	OK
+# A statement that spills to disk (MEMTABLE_SIZE 1 MiB) checks against its own staged chunks
+CREATE TABLE big (itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG', clock INT NOT NULL, value DOUBLE NOT NULL, ns INT NOT NULL,
+PRIMARY KEY (itemid, clock, ns)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock' MEMTABLE_SIZE=1048576 CHUNK_INTERVAL='1 DAY';
+CREATE TABLE big_i (itemid BIGINT UNSIGNED NOT NULL, clock INT NOT NULL, value DOUBLE NOT NULL, ns INT NOT NULL,
+PRIMARY KEY (itemid, clock, ns)) ENGINE=InnoDB;
+INSERT INTO big SELECT 1 + seq MOD 7, 1700000000 + seq DIV 7, seq, 1 FROM seq_1_to_40000 UNION ALL SELECT 2, 1700000000, 0, 1;
+ERROR 23000: Duplicate entry '2-1700000000-1' for key 'PRIMARY'
+SELECT COUNT(*) AS kept_rows_before_the_duplicate FROM big;
+kept_rows_before_the_duplicate
+40000
+TRUNCATE TABLE big;
+INSERT INTO big SELECT 1 + seq MOD 7, 1700000000 + seq DIV 7, seq, 1 FROM seq_1_to_150000;
+INSERT INTO big_i SELECT 1 + seq MOD 7, 1700000000 + seq DIV 7, seq, 1 FROM seq_1_to_150000;
+SELECT CHUNKS >= 1 AS sealed FROM information_schema.MOOSEDB_TABLES WHERE TABLE_NAME = 'big';
+sealed
+1
+INSERT IGNORE INTO big SELECT 1 + seq MOD 7, 1700000000 + seq DIV 7, 0, 1 FROM seq_1_to_150000 WHERE seq MOD 3 = 0;
+SELECT @@warning_count AS duplicates;
+duplicates
+50000
+INSERT IGNORE INTO big SELECT 1 + seq MOD 7, 1700000000 + 30000 + seq DIV 7, 0, seq MOD 2 FROM seq_1_to_100000;
+SELECT @@warning_count AS duplicates_in_the_new_range;
+duplicates_in_the_new_range
+0
+INSERT IGNORE INTO big_i SELECT 1 + seq MOD 7, 1700000000 + 30000 + seq DIV 7, 0, seq MOD 2 FROM seq_1_to_100000;
+# 
+a	b	c	vs_innodb
+250000	11250075000	2375655722	SAME
+DROP TABLE big, big_i;
+##################################################################
+# Answers and plans of the queries Zabbix runs on a table with this key
+##################################################################
+CREATE TABLE zm (itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG', clock INT NOT NULL DEFAULT 0, value DOUBLE NOT NULL DEFAULT 0, ns INT NOT NULL DEFAULT 0,
+PRIMARY KEY (itemid, clock, ns)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock' CHUNK_INTERVAL='1 DAY' HOT_THRESHOLD='1 HOUR';
+CREATE TABLE zi (itemid BIGINT UNSIGNED NOT NULL, clock INT NOT NULL DEFAULT 0, value DOUBLE NOT NULL DEFAULT 0, ns INT NOT NULL DEFAULT 0,
+PRIMARY KEY (itemid, clock, ns)) ENGINE=InnoDB;
+CREATE TABLE it (itemid BIGINT UNSIGNED NOT NULL PRIMARY KEY, lastclock INT NOT NULL, lastns INT NOT NULL) ENGINE=InnoDB;
+# 30 items, every 4th second of 100: samples ns 300 and 100, and ns 200 every 8th second;
+# inserted out of order into two chunks and the MemTable
+INSERT INTO zm SELECT 1 + a.seq, 1700000000 + b.seq, a.seq * 1000 + b.seq, 300 FROM seq_0_to_29 a, seq_0_to_99 b WHERE b.seq MOD 4 = 0;
+INSERT INTO zi SELECT 1 + a.seq, 1700000000 + b.seq, a.seq * 1000 + b.seq, 300 FROM seq_0_to_29 a, seq_0_to_99 b WHERE b.seq MOD 4 = 0;
+FLUSH TABLES zm;
+INSERT INTO zm SELECT 1 + a.seq, 1700000000 + b.seq, a.seq * 1000 + b.seq + 0.25, 100 FROM seq_0_to_29 a, seq_0_to_99 b WHERE b.seq MOD 4 = 0;
+INSERT INTO zi SELECT 1 + a.seq, 1700000000 + b.seq, a.seq * 1000 + b.seq + 0.25, 100 FROM seq_0_to_29 a, seq_0_to_99 b WHERE b.seq MOD 4 = 0;
+FLUSH TABLES zm;
+INSERT INTO zm SELECT 1 + a.seq, 1700000000 + b.seq, a.seq * 1000 + b.seq + 0.5, 200 FROM seq_0_to_29 a, seq_0_to_99 b WHERE b.seq MOD 8 = 0;
+INSERT INTO zi SELECT 1 + a.seq, 1700000000 + b.seq, a.seq * 1000 + b.seq + 0.5, 200 FROM seq_0_to_29 a, seq_0_to_99 b WHERE b.seq MOD 8 = 0;
+SELECT COUNT(*), COUNT(DISTINCT itemid), MIN(clock), MAX(clock) FROM zm;
+COUNT(*)	COUNT(DISTINCT itemid)	MIN(clock)	MAX(clock)
+1890	30	1700000000	1700000096
+SELECT COUNT(*), COUNT(DISTINCT itemid), MIN(clock), MAX(clock) FROM zi;
+COUNT(*)	COUNT(DISTINCT itemid)	MIN(clock)	MAX(clock)
+1890	30	1700000000	1700000096
+INSERT INTO it SELECT itemid, MAX(clock), 200 FROM zi GROUP BY itemid;
+# ---- EXPLAIN
+# last value (CHistoryManager::getLastValuesFromSqlWithPk): index order, no sort
+EXPLAIN SELECT clock, ns, value FROM zm WHERE itemid = 7 AND clock > 1700000030 ORDER BY clock DESC, ns DESC LIMIT 1;
+id	select_type	table	type	possible_keys	key	key_len	ref	rows	Extra
+1	SIMPLE	zm	range	PRIMARY	PRIMARY	12	NULL	44	Using where
+EXPLAIN SELECT clock, ns, value FROM zm WHERE itemid = 7 AND clock <= 1700000050 ORDER BY clock DESC, ns DESC LIMIT 1;
+id	select_type	table	type	possible_keys	key	key_len	ref	rows	Extra
+1	SIMPLE	zm	range	PRIMARY	PRIMARY	12	NULL	33	Using where
+EXPLAIN SELECT clock, ns, value FROM zm WHERE itemid = 7 AND clock BETWEEN 1700000020 AND 1700000050 ORDER BY clock DESC, ns DESC LIMIT 5;
+id	select_type	table	type	possible_keys	key	key_len	ref	rows	Extra
+1	SIMPLE	zm	range	PRIMARY	PRIMARY	12	NULL	20	Using where
+EXPLAIN SELECT clock, ns, value FROM zm WHERE itemid = 7 AND clock > 1700000030 ORDER BY clock, ns LIMIT 3;
+id	select_type	table	type	possible_keys	key	key_len	ref	rows	Extra
+1	SIMPLE	zm	range	PRIMARY	PRIMARY	12	NULL	44	Using where
+EXPLAIN SELECT clock, ns, value FROM zm WHERE itemid = 7 ORDER BY clock DESC, ns DESC LIMIT 1;
+id	select_type	table	type	possible_keys	key	key_len	ref	rows	Extra
+1	SIMPLE	zm	ref	PRIMARY	PRIMARY	8	const	63	Using where
+EXPLAIN SELECT value FROM zm WHERE itemid = 7 AND clock = 1700000024 ORDER BY ns DESC LIMIT 1;
+id	select_type	table	type	possible_keys	key	key_len	ref	rows	Extra
+1	SIMPLE	zm	ref	PRIMARY	PRIMARY	12	const,const	1	Using where
+EXPLAIN SELECT MAX(clock) FROM zm WHERE itemid = 7;
+id	select_type	table	type	possible_keys	key	key_len	ref	rows	Extra
+1	SIMPLE	NULL	NULL	NULL	NULL	NULL	NULL	NULL	Select tables optimized away
+# exact lookup by the whole key: const, and eq_ref in a join
+EXPLAIN SELECT * FROM zm WHERE itemid = 7 AND clock = 1700000024 AND ns = 300;
+id	select_type	table	type	possible_keys	key	key_len	ref	rows	Extra
+1	SIMPLE	zm	const	PRIMARY	PRIMARY	16	const,const,const	1	
+EXPLAIN SELECT zm.* FROM it JOIN zm ON zm.itemid = it.itemid AND zm.clock = it.lastclock AND zm.ns = it.lastns;
+id	select_type	table	type	possible_keys	key	key_len	ref	rows	Extra
+1	SIMPLE	it	ALL	PRIMARY	NULL	NULL	NULL	30	
+1	SIMPLE	zm	eq_ref	PRIMARY	PRIMARY	16	test.it.itemid,test.it.lastclock,test.it.lastns	1	
+EXPLAIN SELECT zm.* FROM it JOIN zm ON zm.itemid = it.itemid AND zm.clock = it.lastclock;
+id	select_type	table	type	possible_keys	key	key_len	ref	rows	Extra
+1	SIMPLE	it	ALL	PRIMARY	NULL	NULL	NULL	30	
+1	SIMPLE	zm	ref	PRIMARY	PRIMARY	12	test.it.itemid,test.it.lastclock	1	
+# a range over several items cannot be served in (clock, ns) order: it sorts
+EXPLAIN SELECT clock, ns, value FROM zm WHERE itemid IN (3, 7) AND clock > 1700000030 ORDER BY clock DESC, ns DESC LIMIT 2;
+id	select_type	table	type	possible_keys	key	key_len	ref	rows	Extra
+1	SIMPLE	zm	range	PRIMARY	PRIMARY	12	NULL	88	Using where; Using filesort
+# ---- the same answers as InnoDB
+# last value after a time
+result_rows	vs_innodb
+1	SAME
+# last value up to a time (three samples in that second)
+result_rows	vs_innodb
+1	SAME
+# the last seven values
+result_rows	vs_innodb
+7	SAME
+# ascending, all ties in ns order
+result_rows	vs_innodb
+27	SAME
+# descending, all ties in ns order
+result_rows	vs_innodb
+27	SAME
+# the samples of one second, ascending
+result_rows	vs_innodb
+2	SAME
+# the samples of one second, descending
+result_rows	vs_innodb
+2	SAME
+# the newest sample of one second
+result_rows	vs_innodb
+1	SAME
+# MIN/MAX of ns in one second
+result_rows	vs_innodb
+1	SAME
+# MAX/MIN(clock) of an item
+result_rows	vs_innodb
+1	SAME
+# several items
+result_rows	vs_innodb
+6	SAME
+# join by the whole key (eq_ref)
+result_rows	vs_innodb
+30	SAME
+# join by (itemid, clock): all samples of the last second
+result_rows	vs_innodb
+90	SAME
+# exact lookup, a row
+result_rows	vs_innodb
+1	SAME
+# exact lookup, no row
+result_rows	vs_innodb
+0	SAME
+# ns IN (...)
+result_rows	vs_innodb
+2	SAME
+# a range on ns
+result_rows	vs_innodb
+2	SAME
+# IN on itemid with the rest of the key
+result_rows	vs_innodb
+2	SAME
+# a time range without the item
+result_rows	vs_innodb
+1	SAME
+# ---- the last value reads one index entry, not the item's series
+# last value after a time (handler counters of the MooseDB run)
+Variable_name	Value
+Handler_read_first	0
+Handler_read_key	1
+Handler_read_last	0
+Handler_read_next	0
+Handler_read_prev	0
+Handler_read_rnd_next	0
+result_rows	vs_innodb
+1	SAME
+##################################################################
+# unique_checks = 0: bulk load without the check (a risk the user takes)
+##################################################################
+CREATE TABLE uc (itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG', clock INT NOT NULL, value DOUBLE NOT NULL, ns INT NOT NULL,
+PRIMARY KEY (itemid, clock, ns)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+INSERT INTO uc VALUES (1, 100, 1, 1), (1, 101, 1, 1);
+SET unique_checks = 0;
+INSERT INTO uc VALUES (1, 100, 2, 1), (1, 102, 2, 1);
+SET unique_checks = 1;
+SELECT clock, ns, value FROM uc ORDER BY clock, value;
+clock	ns	value
+100	1	1
+100	1	2
+101	1	1
+102	1	2
+# new rows are checked again, and the rows stored without the check are known
+INSERT INTO uc VALUES (1, 102, 3, 1);
+ERROR 23000: Duplicate entry '1-102-1' for key 'PRIMARY'
+INSERT INTO uc VALUES (1, 100, 3, 1);
+ERROR 23000: Duplicate entry '1-100-1' for key 'PRIMARY'
+INSERT INTO uc VALUES (1, 103, 3, 1);
+SELECT COUNT(*) FROM uc;
+COUNT(*)
+5
+DROP TABLE uc;
+##################################################################
+# LOCK TABLES, stored routines, triggers
+##################################################################
+CREATE TABLE lk (itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG', clock INT NOT NULL, ns INT NOT NULL,
+PRIMARY KEY (itemid, clock, ns)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+CREATE TABLE lk_log (n INT) ENGINE=InnoDB;
+LOCK TABLES lk WRITE;
+INSERT INTO lk VALUES (1, 100, 1);
+INSERT INTO lk VALUES (1, 100, 1);
+ERROR 23000: Duplicate entry '1-100-1' for key 'PRIMARY'
+INSERT INTO lk VALUES (1, 100, 2), (1, 101, 1);
+INSERT INTO lk VALUES (1, 102, 1), (1, 101, 1);
+ERROR 23000: Duplicate entry '1-101-1' for key 'PRIMARY'
+INSERT IGNORE INTO lk VALUES (1, 100, 2), (1, 103, 1);
+Warnings:
+Warning	1062	Duplicate entry '1-100-2' for key 'PRIMARY'
+SELECT @@warning_count;
+@@warning_count
+1
+UNLOCK TABLES;
+SELECT * FROM lk ORDER BY clock, ns;
+itemid	clock	ns
+1	100	1
+1	100	2
+1	101	1
+1	102	1
+1	103	1
+CREATE PROCEDURE lk_p(IN c INT)
+BEGIN
+INSERT INTO lk VALUES (2, c, 1);
+INSERT INTO lk VALUES (2, c, 1);
+END|
+CALL lk_p(50);
+ERROR 23000: Duplicate entry '2-50-1' for key 'PRIMARY'
+SELECT * FROM lk WHERE itemid = 2;
+itemid	clock	ns
+2	50	1
+CREATE TABLE lk_src (itemid BIGINT UNSIGNED NOT NULL, clock INT NOT NULL, ns INT NOT NULL) ENGINE=InnoDB;
+CREATE TRIGGER lk_t AFTER INSERT ON lk_src FOR EACH ROW INSERT INTO lk VALUES (NEW.itemid, NEW.clock, NEW.ns);
+INSERT INTO lk_src VALUES (3, 1, 1), (3, 2, 1);
+INSERT INTO lk_src VALUES (3, 3, 1), (3, 2, 1);
+ERROR 23000: Duplicate entry '3-2-1' for key 'PRIMARY'
+SELECT * FROM lk WHERE itemid = 3 ORDER BY clock;
+itemid	clock	ns
+3	1	1
+3	2	1
+3	3	1
+DROP TRIGGER lk_t;
+DROP PROCEDURE lk_p;
+DROP TABLE lk, lk_log, lk_src;
+##################################################################
+# TRUNCATE and retention forget the keys
+##################################################################
+CREATE TABLE tr (itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG', clock INT NOT NULL, value DOUBLE NOT NULL, ns INT NOT NULL,
+PRIMARY KEY (itemid, clock, ns)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock' CHUNK_INTERVAL='1 DAY' RETENTION_PERIOD='30 DAYS';
+INSERT INTO tr VALUES (1, 100, 1, 1), (1, 101, 1, 1);
+FLUSH TABLES tr;
+INSERT INTO tr VALUES (1, 102, 1, 1);
+INSERT INTO tr VALUES (1, 100, 2, 1);
+ERROR 23000: Duplicate entry '1-100-1' for key 'PRIMARY'
+TRUNCATE TABLE tr;
+SELECT COUNT(*) FROM tr;
+COUNT(*)
+0
+INSERT INTO tr VALUES (1, 100, 2, 1), (1, 101, 2, 1), (1, 102, 2, 1);
+INSERT INTO tr VALUES (1, 101, 3, 1);
+ERROR 23000: Duplicate entry '1-101-1' for key 'PRIMARY'
+SELECT clock, value FROM tr ORDER BY clock;
+clock	value
+100	2
+101	2
+102	2
+# retention: the key of an expired row can be inserted again
+TRUNCATE TABLE tr;
+INSERT INTO tr VALUES (1, UNIX_TIMESTAMP() - 200 * 86400, 1, 1), (1, UNIX_TIMESTAMP() - 100 * 86400, 1, 1), (1, UNIX_TIMESTAMP() - 3600, 1, 1);
+FLUSH TABLES tr;
+INSERT INTO tr VALUES (1, UNIX_TIMESTAMP() - 200 * 86400, 2, 1);
+ERROR 23000: Duplicate entry '1-<clock>-1' for key 'PRIMARY'
+CALL moosedb_apply_retention('test.tr');
+SELECT COUNT(*) AS rows_left FROM tr;
+rows_left
+1
+INSERT INTO tr VALUES (1, UNIX_TIMESTAMP() - 200 * 86400, 2, 1);
+INSERT INTO tr VALUES (1, UNIX_TIMESTAMP() - 200 * 86400, 3, 1);
+ERROR 23000: Duplicate entry '1-<clock>-1' for key 'PRIMARY'
+INSERT INTO tr VALUES (1, UNIX_TIMESTAMP() - 3600, 3, 1);
+ERROR 23000: Duplicate entry '1-<clock>-1' for key 'PRIMARY'
+DROP TABLE tr;
+##################################################################
+# ALTER TABLE
+##################################################################
+CREATE TABLE al (itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG', clock INT NOT NULL, ns INT NOT NULL, INDEX (clock))
+ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+INSERT INTO al VALUES (1, 100, 1), (1, 100, 1), (1, 101, 1);
+# adding the key to a table that holds a duplicate fails
+ALTER TABLE al ADD PRIMARY KEY (itemid, clock, ns);
+ERROR 23000: Duplicate entry '1-100-1' for key 'PRIMARY'
+SELECT COUNT(*) FROM al;
+COUNT(*)
+3
+TRUNCATE TABLE al;
+INSERT INTO al VALUES (1, 100, 1), (1, 100, 2), (1, 101, 1);
+ALTER TABLE al ADD PRIMARY KEY (itemid, clock, ns);
+SHOW CREATE TABLE al;
+Table	Create Table
+al	CREATE TABLE `al` (
+  `itemid` bigint(20) unsigned NOT NULL COMMENT 'TAG',
+  `clock` int(11) NOT NULL,
+  `ns` int(11) NOT NULL,
+  PRIMARY KEY (`itemid`,`clock`,`ns`),
+  KEY `clock` (`clock`)
+) ENGINE=MooseDB DEFAULT CHARSET=latin1 COLLATE=latin1_swedish_ci `TIMESTAMP_COLUMN`='clock'
+INSERT INTO al VALUES (1, 100, 2);
+ERROR 23000: Duplicate entry '1-100-2' for key 'PRIMARY'
+SELECT * FROM al ORDER BY clock, ns;
+itemid	clock	ns
+1	100	1
+1	100	2
+1	101	1
+# the key can be dropped again; the table then needs an index on the time column
+ALTER TABLE al DROP PRIMARY KEY;
+INSERT INTO al VALUES (1, 100, 2);
+SELECT COUNT(*) FROM al;
+COUNT(*)
+4
+CREATE TABLE al2 (itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG', clock INT NOT NULL, PRIMARY KEY (itemid, clock)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+ALTER TABLE al2 DROP PRIMARY KEY;
+ERROR HY000: MooseDB: missing index on the timestamp column: add INDEX (clock)
+ALTER TABLE al2 DROP PRIMARY KEY, ADD INDEX (clock);
+DROP TABLE al2;
+# converting an InnoDB table with the key
+CREATE TABLE cv (itemid BIGINT UNSIGNED NOT NULL, clock INT NOT NULL, ns INT NOT NULL, PRIMARY KEY (itemid, clock, ns)) ENGINE=InnoDB;
+INSERT INTO cv VALUES (1, 1, 1), (1, 1, 2), (2, 1, 1);
+ALTER TABLE cv ENGINE=MooseDB TIMESTAMP_COLUMN='clock', MODIFY itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG';
+SHOW CREATE TABLE cv;
+Table	Create Table
+cv	CREATE TABLE `cv` (
+  `itemid` bigint(20) unsigned NOT NULL COMMENT 'TAG',
+  `clock` int(11) NOT NULL,
+  `ns` int(11) NOT NULL,
+  PRIMARY KEY (`itemid`,`clock`,`ns`)
+) ENGINE=MooseDB DEFAULT CHARSET=latin1 COLLATE=latin1_swedish_ci `TIMESTAMP_COLUMN`='clock'
+INSERT INTO cv VALUES (1, 1, 2);
+ERROR 23000: Duplicate entry '1-1-2' for key 'PRIMARY'
+SELECT * FROM cv ORDER BY itemid, clock, ns;
+itemid	clock	ns
+1	1	1
+1	1	2
+2	1	1
+DROP TABLE al, cv;
+DROP TABLE zm, zi, it, sp, si, pr;
+DROP PROCEDURE moosedb_compact;
+DROP PROCEDURE moosedb_apply_retention;
+DROP FUNCTION moosedb_compact_impl;
+DROP FUNCTION moosedb_retention_impl;

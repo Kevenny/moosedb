@@ -12,6 +12,7 @@ moosedb_compaction_trigger_chunks	10
 moosedb_max_open_chunks	100
 moosedb_memtable_flush_threshold	67108864
 moosedb_retention_check_interval	3600
+moosedb_unique_lock_wait_timeout	50
 moosedb_wal_sync_mode	fsync
 # Full option syntax (spec §7)
 CREATE TABLE metricas (
@@ -61,14 +62,15 @@ CREATE TABLE t1 (ts DATETIME NOT NULL, v INT) ENGINE=MooseDB;
 ERROR HY000: MooseDB: a MooseDB table needs a DATETIME/TIMESTAMP column with an index (INDEX ts_idx (ts)) or TIMESTAMP_COLUMN = '<column>'
 CREATE TABLE t1 (ts DATETIME NULL, INDEX(ts)) ENGINE=MooseDB;
 ERROR 42000: Table handler doesn't support NULL in given index. Please change column 'ts' to be NOT NULL or use another handler
+# (PRIMARY KEY on the time column of a table without TAG columns is accepted: primary_key.test)
 CREATE TABLE t1 (ts DATETIME NOT NULL, PRIMARY KEY(ts)) ENGINE=MooseDB;
-ERROR HY000: MooseDB: index 'PRIMARY' cannot be UNIQUE/PRIMARY: time-series rows are not unique by time
+DROP TABLE t1;
 CREATE TABLE t1 (ts DATETIME NOT NULL, v INT NOT NULL, INDEX(ts), INDEX(v)) ENGINE=MooseDB;
-ERROR HY000: MooseDB: index 'v' is not supported: MooseDB only indexes the timestamp column (TAG columns are indexed implicitly)
+ERROR HY000: MooseDB: index 'v' is not supported: column 'v' is not a TAG column or the timestamp column. MooseDB indexes the timestamp column alone, or TAG columns optionally followed by the timestamp (INDEX (itemid, clock))
 CREATE TABLE t1 (ts DATETIME NOT NULL, INDEX(ts)) ENGINE=MooseDB TIMESTAMP_COLUMN='nope';
 ERROR HY000: MooseDB: TIMESTAMP_COLUMN 'nope' does not exist
-CREATE TABLE t1 (ts DATETIME NOT NULL, v INT NOT NULL, INDEX(ts)) ENGINE=MooseDB TIMESTAMP_COLUMN='v';
-ERROR HY000: MooseDB: timestamp column 'v' must be a stored DATETIME or TIMESTAMP column
+CREATE TABLE t1 (ts DATETIME NOT NULL, v DOUBLE NOT NULL, INDEX(ts)) ENGINE=MooseDB TIMESTAMP_COLUMN='v';
+ERROR HY000: MooseDB: timestamp column 'v' must be a stored DATETIME, TIMESTAMP, INT or BIGINT column
 CREATE TABLE t1 (id INT NOT NULL AUTO_INCREMENT, ts DATETIME NOT NULL, INDEX(id), INDEX(ts)) ENGINE=MooseDB;
 ERROR 42000: Storage engine MooseDB doesn't support AUTO_INCREMENT columns
 # TIMESTAMP columns work as the time axis too

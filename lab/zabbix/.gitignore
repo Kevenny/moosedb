@@ -1,0 +1,4 @@
+# artefatos gerados pelos scripts do laboratório (logs, medições, lista de itens)
+results/
+# cópia local do plugin montada no container (ver README)
+plugin/

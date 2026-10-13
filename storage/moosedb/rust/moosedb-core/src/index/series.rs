@@ -183,6 +183,18 @@ impl SeriesIndex {
         id
     }
 
+    /// [`SeriesIndex::get_or_insert`] for a caller that already has the key
+    /// (`series_key(tags)`): a known series costs one lookup, no allocation.
+    pub(crate) fn get_or_insert_keyed(&mut self, key: &[u8], tags: &[Value]) -> u64 {
+        if let Some(&id) = self.by_key.get(key) {
+            return id;
+        }
+        let id = self.next_id;
+        self.next_id += 1;
+        self.add(key.to_vec(), id, tags);
+        id
+    }
+
     /// Registers a series found in a chunk. The same series may appear in many
     /// chunks, but an id must always map to the same tags and vice versa.
     pub(crate) fn register(&mut self, id: u64, tags: &[Value]) -> Result<()> {

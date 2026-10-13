@@ -30,6 +30,13 @@ typedef enum {
   // (wrong or retired key, damaged ciphertext): distinct from
   // `TF_ERR_CORRUPT` because the data may be intact.
   TF_ERR_CRYPTO = 10,
+  // A UNIQUE/PRIMARY key already exists (the row was not stored).
+  TF_ERR_DUPLICATE = 11,
+  // Another statement holds the series this row needs; nothing changed,
+  // call again (see `moosedb_batch_write`).
+  TF_ERR_BUSY = 12,
+  // Waiting for that series would close a cycle of waiting statements.
+  TF_ERR_DEADLOCK = 13,
 } TFStatus;
 
 // Column type codes used in `TFTableConfig::column_types` and `TFValue::kind`.
@@ -106,6 +113,15 @@ typedef struct {
   const uint8_t *column_types;
   // Key id for encryption at rest; 0 = not encrypted.
   uint32_t encryption_key_id;
+  // The table has a UNIQUE/PRIMARY key `(all TAG columns, time column,
+  // <unique_extra_cols>)`: inserting an existing key fails with
+  // `TF_ERR_DUPLICATE`. Not persisted; supplied at every open.
+  bool unique;
+  // Number of key columns after the time column (at most 2).
+  uint32_t unique_extra_count;
+  // `unique_extra_count` schema column indexes (INT64 columns); may be NULL
+  // when the count is 0.
+  const uint32_t *unique_extra_cols;
 } TFTableConfig;
 
 typedef struct {
@@ -136,6 +152,52 @@ typedef struct {
   uint32_t col_count;
   TFValue *values;
 } TFRow;
+
+// One column of a `TFBatch` (see `moosedb_scan_next_batch`). All pointers
+// belong to the scan and follow the lifetime of the batch.
+//
+// `row_count` below is `TFBatch::row_count`. If `present == 0` the column was
+// not requested by the projection and every pointer is NULL.
+//
+// * `nulls`: NULL when no row of the batch is NULL in this column; otherwise
+//   `row_count` bytes, non-zero = NULL. A NULL row holds 0 / an empty string in
+//   the value arrays below.
+// * fixed-width columns use `values` (`row_count` elements):
+//   `TF_COL_TIMESTAMP` int64 microseconds, `TF_COL_INT64` int64,
+//   `TF_COL_FLOAT64` double, `TF_COL_FLOAT32` float, `TF_COL_BOOL` uint8 (0/1).
+//   Elements are naturally aligned for their type.
+// * variable-width columns (`TF_COL_VARCHAR`, `TF_COL_TAG`, `TF_COL_DECIMAL`)
+//   use `starts` and `lens` (`row_count` uint32 each): the value of row `i`
+//   is `data[starts[i] .. starts[i] + lens[i]]`; `data` may be NULL when
+//   every length is 0. Bytes are not NUL-terminated. A TAG value is stored
+//   once per series run: rows of the same series in one batch share the
+//   same `starts[i]`, so a handler may skip re-storing a TAG whose `starts`
+//   equals the previous row's.
+typedef struct {
+  // A `TFColumnType` code.
+  uint8_t kind;
+  // 1 if projected (filled), 0 if not requested.
+  uint8_t present;
+  const uint8_t *nulls;
+  const void *values;
+  const uint32_t *starts;
+  const uint32_t *lens;
+  const uint8_t *data;
+  // Size in bytes of `data`; `starts[i] + lens[i] <= data_len` for every row.
+  uint64_t data_len;
+} TFColumnBatch;
+
+// Up to N rows of a scan in columnar form (`moosedb_scan_next_batch`).
+// Owned by the scan; valid until the next call on it.
+typedef struct {
+  // Rows in this batch; 0 means the end of the scan.
+  uint32_t row_count;
+  // Number of table columns: `columns[c]` describes schema column `c`.
+  uint32_t col_count;
+  const TFColumnBatch *columns;
+  // `row_count * TF_POSITION_LEN` bytes: the position of each row.
+  const uint8_t *positions;
+} TFBatch;
 
 // Table-level diagnostics (INFORMATION_SCHEMA.MOOSEDB_TABLES). Strings are
 // owned by the `MooseDBInfo` handle.
@@ -250,8 +312,23 @@ TFStatus moosedb_write_row(MooseDBTable *table, const TFRow *row);
 // `table` must be a valid handle; `out_batch` writable.
 TFStatus moosedb_batch_begin(MooseDBTable *table, MooseDBBatch **out_batch);
 
+// Turns the UNIQUE key checks of this statement on (the default) or off
+// (`unique_checks = 0`). Off, rows are stored without checking and without
+// claiming their series, so a key stored this way can be a duplicate and later
+// checks cannot tell; the engine still records them for what comes after.
+// No effect on a table without a UNIQUE key.
+//
+// # Safety
+// `batch` must be a live batch handle.
+TFStatus moosedb_batch_set_unique_checks(MooseDBBatch *batch, bool enabled);
+
 // Adds one row to the batch (same value convention as `moosedb_write_row`).
 // On error the row is not part of the batch; the batch stays usable.
+//
+// On a table with a UNIQUE key: `TF_ERR_DUPLICATE` = the key exists (stored,
+// or in an open statement); `TF_ERR_BUSY` = another statement holds the series
+// (after waiting a short while): nothing changed, call again with the same
+// row; `TF_ERR_DEADLOCK` = waiting would close a cycle between statements.
 //
 // # Safety
 // `batch` must be a live batch handle; `row` as in `moosedb_write_row`.
@@ -323,6 +400,34 @@ TFStatus moosedb_scan_open_filtered(MooseDBTable *table,
                                     bool sorted,
                                     MooseDBScan **out_scan);
 
+// `moosedb_scan_open_filtered` that decodes and returns only some columns.
+//
+// `columns_mask` holds `mask_len` bytes, one per table column in schema
+// order; a non-zero byte requests the column. `mask_len` must equal the
+// number of columns of the table, else `TF_ERR_INVALID_ARG`.
+// `columns_mask == NULL` with `mask_len == 0` requests every column.
+//
+// Columns that are not requested are never decoded. Through
+// `moosedb_scan_next` / `moosedb_scan_prev` they read as NULL; through the
+// batch calls they are reported with `present == 0`. The timestamp is
+// decoded internally when the range or the order needs it, whether or not it
+// is requested. `moosedb_snapshot_fetch` ignores the projection: it returns
+// whole rows.
+//
+// # Safety
+// `series_ids` must hold `series_count` elements when `series_count > 0`;
+// `columns_mask` must hold `mask_len` readable bytes (or be NULL with
+// `mask_len == 0`).
+TFStatus moosedb_scan_open_projected(MooseDBTable *table,
+                                     int64_t ts_start_us,
+                                     int64_t ts_end_us,
+                                     const uint64_t *series_ids,
+                                     int64_t series_count,
+                                     bool sorted,
+                                     const uint8_t *columns_mask,
+                                     uint32_t mask_len,
+                                     MooseDBScan **out_scan);
+
 // Advances the scan. At the end, `*out_eof` is set and `out_row` emptied.
 //
 // # Safety
@@ -334,6 +439,61 @@ TFStatus moosedb_scan_next(MooseDBScan *scan, TFRow *out_row, bool *out_eof);
 // # Safety
 // As `moosedb_scan_next`.
 TFStatus moosedb_scan_prev(MooseDBScan *scan, TFRow *out_row, bool *out_bof);
+
+// Reads the next rows of the scan into columnar buffers owned by the scan.
+//
+// Fills `*out` with up to `max_rows` rows (`0` = 1024; at most 65536). When
+// the scan is exhausted `out->row_count` is 0 and `*out_end` is set; a
+// non-empty batch never sets `*out_end` (the end is reported by the next
+// call). A batch may hold fewer rows than asked for.
+//
+// Lifetime: everything `*out` points to (the `columns` array, every column
+// buffer and `positions`) belongs to the scan and stays valid until the next
+// call on that scan (`moosedb_scan_next`, `_prev`, `_next_batch`,
+// `_prev_batch`, `_seek_end`) or `moosedb_scan_close`. It is invalidated even
+// if that next call fails. Buffers are reused, so the steady state does not
+// allocate.
+//
+// Position: after the call, `moosedb_scan_position` returns the position of
+// the last row of the batch. `positions` holds `row_count` entries of
+// `TF_POSITION_LEN` bytes, one per row, in the format `moosedb_scan_position`
+// writes and `moosedb_snapshot_fetch` takes, so `position()` can be served
+// for any row of the batch without calling back.
+//
+// Direction: the batch calls work on sorted and unsorted scans alike, but
+// `moosedb_scan_prev_batch` needs a sorted scan (`TF_ERR_UNSUPPORTED`
+// otherwise). The cursor ends after the last row of the batch, not after the
+// row the handler is serving: a handler that switches direction
+// (`index_prev` after `index_next`) must account for the rows read ahead
+// (the next row in the other direction is the one before the batch's last).
+// Reading ahead decodes data early; `ORDER BY ... LIMIT n` should start with
+// a small `max_rows`.
+//
+// # Safety
+// `scan` must be valid; `out` and `out_end` writable.
+TFStatus moosedb_scan_next_batch(MooseDBScan *scan, uint32_t max_rows, TFBatch *out, bool *out_end);
+
+// Like `moosedb_scan_next_batch`, for the rows before the cursor (sorted
+// scans only), nearest first: after `moosedb_scan_seek_end` the batch holds
+// the newest rows, newest first.
+//
+// # Safety
+// As `moosedb_scan_next_batch`.
+TFStatus moosedb_scan_prev_batch(MooseDBScan *scan, uint32_t max_rows, TFBatch *out, bool *out_end);
+
+// Rewinds the scan to before its first row on the same snapshot it opened with
+// (no new snapshot: rows written since the scan opened stay invisible). Works
+// on sorted and unsorted scans; the next `moosedb_scan_next` /
+// `moosedb_scan_next_batch` returns the first row.
+//
+// After a scan reported its end (EOF with `next*`, BOF with `prev*`), the
+// only supported way to continue is `moosedb_scan_seek_start` or
+// `moosedb_scan_seek_end`; what `prev`/`next` do straight after an end is
+// unspecified.
+//
+// # Safety
+// `scan` must be valid.
+TFStatus moosedb_scan_seek_start(MooseDBScan *scan);
 
 // Positions a sorted scan after its last row (for `index_last`).
 //

@@ -212,6 +212,18 @@ fn parse_prefix(n: usize, block: &BlockPayload) -> Result<Parsed<'_>> {
 }
 
 fn decode_present<'a>(ty: ColumnType, encoding: u8, r: &mut ByteReader<'a>, present: usize) -> Result<Present<'a>> {
+    decode_present_prefix(ty, encoding, r, present, present)
+}
+
+/// Like [`decode_present`] but materializes only the first `take` of the
+/// `present` values; `take < present` skips the tail (and its strict checks).
+fn decode_present_prefix<'a>(
+    ty: ColumnType,
+    encoding: u8,
+    r: &mut ByteReader<'a>,
+    present: usize,
+    take: usize,
+) -> Result<Present<'a>> {
     let expect = |e: u8| {
         if encoding == e {
             Ok(())
@@ -222,23 +234,25 @@ fn decode_present<'a>(ty: ColumnType, encoding: u8, r: &mut ByteReader<'a>, pres
     let values = match ty {
         ColumnType::Timestamp => {
             expect(ENC_DELTA_OF_DELTA)?;
-            Present::Ints(delta::decode_delta_of_delta(r, present)?)
+            Present::Ints(delta::decode_delta_of_delta_prefix(r, present, take)?)
         }
         ColumnType::Int64 => {
             expect(ENC_DELTA)?;
-            Present::Ints(delta::decode_delta(r, present)?)
+            Present::Ints(delta::decode_delta_prefix(r, present, take)?)
         }
         ColumnType::Float64 => {
             expect(ENC_GORILLA64)?;
-            Present::Bits(gorilla::decode(r.take(r.remaining())?, present, 64)?)
+            Present::Bits(gorilla::decode_prefix(r.take(r.remaining())?, present, take, 64)?)
         }
         ColumnType::Float32 => {
             expect(ENC_GORILLA32)?;
-            Present::Bits(gorilla::decode(r.take(r.remaining())?, present, 32)?)
+            Present::Bits(gorilla::decode_prefix(r.take(r.remaining())?, present, take, 32)?)
         }
         ColumnType::Bool => {
             expect(ENC_BOOL_RLE)?;
-            Present::Bools(rle::decode(r, present)?)
+            let mut v = rle::decode(r, present)?;
+            v.truncate(take);
+            Present::Bools(v)
         }
         ColumnType::Varchar | ColumnType::Decimal => {
             expect(ENC_PLAIN)?;
@@ -246,15 +260,15 @@ fn decode_present<'a>(ty: ColumnType, encoding: u8, r: &mut ByteReader<'a>, pres
             if present > r.remaining() / 4 {
                 return Err(corrupt("column block holds fewer values than expected"));
             }
-            let mut v = Vec::with_capacity(present);
-            for _ in 0..present {
+            let mut v = Vec::with_capacity(take);
+            for _ in 0..take {
                 v.push(r.bytes()?);
             }
             Present::Bytes(v)
         }
         ColumnType::Tag => return Err(corrupt("tag column stored as data block")),
     };
-    if r.remaining() != 0 {
+    if take == present && r.remaining() != 0 {
         return Err(corrupt("trailing bytes in column block"));
     }
     let got = match &values {
@@ -263,7 +277,7 @@ fn decode_present<'a>(ty: ColumnType, encoding: u8, r: &mut ByteReader<'a>, pres
         Present::Bools(v) => v.len(),
         Present::Bytes(v) => v.len(),
     };
-    if got != present {
+    if got != take {
         return Err(corrupt("column block value count mismatch"));
     }
     Ok(values)
@@ -323,10 +337,28 @@ fn spread<T: Copy + Default>(present: Vec<T>, nulls: Option<&[bool]>) -> Result<
 
 /// Like [`decode`], but keeps the column compact (see [`ColumnData`]).
 pub(crate) fn decode_compact(ty: ColumnType, n: usize, block: &BlockPayload) -> Result<ColumnData> {
+    decode_compact_prefix(ty, n, n, block)
+}
+
+/// Like [`decode_compact`] for the first `upto` of the block's `n` values: the
+/// column holds `upto` rows and the codec stops there. Delta and Gorilla
+/// streams cannot be entered in the middle, so a leading part is the cheapest
+/// way to reach rows `[a, b)`: decode `[0, b)` and use `[a, b)`.
+pub(crate) fn decode_compact_prefix(ty: ColumnType, n: usize, upto: usize, block: &BlockPayload) -> Result<ColumnData> {
     check_materialization(n, 9)?;
-    let Parsed { mut r, nulls, present } = parse_prefix(n, block)?;
+    let upto = upto.min(n);
+    let Parsed { mut r, mut nulls, present } = parse_prefix(n, block)?;
+    let take = if upto == n {
+        present
+    } else {
+        nulls.as_mut().map_or(upto, |m| {
+            m.truncate(upto);
+            m.iter().filter(|b| !**b).count()
+        })
+    };
+    let n = upto;
     let nl = nulls.as_deref();
-    let values = match decode_present(ty, block.encoding, &mut r, present)? {
+    let values = match decode_present_prefix(ty, block.encoding, &mut r, present, take)? {
         Present::Ints(v) => Dense::Ints(spread(v, nl)?),
         Present::Bits(v) if ty == ColumnType::Float64 => Dense::Bits64(spread(v, nl)?),
         Present::Bits(v) => Dense::Bits32(spread(v.into_iter().map(|b| b as u32).collect(), nl)?),
@@ -349,7 +381,43 @@ pub(crate) fn decode_compact(ty: ColumnType, n: usize, block: &BlockPayload) -> 
     Ok(ColumnData { ty, nulls, values })
 }
 
+/// Borrowed view of a column's values, for bulk copies (scan batches).
+pub(crate) enum DenseRef<'a> {
+    Ints(&'a [i64]),
+    Bits64(&'a [u64]),
+    Bits32(&'a [u32]),
+    Bools(&'a [bool]),
+    /// `len + 1` offsets into `data`.
+    Bytes {
+        offsets: &'a [u32],
+        data: &'a [u8],
+    },
+}
+
 impl ColumnData {
+    pub(crate) fn dense(&self) -> DenseRef<'_> {
+        match &self.values {
+            Dense::Ints(v) => DenseRef::Ints(v),
+            Dense::Bits64(v) => DenseRef::Bits64(v),
+            Dense::Bits32(v) => DenseRef::Bits32(v),
+            Dense::Bools(v) => DenseRef::Bools(v),
+            Dense::Bytes { offsets, data } => DenseRef::Bytes { offsets, data },
+        }
+    }
+
+    /// NULL flags (`true` = NULL), if the column has any NULL.
+    pub(crate) fn null_flags(&self) -> Option<&[bool]> {
+        self.nulls.as_deref()
+    }
+
+    /// The values of an integer-like column (TIMESTAMP, INT64).
+    pub(crate) fn ints(&self) -> Option<&[i64]> {
+        match &self.values {
+            Dense::Ints(v) => Some(v),
+            _ => None,
+        }
+    }
+
     pub(crate) fn len(&self) -> usize {
         match &self.values {
             Dense::Ints(v) => v.len(),
@@ -402,6 +470,36 @@ mod tests {
         let p = unpack(&b.bytes).unwrap();
         assert_eq!(decode(ty, values.len(), &p).unwrap(), values, "{ty:?} {codec:?}");
         b
+    }
+
+    #[test]
+    fn a_leading_part_of_a_column_decodes_like_the_whole() {
+        let n = 300usize;
+        let nullable = |f: &dyn Fn(usize) -> Value| -> Vec<Value> {
+            (0..n).map(|i| if i % 5 == 2 || (100..110).contains(&i) { Value::Null } else { f(i) }).collect()
+        };
+        let cases: Vec<(ColumnType, Vec<Value>)> = vec![
+            (ColumnType::Timestamp, (0..n).map(|i| Value::Timestamp(i as i64 * 10 + (i % 3) as i64)).collect()),
+            (ColumnType::Int64, nullable(&|i| Value::Int(i as i64 * i as i64))),
+            (ColumnType::Float64, nullable(&|i| Value::Float64(i as f64 / 3.0))),
+            (ColumnType::Float32, nullable(&|i| Value::Float32(i as f32 * 0.5))),
+            (ColumnType::Bool, nullable(&|i| Value::Bool(i % 3 == 0))),
+            (ColumnType::Varchar, nullable(&|i| Value::Bytes(vec![b'a'; i % 9]))),
+        ];
+        for codec in [Codec::None, Codec::Zstd(3)] {
+            for (ty, values) in &cases {
+                let refs: Vec<&Value> = values.iter().collect();
+                let p = unpack(&encode(*ty, &refs, codec).unwrap().bytes).unwrap();
+                for upto in [0, 1, 2, 3, 99, 100, 105, 110, 111, 299, 300, 400] {
+                    let col = decode_compact_prefix(*ty, n, upto, &p).unwrap();
+                    let k = upto.min(n);
+                    assert_eq!(col.len(), k, "{ty:?} upto {upto}");
+                    for (i, v) in values.iter().enumerate().take(k) {
+                        assert_eq!(col.value_at(i).as_ref(), Some(v), "{ty:?} upto {upto} row {i}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]

@@ -47,11 +47,37 @@ impl BitReader<'_> {
         Ok(b)
     }
 
+    /// The next `n <= 64` bits, most significant first.
     fn bits(&mut self, n: u32) -> Result<u64> {
-        let mut v = 0u64;
-        for _ in 0..n {
-            v = (v << 1) | u64::from(self.bit()?);
+        if n == 0 {
+            return Ok(0);
         }
+        let end = self
+            .pos
+            .checked_add(n as usize)
+            .filter(|&e| e <= self.data.len() * 8)
+            .ok_or_else(|| corrupt("gorilla stream truncated"))?;
+        let (byte, shift) = (self.pos / 8, (self.pos % 8) as u32);
+        // Fast path: one 64-bit big-endian load (plus a ninth byte if the
+        // field straddles it); the last bytes of the stream use the bit loop.
+        let word = self.data.get(byte..byte + 8).and_then(|c| <[u8; 8]>::try_from(c).ok()).map(u64::from_be_bytes);
+        let v = match word {
+            Some(w) if shift + n <= 64 => (w << shift) >> (64 - n),
+            Some(w) => {
+                let ninth = u64::from(*self.data.get(byte + 8).ok_or_else(|| corrupt("gorilla stream truncated"))?);
+                let extra = shift + n - 64;
+                ((w << shift) >> (64 - n)) | (ninth >> (8 - extra))
+            }
+            None => {
+                let mut v = 0u64;
+                for i in 0..n as usize {
+                    let p = self.pos + i;
+                    v = (v << 1) | u64::from(self.data[p / 8] & (0x80 >> (p % 8)) != 0);
+                }
+                v
+            }
+        };
+        self.pos = end;
         Ok(v)
     }
 }
@@ -90,16 +116,27 @@ pub(crate) fn encode(values: &[u64], width: u32, out: &mut Vec<u8>) {
     out.extend_from_slice(&w.buf);
 }
 
+#[cfg(test)]
 pub(crate) fn decode(data: &[u8], count: usize, width: u32) -> Result<Vec<u64>> {
+    decode_prefix(data, count, count, width)
+}
+
+/// Decodes the first `upto` of `count` values; the tail is not examined when
+/// `upto < count` (the block was CRC-verified by the caller).
+pub(crate) fn decode_prefix(data: &[u8], count: usize, upto: usize, width: u32) -> Result<Vec<u64>> {
     if count == 0 {
         return if data.is_empty() { Ok(Vec::new()) } else { Err(corrupt("gorilla stream for zero values")) };
     }
+    let upto = upto.min(count);
+    if upto == 0 {
+        return Ok(Vec::new());
+    }
     let mut r = BitReader { data, pos: 0 };
-    let mut out = Vec::with_capacity(count.min(data.len() * 8));
+    let mut out = Vec::with_capacity(upto.min(data.len() * 8));
     let mut prev = r.bits(width)?;
     out.push(prev);
     let mut window: Option<(u32, u32)> = None;
-    while out.len() < count {
+    while out.len() < upto {
         if r.bit()? {
             let (lead, len) = if r.bit()? {
                 let lead = r.bits(5)? as u32;
@@ -119,7 +156,7 @@ pub(crate) fn decode(data: &[u8], count: usize, width: u32) -> Result<Vec<u64>> 
         out.push(prev);
     }
     // Only zero padding may follow the last value.
-    if r.pos.div_ceil(8) != data.len() {
+    if upto == count && r.pos.div_ceil(8) != data.len() {
         return Err(corrupt("trailing bytes after gorilla stream"));
     }
     Ok(out)
@@ -150,6 +187,40 @@ mod tests {
         rt64(&[1.0]);
         rt64(&[f64::NAN, -0.0, 0.0, f64::INFINITY, f64::NEG_INFINITY, f64::MIN_POSITIVE, f64::MAX, 1e-300]);
         rt64(&(0..1000).map(|i| (i as f64).sin()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn word_reads_match_the_bit_loop_at_every_offset_and_width() {
+        let data: Vec<u8> = (0..40u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+        for start in 0..data.len() * 8 {
+            for n in [0u32, 1, 2, 5, 7, 8, 9, 31, 32, 33, 56, 57, 63, 64] {
+                let mut fast = BitReader { data: &data, pos: start };
+                let mut slow = BitReader { data: &data, pos: start };
+                let mut want = 0u64;
+                let mut ok = true;
+                for _ in 0..n {
+                    match slow.bit() {
+                        Ok(b) => want = (want << 1) | u64::from(b),
+                        Err(_) => ok = false,
+                    }
+                }
+                match fast.bits(n) {
+                    Ok(v) => assert!(ok && v == want, "start {start} n {n}"),
+                    Err(_) => assert!(!ok, "start {start} n {n}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn prefixes_match_the_full_decode() {
+        let bits: Vec<u64> = (0..500).map(|i| ((i as f64 * 0.37).sin() * 100.0).to_bits()).collect();
+        let mut buf = Vec::new();
+        encode(&bits, 64, &mut buf);
+        for upto in [0, 1, 2, 250, 499, 500, 800] {
+            assert_eq!(decode_prefix(&buf, bits.len(), upto, 64).unwrap(), bits[..upto.min(500)], "upto {upto}");
+        }
+        assert!(decode_prefix(&buf[..buf.len() / 2], bits.len(), 499, 64).is_err());
     }
 
     #[test]

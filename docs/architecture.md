@@ -257,6 +257,19 @@ Segmento cifrado só com header não exige a chave no replay.
   Para não ver um statement pela metade, o handler relê a versão depois de
   abrir o scan e refaz se ela mudou; após 16 tentativas (ou erro), abre o
   scan sem filtro de séries — correto, pois o servidor avalia o WHERE inteiro.
+* **Leitura colunar, projetada e em lote**: o scan recebe as colunas
+  pedidas (o handler deriva do `read_set`) e só elas são decodificadas; cada
+  série vira colunas tipadas e as linhas são emitidas em lotes colunares
+  reutilizáveis (`moosedb_scan_next_batch` / `prev_batch`), sem alocação por
+  linha. Dentro da série (ordenada por ts — fora de ordem é `Corrupt`), o
+  intervalo de tempo é achado por busca binária e as demais colunas são
+  decodificadas só até o fim dele. Medido no core (2M linhas): full scan de
+  135 → 5 ns/linha; range de 1 h em chunk de 1 dia, 236 → 6 ms.
+  Consequência: uma consulta só detecta corrupção nos blocos que lê (ex.:
+  `SUM(v)` não acusa um bloco de `ts` danificado); `CHECK TABLE` continua
+  verificando o CRC de todos os blocos. Colunas virtuais, comandos que não
+  são SELECT e `read_set` ampliado após a abertura usam a linha inteira;
+  `rnd_pos` sempre devolve a linha inteira.
 * **Full scan**: chunk por chunk, série por série (blocos lidos sob demanda,
   via cache LRU), e por fim a MemTable.
 * **Scan por índice** (`index_read_map`, `index_first/last`, `ORDER BY ts`):
@@ -264,11 +277,80 @@ Segmento cifrado só com header não exige a chave no replay.
   descendente. Cada série só é decodificada quando chega ao topo do heap, então
   `ORDER BY ts DESC LIMIT n` lê apenas os dados mais novos. Se a direção muda
   no meio (`index_next` após `index_prev`), o intervalo é materializado.
+* **Índices compostos `(TAG…, tempo)`** (`index_read_map`, `read_range_*`,
+  `records_in_range`, `info`). A chave do índice (formato *key image* do
+  campo) é convertida, pelo próprio campo, no texto canônico que a TAG grava
+  (`val_str`: decimal para inteiros, bytes na charset da coluna para strings) e
+  vira um predicado de igualdade no **mesmo cache de séries por TAG** do
+  pushdown (`hash_sort` + `strnncollsp`, invalidado por *epoch*), então a busca
+  de um valor é O(1) e usa a collation da coluna (`'ALPHA'` casa as séries
+  `alpha`, `Alpha` e `ALPHA ` de uma coluna `_ci`). O scan é o k-way merge
+  ordenado por tempo sobre essas séries, com a faixa de tempo da chave
+  (`=`, `>`, `>=`, `<`, `<=`; o `end_range` aperta o limite superior) — dentro de um prefixo
+  fixo de tags as linhas saem em ordem de tempo, crescente ou decrescente
+  (`ORDER BY clock DESC LIMIT n`, `MAX/MIN(clock)` por item: uma chamada de
+  índice). Prefixo parcial de tags (`hostid = 2` num `(hostid, itemid, clock)`)
+  mistura as séries por tempo. O scan usa o lote/snapshot privado do statement
+  (as linhas do `INSERT … SELECT` da própria tabela não são vistas) e refaz a
+  resolução de séries se uma série nova apareceu entre a resolução e o
+  snapshot (sem o *fallback* sem filtro do pushdown: aqui as séries são o
+  significado da leitura; após 64 tentativas falha com `HA_ERR_LOCK_WAIT_TIMEOUT`).
+  As colunas do índice entram sempre na projeção do scan (o servidor as lê do
+  registro em `compare_key`/`key_cmp_if_same`).
+  **O que a engine promete sobre ordem.** Tags fixas + tempo: ordem de tempo.
+  **Ordem entre valores diferentes de TAG** só em *leituras ordenadas*, pedidas
+  pelo servidor quando ele depende dela: `MIN/MAX(tag)`, `MIN/MAX(tag) WHERE
+  tag <op> const` (otimização de `opt_sum`, que pergunta `index_flags(idx,
+  parte, 0)`), `index_first/last` e `index_read_map` só com tags e
+  `KEY_OR_NEXT/AFTER_KEY/KEY_OR_PREV/BEFORE_KEY`. Elas usam uma visão
+  ordenada das séries (tuplas de tag ordenadas pela comparação da coluna —
+  numérica para TAG inteira com ou sem sinal, collation para string —, séries
+  de tupla igual fundidas), reconstruída só quando a versão das séries muda
+  (O(S log S), fora do mutex da tabela; teto de 512 MiB de heap para todas as visões do processo, com estimativa conservadora e cobrança em dobro durante a construção; acima disso a leitura falha com erro). A versão comparada é `moosedb_series_version()`, o mesmo contador que `moosedb_series_list_version()` informa para a lista usada na construção, e `index_next/prev` passam à tupla
+  vizinha quando a atual acaba. **Cada tupla é lida num snapshot próprio** (não há um corte único no statement para leituras ordenadas que atravessam tuplas: linhas commitadas por outra sessão no meio podem aparecer só nas tuplas seguintes; cada tupla individualmente é consistente e atômica por statement). Se a tupla da
+  chave existe (o caso comum: `MAX(clock)` de um item) a leitura não toca a
+  visão ordenada. `index_flags(idx, parte, 1)` — a pergunta de `ORDER BY` /
+  `GROUP BY` — **não** inclui `HA_READ_ORDER` para parte TAG, e nenhuma parte
+  TAG tem `HA_READ_RANGE`: `ORDER BY itemid`, `GROUP BY itemid` e
+  `itemid > 5` nunca usam o índice (filesort / outro índice), então nenhuma
+  ordem errada pode ser devolvida. `index_next_same` de leitura exata não
+  recompara as partes (todas as linhas já casam).
+  **Estimativas.** `records_in_range` = linhas da janela de tempo (estimativa
+  por chunk, já existente) × séries casadas ÷ séries da tabela (as séries
+  casadas vêm do mesmo cache); nunca 0. `rec_per_key` das partes (`info`):
+  linhas ÷ tuplas distintas, onde tuplas = `min(séries, produto dos
+  distintos por TAG)` (contagens do cache de TAG, recalculadas só quando a
+  versão das séries muda) e a parte de tempo = séries por tupla — daí o
+  `ref` por `(itemid, clock)` em joins é custeado como ~1 linha.
+  Medido (3000 itens × 2 dias × 60 s = 8,6 M linhas, MemTable com 300 k
+  linhas): lookup por `(itemid, clock)` ≈ 20 µs, `MAX(clock)` de um item
+  ≈ 15 µs; self-join `AGGREGATE_LAST` de 1 item/24 h 1,40 s → 0,97 ms
+  (InnoDB 0,90 ms). Para isso o core passou a achar as séries pedidas dentro
+  de um chunk por índice (`ChunkMeta::entries_of`, busca binária) e as
+  linhas da MemTable por índice por segmento (`MemSnapshot::rows_of_series`)
+  em vez de varrer todas as entradas/linhas a cada abertura de scan.
+  O índice por segmento da MemTable só existe em segmentos de ≥ 64 linhas com no máximo 1 série por 4 linhas (senão o segmento é percorrido), e seu custo (24 B por linha) entra no `row_bytes` da MemTable, então flush e o orçamento global dos lotes continuam honestos. Se o cache de TAG passa de 32 índices ou 256 MiB, o pushdown e o lookup caem na comparação direta, O(séries) por sondagem (correto, só mais lento).
 * **Pushdown de TAG** (`cond_push`): igualdades, `IN` e igualdades múltiplas
   sobre colunas TAG com constantes string viram um conjunto de `series_id`,
   calculado comparando os valores de cada série **com a collation da
   comparação** (`strnncollsp`). Só essas séries são lidas; os Bloom filters
   podam chunks. O servidor continua avaliando o WHERE inteiro.
+  **TAG inteira** (`TINYINT`..`BIGINT`, signed/unsigned, sem `ZEROFILL`): a
+  série guarda o texto de `val_str()` (decimal canônico) e o predicado é
+  comparado **byte a byte** (`my_charset_bin`, também no cache — o mesmo
+  `hash_sort` + `strnncollsp` do caminho string, então cache e fallback
+  coincidem). A constante é convertida ao mesmo texto só quando isso é
+  exatamente o que o servidor decide (`numeric_const()`): `INT` e `DECIMAL`
+  são exatos; `DOUBLE` só abaixo de 2⁵³ (acima, `2⁵³+1` compara igual a `2⁵³`
+  como double); string só se for inteiro limpo (`-?(0|[1-9]\d*)`, ≤ 16
+  dígitos, charset não binário e de 1 byte por caractere); fracionária ou
+  fora do intervalo do campo → o valor não casa série alguma e sai da lista;
+  qualquer valor duvidoso (`'0123'`, `' 12'`, `'1e3'`, hex/binário, ≥ 2⁵³) →
+  o predicado inteiro **não** é empurrado. `ZEROFILL` nunca é empurrado (o
+  texto gravado é preenchido). TAG `VARCHAR` comparada com número também não
+  (o servidor compara como `DOUBLE`). Em coluna `BIGINT` o servidor converte
+  constantes string em inteiras antes de `cond_push` (`convert_const_to_int`),
+  então o handler já recebe a constante `INT`.
 
 ## Manutenção em background
 
@@ -313,6 +395,7 @@ v3. Salvaguardas atuais:
 | DATETIME | TIMESTAMP (µs) | relógio de parede tratado como UTC — fronteiras de chunk independem de `time_zone` |
 | TIMESTAMP | TIMESTAMP (µs) | tempo Unix real |
 | TINYINT..BIGINT, YEAR, BIT | INT64 | BIGINT UNSIGNED preservado bit a bit |
+| INT/BIGINT nomeado em `TIMESTAMP_COLUMN` | TIMESTAMP (µs) | segundos desde 1970 UTC × 10⁶ (eixo inteiro); fora de ±9223372036854 s o INSERT é recusado |
 | FLOAT / DOUBLE | FLOAT32 / FLOAT64 | |
 | DECIMAL | DECIMAL | string canônica (exata) |
 | `COMMENT 'TAG'` | TAG | identidade da série |
@@ -329,7 +412,7 @@ v3. Salvaguardas atuais:
 | 4 | `MYSQL_ADD_PLUGIN(... DEFAULT)` | `MODULE_ONLY` | `DEFAULT` compila a engine *dentro* do servidor; a spec exige `INSTALL SONAME`. |
 | 5 | Glob em `DEPENDS` do `add_custom_command` | `FILE(GLOB_RECURSE … CONFIGURE_DEPENDS)` | CMake não expande globs em `DEPENDS`. |
 | 6 | TINYINT(1) → BOOL | TINYINT → INT64 | `TINYINT(1)` aceita -128..127; a codificação delta comprime igualmente. |
-| 7 | `max_supported_key_parts = 4` | `1`, só índice no timestamp, não-UNIQUE | O otimizador remove condições usadas em `ref`; um índice composto exigiria igualdade exata em todas as partes. TAGs são filtradas por pushdown. |
+| 7 | `max_supported_key_parts = 4` | `16`; formas de índice: o tempo sozinho, `(tag_1..tag_k, tempo)` e `(tag_1..tag_k)` (não únicos, #29) e **uma** chave única `(todas as TAGs, tempo[, 1-2 inteiras])` (#30) | Originalmente `1` (só o tempo): o otimizador remove do `WHERE` as condições usadas em `ref`, e um índice composto só vale se a engine honrar igualdade exata nas TAGs; passou a honrar (#29). `UNIQUE`/`PRIMARY` passaram a ser aceitos na forma do #30. |
 | 8 | `HA_CAN_INDEX_BLOBS` | removido; `+HA_BINLOG_*_CAPABLE`, `HA_NO_AUTO_INCREMENT`, `HA_READ_ORDER`, `HA_CAN_TABLE_CONDITION_PUSHDOWN` | Binlog (§13), `ORDER BY ts DESC` pelo índice, pushdown de TAG. |
 | 9 | TFValue com `bool`/enum/união anônima | `uint8_t bool_val`, `uint8_t kind`, união `data` | Ler `bool`/enum inválido vindo do C é UB no Rust; cbindgen não gera união anônima. |
 | 10 | — | `TF_ERR_INTERNAL`, `TF_ERR_UNSUPPORTED`, `TF_ERR_CRYPTO` (10) | Panic capturado / recurso indisponível / falha de decriptação ou chave indisponível (vira `HA_ERR_DECRYPTION_FAILED`). |
@@ -348,6 +431,67 @@ v3. Salvaguardas atuais:
 | 23 | `RETENTION_PERIOD` / `HOT_THRESHOLD` sem limite | ≤ 10 000 anos; cálculo de cutoff saturante | Períodos absurdos estouravam a aritmética e geravam cutoff no futuro (retenção apagaria tudo). |
 | 24 | — (isolamento não especificado) | atomicidade por statement: linhas de um statement aparecem todas de uma vez; crash no meio não deixa nada; sem MVCC nem transações multi-statement | Leituras nunca veem statements parciais; MVCC completo não se justifica com dados imutáveis. Erro no meio do statement mantém as linhas já inseridas (coerente com o binlog de engine não transacional). |
 | 25 | Entrada do WAL única | WAL v2 com `ROW`/`COMMIT`/`ROW_COMMIT`; MANIFEST v2 com `replay_seq` | Necessário para a atomicidade por statement com escritores concorrentes. v1 continua legível. |
+| 26 | Leitura linha a linha | leitura colunar projetada e em lote pela FFI (`TFBatch`), poda por ts dentro da série | O custo dominante era montar linhas (4 mallocs/linha), não decodificar. |
+| 27 | Eixo de tempo só `DATETIME`/`TIMESTAMP` | + `INT`/`BIGINT` (signed/unsigned, `NOT NULL`, armazenada) **somente** via `TIMESTAMP_COLUMN='col'`, lido como segundos epoch UTC (`ts_us = secs × 10⁶`); índice simples sobre a coluna continua obrigatório; `ns` não é dobrado no eixo | Zabbix guarda `clock INT` + `ns INT`. Exigir `TIMESTAMP_COLUMN` evita que um índice qualquer sobre um inteiro mude o significado de tabelas existentes. Produto que estoura `i64` (ou `BIGINT UNSIGNED` > 2⁶³) é erro explícito, não truncamento; limites de range vindos do índice saturam. O core não mudou (mesmo `TF_COL_TIMESTAMP`, sem mudança de FFI); o IS exibe o eixo como DATETIME (clampa em 0000/9999 nos extremos). |
+| 28 | Pushdown de TAG só para strings | + TAG inteira (`TINYINT`..`BIGINT`) com constantes `INT`/`DECIMAL`/`DOUBLE`/string-inteira-limpa em `=`, `IN`, igualdade múltipla; comparação binária do texto canônico | O Zabbix consulta `itemid = 123` sem aspas; cada query varria todas as séries. Regra de correção: o servidor reavalia o WHERE, então só se poda uma série quando é certo que o servidor não a casaria (ver §Leitura). Tipos mistos: em `IN`, uma constante de módulo ≥ 2⁵³ junto de constante `DOUBLE`/string (a lista pode ser comparada como DOUBLE) recusa o pushdown; em igualdade múltipla, todos os membros precisam ser colunas inteiras (membro `DOUBLE`/`DECIMAL`/string recusa). |
+| 29 | Índice só no timestamp | Índices compostos não-UNIQUE `(tag_1..tag_k [, tempo])`, até 8 por tabela. TAG do índice: `COMMENT 'TAG'`, `NOT NULL`, inteira (`TINYINT`..`BIGINT`) ou `CHAR`/`VARCHAR` inteira (sem prefixo), sem repetição, sem `DESC`; qualquer subconjunto/ordem das TAGs (não precisa ser prefixo da ordem do schema); o tempo, se presente, é a **última** parte. O índice só no tempo continua obrigatório. `index_flags`: parte de tempo = `NEXT\|PREV\|ORDER\|RANGE`; parte TAG = `NEXT\|PREV`, e `+ORDER` só para `all_parts=0` (pergunta do `MIN/MAX(col)`); **nenhuma** parte TAG anuncia `RANGE`. Detalhes em §Leitura (índices compostos) | Zabbix lê `WHERE itemid=X AND clock BETWEEN …`, `MAX(clock) … itemid=X`, e faz self-join em `(itemid, clock)`; sem índice cada linha do join varria a série inteira (4,1 s vs 0,7 ms no InnoDB). A engine não tem estrutura de índice: a leitura é "quais séries casam as TAGs da chave" (cache de TAG, O(1)) + faixa de tempo (poda por busca binária), servida pelo k-way merge que já existia. Por isso a ordem que o servidor pode assumir é só a que isso dá de graça (ver §Leitura), e **não** se anuncia ordem nem faixa entre valores de TAG. |
+| 30 | Índices só não-UNIQUE ("linhas não são únicas por tag+tempo") | **Uma** `PRIMARY KEY`/`UNIQUE (todas as TAGs em qualquer ordem, tempo[, 1-2 colunas INT NOT NULL])`, com unicidade verificada de verdade (`ER_DUP_ENTRY`, `INSERT IGNORE`, errkey = a chave). Sem TAGs: só `UNIQUE(tempo)`. TAG de texto na chave exige collation binária NO PAD (ou inteira); `REPLACE`/`ODKU` sobre chave existente → `ER_ILLEGAL_HA` (sem UPDATE/DELETE); `unique_checks=0` pula a checagem. Detalhes em §Chave única | O Zabbix 7.0 declara `PRIMARY KEY (itemid,clock,ns)`; antes só rodava com a PK removida. Subconjunto de TAGs foi recusado: unicidade sobre parte da identidade da série exigiria checar várias séries a cada INSERT. Collation `_ci`/PAD SPACE foi recusada porque duas séries (bytes diferentes) seriam a mesma chave. O índice de tempo isolado deixa de ser obrigatório quando existe a chave única (ela contém o tempo). |
+
+## Chave única (`PRIMARY KEY` / `UNIQUE`)
+
+Forma aceita (`build_layout`): `(todas as TAGs, coluna de tempo [, até 2 inteiras
+NOT NULL])`; a coluna de tempo e as extras entram no core como `UniqueSpec`
+(passada em `TFTableConfig`, não persistida: o DDL a fornece a cada abertura).
+A engine não tem estrutura de índice, então a unicidade é checada contra os dados,
+com três peças em memória (`unique.rs`, estado sob o mutex da tabela):
+
+* **por série, o maior tempo já aceito** (`max_ts`, confirmado *ou* em andamento) e,
+  quando conhecido (`complete`), o conjunto das colunas extras das linhas
+  exatamente nesse tempo. Linha com tempo `> max_ts` não pode ser duplicata
+  (caso comum do *history syncer*: nada é lido); no `max_ts` responde o
+  conjunto; mais antigo (ou conjunto desconhecido) faz um *lookup*: a série é
+  lida naquele único instante nos chunks (Bloom + busca binária, cifrados ou
+  frios incluídos), nos chunks em estágio (*spill*) do statement, na MemTable e
+  nas linhas ainda no buffer do próprio statement. `max_ts` é só um limite
+  superior (retenção e statements abortados nunca o baixam): estado perdido ou
+  velho torna a checagem mais lenta, nunca errada. Reconstruído na abertura a
+  partir das entradas de série dos chunks (`max_ts`, `complete=false`) e das
+  linhas reaplicadas do WAL; `TRUNCATE` o zera;
+* **reserva de séries (`claims`).** Linhas de um statement são invisíveis aos
+  outros até o commit, então duas sessões veriam "a chave não existe". A primeira
+  linha que um statement escreve numa série a reserva até o commit/abort; outro
+  statement que precise dela espera (`Error::Busy`, em fatias de 50 ms numa
+  condvar; o handler repete respeitando `KILL` e `moosedb_unique_lock_wait_timeout`)
+  e depois confere contra o confirmado. Resultado: de duas inserções da mesma
+  chave, exatamente uma vence (`Duplicate` para a outra). Ciclos de espera
+  (A segura s1 e quer s2, B o inverso) são detectados e o que fecha o ciclo falha
+  com `Error::Deadlock` → `ER_LOCK_DEADLOCK`. Statements em séries disjuntas não
+  se tocam; statements que varrem as mesmas séries na mesma ordem se serializam.
+  Um statement que falha/aborta invalida o estado das séries que segurava;
+* **`unique_checks=0`**: linhas gravadas sem checar e sem reservar, mas ainda
+  registradas em `max_ts`/conjunto (as seguintes continuam corretas para o que foi
+  registrado). Chaves gravadas assim podem estar duplicadas e isso não é detectado
+  depois — o mesmo risco do InnoDB em carga em massa, que aqui inclui a PK.
+
+Durabilidade/atomicidade: nada muda (a checagem acontece antes de gravar a linha no
+WAL/buffer; a linha recusada não entra no lote, que continua utilizável). Um erro
+no meio do statement mantém as linhas já aceitas (§Atomicidade, #24): ao contrário
+do InnoDB, `INSERT (a),(b),(a)` deixa `a` e `b`.
+
+**Leitura pela chave.** A PK é um índice composto `(TAGs, tempo, extras)`: as
+partes extras só aceitam igualdade (sem `HA_READ_RANGE`); o `index_read_map` com a
+chave inteira (`HA_WHOLE_KEY`, `const`/`eq_ref`/ODKU/REPLACE) filtra as colunas
+extras entre as linhas do instante. **Ordem:** nos scans ordenados de uma tabela com
+chave única, o *merge* do core põe as linhas de mesmo `ts` em ordem das colunas extras
+(coleta o grupo de um instante entre todos os runs, ordena, entrega — crescente ou
+decrescente; um grupo pode atravessar lotes), então a parte `ns` anuncia
+`HA_READ_NEXT|PREV|ORDER` e `WHERE itemid=X AND clock>N ORDER BY clock DESC, ns DESC
+LIMIT 1` não faz filesort. Partes TAG continuam sem ordem (`all_parts=1`).
+
+**Custo medido** (carga no formato do syncer: 100 statements de 5000 itens, 500 k
+linhas, autocommit, em ordem de clock; MooseDB sem PK com `INDEX(clock)` +
+`INDEX(itemid,clock)` contra a PK `(itemid,clock,ns)`): 0,75 s contra 0,81 s em média
+de 6 execuções (+8 %, de −8 % a +20 % entre execuções; o InnoDB leva ~21 s).
 
 ## Limitações conhecidas
 
@@ -355,9 +499,44 @@ v3. Salvaguardas atuais:
   `OPTIMIZE TABLE` e as procedures funcionam sempre.
 * `DELETE FROM t` sem `WHERE` com `binlog_format=ROW` é executado linha a linha
   pelo servidor e falha (`ER_ILLEGAL_HA`); `TRUNCATE` funciona sempre.
-* Pushdown de TAG só para constantes string em `=`, `IN` e igualdades
-  múltiplas ligadas por `AND` (OR e TAGs numéricas são avaliados só pelo
-  servidor).
+* Pushdown de TAG só em `=`, `IN` (não negado) e igualdades múltiplas ligadas
+  por `AND` (OR, `NOT IN`, `<>`, `<=>` são avaliados só pelo servidor), com
+  constantes string (colunas string) ou numéricas (TAG inteira, ver §Leitura).
+  Sem pushdown: TAG `ZEROFILL`, TAG `VARCHAR` comparada com número, TAG
+  `DECIMAL`/`DOUBLE`/`YEAR`/`BIT`, strings inteiras ≥ 2⁵³ ou não limpas e
+  `DOUBLE` ≥ 2⁵³.
+* Chave única, falhas da reserva: `ER_LOCK_DEADLOCK`, `ER_LOCK_WAIT_TIMEOUT` e `KILL`
+  durante a espera por uma série saem com as linhas anteriores do statement já
+  mantidas (#24), ao contrário do InnoDB; quem re-executa recebe `ER_DUP_ENTRY` nessas
+  linhas. Recomendação: `INSERT IGNORE` no retry, ou statements de uma série / ordem
+  de séries consistente. O estado de unicidade (~70 B/série, em `Inner`) não entra no
+  `moosedb_batch_memory_budget`. O desempate por `ns` em varredura ordenada de tabela
+  inteira com PK coleta e ordena o grupo de cada instante (custo extra por linha;
+  não medido isoladamente). `Table::write_shared` usa um prazo fixo de 50 s
+  (o handler não o usa: respeita `moosedb_unique_lock_wait_timeout`).
+* Chave única: uma só por tabela, forma fixa (ver §Chave única); statements que
+  escrevem várias séries em ordens opostas ao mesmo tempo podem receber
+  `ER_LOCK_DEADLOCK`; uma sessão que tem dois statements abertos na mesma tabela
+  e espera por si mesma só sai pelo timeout; `REPLACE`/`ODKU` sobre chave
+  existente e `UPDATE`/`DELETE` seguem recusados; `unique_checks=0` abre mão da
+  checagem sem aviso; ao ler a PK, `ns` com intervalo (`ns > X`) não vira faixa de
+  índice (o servidor filtra).
+* Índices compostos não únicos: TAG nullable, `DECIMAL`/`DOUBLE`/`YEAR`/
+  `ENUM`/`BLOB` ou prefixo (`col(8)`) não são aceitos em índice; o tempo é sempre
+  a última parte. Uma faixa sobre TAG (`itemid > 5`) não vira faixa de índice, e
+  `ORDER BY`/`GROUP BY` por TAG não são servidos pelo índice. `ORDER BY clock
+  DESC, ns DESC LIMIT 1` (índice não único: o `ns` não está nele; com a PK `(itemid,clock,ns)` sai do índice sem sort, ver §Chave única) lê a faixa do item e ordena
+  (≈ 1440 linhas/dia a 60 s): ~210 µs por item contra ~55 µs no InnoDB (PK com `ns`);
+  a forma do frontend sem PK (`MAX(clock)` + `clock = X ORDER BY ns DESC LIMIT 1`)
+  fica em ~60 µs por item, incluindo o PREPARE/EXECUTE. A visão ordenada de tuplas (leituras `MIN/MAX(tag)`) é refeita quando
+  surge série nova e custa O(S log S); acima de 512 MiB a leitura falha com erro
+  em vez de devolver ordem errada. O estimador supõe séries de tamanho
+  parecido.
+* Eixo de tempo inteiro: só `INT`/`BIGINT` e só por `TIMESTAMP_COLUMN`; intervalo
+  ±9223372036854 s (≈ ano 292277); `SMALLINT`/`MEDIUMINT`/`TINYINT` não são
+  aceitos como eixo. `ns` do Zabbix é coluna comum (não há `TIMESTAMP_NS_COLUMN`);
+  `ORDER BY clock, ns` usa filesort. As procedures de manutenção continuam
+  recebendo limites como `'YYYY-MM-DD[ HH:MM:SS]'` (UTC) também para eixo inteiro.
 * A compactação mantém um intervalo de tempo em um chunk; com
   `CHUNK_INTERVAL='1 MONTH'` e muitas séries, o chunk resultante pode ser grande.
   Uma série que não cabe nos limites de bloco é dividida em vários chunks do

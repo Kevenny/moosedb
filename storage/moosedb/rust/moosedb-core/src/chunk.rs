@@ -28,7 +28,8 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, OnceLock};
 
 use crate::bytes::{put_i64, put_u32, put_u64, ByteReader};
 use crate::compression::Codec;
@@ -162,6 +163,34 @@ pub struct SeriesEntry {
     pub blocks: Vec<BlockRef>,
 }
 
+/// Entry indexes sorted by `(series_id, index)`: valid whatever order the
+/// entries are stored in (older or compacted chunks may hold a series in
+/// several entries, not in id order). `None` past `u32` entries.
+pub(crate) fn build_by_id(series: &[SeriesEntry]) -> Option<Vec<u32>> {
+    let n = u32::try_from(series.len()).ok()?;
+    let mut v: Vec<u32> = (0..n).collect();
+    v.sort_unstable_by_key(|&i| (series.get(i as usize).map_or(0, |e| e.series_id), i));
+    Some(v)
+}
+
+/// Ascending indexes of the entries whose series is in `ids`, through the
+/// `build_by_id` order.
+pub(crate) fn entries_in(series: &[SeriesEntry], by_id: &[u32], ids: &HashSet<u64>) -> Vec<usize> {
+    let id_of = |i: u32| series.get(i as usize).map(|e| e.series_id);
+    let mut out = Vec::new();
+    for &id in ids {
+        let start = by_id.partition_point(|&i| id_of(i).is_some_and(|x| x < id));
+        for &i in by_id.get(start..).unwrap_or(&[]) {
+            if id_of(i) != Some(id) {
+                break;
+            }
+            out.push(i as usize);
+        }
+    }
+    out.sort_unstable();
+    out
+}
+
 /// Owns a chunk file's lifetime. When a chunk leaves the live set (flush
 /// replaced it, retention expired it, compaction merged it, TRUNCATE) it is
 /// only *marked* obsolete; the file is deleted when the last snapshot that
@@ -213,9 +242,21 @@ pub struct ChunkMeta {
     pub series_offsets: Vec<u64>,
     pub bloom: Bloom,
     pub(crate) cipher: Option<CipherParams>,
+    /// Indexes of `series`, sorted by `(series_id, index)`; built on first use
+    /// (see `entries_of`). `None` when the chunk has more entries than `u32`.
+    pub(crate) by_id: OnceLock<Option<Vec<u32>>>,
 }
 
 impl ChunkMeta {
+    /// Indexes into `series` (ascending) of the entries of the given series:
+    /// O(wanted x log entries) instead of a pass over every entry, so
+    /// opening a scan for one series of a chunk with thousands of series is
+    /// cheap. `None` when the chunk cannot be indexed (the caller walks it).
+    pub(crate) fn entries_of(&self, ids: &HashSet<u64>) -> Option<Vec<usize>> {
+        let by_id = self.by_id.get_or_init(|| build_by_id(&self.series)).as_ref()?;
+        Some(entries_in(&self.series, by_id, ids))
+    }
+
     pub fn path(&self) -> &Path {
         &self.file.path
     }
@@ -289,6 +330,24 @@ pub(crate) fn decode_series_entry(r: &mut ByteReader<'_>) -> Result<SeriesEntry>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn entry(id: u64) -> SeriesEntry {
+        SeriesEntry { series_id: id, row_count: 1, ts_min: 0, ts_max: 0, tags: Vec::new(), blocks: Vec::new() }
+    }
+
+    /// Entries out of id order and one series split over several entries (old
+    /// or compacted chunks): the lookup finds exactly the matching entries.
+    #[test]
+    fn entries_of_handles_unsorted_and_repeated_series() {
+        let ids_in_file = [9u64, 3, 3, 7, 9, 1, 3, 9, 5];
+        let series: Vec<SeriesEntry> = ids_in_file.iter().map(|&i| entry(i)).collect();
+        let by_id = build_by_id(&series).unwrap();
+        for wanted in [vec![3u64], vec![9, 1], vec![4], vec![5, 7, 3], vec![], vec![u64::MAX, 0]] {
+            let set: HashSet<u64> = wanted.iter().copied().collect();
+            let want: Vec<usize> = (0..series.len()).filter(|&i| set.contains(&ids_in_file[i])).collect();
+            assert_eq!(entries_in(&series, &by_id, &set), want, "{wanted:?}");
+        }
+    }
 
     #[test]
     fn header_roundtrip_and_crc() {

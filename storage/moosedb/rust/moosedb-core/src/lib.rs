@@ -31,11 +31,13 @@ pub mod maintenance;
 mod manifest;
 mod memtable;
 pub mod options;
+mod rowbatch;
 pub mod scan;
 pub mod schema;
 pub mod settings;
 pub mod table;
 pub mod time;
+pub mod unique;
 mod wal;
 
 pub use batch::Batch;
@@ -43,9 +45,11 @@ pub use compaction::CompactionReport;
 pub use error::{Error, Result};
 pub use index::series::SeriesSnapshot;
 pub use options::{RawOptions, TableConfig, TableOptions};
+pub use rowbatch::{BatchColumn, ScanBatch, DEFAULT_BATCH_ROWS, MAX_BATCH_ROWS};
 pub use scan::{Position, Scan, ScanFilter, Snapshot, POSITION_LEN};
 pub use schema::{Column, ColumnType, Row, Schema, Value};
 pub use table::{Table, TableStats};
+pub use unique::UniqueSpec;
 
 /// Bytes held right now by the process-wide decoded block/series cache
 /// (bounded by `settings::chunk_cache_bytes`).

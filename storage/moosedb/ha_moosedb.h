@@ -60,6 +60,8 @@ struct tf_index_def
 {
   bool simple_ts= false;
   bool has_time= false;
+  bool unique= false;                  /* UNIQUE / PRIMARY KEY (see build_layout) */
+  std::vector<uint> extra_fields;      /* TABLE::field index of each key column after the time part */
   std::vector<uint> tag_fields;    /* TABLE::field index of each TAG part */
   std::vector<int> tag_pos;        /* position among the TAG columns      */
 };
@@ -71,6 +73,8 @@ struct tf_layout
   uint ts_column= 0;               /* index into `columns`              */
   uint ts_key= MAX_KEY;            /* a key on the timestamp column alone */
   std::vector<tf_index_def> indexes;   /* one per key of the table       */
+  uint unique_key= MAX_KEY;           /* the table's UNIQUE/PRIMARY key, if any */
+  std::vector<uint32_t> unique_extra_cols;  /* its columns after the time part, as indexes into `columns` */
 
   /* Position of a field among the TAG columns, or -1. */
   int tag_position(uint field_index) const;
@@ -302,6 +306,10 @@ private:
   int key_to_ts(uint idx, const uchar *key, uint part, longlong *out);
   int map_status(TFStatus status, const char *name= nullptr);
   int commit_batch();   /* publish + sync the open statement batch, if any */
+  int write_batch_row(const TFRow &row);  /* batch write, waiting for UNIQUE series claims */
+  bool extras_equal(const uchar *rec) const;   /* idx_req_.extra_vals vs the row in rec */
+  int key_extra_values(uint idx, const uchar *key, uint from, uint to,
+                      std::vector<longlong> *out);
 
   void collect_tag_predicates(const Item *cond,
                               std::vector<tf_tag_predicate> *out);
@@ -340,6 +348,7 @@ private:
   std::vector<tf_snapshot_ptr> snapshots_;  /* resolve positions in rnd_pos */
   tf_batch_ptr batch_;         /* open statement batch (lazy, per stmt)  */
   bool in_bulk_insert_= false;
+  uint dup_key_= MAX_KEY;     /* key of the last HA_ERR_FOUND_DUPP_KEY (info ERRKEY) */
   query_id_t bulk_query_id_= 0;  /* statement that called start_bulk_insert */
   std::string last_error_;     /* message for get_error_message()        */
   /*
@@ -395,6 +404,7 @@ private:
     bool have_cur= false;
     std::vector<std::string> cur;       /* tag tuple of the scanned series   */
     std::shared_ptr<const tf_tuple_index> tix;   /* sorted tuples, if used   */
+    std::vector<longlong> extra_vals;   /* values of the key columns after the time part, if given */
     longlong lo= LONGLONG_MIN, hi= LONGLONG_MAX;
   } idx_req_;
   std::vector<uint64_t> idx_ids_;       /* series of idx_req_                   */

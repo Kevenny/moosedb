@@ -37,11 +37,7 @@ ALTER TABLE a3 DROP INDEX host, ADD INDEX (item, host, ts);
 SHOW INDEX FROM a3;
 DROP TABLE a1, a2, a3;
 
---echo # Refused: UNIQUE / PRIMARY (rows are not unique by tags + time)
---error ER_ILLEGAL_HA_CREATE_OPTION
-CREATE TABLE e (clock INT NOT NULL, itemid BIGINT NOT NULL COMMENT 'TAG', INDEX (clock), UNIQUE (itemid, clock)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
---error ER_ILLEGAL_HA_CREATE_OPTION
-CREATE TABLE e (clock INT NOT NULL, itemid BIGINT NOT NULL COMMENT 'TAG', INDEX (clock), PRIMARY KEY (itemid, clock)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+--echo # UNIQUE / PRIMARY (all TAGs, time) is accepted (primary_key.test); a key without the time is refused
 --error ER_ILLEGAL_HA_CREATE_OPTION
 CREATE TABLE e (clock INT NOT NULL, itemid BIGINT NOT NULL COMMENT 'TAG', INDEX (clock), UNIQUE (itemid)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
 --echo # Refused: the time column must be the last part

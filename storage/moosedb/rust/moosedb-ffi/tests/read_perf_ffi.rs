@@ -91,6 +91,9 @@ fn build(path: &str, hosts: i64, rows: i64) -> (*mut MooseDBTable, i64) {
         column_names: name_ptrs.as_ptr(),
         column_types: types.as_ptr(),
         encryption_key_id: 0,
+        unique: false,
+        unique_extra_count: 0,
+        unique_extra_cols: std::ptr::null(),
     };
     let p = CString::new(path).unwrap();
     let mut t = ptr::null_mut();

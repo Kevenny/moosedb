@@ -9,6 +9,8 @@
 --                como eixo de tempo (TIMESTAMP_COLUMN='clock'), sem ts/trigger;
 --                INDEX (clock) + INDEX (itemid, clock): o índice composto dá ref
 --                por item, self-join e MAX(clock) por item sem varrer a série
+--   h_moose_v4   DDL oficial do Zabbix com PRIMARY KEY (itemid,clock,ns) verificada
+--                (unicidade real); lê pela PK (ORDER BY clock DESC, ns DESC sem filesort)
 --
 -- RETENTION_PERIOD='6 DAYS' nas MooseDB: o teste de housekeeping descarta o
 -- 1º dia (parcial) dos 7 carregados. A varredura automática é desligada
@@ -48,6 +50,16 @@ CREATE TABLE h_moose_v3 (
   ns     integer DEFAULT '0' NOT NULL,
   INDEX clock_idx (clock),
   INDEX item_clock (itemid, clock)
+) ENGINE=MooseDB TIMESTAMP_COLUMN='clock' CHUNK_INTERVAL='1 DAY' RETENTION_PERIOD='6 DAYS' HOT_THRESHOLD='1 DAY';
+
+-- v4: o DDL oficial do Zabbix 7.0 (PRIMARY KEY (itemid,clock,ns), sem índices extras);
+-- só COMMENT 'TAG' em itemid e as opções da engine. A PK é checada de verdade.
+CREATE TABLE h_moose_v4 (
+  itemid bigint unsigned NOT NULL COMMENT 'TAG',
+  clock  integer DEFAULT '0' NOT NULL,
+  value  DOUBLE PRECISION DEFAULT '0.0000' NOT NULL,
+  ns     integer DEFAULT '0' NOT NULL,
+  PRIMARY KEY (itemid,clock,ns)
 ) ENGINE=MooseDB TIMESTAMP_COLUMN='clock' CHUNK_INTERVAL='1 DAY' RETENTION_PERIOD='6 DAYS' HOT_THRESHOLD='1 DAY';
 
 DELIMITER //

@@ -174,6 +174,18 @@ bool is_int_tag_field(const Field *f)
 }
 
 /*
+  A collation under which two strings are equal only when their bytes are:
+  binary, or a binary-sorted NO PAD one. A UNIQUE key may only hold TAG
+  columns of these, since the series (one per distinct byte string) are what
+  the uniqueness is checked inside.
+*/
+bool tag_cs_exact(const CHARSET_INFO *cs)
+{
+  return cs == &my_charset_bin ||
+         ((cs->state & MY_CS_BINSORT) && (cs->state & MY_CS_NOPAD));
+}
+
+/*
   Seconds -> µs for a range bound taken from an index key: saturates instead
   of wrapping (a bound beyond what can be stored selects nothing / everything,
   exactly like the unbounded side).
@@ -346,6 +358,7 @@ static double srv_bloom_fpr= 0.01;
 static ulonglong srv_chunk_cache_size= 128ULL << 20;
 static uint srv_max_open_chunks= 100;
 static ulonglong srv_batch_memory_budget= 1ULL << 30;
+static uint srv_unique_lock_wait_timeout= 50;
 
 /* Mirrors the current values into the Rust core. */
 static void push_globals()
@@ -421,6 +434,13 @@ static MYSQL_SYSVAR_ULONGLONG(batch_memory_budget, srv_batch_memory_budget,
   "above it, batches holding at least 1 MiB spill to disk early",
   NULL, update_global<ulonglong>, 1ULL << 30, 16ULL << 20, 1ULL << 40, 0);
 
+static MYSQL_SYSVAR_UINT(unique_lock_wait_timeout, srv_unique_lock_wait_timeout,
+  PLUGIN_VAR_RQCMDARG,
+  "Seconds an INSERT into a table with a UNIQUE/PRIMARY key waits for another "
+  "statement that is inserting into the same series before failing with a "
+  "lock wait timeout (0 = fail at once)",
+  NULL, NULL, 50, 0, 86400, 0);
+
 static struct st_mysql_sys_var *moosedb_system_variables[]= {
   MYSQL_SYSVAR(wal_sync_mode),
   MYSQL_SYSVAR(memtable_flush_threshold),
@@ -431,6 +451,7 @@ static struct st_mysql_sys_var *moosedb_system_variables[]= {
   MYSQL_SYSVAR(chunk_cache_size),
   MYSQL_SYSVAR(max_open_chunks),
   MYSQL_SYSVAR(batch_memory_budget),
+  MYSQL_SYSVAR(unique_lock_wait_timeout),
   NULL
 };
 
@@ -546,9 +567,22 @@ bool build_layout(TABLE_SHARE *s, tf_layout *out, std::string *err)
   }
 
   /*
-    Indexes: the timestamp column alone, and non-UNIQUE composite indexes
+    Indexes: the timestamp column alone, and composite indexes
     (tag_1, ..., tag_k [, timestamp]) over TAG columns (see index_flags()).
+
+    One UNIQUE / PRIMARY KEY is accepted, in the form
+    (every TAG column of the table, the timestamp column [, 1-2 integer
+    NOT NULL columns]) -- the series plus the time (plus a tie-breaker such as
+    Zabbix's ns) identify a row, which the core can check without any index
+    structure (see unique.rs). Without TAG columns only UNIQUE (timestamp).
+    TAG columns of a UNIQUE key must compare byte for byte (integers, or
+    strings with a binary NO PAD collation), because the series that the key
+    values select are compared byte for byte too.
   */
+  size_t n_tag_cols= 0;
+  for (uint i= 0; i < s->fields; i++)
+    if (s->field[i]->stored_in_db() && is_tag_comment(s->field[i]->comment))
+      n_tag_cols++;
   l.indexes.assign(s->keys, tf_index_def());
   for (uint k= 0; k < s->keys; k++)
   {
@@ -556,12 +590,35 @@ bool build_layout(TABLE_SHARE *s, tf_layout *out, std::string *err)
     const uint np= key.user_defined_key_parts;
     tf_index_def &def= l.indexes[k];
     const std::string head= std::string("index '") + key.name.str + "' ";
+    const bool unique= (key.flags & HA_NOSAME) != 0;
+    const char *const unique_form=
+      ". A MooseDB UNIQUE/PRIMARY key is (every TAG column, the timestamp "
+      "column [, up to 2 integer NOT NULL columns]), e.g. PRIMARY KEY "
+      "(itemid, clock, ns)";
+    if (unique)
+    {
+      def.unique= true;
+      if (l.unique_key != MAX_KEY)
+      {
+        *err= head + "is not supported: a MooseDB table takes at most one "
+              "UNIQUE/PRIMARY key";
+        return true;
+      }
+      l.unique_key= k;
+    }
     if (np == 1 && key.key_part[0].field == ts_field)
     {
       def.simple_ts= true;
       if (key.key_part[0].key_part_flag & HA_REVERSE_SORT)
       {
         *err= head + "is not supported: descending index parts";
+        return true;
+      }
+      if (unique && n_tag_cols != 0)
+      {
+        *err= head + "is not supported: the table has TAG columns, so its "
+              "UNIQUE/PRIMARY key must list all of them before the timestamp" +
+              unique_form;
         return true;
       }
     }
@@ -582,8 +639,25 @@ bool build_layout(TABLE_SHARE *s, tf_layout *out, std::string *err)
         std::string why;
         if (!f || !f->stored_in_db())
           why= col + " is not a stored column";
+        else if (def.has_time)
+        {
+          /* a part after the timestamp: only a UNIQUE key has them */
+          if (!unique)
+            why= col + " follows the timestamp, which must be the last part";
+          else if (is_tag_comment(f->comment))
+            why= "TAG " + col + " comes after the timestamp (list the TAG "
+                 "columns first)";
+          else if (f->real_maybe_null())
+            why= col + " must be NOT NULL in a UNIQUE key";
+          else if (!is_int_tag_field(f))
+            why= col + " must be an integer column (TINYINT..BIGINT) to "
+                 "follow the timestamp in a UNIQUE key";
+          else if (def.extra_fields.size() >= 2)
+            why= "at most 2 columns may follow the timestamp";
+        }
         else if (f == ts_field)
-          why= last ? "" : col + " (the timestamp) must be the last part";
+          why= (last || unique) ? ""
+                                : col + " (the timestamp) must be the last part";
         else if (!is_tag_comment(f->comment))
           why= col + " is not a TAG column or the timestamp column";
         else if (f->real_maybe_null())
@@ -593,7 +667,12 @@ bool build_layout(TABLE_SHARE *s, tf_layout *out, std::string *err)
                  f->real_type() != MYSQL_TYPE_STRING)
           why= "TAG " + col + " must be an integer, CHAR or VARCHAR to be "
                "indexed";
-        else if (kp.length != f->key_length())
+        else if (unique && !is_int_tag_field(f) && !tag_cs_exact(f->charset()))
+          why= "TAG " + col + " needs a binary NO PAD collation (e.g. "
+               "utf8mb4_nopad_bin, or BINARY/VARBINARY) in a UNIQUE key, "
+               "because rows of series that only differ by case or trailing "
+               "spaces would not be detected as duplicates";
+        if (why.empty() && f && kp.length != f->key_length())
           why= col + ": index prefixes are not supported";
         if (why.empty() && (kp.key_part_flag & HA_REVERSE_SORT))
           why= col + ": descending index parts are not supported";
@@ -605,25 +684,40 @@ bool build_layout(TABLE_SHARE *s, tf_layout *out, std::string *err)
         {
           *err= head + "is not supported: " + why + ". MooseDB indexes the "
                 "timestamp column alone, or TAG columns optionally followed "
-                "by the timestamp (INDEX (itemid, clock))";
+                "by the timestamp (INDEX (itemid, clock))" +
+                (unique ? std::string(unique_form) : std::string());
           return true;
         }
-        if (f == ts_field)
+        if (def.has_time)
+          def.extra_fields.push_back(f->field_index);
+        else if (f == ts_field)
           def.has_time= true;
         else
           def.tag_fields.push_back(f->field_index);
       }
-    }
-    if (key.flags & HA_NOSAME)
-    {
-      *err= head + "cannot be UNIQUE/PRIMARY: time-series rows are not unique "
-            "by time";
-      return true;
+      if (unique)
+      {
+        std::string why;
+        if (!def.has_time)
+          why= "must include the timestamp column after the TAG columns";
+        else if (def.tag_fields.empty())
+          why= "needs TAG columns (a table without any only takes UNIQUE "
+               "on the timestamp column alone)";
+        else if (def.tag_fields.size() != n_tag_cols)
+          why= "must list every TAG column of the table (the series identity)";
+        if (!why.empty())
+        {
+          *err= head + "is not supported: " + why + unique_form;
+          return true;
+        }
+      }
     }
     if (def.simple_ts)
       l.ts_key= k;
   }
-  if (l.ts_key == MAX_KEY)
+  /* A UNIQUE key (which contains the timestamp) can stand in for the index on
+     the timestamp column alone. */
+  if (l.ts_key == MAX_KEY && l.unique_key == MAX_KEY)
   {
     *err= std::string("missing index on the timestamp column: add INDEX (") +
           ts_field->field_name.str + ")";
@@ -706,6 +800,19 @@ bool build_layout(TABLE_SHARE *s, tf_layout *out, std::string *err)
       }
       d.tag_pos.push_back(pos);
     }
+  if (l.unique_key != MAX_KEY)
+    for (const uint fi : l.indexes[l.unique_key].extra_fields)
+    {
+      uint pos= 0;
+      while (pos < l.columns.size() && l.columns[pos].field_index != fi)
+        pos++;
+      if (pos >= l.columns.size())
+      {
+        *err= "a UNIQUE key column is not a stored column";
+        return true;
+      }
+      l.unique_extra_cols.push_back(pos);
+    }
   *out= std::move(l);
   return false;
 }
@@ -715,6 +822,7 @@ struct tf_config_holder
 {
   std::vector<const char *> names;
   std::vector<uint8_t> types;
+  std::vector<uint32_t> unique_extra;
   TFTableConfig cfg{};
 
   tf_config_holder(TABLE_SHARE *s, const tf_layout &l)
@@ -740,6 +848,10 @@ struct tf_config_holder
     cfg.column_types= types.data();
     cfg.encryption_key_id= opt && opt->encryption
                              ? (uint32_t) opt->encryption_key_id : 0;
+    unique_extra= l.unique_extra_cols;
+    cfg.unique= l.unique_key != MAX_KEY;
+    cfg.unique_extra_count= (uint32_t) unique_extra.size();
+    cfg.unique_extra_cols= unique_extra.data();
   }
 };
 
@@ -826,6 +938,9 @@ int ha_moosedb::map_status(TFStatus status, const char *name)
   case TF_ERR_OOM:       return HA_ERR_OUT_OF_MEM;
   case TF_ERR_NOT_FOUND: return HA_ERR_NO_SUCH_TABLE;
   case TF_ERR_CRYPTO:    return HA_ERR_DECRYPTION_FAILED;
+  case TF_ERR_DUPLICATE: return HA_ERR_FOUND_DUPP_KEY;
+  case TF_ERR_DEADLOCK:  return HA_ERR_LOCK_DEADLOCK;
+  case TF_ERR_BUSY:      return HA_ERR_LOCK_WAIT_TIMEOUT;
   default:               return HA_ERR_MOOSEDB_BASE + (int) status;
   }
 }
@@ -1096,8 +1211,10 @@ int ha_moosedb::write_row(const uchar *buf)
   /* a bulk flag left over from an earlier statement is stale */
   if (in_bulk_insert_ && bulk_query_id_ != thd->query_id)
     in_bulk_insert_= false;
-  if (!batch_ && !in_bulk_insert_ &&
-      thd->locked_tables_mode == LTM_LOCK_TABLES)
+  const bool unique= share_->layout.unique_key != MAX_KEY;
+  const bool lone= !batch_ && !in_bulk_insert_ &&
+                   thd->locked_tables_mode == LTM_LOCK_TABLES;
+  if (lone && !unique)
   {
     if (!(error= map_status(moosedb_write_row(share_->table.get(), &row))))
       error= map_status(moosedb_sync_wal(share_->table.get(),
@@ -1112,9 +1229,68 @@ int ha_moosedb::write_row(const uchar *buf)
     if (!b)
       DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
     batch_.reset(b);
+    /* unique_checks=0: the statement stores rows without checking the key */
+    if (unique && (thd->variables.option_bits & OPTION_RELAXED_UNIQUE_CHECKS) &&
+        moosedb_batch_set_unique_checks(batch_.get(), false) != TF_OK)
+      take_last_error();
   }
-  error= map_status(moosedb_batch_write(batch_.get(), &row));
+  error= write_batch_row(row);
+  if (error == HA_ERR_FOUND_DUPP_KEY)
+    dup_key_= share_->layout.unique_key;
+  if (lone)
+  {
+    /* UNIQUE table under LOCK TABLES: a one-row statement, committed now */
+    const int ce= commit_batch();
+    if (!error)
+      error= ce;
+  }
   DBUG_RETURN(error);
+}
+
+/*
+  Adds one row to the statement batch. On a table with a UNIQUE key the core
+  may report that another statement holds the row's series (TF_ERR_BUSY after
+  a short wait): nothing changed, so the same row is offered again until the
+  series is free, the statement is killed or the wait times out.
+*/
+int ha_moosedb::write_batch_row(const TFRow &row)
+{
+  THD *thd= ha_thd();
+  ulonglong waited_from= 0;
+  bool waiting= false;
+  int error= 0;
+  for (;;)
+  {
+    const TFStatus st= moosedb_batch_write(batch_.get(), &row);
+    if (st != TF_ERR_BUSY)
+    {
+      error= map_status(st);
+      break;
+    }
+    take_last_error();
+    if (!waiting)
+    {
+      waiting= true;
+      waited_from= microsecond_interval_timer();
+      if (thd)
+        thd_wait_begin(thd, THD_WAIT_ROW_LOCK);
+    }
+    if (thd && thd_killed(thd))
+    {
+      error= HA_ERR_QUERY_INTERRUPTED;
+      break;
+    }
+    if (microsecond_interval_timer() - waited_from >=
+        (ulonglong) srv_unique_lock_wait_timeout * 1000000ULL)
+    {
+      last_error_= "another statement is inserting into the same series";
+      error= HA_ERR_LOCK_WAIT_TIMEOUT;
+      break;
+    }
+  }
+  if (waiting && thd)
+    thd_wait_end(thd);
+  return error;
 }
 
 int ha_moosedb::fill_record(uchar *buf, const TFRow &row)
@@ -3372,6 +3548,63 @@ int ha_moosedb::composite_ends(uchar *buf, bool last)
   return rc == HA_ERR_END_OF_FILE ? advance_group(buf, last) : rc;
 }
 
+/*
+  Values of key parts [from, to) of `key` (a key image of index `idx`): the
+  integer columns that follow the time part of a UNIQUE key. Decoded by the
+  fields themselves, in a private record (the caller's buffers stay intact).
+*/
+int ha_moosedb::key_extra_values(uint idx, const uchar *key, uint from,
+                                 uint to, std::vector<longlong> *out)
+{
+  assert(table && key && out);
+  if (!table || !key || !out || !table->key_info || idx >= table->s->keys)
+    return HA_ERR_INTERNAL_ERROR;
+  KEY *ki= &table->key_info[idx];
+  if (!ki->key_part || from > to || to > ki->user_defined_key_parts)
+    return HA_ERR_INTERNAL_ERROR;
+  uint len= 0;
+  for (uint p= 0; p < to; p++)
+    len+= ki->key_part[p].store_length;
+  std::vector<uchar> scratch(table->s->rec_buff_length, 0);
+  key_restore(scratch.data(), key, ki, len);
+  const my_ptrdiff_t diff= scratch.data() - table->record[0];
+  out->clear();
+  for (uint p= from; p < to; p++)
+  {
+    Field *f= ki->key_part[p].field;
+    if (!f)
+      return HA_ERR_INTERNAL_ERROR;
+    f->move_field_offset(diff);
+    out->push_back(f->val_int());
+    f->move_field_offset(-diff);
+  }
+  return 0;
+}
+
+/* Whether the row in `rec` has the extra key columns of idx_req_.extra_vals. */
+bool ha_moosedb::extras_equal(const uchar *rec) const
+{
+  const tf_index_def *def= index_def(idx_req_.index);
+  if (!def || !table || !rec || idx_req_.index >= table->s->keys ||
+      !table->key_info)
+    return false;
+  const KEY *ki= &table->key_info[idx_req_.index];
+  const uint first= (uint) def->tag_pos.size() + 1;
+  const my_ptrdiff_t diff= rec - table->record[0];
+  bool same= true;
+  for (size_t e= 0; e < idx_req_.extra_vals.size() && same; e++)
+  {
+    if (!ki->key_part || first + e >= ki->user_defined_key_parts ||
+        !ki->key_part[first + e].field)
+      return false;
+    Field *f= ki->key_part[first + e].field;
+    f->move_field_offset(diff);
+    same= f->val_int() == idx_req_.extra_vals[e];
+    f->move_field_offset(-diff);
+  }
+  return same;
+}
+
 int ha_moosedb::composite_read(uchar *buf, const uchar *key,
                                key_part_map map,
                                enum ha_rkey_function find_flag)
@@ -3396,6 +3629,8 @@ int ha_moosedb::composite_read(uchar *buf, const uchar *key,
   }
   const uint ntag= std::min(nparts, k);
   const bool time_given= def->has_time && nparts > k;
+  /* key parts given after the time part (a UNIQUE key: ns of Zabbix) */
+  const uint nextra= time_given ? nparts - k - 1 : 0;
   const bool all_tags= ntag == k;
 
   idx_req_= idx_request();
@@ -3413,6 +3648,13 @@ int ha_moosedb::composite_read(uchar *buf, const uchar *key,
       idx_req_= idx_request();
       return rc;
     }
+  if (nextra > 0)
+    if (int rc= key_extra_values(active_index, key, k + 1, nparts,
+                                 &idx_req_.extra_vals))
+    {
+      idx_req_= idx_request();
+      return rc;
+    }
   uint tag_len= 0;
   for (uint p= 0; p < ntag; p++)
     tag_len+= ki->key_part[p].store_length;
@@ -3424,6 +3666,9 @@ int ha_moosedb::composite_read(uchar *buf, const uchar *key,
 
   bool backward= false, ordered= false, exact= false;
   idx_op op= idx_op::NONE;
+  if (nextra > 0 && find_flag != HA_READ_KEY_EXACT &&
+      find_flag != HA_READ_PREFIX)
+    goto unsupported;       /* only the exact lookup of a UNIQUE key names them */
   /*
     With the time part given, the tags are equalities of a ref / range / MIN
     or MAX(time) read: the rows are those of the key's series. (The server
@@ -3516,7 +3761,7 @@ int ha_moosedb::composite_read(uchar *buf, const uchar *key,
     hi= std::min(hi, end_ts);
   }
   idx_req_.ordered= ordered;
-  idx_req_.exact= exact;
+  idx_req_.exact= exact && nextra == 0;
   idx_req_.op= op;
   idx_req_.backward= backward;
   idx_req_.lo= lo;
@@ -3529,7 +3774,10 @@ int ha_moosedb::composite_read(uchar *buf, const uchar *key,
     if (backward)
       if (int rc= map_status(moosedb_scan_seek_end(scan_.get())))
         return rc;
-    const int rc= read_from_scan(buf, backward, HA_ERR_KEY_NOT_FOUND);
+    int rc= read_from_scan(buf, backward, HA_ERR_KEY_NOT_FOUND);
+    /* exact lookup of a full UNIQUE key: the rows of that time, filtered by the extra columns */
+    while (rc == 0 && !idx_req_.extra_vals.empty() && !extras_equal(buf))
+      rc= read_from_scan(buf, backward, HA_ERR_KEY_NOT_FOUND);
     if (ordered && rc == HA_ERR_KEY_NOT_FOUND)
     {
       /* series without visible rows: the next tuple in that direction */
@@ -3565,6 +3813,9 @@ int ha_moosedb::index_read_map(uchar *buf, const uchar *key,
   const tf_index_def *def= index_def(active_index);
   if (!def)
     DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
+  /* HA_WHOLE_KEY (const / eq_ref lookups, ODKU and REPLACE) = every part */
+  if (keypart_map == HA_WHOLE_KEY && table->key_info)
+    keypart_map= ((key_part_map) 1 << table->key_info[active_index].user_defined_key_parts) - 1;
   if (!def->simple_ts)
     DBUG_RETURN(composite_read(buf, key, keypart_map, find_flag));
   longlong ts;
@@ -3696,6 +3947,18 @@ ulong ha_moosedb::index_flags(uint idx, uint part, bool all_parts) const
   const Field *f= key.key_part[part].field;
   if (!f)
     return 0;
+  /*
+    A part after the time column (UNIQUE key, e.g. ns): within one timestamp
+    the scans return rows ordered by it (the core sorts timestamp ties by the
+    key's extra columns), so ORDER BY clock DESC, ns DESC LIMIT 1 needs no
+    sort. No HA_READ_RANGE: only equalities become key ranges on it.
+  */
+  for (uint q= 0; q < part; q++)
+  {
+    const Field *g= key.key_part[q].field;
+    if (g && !is_tag_comment(g->comment))
+      return HA_READ_NEXT | HA_READ_PREV | HA_READ_ORDER;
+  }
   if (!is_tag_comment(f->comment))
     return TIME;
   return all_parts ? (HA_READ_NEXT | HA_READ_PREV)
@@ -3705,6 +3968,8 @@ ulong ha_moosedb::index_flags(uint idx, uint part, bool all_parts) const
 int ha_moosedb::info(uint flag)
 {
   DBUG_ENTER("ha_moosedb::info");
+  if (flag & HA_STATUS_ERRKEY)
+    errkey= dup_key_;   /* the key of the last HA_ERR_FOUND_DUPP_KEY */
   if (!share_ || !share_->table)
     DBUG_RETURN(0);
   if (flag & (HA_STATUS_VARIABLE | HA_STATUS_CONST))
@@ -3823,8 +4088,12 @@ void ha_moosedb::update_rec_per_key(uint64_t rows)
                                    distinct * (double) std::max<uint64_t>(it->second, 1));
         rpk= (double) rows / distinct;
       }
+      else if (p == d.tag_pos.size())
+        /* the time part; the last part of a UNIQUE key is one row per value */
+        rpk= (ki.flags & HA_NOSAME) && p + 1 == ki.user_defined_key_parts
+               ? 1.0 : (double) st.series / distinct;
       else
-        rpk= (double) st.series / distinct;      /* the time part */
+        rpk= 1.0;                               /* extra UNIQUE columns */
       ki.rec_per_key[p]= (ulong) std::max<double>(1.0, std::min(rpk, 4.0e9));
     }
   }
@@ -3882,6 +4151,15 @@ ha_rows ha_moosedb::records_in_range(uint inx, const key_range *min_key,
   const tf_index_def *def= index_def(inx);
   if (!def)
     DBUG_RETURN(HA_POS_ERROR);
+  /* an equality on every part of the UNIQUE key matches at most one row */
+  {
+    const KEY &uk= table->key_info[inx];
+    if ((uk.flags & HA_NOSAME) && min_key && max_key &&
+        min_key->flag == HA_READ_KEY_EXACT &&
+        max_key->flag == HA_READ_AFTER_KEY &&
+        min_key->length == uk.key_length && max_key->length == uk.key_length)
+      DBUG_RETURN(1);
+  }
   longlong lo= LONGLONG_MIN, hi= LONGLONG_MAX;
 
   if (def->simple_ts)

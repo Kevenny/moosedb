@@ -55,6 +55,13 @@ pub enum TFStatus {
     /// (wrong or retired key, damaged ciphertext): distinct from
     /// `TF_ERR_CORRUPT` because the data may be intact.
     TF_ERR_CRYPTO = 10,
+    /// A UNIQUE/PRIMARY key already exists (the row was not stored).
+    TF_ERR_DUPLICATE = 11,
+    /// Another statement holds the series this row needs; nothing changed,
+    /// call again (see `moosedb_batch_write`).
+    TF_ERR_BUSY = 12,
+    /// Waiting for that series would close a cycle of waiting statements.
+    TF_ERR_DEADLOCK = 13,
 }
 
 /// Column type codes used in `TFTableConfig::column_types` and `TFValue::kind`.
@@ -179,6 +186,15 @@ pub struct TFTableConfig {
     pub column_types: *const u8,
     /// Key id for encryption at rest; 0 = not encrypted.
     pub encryption_key_id: u32,
+    /// The table has a UNIQUE/PRIMARY key `(all TAG columns, time column,
+    /// <unique_extra_cols>)`: inserting an existing key fails with
+    /// `TF_ERR_DUPLICATE`. Not persisted; supplied at every open.
+    pub unique: bool,
+    /// Number of key columns after the time column (at most 2).
+    pub unique_extra_count: u32,
+    /// `unique_extra_count` schema column indexes (INT64 columns); may be NULL
+    /// when the count is 0.
+    pub unique_extra_cols: *const u32,
 }
 
 /// Process-wide tunables (the `moosedb_*` system variables).
@@ -332,6 +348,9 @@ fn status_of(e: &Error) -> TFStatus {
         Error::InvalidArg(_) => TFStatus::TF_ERR_INVALID_ARG,
         Error::ReadOnly(_) => TFStatus::TF_ERR_READONLY,
         Error::Unsupported(_) => TFStatus::TF_ERR_UNSUPPORTED,
+        Error::Duplicate(_) => TFStatus::TF_ERR_DUPLICATE,
+        Error::Busy(_) => TFStatus::TF_ERR_BUSY,
+        Error::Deadlock(_) => TFStatus::TF_ERR_DEADLOCK,
     }
 }
 
@@ -450,10 +469,24 @@ unsafe fn config_from_c(
             memtable_size_bytes: cfg.memtable_size_bytes,
             encryption_key_id: (cfg.encryption_key_id != 0).then_some(cfg.encryption_key_id),
         };
-        if existing {
-            TableConfig::for_existing(dir, schema, &raw)
+        let cfg_t =
+            if existing { TableConfig::for_existing(dir, schema, &raw) } else { TableConfig::new(dir, schema, &raw) }?;
+        if cfg.unique {
+            if cfg.unique_extra_count as usize > moosedb_core::unique::MAX_EXTRAS {
+                return Err(invalid(&format!(
+                    "unique_extra_count {} exceeds the maximum of {}",
+                    cfg.unique_extra_count,
+                    moosedb_core::unique::MAX_EXTRAS
+                )));
+            }
+            let extras: Vec<usize> =
+                slice(cfg.unique_extra_cols, cfg.unique_extra_count as usize, "unique_extra_cols")?
+                    .iter()
+                    .map(|&c| c as usize)
+                    .collect();
+            cfg_t.with_unique(extras)
         } else {
-            TableConfig::new(dir, schema, &raw)
+            Ok(cfg_t)
         }
     }
 }
@@ -699,7 +732,7 @@ pub unsafe extern "C" fn moosedb_write_row(table: *mut MooseDBTable, row: *const
         let t = table_ref(table)?;
         // SAFETY: caller contract.
         let row = unsafe { row_from_c(t.table.schema(), row) }?;
-        t.table.write(row)
+        t.table.write_shared(row)
     })
 }
 
@@ -745,8 +778,29 @@ pub unsafe extern "C" fn moosedb_batch_begin(table: *mut MooseDBTable, out_batch
     })
 }
 
+/// Turns the UNIQUE key checks of this statement on (the default) or off
+/// (`unique_checks = 0`). Off, rows are stored without checking and without
+/// claiming their series, so a key stored this way can be a duplicate and later
+/// checks cannot tell; the engine still records them for what comes after.
+/// No effect on a table without a UNIQUE key.
+///
+/// # Safety
+/// `batch` must be a live batch handle.
+#[no_mangle]
+pub unsafe extern "C" fn moosedb_batch_set_unique_checks(batch: *mut MooseDBBatch, enabled: bool) -> TFStatus {
+    guard(|| {
+        handle_mut(batch, "batch")?.batch.set_unique_checks(enabled);
+        Ok(())
+    })
+}
+
 /// Adds one row to the batch (same value convention as `moosedb_write_row`).
 /// On error the row is not part of the batch; the batch stays usable.
+///
+/// On a table with a UNIQUE key: `TF_ERR_DUPLICATE` = the key exists (stored,
+/// or in an open statement); `TF_ERR_BUSY` = another statement holds the series
+/// (after waiting a short while): nothing changed, call again with the same
+/// row; `TF_ERR_DEADLOCK` = waiting would close a cycle between statements.
 ///
 /// # Safety
 /// `batch` must be a live batch handle; `row` as in `moosedb_write_row`.

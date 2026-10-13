@@ -22,6 +22,13 @@ pub enum Error {
     /// two cannot be told apart, so callers must fail closed (never quarantine
     /// or rewrite metadata because of it).
     Crypto(String),
+    /// A UNIQUE/PRIMARY key is already present (`INSERT` of an existing key).
+    Duplicate(String),
+    /// Another statement holds the series this row needs; nothing was changed
+    /// and the caller may retry the same write (see `unique`).
+    Busy(String),
+    /// Waiting for that series would close a cycle of waiting statements.
+    Deadlock(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -37,6 +44,9 @@ impl fmt::Display for Error {
             Error::ReadOnly(m) => write!(f, "read-only: {m}"),
             Error::Unsupported(m) => write!(f, "unsupported: {m}"),
             Error::Crypto(m) => write!(f, "encryption: {m}"),
+            Error::Duplicate(m) => write!(f, "duplicate key: {m}"),
+            Error::Busy(m) => write!(f, "busy: {m}"),
+            Error::Deadlock(m) => write!(f, "deadlock: {m}"),
         }
     }
 }

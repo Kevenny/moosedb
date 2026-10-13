@@ -1227,3 +1227,6 @@ mod batch_tests;
 
 #[cfg(test)]
 mod read_tests;
+
+#[cfg(test)]
+mod unique_tests;

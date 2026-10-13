@@ -193,7 +193,7 @@ ERROR HY000: MooseDB: a MooseDB table needs a DATETIME/TIMESTAMP column with an 
 ALTER TABLE m MODIFY t2 DATETIME(6) NULL;
 ERROR 42000: Table handler doesn't support NULL in given index. Please change column 't2' to be NOT NULL or use another handler
 ALTER TABLE m ADD PRIMARY KEY (t2);
-ERROR HY000: MooseDB: index 'PRIMARY' cannot be UNIQUE/PRIMARY: time-series rows are not unique by time
+ERROR HY000: MooseDB: index 'PRIMARY' is not supported: the table has TAG columns, so its UNIQUE/PRIMARY key must list all of them before the timestamp. A MooseDB UNIQUE/PRIMARY key is (every TAG column, the timestamp column [, up to 2 integer NOT NULL columns]), e.g. PRIMARY KEY (itemid, clock, ns)
 ALTER TABLE m ADD UNIQUE (v);
 ERROR 42000: Table handler doesn't support NULL in given index. Please change column 'v' to be NOT NULL or use another handler
 # An index on a TAG column is accepted (it serves ref lookups); it can be dropped again

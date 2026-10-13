@@ -46,7 +46,8 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, MutexGuard};
+use std::time::{Duration, Instant};
 
 use crate::chunk::ChunkMeta;
 use crate::chunk_writer::{chunks_needed, write_bucket, SeriesParts};
@@ -56,8 +57,10 @@ use crate::fsutil::{is_fsync_error, sync_dir};
 use crate::index::series::{row_tags, series_key};
 use crate::log::warn;
 use crate::memtable::{group_rows, row_bytes, MemRow};
+use crate::scan::Snapshot;
 use crate::schema::{Row, Schema, Value};
-use crate::table::{OpenBatch, Table};
+use crate::table::{Inner, OpenBatch, Table};
+use crate::unique::{existing_extras, Claim, Extras, Plan, UniqueSpec};
 use crate::wal;
 
 /// Bytes held by the row buffers of every open batch of the process.
@@ -110,10 +113,21 @@ pub struct Batch {
     /// The batch moved to the spill path: no more WAL logging.
     spilled: bool,
     /// Staged chunks, not listed in the MANIFEST.
-    staged: Vec<ChunkMeta>,
+    staged: Vec<Arc<ChunkMeta>>,
     spill_limit: usize,
     /// Commit reached its point of no return, or the batch was cleaned up.
     finished: bool,
+    /// UNIQUE key checks on (the default); off = `unique_checks = 0`.
+    unique_checks: bool,
+    /// Series (global ids) this statement claimed and has not given back.
+    claimed: Vec<u64>,
+    /// Series written with `unique_checks = 0` (no claim): their key state is
+    /// dropped too if the statement does not commit.
+    unchecked: std::collections::HashSet<u64>,
+    /// Global series id of each local id (UNIQUE tables only).
+    local_gid: Vec<u64>,
+    /// Keys of the rows now in `rows`, built when a lookup first needs them.
+    own: Option<HashMap<(u64, i64), Vec<Extras>>>,
 }
 
 /// Half-open time interval `[start, end)` of a chunk.
@@ -124,6 +138,16 @@ type LocalParts<'a> = (u64, Vec<&'a [&'a Row]>);
 fn stale() -> Error {
     invalid("the table was truncated while the batch was open")
 }
+
+fn duplicate() -> Error {
+    Error::Duplicate("the UNIQUE key already exists".into())
+}
+
+/// Heap a key kept for the lookups of a batch is charged (map entry, list, key).
+const OWN_KEY_COST: usize = 96;
+/// How long one write waits for a series another statement holds before it
+/// reports `Busy` (the caller then checks for kill and timeout and retries).
+const CLAIM_WAIT_SLICE: Duration = Duration::from_millis(50);
 
 impl Table {
     /// Starts a batch (one statement's worth of rows). See [`Batch`].
@@ -155,7 +179,37 @@ impl Table {
             staged: Vec::new(),
             spill_limit,
             finished: false,
+            unique_checks: true,
+            claimed: Vec::new(),
+            unchecked: std::collections::HashSet::new(),
+            local_gid: Vec::new(),
+            own: None,
         })
+    }
+}
+
+/// How long [`Table::write_shared`] keeps retrying a series held by another
+/// statement.
+const WRITE_SHARED_WAIT: Duration = Duration::from_secs(50);
+
+impl Table {
+    /// [`Table::write`] that also works on tables with a UNIQUE key: the row is
+    /// checked and stored as a one-row statement (the WAL is synced by the
+    /// caller, as for `write`).
+    pub fn write_shared(self: &Arc<Self>, row: Row) -> Result<()> {
+        if self.config.unique.is_none() {
+            return self.write(row);
+        }
+        let deadline = Instant::now() + WRITE_SHARED_WAIT;
+        let mut b = self.begin_batch()?;
+        loop {
+            match b.write(row.clone()) {
+                Ok(()) => break,
+                Err(Error::Busy(_)) if Instant::now() < deadline => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        b.commit(false)
     }
 }
 
@@ -164,8 +218,20 @@ impl Batch {
         &self.table.schema
     }
 
+    /// Turns the `unique_checks` of this statement on or off (default on). Off,
+    /// rows are not checked and claim nothing, but still update the key state.
+    pub fn set_unique_checks(&mut self, on: bool) {
+        self.unique_checks = on;
+    }
+
     /// Buffers one row (and logs it unless the batch has spilled). The row is
     /// invisible to readers until `commit`.
+    ///
+    /// On a table with a UNIQUE key the key is checked first: `Duplicate` if it
+    /// exists (committed, or earlier in this or another open statement), `Busy`
+    /// if another statement holds the series (nothing changed, call again) and
+    /// `Deadlock` if waiting would close a cycle. After any error the row is not
+    /// part of the batch and the batch stays usable.
     pub fn write(&mut self, row: Row) -> Result<()> {
         if self.finished {
             return Err(invalid("the batch is already finished"));
@@ -188,26 +254,23 @@ impl Batch {
             Some(p)
         };
         let tags = row_tags(&table.schema, &row);
-        if let Some(p) = payload {
-            let mut guard = table.lock()?;
-            let inner = &mut *guard;
-            inner.check_writable()?;
-            if inner.epoch != self.epoch {
-                return Err(stale());
-            }
-            if let Err(e) = inner.wal.append(&p) {
-                if !matches!(e, Error::InvalidArg(_)) {
-                    inner.poison(format!("WAL append failed: {e}"));
-                }
-                return Err(e);
-            }
-            let seg = inner.wal.seq();
-            let hint = self.spill_hint.clone();
-            inner.open_batches.entry(self.id).or_insert_with(|| OpenBatch { seg, spill_hint: hint });
-            self.logged = true;
-        }
-        let ts = table.schema.row_ts(&row);
         let key = series_key(&tags);
+        let ts = table.schema.row_ts(&row);
+        let gid = match table.config.unique.as_ref() {
+            Some(spec) => Some(self.admit(spec, &key, &tags, &row, ts, payload.as_deref())?),
+            None => {
+                if let Some(p) = payload {
+                    let mut guard = table.lock()?;
+                    let inner = &mut *guard;
+                    inner.check_writable()?;
+                    if inner.epoch != self.epoch {
+                        return Err(stale());
+                    }
+                    self.log_row(inner, &p)?;
+                }
+                None
+            }
+        };
         let rb = row_bytes(&row);
         let mut added = rb;
         let local = match self.local_ids.get(&key) {
@@ -219,9 +282,19 @@ impl Batch {
                 added += cost;
                 self.local_tags.push(tags);
                 self.local_ids.insert(key, l);
+                if let Some(g) = gid {
+                    self.local_gid.push(g);
+                }
                 l
             }
         };
+        if let (Some(g), Some(spec), Some(own)) = (gid, table.config.unique.as_ref(), self.own.as_mut()) {
+            if let Some(x) = spec.extras_of(&row) {
+                own.entry((g, ts)).or_default().push(x);
+                added += OWN_KEY_COST;
+                self.series_bytes += OWN_KEY_COST;
+            }
+        }
         self.bytes += rb;
         self.ts_min = self.ts_min.min(ts);
         self.ts_max = self.ts_max.max(ts);
@@ -229,6 +302,162 @@ impl Batch {
         self.accounted += added;
         BATCH_BYTES.fetch_add(added as u64, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Appends the row to the WAL and registers the batch as open there.
+    fn log_row(&mut self, inner: &mut Inner, p: &[u8]) -> Result<()> {
+        if let Err(e) = inner.wal.append(p) {
+            if !matches!(e, Error::InvalidArg(_)) {
+                inner.poison(format!("WAL append failed: {e}"));
+            }
+            return Err(e);
+        }
+        let seg = inner.wal.seq();
+        let hint = self.spill_hint.clone();
+        inner.open_batches.entry(self.id).or_insert_with(|| OpenBatch { seg, spill_hint: hint });
+        self.logged = true;
+        Ok(())
+    }
+
+    /// UNIQUE tables: claims the row's series, checks the key, logs the row and
+    /// records the key. Returns the global id of the series.
+    fn admit(
+        &mut self,
+        spec: &UniqueSpec,
+        key: &[u8],
+        tags: &[Value],
+        row: &Row,
+        ts: i64,
+        payload: Option<&[u8]>,
+    ) -> Result<u64> {
+        let table = self.table.clone();
+        let Some(ex) = spec.extras_of(row) else {
+            return Err(invalid("a column of the UNIQUE key is NULL"));
+        };
+        let checks = self.unique_checks;
+        let mut guard = table.lock()?;
+        let mut lookup: Option<Arc<Snapshot>> = None;
+        let sid;
+        {
+            let inner = &mut *guard;
+            inner.check_writable()?;
+            if inner.epoch != self.epoch {
+                return Err(stale());
+            }
+            sid = inner.series.get_or_insert_keyed(key, tags);
+            if checks {
+                match inner.uniq.claim(sid, self.id) {
+                    Claim::Held { new } => {
+                        if new {
+                            self.claimed.push(sid);
+                        }
+                    }
+                    Claim::Busy(owner) => return Err(self.wait_for_claim(guard, owner)),
+                    Claim::Deadlock => {
+                        return Err(Error::Deadlock(
+                            "statements wait for each other's UNIQUE key series; the statement was stopped".into(),
+                        ))
+                    }
+                }
+                match inner.uniq.plan(sid, ts, &ex) {
+                    Plan::Duplicate => return Err(duplicate()),
+                    Plan::Accept => {}
+                    Plan::Lookup => lookup = Some(table.snapshot_locked(inner)),
+                }
+            }
+        }
+        let mut existing: Option<Vec<Extras>> = None;
+        if let Some(snap) = lookup {
+            // The series is claimed: nobody else can add rows to it while the
+            // chunks are read outside the table mutex.
+            drop(guard);
+            let found = self.find_existing(spec, &snap, sid, ts)?;
+            if found.contains(&ex) {
+                return Err(duplicate());
+            }
+            existing = Some(found);
+            guard = table.lock()?;
+            guard.check_writable()?;
+            if guard.epoch != self.epoch {
+                return Err(stale());
+            }
+        }
+        let inner = &mut *guard;
+        if let Some(p) = payload {
+            self.log_row(inner, p)?;
+        }
+        inner.uniq.accept(sid, ts, ex, existing.as_deref());
+        if !checks {
+            self.unchecked.insert(sid);
+        }
+        Ok(sid)
+    }
+
+    /// Waits (a short slice) for the statement that holds a series; the caller
+    /// retries the write on `Busy`.
+    fn wait_for_claim(&self, mut guard: MutexGuard<'_, Inner>, owner: u64) -> Error {
+        guard.uniq.set_waiting(self.id, owner);
+        match self.table.claims_cv.wait_timeout(guard, CLAIM_WAIT_SLICE) {
+            Ok((mut g, _)) => {
+                g.uniq.clear_waiting(self.id);
+                Error::Busy("another statement is inserting into the same series".into())
+            }
+            Err(_) => Error::ReadOnly("table must be reopened: a thread panicked while holding the table state".into()),
+        }
+    }
+
+    /// Extras tuples stored for `(sid, ts)`: committed data, chunks staged by
+    /// this batch, and the rows still buffered in it.
+    fn find_existing(&mut self, spec: &UniqueSpec, snap: &Snapshot, sid: u64, ts: i64) -> Result<Vec<Extras>> {
+        let table = self.table.clone();
+        let mut out = existing_extras(&table.schema, spec, snap, &self.staged, sid, ts)?;
+        if self.own.is_none() {
+            let mut m: HashMap<(u64, i64), Vec<Extras>> = HashMap::new();
+            for r in &self.rows {
+                let gid = usize::try_from(r.series_id).ok().and_then(|l| self.local_gid.get(l)).copied();
+                if let (Some(g), Some(x)) = (gid, spec.extras_of(&r.row)) {
+                    m.entry((g, table.schema.row_ts(&r.row))).or_default().push(x);
+                }
+            }
+            let cost = self.rows.len() * OWN_KEY_COST;
+            self.series_bytes += cost;
+            self.accounted += cost;
+            BATCH_BYTES.fetch_add(cost as u64, Ordering::Relaxed);
+            self.own = Some(m);
+        }
+        if let Some(v) = self.own.as_ref().and_then(|m| m.get(&(sid, ts))) {
+            out.extend_from_slice(v);
+        }
+        Ok(out)
+    }
+
+    /// Gives back the claims after the rows became visible (table mutex held).
+    fn release_claims_locked(&mut self, inner: &mut Inner) {
+        self.unchecked.clear();
+        if !self.claimed.is_empty() {
+            inner.uniq.release(&self.claimed, self.id, false);
+            self.claimed.clear();
+            self.table.claims_cv.notify_all();
+        }
+    }
+
+    /// Gives back the claims; with `invalidate` the key state of those series is
+    /// dropped too (the rows of this statement may not survive).
+    fn release_claims(&mut self, invalidate: bool) {
+        if self.claimed.is_empty() && self.unchecked.is_empty() {
+            return;
+        }
+        if let Ok(mut g) = self.table.lock() {
+            g.uniq.release(&self.claimed, self.id, invalidate);
+            if invalidate {
+                for sid in &self.unchecked {
+                    g.uniq.invalidate(*sid);
+                }
+            }
+        }
+        self.unchecked.clear();
+        self.table.claims_cv.notify_all();
+        self.claimed.clear();
     }
 
     /// Whether the next write must first move the buffer to staged chunks.
@@ -255,7 +484,7 @@ impl Batch {
     /// Writes the buffered rows as staged chunks and drops them from memory.
     fn spill(&mut self) -> Result<()> {
         let metas = stage_rows(&self.table, &self.rows, &self.local_tags, self.epoch)?;
-        self.staged.extend(metas);
+        self.staged.extend(metas.into_iter().map(Arc::new));
         self.rows = Vec::new();
         self.bytes = 0;
         self.series_bytes = 0;
@@ -264,6 +493,8 @@ impl Batch {
         self.release_budget();
         self.local_ids = HashMap::new();
         self.local_tags = Vec::new();
+        self.local_gid = Vec::new();
+        self.own = None;
         if !self.spilled {
             self.spilled = true;
             if self.logged {
@@ -328,6 +559,8 @@ impl Batch {
                 r.series_id = ids[r.series_id as usize];
             }
             inner.memtable.append(rows, self.bytes, self.ts_min, self.ts_max);
+            // The rows are visible: the series it held can be written by others.
+            self.release_claims_locked(inner);
             // The rows now belong to the MemTable, which has its own limits.
             self.release_budget();
             inner.changed();
@@ -363,8 +596,9 @@ impl Batch {
         self.finished = true;
         inner.commit_manifest(&table.config.dir, manifest)?;
         let mut chunks = inner.chunks.clone();
-        chunks.extend(staged.into_iter().map(Arc::new));
+        chunks.extend(staged);
         inner.replace_chunks(chunks);
+        self.release_claims_locked(inner);
         // The rows this batch logged before spilling are dead weight in the
         // WAL: collect them now, unless another batch still needs those
         // segments (the check is inside).
@@ -387,6 +621,7 @@ impl Batch {
         self.staged.clear();
         self.rows = Vec::new();
         self.release_budget();
+        self.release_claims(true);
         if self.logged {
             if let Ok(mut g) = self.table.lock() {
                 g.open_batches.remove(&self.id);
@@ -402,6 +637,8 @@ impl Drop for Batch {
         }
         // A commit that failed before publishing leaves its share behind.
         self.release_budget();
+        // Claims a finished-but-failed commit still holds.
+        self.release_claims(true);
     }
 }
 

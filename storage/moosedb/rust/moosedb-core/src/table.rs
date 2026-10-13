@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 use crate::bytes::ByteReader;
 use crate::chunk::{parse_chunk_id, ChunkMeta};
@@ -28,6 +28,7 @@ use crate::memtable::MemTable;
 use crate::options::TableConfig;
 use crate::scan::{check_tag_columns, Position, ResolvedFilter, Scan, ScanFilter, Snapshot};
 use crate::schema::{Row, Schema, Value};
+use crate::unique::UniqueState;
 use crate::wal::{self, list_segments, segment_path, Wal};
 
 pub(crate) const OPTIONS_FILE: &str = "OPTIONS";
@@ -159,6 +160,8 @@ pub(crate) struct Inner {
     pub(crate) open_batches: HashMap<u64, OpenBatch>,
     /// Bumped by TRUNCATE; a batch begun earlier can no longer commit.
     pub(crate) epoch: u64,
+    /// UNIQUE key state (empty and unused when the table declares none).
+    pub(crate) uniq: UniqueState,
 }
 
 /// A batch that has logged rows to the WAL and has not finished.
@@ -286,6 +289,9 @@ pub struct Table {
     pub(crate) last_retention: AtomicI64,
     /// Whether a maintenance job for this table is queued (scheduler use).
     pub(crate) queued: AtomicBool,
+    /// Signalled when a statement gives back the series it claimed (UNIQUE
+    /// tables); waits on it use the table mutex.
+    pub(crate) claims_cv: Condvar,
 }
 
 /// Deletes WAL segments `<= upto`, logging (not failing) on errors: leftover
@@ -477,9 +483,14 @@ impl Table {
         }
 
         let mut series = SeriesIndex::default();
+        let mut uniq = UniqueState::default();
+        let unique = config.unique.clone();
         for c in &chunks {
             for e in &c.series {
                 series.register(e.series_id, &e.tags)?;
+                if unique.is_some() {
+                    uniq.note_chunk(e.series_id, e.ts_max);
+                }
             }
         }
 
@@ -506,6 +517,9 @@ impl Table {
                     corrupt(format!("WAL segment {seq} holds a row that does not match the schema: {e}"))
                 })?;
                 let sid = series.get_or_insert(&row_tags(&schema, &row));
+                if let Some(spec) = &unique {
+                    uniq.note_row(sid, schema.row_ts(&row), spec.extras_of(&row));
+                }
                 memtable.push(schema.row_ts(&row), sid, row);
                 if memtable.bytes() > limits.applied {
                     // A MemTable flushes long before this: only a forged or damaged
@@ -602,6 +616,7 @@ impl Table {
                 next_batch_id,
                 open_batches: HashMap::new(),
                 epoch: 0,
+                uniq,
             }),
             series_version,
             maint: Mutex::new(()),
@@ -610,6 +625,7 @@ impl Table {
             // sweeps (OPTIMIZE, CALL moosedb_apply_retention) run at once.
             last_retention: AtomicI64::new(crate::time::now_micros() / crate::time::MICROS_PER_SEC),
             queued: AtomicBool::new(false),
+            claims_cv: Condvar::new(),
         })
     }
 
@@ -640,6 +656,11 @@ impl Table {
     /// Appends a row: WAL first, then MemTable. The row is durable once
     /// `sync_wal(true)` returns.
     pub fn write(&self, row: Row) -> Result<()> {
+        if self.config.unique.is_some() {
+            return Err(Error::Unsupported(
+                "a table with a UNIQUE key is written through write_shared or a batch".into(),
+            ));
+        }
         self.schema.validate_for_write(&row)?;
         let payload = wal::row_commit_entry(&row);
         // Reject before touching the WAL: an oversized row is the caller's
@@ -841,6 +862,8 @@ impl Table {
         // commit is refused (epoch) and their logged rows lie before replay_seq.
         inner.open_batches.clear();
         inner.epoch += 1;
+        inner.uniq.clear();
+        self.claims_cv.notify_all();
         inner.rotate_wal(dir, self.config.opts.encryption_key_id)?;
         delete_wal_upto(dir, old_seq);
         Ok(())
@@ -873,7 +896,7 @@ impl Table {
         Ok(self.snapshot_locked(&mut guard))
     }
 
-    fn snapshot_locked(&self, inner: &mut Inner) -> Arc<Snapshot> {
+    pub(crate) fn snapshot_locked(&self, inner: &mut Inner) -> Arc<Snapshot> {
         if let Some(s) = &inner.snapshot_cache {
             return s.clone();
         }
@@ -935,7 +958,8 @@ impl Table {
             (self.snapshot_locked(&mut guard), all)
         };
         let resolved = self.resolve(filter, all)?;
-        Scan::new(snap, resolved, sorted, columns)
+        let tie = self.config.unique.as_ref().map_or(&[][..], |u| u.extra_columns());
+        Scan::new(snap, resolved, sorted, columns, tie)
     }
 
     /// Re-reads the row at `pos` from the current contents.

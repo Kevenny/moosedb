@@ -37,13 +37,9 @@ a3	1	item	1	item	A	NULL	NULL	NULL		TSIDX			NO
 a3	1	item	2	host	A	NULL	NULL	NULL		TSIDX			NO
 a3	1	item	3	ts	A	NULL	NULL	NULL		TSIDX			NO
 DROP TABLE a1, a2, a3;
-# Refused: UNIQUE / PRIMARY (rows are not unique by tags + time)
-CREATE TABLE e (clock INT NOT NULL, itemid BIGINT NOT NULL COMMENT 'TAG', INDEX (clock), UNIQUE (itemid, clock)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
-ERROR HY000: MooseDB: index 'itemid' cannot be UNIQUE/PRIMARY: time-series rows are not unique by time
-CREATE TABLE e (clock INT NOT NULL, itemid BIGINT NOT NULL COMMENT 'TAG', INDEX (clock), PRIMARY KEY (itemid, clock)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
-ERROR HY000: MooseDB: index 'PRIMARY' cannot be UNIQUE/PRIMARY: time-series rows are not unique by time
+# UNIQUE / PRIMARY (all TAGs, time) is accepted (primary_key.test); a key without the time is refused
 CREATE TABLE e (clock INT NOT NULL, itemid BIGINT NOT NULL COMMENT 'TAG', INDEX (clock), UNIQUE (itemid)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
-ERROR HY000: MooseDB: index 'itemid' cannot be UNIQUE/PRIMARY: time-series rows are not unique by time
+ERROR HY000: MooseDB: index 'itemid' is not supported: must include the timestamp column after the TAG columns. A MooseDB UNIQUE/PRIMARY key is (every TAG column, the timestamp column [, up to 2 integer NOT NULL columns]), e.g. PRIMARY KEY (itemid, clock, ns)
 # Refused: the time column must be the last part
 CREATE TABLE e (clock INT NOT NULL, itemid BIGINT NOT NULL COMMENT 'TAG', INDEX (clock), INDEX (clock, itemid)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
 ERROR HY000: MooseDB: index 'clock_2' is not supported: column 'clock' (the timestamp) must be the last part. MooseDB indexes the timestamp column alone, or TAG columns optionally followed by the timestamp (INDEX (itemid, clock))

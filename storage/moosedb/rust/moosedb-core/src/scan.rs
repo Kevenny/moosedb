@@ -25,7 +25,7 @@
 //! `next_row`/`prev_row` are the one-row form of the same path.
 
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::{BinaryHeap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use crate::chunk::ChunkMeta;
@@ -248,6 +248,24 @@ struct MergeState {
     heap: BinaryHeap<HeapEntry>,
     /// Key of the row returned last.
     last: Option<Key>,
+    /// Rows of one timestamp already put in order (UNIQUE tables, see `Scan::tie`)
+    /// that did not fit the batch yet.
+    pending: VecDeque<Pend>,
+}
+
+/// A row of a timestamp group waiting for its turn (tie-ordered scans).
+struct Pend {
+    /// Values of the tie-break columns (the extra columns of the UNIQUE key).
+    extras: [i64; 2],
+    key: Key,
+    src: PendSrc,
+}
+
+enum PendSrc {
+    /// Row `i` of the decoded series of run `run`.
+    Chunk { run: usize, i: usize },
+    /// MemTable row `key.2`.
+    Mem,
 }
 
 enum Mode {
@@ -266,6 +284,9 @@ pub struct Scan {
     filter: ResolvedFilter,
     mode: Mode,
     plan: Plan,
+    /// Columns that order rows of equal timestamp in sorted scans (the extra
+    /// columns of a UNIQUE key; empty = no tie-break, arrival order).
+    tie: Vec<usize>,
     /// Output buffers, reused across calls.
     batch: Option<ScanBatch>,
 }
@@ -276,6 +297,7 @@ impl Scan {
         filter: ResolvedFilter,
         sorted: bool,
         projection: Option<&[bool]>,
+        tie: &[usize],
     ) -> Result<Scan> {
         if let Some(m) = projection {
             if m.len() != snap.schema.columns().len() {
@@ -286,12 +308,24 @@ impl Scan {
                 )));
             }
         }
-        let plan = Plan::new(&snap.schema, projection);
+        // Tie-ordered scans must decode the tie columns even when not asked for.
+        let tie: Vec<usize> = if sorted { tie.to_vec() } else { Vec::new() };
+        let forced: Option<Vec<bool>> = (!tie.is_empty()).then(|| {
+            let mut m: Vec<bool> = projection.map_or_else(|| vec![true; snap.schema.columns().len()], <[bool]>::to_vec);
+            for &c in &tie {
+                if let Some(w) = m.get_mut(c) {
+                    *w = true;
+                }
+            }
+            m
+        });
+        let plan = Plan::new(&snap.schema, forced.as_deref().or(projection));
         let mut scan = Scan {
             snap,
             filter,
             mode: Mode::Stream(StreamState { next_chunk: 0, next_series: 0, cur: None, mem_next: 0 }),
             plan,
+            tie,
             batch: None,
         };
         if sorted {
@@ -352,7 +386,7 @@ impl Scan {
         match &self.mode {
             Mode::Stream(_) if backward => Err(Error::Unsupported("backward iteration on an unsorted scan".into())),
             Mode::Stream(_) => self.stream_fill(batch, max),
-            Mode::Merge(m) if m.desc == backward => self.merge_fill(batch, max),
+            Mode::Merge(m) if m.desc == backward => self.merge_step(batch, max),
             Mode::Merge(_) => {
                 self.materialize()?;
                 self.materialized_fill(batch, max, backward)
@@ -522,7 +556,7 @@ impl Scan {
                 runs.push(Run::Mem { keys, next: 0 });
             }
         }
-        MergeState { desc, runs, heap, last: None }
+        MergeState { desc, runs, heap, last: None, pending: VecDeque::new() }
     }
 
     fn merge_fill(&mut self, batch: &mut ScanBatch, max: usize) -> Result<()> {
@@ -590,6 +624,166 @@ impl Scan {
         Ok(())
     }
 
+    fn merge_step(&mut self, batch: &mut ScanBatch, max: usize) -> Result<()> {
+        if self.tie.is_empty() {
+            self.merge_fill(batch, max)
+        } else {
+            self.merge_fill_tie(batch, max)
+        }
+    }
+
+    /// [`Scan::merge_fill`] for tables with a UNIQUE key: rows of the same
+    /// timestamp leave ordered by the key's extra columns (`Scan::tie`), then
+    /// by position, ascending or descending like the timestamps. Stored series
+    /// are only sorted by timestamp, so the rows of one timestamp are collected
+    /// from every run first (a timestamp group is small: the key is unique),
+    /// put in order and handed out from `pending`, which survives the end of a
+    /// batch.
+    fn merge_fill_tie(&mut self, batch: &mut ScanBatch, max: usize) -> Result<()> {
+        let Scan { snap, filter: f, mode, plan, tie, .. } = self;
+        let Mode::Merge(m) = mode else { return Ok(()) };
+        let MergeState { desc, runs, heap, last, pending } = m;
+        let desc = *desc;
+        let tie_of_row = |row: &[Value]| -> [i64; 2] {
+            let mut x = [i64::MIN; 2];
+            for (slot, &c) in x.iter_mut().zip(tie.iter()) {
+                if let Some(Value::Int(v)) = row.get(c) {
+                    *slot = *v;
+                }
+            }
+            x
+        };
+        while batch.rows() < max {
+            if let Some(p) = pending.front() {
+                match p.src {
+                    PendSrc::Mem => {
+                        if let Some(mr) = snap.mem.get(p.key.2) {
+                            if !batch.row_room(plan, &mr.row) {
+                                break;
+                            }
+                            batch.push_row(plan, &mr.row, pos_of(p.key).to_bytes());
+                            *last = Some(p.key);
+                        }
+                    }
+                    PendSrc::Chunk { run, i } => {
+                        if let Some(Run::Chunk { chunk, series, cur: Some(c), .. }) = runs.get(run) {
+                            let meta = &snap.chunks[*chunk];
+                            let entry = &meta.series[*series];
+                            let key = run_key(*chunk, *series);
+                            if !batch.tags_room(plan, key, &entry.tags) || batch.fit_window(plan, &c.win, i, 1) == 0 {
+                                break;
+                            }
+                            batch.push_window(
+                                plan,
+                                &c.win,
+                                &entry.tags,
+                                key,
+                                meta.id,
+                                meta.series_offsets[*series],
+                                i,
+                                1,
+                            );
+                            *last = Some(p.key);
+                        }
+                    }
+                }
+                pending.pop_front();
+                continue;
+            }
+
+            // Collect every row of the next timestamp.
+            let mut group: Vec<Pend> = Vec::new();
+            let mut t0: Option<i64> = None;
+            loop {
+                let entry = match t0 {
+                    Some(t) => match heap.peek() {
+                        Some(h) if h.key.0 == t => heap.pop(),
+                        _ => None,
+                    },
+                    None => heap.pop(),
+                };
+                let Some(top) = entry else { break };
+                let Some(run) = runs.get_mut(top.run) else { continue };
+                match run {
+                    Run::Chunk { chunk, series, loaded, cur } => {
+                        let meta = &snap.chunks[*chunk];
+                        let base = meta.series_offsets[*series];
+                        if !*loaded {
+                            *loaded = true;
+                            let range = (f.ts_min, f.ts_max);
+                            if let Some(win) = load_window(&snap.schema, meta, *series, range, &plan.want, true)? {
+                                let c = RunCursor { front: win.lo, back: win.hi, win };
+                                let i = if desc { c.back - 1 } else { c.front };
+                                heap.push(HeapEntry {
+                                    key: (c.win.ts_at(i)?, meta.id, base + i as u64),
+                                    run: top.run,
+                                    desc,
+                                });
+                                *cur = Some(c);
+                            }
+                            continue;
+                        }
+                        let Some(c) = cur else { continue };
+                        let i = if desc { c.back - 1 } else { c.front };
+                        let ts = c.win.ts_at(i)?;
+                        let mut x = [i64::MIN; 2];
+                        for (slot, &col) in x.iter_mut().zip(tie.iter()) {
+                            let v = c
+                                .win
+                                .cols
+                                .get(col)
+                                .and_then(Option::as_ref)
+                                .and_then(|d| d.ints())
+                                .and_then(|v| v.get(i));
+                            if let Some(v) = v {
+                                *slot = *v;
+                            }
+                        }
+                        if desc {
+                            c.back -= 1;
+                        } else {
+                            c.front += 1;
+                        }
+                        if c.front < c.back {
+                            let j = if desc { c.back - 1 } else { c.front };
+                            heap.push(HeapEntry {
+                                key: (c.win.ts_at(j)?, meta.id, base + j as u64),
+                                run: top.run,
+                                desc,
+                            });
+                        }
+                        group.push(Pend {
+                            extras: x,
+                            key: (ts, meta.id, base + i as u64),
+                            src: PendSrc::Chunk { run: top.run, i },
+                        });
+                        t0 = Some(ts);
+                    }
+                    Run::Mem { keys, next } => {
+                        let Some(&key) = keys.get(*next) else { continue };
+                        *next += 1;
+                        if let Some(&k) = keys.get(*next) {
+                            heap.push(HeapEntry { key: k, run: top.run, desc });
+                        }
+                        if let Some(mr) = snap.mem.get(key.2) {
+                            group.push(Pend { extras: tie_of_row(&mr.row), key, src: PendSrc::Mem });
+                            t0 = Some(key.0);
+                        }
+                    }
+                }
+            }
+            if group.is_empty() {
+                break;
+            }
+            group.sort_by_key(|a| (a.extras, a.key.1, a.key.2));
+            if desc {
+                group.reverse();
+            }
+            pending.extend(group);
+        }
+        Ok(())
+    }
+
     // ── materialized ──
 
     /// Switches a merge to materialized mode, keeping the cursor on the row
@@ -605,7 +799,7 @@ impl Scan {
         let mut rows = Vec::new();
         loop {
             one.begin(&self.plan.want);
-            if let Err(e) = self.merge_fill(&mut one, 1) {
+            if let Err(e) = self.merge_step(&mut one, 1) {
                 self.mode = old;
                 return Err(e);
             }
@@ -617,6 +811,8 @@ impl Scan {
             rows.push((key, one.row_at(0)));
         }
         let cursor = match last {
+            // Tie-ordered rows are not sorted by key alone: find the row itself.
+            Some(k) if !self.tie.is_empty() => rows.iter().position(|(rk, _)| *rk == k).map_or(-1, |i| i as isize),
             Some(k) => rows.binary_search_by_key(&k, |(rk, _)| *rk).map_or_else(|i| i as isize, |i| i as isize),
             None if desc => rows.len() as isize,
             None => -1,
@@ -782,7 +978,11 @@ mod selective_scan_tests {
             for h in 0..400i64 {
                 for k in 0..6i64 {
                     let ts = round * 1000 + k * 7 + h % 5;
-                    let row = vec![Value::Timestamp(ts), Value::Bytes(format!("h{h}").into_bytes()), Value::Int(h * 100 + ts)];
+                    let row = vec![
+                        Value::Timestamp(ts),
+                        Value::Bytes(format!("h{h}").into_bytes()),
+                        Value::Int(h * 100 + ts),
+                    ];
                     t.write(row).unwrap();
                 }
             }

@@ -29,7 +29,9 @@ no repositório. `results/` (logs e medições) é ignorado pelo git.
 | `scripts/compat_test.sh` | tenta `ALTER TABLE history* ENGINE=MooseDB` no esquema oficial e isola cada incompatibilidade |
 | `scripts/bench.sh` + `sql/bench_setup.sql` | benchmark InnoDB x MooseDB com dados sintéticos idênticos |
 | `sql/adapted_history.sql` | variante adaptada v1 (itemid `BIGINT` TAG) |
-| `sql/adapted_history_vtag.sql` | variante adaptada v2 (itemid `VARCHAR(20)` TAG — **recomendada**) |
+| `sql/adapted_history_vtag.sql` | variante adaptada v2 (itemid `VARCHAR(20)` TAG) |
+| `sql/adapted_history_v3.sql` | variante v3 (itemid `BIGINT` TAG, `clock` como eixo, `INDEX (itemid, clock)`, sem PK) |
+| `sql/adapted_history_v4.sql` | **recomendada**: DDL oficial do Zabbix 7.0 com `PRIMARY KEY (itemid,clock,ns)` verificada; só `COMMENT 'TAG'` + `TIMESTAMP_COLUMN='clock'` |
 | `sql/revert_history.sql` | volta às tabelas InnoDB oficiais |
 
 ## Subir
@@ -179,3 +181,33 @@ valor) a MooseDB fica na mesma ordem do InnoDB. Sempre que o Zabbix manda o
 itemid como **número** (server/value cache, `dbConditionInt`) ou usa o itemid
 BIGINT como TAG, não há pushdown e cada consulta varre a tabela inteira
 (2–9 s em 50 M linhas, crescendo linearmente com o histórico).
+
+## Atualização: PRIMARY KEY aceita — v4 é a variante recomendada
+
+`PRIMARY KEY`/`UNIQUE (itemid,clock,ns)` **passou a ser aceita** (unicidade verificada
+de verdade; `ER_DUP_ENTRY`, `INSERT IGNORE`). As linhas "PRIMARY KEY … ERROR 1070" e
+"duplicata aceita" da tabela de compatibilidade acima são o registro da rodada de
+2026-10-07. A variante **`sql/adapted_history_v4.sql`** é o DDL oficial do Zabbix 7.0
+com apenas `COMMENT 'TAG'` em `itemid` e `ENGINE=MooseDB TIMESTAMP_COLUMN='clock'`
+(mais as opções de chunk/retenção); sem `INDEX (clock)` nem trigger. Com ela o Zabbix
+7.0.31 detecta a PK e usa o caminho com PK (`ORDER BY clock DESC, ns DESC LIMIT 1`
+sem filesort).
+
+Uso: `docker exec zbxlab-mariadb mariadb -uroot -pzbxlab zabbix -e "SOURCE /lab/sql/adapted_history_v4.sql"`
+(server parado). `bench.sh` agora inclui `h_moose_v4`.
+
+**Mantenha o housekeeper de histórico DESLIGADO** (`--history-hk off`): o
+`DELETE … WHERE itemid=… AND clock<…` por item continua sem suporte (`ER_ILLEGAL_HA`);
+a expiração é por `RETENTION_PERIOD`. `REPLACE`/`ON DUPLICATE KEY UPDATE` sobre
+chave existente também são recusados.
+
+### InnoDB x v3 x v4 (`results/bench_v4_5000x7d.txt`, 5.000 itens × 7 d × 60 s)
+
+| Métrica | InnoDB | MooseDB v3 (sem PK) | MooseDB v4 (PK) |
+|---|---:|---:|---:|
+| Carga (linhas/s) | 524.949 | 463.456 | 433.342 |
+| Disco (MiB) | 2.384 | 393,1 | 393,1 |
+| Último valor, forma com PK (`lastvalue_pk`, ms) | 0,816 | 3,946 | 1,053 |
+| Agregação por hora (`agg_hour`, ms) | 27,9 | 35,3 | 37,1 |
+| Agregação LAST (`agg_last`, ms) | 0,71 | 1,19 | 1,31 |
+| Expirar 1 dia | 16,3 s | 14,5 ms | 14,5 ms |

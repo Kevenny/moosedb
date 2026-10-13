@@ -24,7 +24,7 @@ NLAST=${NLAST:-20}; NAGG=${NAGG:-100}; SKIP_LOAD=${SKIP_LOAD:-0}
 PW="${ROOT_PASSWORD:-zbxlab}"
 DB=zbxbench
 DATADIR=/var/lib/mysql
-TABLES="h_innodb h_moose_int h_moose_str h_moose_v3"
+TABLES="h_innodb h_moose_int h_moose_str h_moose_v3 h_moose_v4"
 NATIVE="h_moose_int h_moose_str"   # tabelas com a coluna ts (forma "nativo(ts)")
 
 q()  { mariadb -uroot -p"$PW" -N -s "$DB" -e "$1"; }
@@ -87,17 +87,17 @@ echo
 # ---------------------------------------------------------------- carga
 if [ "$SKIP_LOAD" != 1 ]; then
   echo "## Carga ($NSTEPS statements de $ITEMS linhas, autocommit, em ordem de clock)"
-  for spec in "h_innodb i 0" "h_moose_int i 1" "h_moose_str CAST(i&AS&CHAR) 1" "h_moose_v3 i 0"; do
+  for spec in "h_innodb i 0" "h_moose_int i 1" "h_moose_str CAST(i&AS&CHAR) 1" "h_moose_v3 i 0" "h_moose_v4 i 0"; do
     set -- $spec; t=$1; expr=${2//&/ }; wts=$3
     s=$(timeit "CALL bench_load('$t','$expr',$wts,$START,$NSTEPS,$STEP,$ITEMS)")
     echo "load	$t	${s}s	$(awk -v r=$ROWS -v s="$s" 'BEGIN{printf "%.0f linhas/s", r/s}')"
   done
   echo
   echo "## Pós-carga"
-  sf=$(timeit "FLUSH TABLES h_moose_int, h_moose_str, h_moose_v3"); echo "flush_moose	${sf}s"
+  sf=$(timeit "FLUSH TABLES h_moose_int, h_moose_str, h_moose_v3, h_moose_v4"); echo "flush_moose	${sf}s"
   q "ANALYZE TABLE h_innodb" >/dev/null
   for t in $TABLES; do echo "size_after_load	$t	$(mb $(size_of $t)) MiB"; done
-  for t in h_moose_int h_moose_str h_moose_v3; do
+  for t in h_moose_int h_moose_str h_moose_v3 h_moose_v4; do
     s=$(timeit "CALL moosedb_compact('$t', NULL, NULL)")
     echo "compact_full	$t	${s}s	-> $(mb $(size_of $t)) MiB"
   done
@@ -172,7 +172,7 @@ for t in $TABLES; do echo "rows_to_expire	$t	$(q "SELECT COUNT(*) FROM $t WHERE 
 s=$(timeit "CALL bench_hk_delete('h_innodb',100001,$ITEMS,$CUT)")
 echo "hk_delete_per_item	h_innodb	${s}s	restantes_antigas=$(q "SELECT COUNT(*) FROM h_innodb WHERE clock<$CUT") size=$(mb $(size_of h_innodb)) MiB (o .ibd não encolhe)"
 echo "hk_delete_moose	h_moose_int	$(timeit "delete from h_moose_int where itemid=100001 and clock<$CUT")"
-for t in h_moose_int h_moose_str h_moose_v3; do
+for t in h_moose_int h_moose_str h_moose_v3 h_moose_v4; do
   s=$(timeit "CALL moosedb_apply_retention('$t')")
   echo "retention_drop_chunk	$t	${s}s	restantes_antigas=$(q "SELECT COUNT(*) FROM $t WHERE clock<$CUT") total=$(q "SELECT COUNT(*) FROM $t") size=$(mb $(size_of $t)) MiB"
 done

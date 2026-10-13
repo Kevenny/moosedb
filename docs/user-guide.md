@@ -52,8 +52,9 @@ Regras:
 * uma coluna `DATETIME` ou `TIMESTAMP` **NOT NULL** é o eixo do tempo, com um
   índice simples (`INDEX (ts)`, obrigatório); além dele só se aceitam os
   índices de TAG descritos em [Índices compostos](#índices-compostos).
-  `UNIQUE`/`PRIMARY KEY` e `AUTO_INCREMENT` não são aceitos, nem `PARTITION BY`
-  (o tempo já é particionado em chunks);
+  `AUTO_INCREMENT` não é aceito, nem `PARTITION BY` (o tempo já é particionado em
+  chunks); uma `PRIMARY KEY`/`UNIQUE (TAGs, tempo[, ns])` é aceita, ver
+  [PRIMARY KEY / UNIQUE](#primary-key--unique-chave-do-histórico-do-zabbix);
 * colunas com `COMMENT 'TAG'` formam a identidade da **série** (host, sensor,
   métrica…). Filtros `=`/`IN` sobre TAGs leem só as séries correspondentes;
 * `DATETIME` é armazenado como relógio de parede (UTC); `TIMESTAMP`, como
@@ -124,8 +125,8 @@ CREATE TABLE history (
 Regras: cada parte TAG é uma coluna `COMMENT 'TAG'`, `NOT NULL`, inteira
 (`TINYINT`..`BIGINT`) ou `CHAR`/`VARCHAR`, indexada inteira (sem `col(8)`),
 sem repetição e sem `DESC`; o tempo, se entrar, é a última parte; as TAGs não
-precisam ser um prefixo da ordem das colunas do schema. `UNIQUE` e `PRIMARY KEY`
-continuam recusados. O índice não ocupa espaço extra: a engine já sabe quais
+precisam ser um prefixo da ordem das colunas do schema. Chaves únicas têm regras
+próprias (seção seguinte). O índice não ocupa espaço extra: a engine já sabe quais
 séries casam cada valor de TAG.
 
 O otimizador passa a usar o índice (`ref`/`range` em `EXPLAIN`) para:
@@ -144,11 +145,99 @@ O otimizador passa a usar o índice (`ref`/`range` em `EXPLAIN`) para:
 
 O que o índice **não** faz: não ordena por valor de TAG (`ORDER BY itemid`,
 `GROUP BY itemid` e `itemid > 5` continuam sendo *filesort* / outro índice) e
-não serve `ORDER BY clock DESC, ns DESC LIMIT 1` por inteiro (`ns` não está no
+só serve `ORDER BY clock DESC, ns DESC LIMIT 1` por inteiro numa chave única que
+inclua `ns` (veja abaixo); num índice não único `ns` não está no
 índice: lê a faixa do item e ordena; para "último valor" use
 `SELECT MAX(clock) …` seguido de `… WHERE itemid = X AND clock = <max>
 ORDER BY ns DESC LIMIT 1`, como o frontend do Zabbix sem PK). O tempo sozinho
 (`INDEX (clock)`) continua sendo o índice das consultas sem TAG.
+
+### PRIMARY KEY / UNIQUE (chave do histórico do Zabbix)
+
+A tabela aceita **uma** `PRIMARY KEY` ou `UNIQUE` na forma
+
+```
+(todas as colunas TAG, a coluna de tempo [, 1 ou 2 colunas inteiras NOT NULL])
+```
+
+— a série mais o tempo (mais um desempate, como o `ns` do Zabbix) identificam a
+linha. Os DDL oficiais do Zabbix 7.0 (`history`, `history_uint`, `history_str`,
+`history_log`, `history_text`, `history_bin`) rodam sem adaptação além de
+`COMMENT 'TAG'` em `itemid` e `ENGINE=MooseDB TIMESTAMP_COLUMN='clock'`; a PK
+dispensa o `INDEX (clock)` (ela fornece o eixo de tempo):
+
+```sql
+CREATE TABLE history (
+  itemid bigint unsigned NOT NULL COMMENT 'TAG',
+  clock  integer DEFAULT '0' NOT NULL,
+  value  DOUBLE PRECISION DEFAULT '0.0000' NOT NULL,
+  ns     integer DEFAULT '0' NOT NULL,
+  PRIMARY KEY (itemid,clock,ns)
+) ENGINE=MooseDB TIMESTAMP_COLUMN='clock' CHUNK_INTERVAL='1 DAY' RETENTION_PERIOD='31 DAYS';
+```
+
+Formas aceitas / recusadas (a mensagem do `CREATE` diz o motivo):
+
+* a chave lista **todas** as TAGs da tabela (em qualquer ordem), depois a coluna
+  de tempo, depois 0–2 colunas `TINYINT`..`BIGINT` `NOT NULL` (sem prefixo, sem
+  `DESC`). Uma chave que não cobre todas as TAGs (`UNIQUE (itemid)` numa tabela
+  com `hostid` e `itemid`) exigiria checar várias séries e é recusada;
+* TAG de texto numa chave única precisa de collation binária *NO PAD*
+  (`utf8mb4_nopad_bin`, `VARBINARY`...): numa collation `_ci` ou *PAD SPACE*,
+  `'A'` e `'a '` seriam a mesma chave mas séries diferentes;
+* tabela **sem** TAG: só `UNIQUE (coluna_de_tempo)`;
+* uma só chave única por tabela; `INDEX (itemid, clock, ns)` (não único)
+  continua recusado.
+
+Semântica:
+
+* `INSERT` de chave existente → `ER_DUP_ENTRY` (`Duplicate entry '42-1700000000-7'
+  for key 'PRIMARY'`); `INSERT IGNORE` pula a linha com um warning; duplicata
+  dentro do mesmo statement, contra a MemTable, chunks selados (quentes, frios,
+  compactados, cifrados), após restart e após `kill -9` + replay do WAL: todos
+  detectados. Como a engine não é transacional, um `INSERT` de várias linhas que
+  falha **mantém as linhas anteriores à duplicata** (o InnoDB desfaz o statement);
+* `REPLACE` e `INSERT … ON DUPLICATE KEY UPDATE` funcionam quando a chave **não**
+  existe; quando existe, falham com `ER_ILLEGAL_HA` (a engine não tem
+  `UPDATE`/`DELETE`) — nunca com semântica errada;
+* duas sessões inserindo a mesma chave: exatamente uma vence. O primeiro
+  statement a escrever numa série a "reserva" até terminar; outro que precise da
+  mesma série **espera** (até `moosedb_unique_lock_wait_timeout` s, padrão 50,
+  respeitando `KILL QUERY`; `ER_LOCK_WAIT_TIMEOUT`) e depois confere contra o já
+  confirmado. Statements que escrevem séries *diferentes* não se atrapalham (o
+  caso do Zabbix, onde cada syncer cuida de itens distintos). Dois statements que
+  escrevem várias séries em ordens opostas e se seguram mutuamente recebem
+  `ER_LOCK_DEADLOCK` num deles;
+* `SET unique_checks = 0` pula a verificação (carga em massa, como no InnoDB —
+  mas aqui vale para a chave primária também): duplicatas inseridas assim são
+  gravadas e **não são detectadas depois**; as chaves gravadas continuam sendo
+  conhecidas pelas verificações seguintes;
+* `ALTER TABLE … ADD PRIMARY KEY` numa tabela com duplicata falha com
+  `ER_DUP_ENTRY`; `DROP PRIMARY KEY` exige que exista (ou seja adicionado no
+  mesmo `ALTER`) um `INDEX` sobre a coluna de tempo;
+* **Falhas da reserva deixam as linhas anteriores do statement.** `ER_LOCK_DEADLOCK`
+  e `ER_LOCK_WAIT_TIMEOUT` (e `KILL`) da espera por uma série saem, como qualquer erro
+  de um statement, **com as linhas já aceitas mantidas** (a engine não desfaz;
+  contrato de atomicidade por statement). O InnoDB desfaria o statement todo. Um
+  cliente (ou réplica) que re-executa o mesmo `INSERT` recebe `ER_DUP_ENTRY` nas
+  linhas que já entraram: no retry use `INSERT IGNORE`, ou escreva cada statement
+  numa só série / numa ordem de séries consistente (o que o Zabbix já faz);
+* **Memória e desempate.** O estado de unicidade (~70 B por série) fica em memória,
+  fora do `moosedb_batch_memory_budget`. Em varreduras ordenadas por tempo de uma
+  tabela inteira com PK, o desempate por `ns` custa um passo extra por instante
+  (coleta e ordena o grupo de cada `clock`); varreduras sem ordem (`rnd_next`) e
+  tabelas sem PK não pagam isso;
+* retenção/`TRUNCATE`: a chave de uma linha expirada pode ser inserida de novo.
+
+Custo: o caso comum (série em ordem de `clock`) se resolve em memória, sem ler
+dados — mede-se ~+10 % no tempo de carga do *history syncer* (ver
+`architecture.md`). Chaves fora de ordem ou repetidas lêem a série no instante
+pedido (~dezenas de µs).
+
+Leitura pela chave: é um índice composto `(itemid, clock, ns)`. `WHERE itemid=X
+AND clock>N ORDER BY clock DESC, ns DESC LIMIT 1` (e `clock<=N`, `BETWEEN`,
+ascendente) sai na ordem do índice, **sem filesort**: dentro de um mesmo `clock`
+as linhas vêm ordenadas por `ns`. A chave completa dá `const` / `eq_ref` em joins.
 
 
 ## Escrevendo e lendo
@@ -292,6 +381,7 @@ Na restauração, copie os diretórios de volta com o mesmo
 | `moosedb_chunk_cache_size` | 128 MiB | cache de blocos e de séries decodificadas (reduzir despeja na hora) |
 | `moosedb_batch_memory_budget` | 1 GiB | memória total de statements em andamento; acima disso, os grandes fazem spill antecipado |
 | `moosedb_max_open_chunks` | 100 | descritores de chunk mantidos abertos |
+| `moosedb_unique_lock_wait_timeout` | 50 | segundos que um INSERT espera outro statement que escreve a mesma série (tabelas com PK/UNIQUE); 0 = falha na hora |
 
 ## Replicação
 

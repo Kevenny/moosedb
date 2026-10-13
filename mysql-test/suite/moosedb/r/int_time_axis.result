@@ -19,8 +19,9 @@ CREATE TABLE e (clock INT NOT NULL COMMENT 'TAG', INDEX(clock)) ENGINE=MooseDB T
 ERROR HY000: MooseDB: the timestamp column cannot be a TAG
 CREATE TABLE e (clock INT NOT NULL, v INT) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
 ERROR HY000: MooseDB: missing index on the timestamp column: add INDEX (clock)
+# (UNIQUE on the axis of a table without TAG columns is accepted: primary_key.test)
 CREATE TABLE e (clock INT NOT NULL, UNIQUE(clock)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
-ERROR HY000: MooseDB: index 'clock' cannot be UNIQUE/PRIMARY: time-series rows are not unique by time
+DROP TABLE e;
 CREATE TABLE e (clock INT NOT NULL, v INT NOT NULL, INDEX(clock), INDEX(v)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
 ERROR HY000: MooseDB: index 'v' is not supported: column 'v' is not a TAG column or the timestamp column. MooseDB indexes the timestamp column alone, or TAG columns optionally followed by the timestamp (INDEX (itemid, clock))
 # An index on a DATETIME column is not the axis when TIMESTAMP_COLUMN says otherwise

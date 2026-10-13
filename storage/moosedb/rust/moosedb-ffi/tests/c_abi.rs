@@ -44,6 +44,9 @@ fn config() -> Config {
         column_names: name_ptrs.as_ptr(),
         column_types: types.as_ptr(),
         encryption_key_id: 0,
+        unique: false,
+        unique_extra_count: 0,
+        unique_extra_cols: std::ptr::null(),
     };
     Config { _strings: strings, _name_ptrs: name_ptrs, _types: types, cfg }
 }

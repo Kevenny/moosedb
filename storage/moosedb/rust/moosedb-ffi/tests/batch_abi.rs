@@ -91,6 +91,9 @@ impl Table {
             column_names: name_ptrs.as_ptr(),
             column_types: types.as_ptr(),
             encryption_key_id: 0,
+            unique: false,
+            unique_extra_count: 0,
+            unique_extra_cols: std::ptr::null(),
         };
         let p = CString::new(path).unwrap();
         check(unsafe { moosedb_table_create(p.as_ptr(), &cfg) }).unwrap();

@@ -50,9 +50,10 @@ CREATE TABLE metricas (
 Regras:
 
 * uma coluna `DATETIME` ou `TIMESTAMP` **NOT NULL** é o eixo do tempo, com um
-  índice simples (`INDEX (ts)`); outros índices, `UNIQUE`/`PRIMARY KEY` e
-  `AUTO_INCREMENT` não são aceitos, nem `PARTITION BY` (o tempo já é
-  particionado em chunks);
+  índice simples (`INDEX (ts)`, obrigatório); além dele só se aceitam os
+  índices de TAG descritos em [Índices compostos](#índices-compostos).
+  `UNIQUE`/`PRIMARY KEY` e `AUTO_INCREMENT` não são aceitos, nem `PARTITION BY`
+  (o tempo já é particionado em chunks);
 * colunas com `COMMENT 'TAG'` formam a identidade da **série** (host, sensor,
   métrica…). Filtros `=`/`IN` sobre TAGs leem só as séries correspondentes;
 * `DATETIME` é armazenado como relógio de parede (UTC); `TIMESTAMP`, como
@@ -101,6 +102,54 @@ Regras:
 | `TIMESTAMP_COLUMN` | nome da coluna (`DATETIME`/`TIMESTAMP`/`INT`/`BIGINT`) | coluna `DATETIME`/`TIMESTAMP` do índice temporal |
 | `ENCRYPTION` | `YES`/`NO` | `NO` |
 | `ENCRYPTION_KEY_ID` | id no key management | 1 |
+
+### Índices compostos
+
+Além do índice simples sobre o tempo (obrigatório), a tabela aceita até 8
+índices **não únicos** destas formas:
+
+```sql
+CREATE TABLE history (
+    itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG',
+    clock  INT NOT NULL,
+    value  DOUBLE NOT NULL,
+    ns     INT NOT NULL,
+    INDEX clock_idx (clock),              -- só o tempo: obrigatório
+    INDEX item_clock (itemid, clock)      -- TAG(s) + tempo (tempo por último)
+) ENGINE=MooseDB TIMESTAMP_COLUMN='clock' CHUNK_INTERVAL='1 DAY';
+-- também: INDEX (hostid, itemid, clock)   várias TAGs, qualquer subconjunto/ordem
+--         INDEX (itemid)                   só TAGs: ref em joins por TAG
+```
+
+Regras: cada parte TAG é uma coluna `COMMENT 'TAG'`, `NOT NULL`, inteira
+(`TINYINT`..`BIGINT`) ou `CHAR`/`VARCHAR`, indexada inteira (sem `col(8)`),
+sem repetição e sem `DESC`; o tempo, se entrar, é a última parte; as TAGs não
+precisam ser um prefixo da ordem das colunas do schema. `UNIQUE` e `PRIMARY KEY`
+continuam recusados. O índice não ocupa espaço extra: a engine já sabe quais
+séries casam cada valor de TAG.
+
+O otimizador passa a usar o índice (`ref`/`range` em `EXPLAIN`) para:
+
+* `itemid = X`, `itemid IN (…)`, e `+ clock` com `=`, `<`, `<=`, `>`, `>=`,
+  `BETWEEN` — lê só as séries pedidas, dentro da faixa de tempo;
+* joins/self-joins por `(itemid, clock)` — um *lookup* de ~20 µs por linha
+  externa (o self-join `AGGREGATE_LAST` do Zabbix caiu de 1,4 s para
+  ~1 ms numa tabela de 8,6 M linhas);
+* `WHERE itemid = X ORDER BY clock [DESC] LIMIT n` sem *filesort*;
+* `SELECT MAX(clock)` / `MIN(clock)` `WHERE itemid = X [AND clock > N]` — uma
+  chamada de índice (`Select tables optimized away`);
+* `hostid = H` num índice `(hostid, itemid, clock)`: as séries do prefixo
+  saem mescladas por tempo;
+* `MIN(itemid)`, `MAX(itemid) WHERE itemid <= N`, etc.
+
+O que o índice **não** faz: não ordena por valor de TAG (`ORDER BY itemid`,
+`GROUP BY itemid` e `itemid > 5` continuam sendo *filesort* / outro índice) e
+não serve `ORDER BY clock DESC, ns DESC LIMIT 1` por inteiro (`ns` não está no
+índice: lê a faixa do item e ordena; para "último valor" use
+`SELECT MAX(clock) …` seguido de `… WHERE itemid = X AND clock = <max>
+ORDER BY ns DESC LIMIT 1`, como o frontend do Zabbix sem PK). O tempo sozinho
+(`INDEX (clock)`) continua sendo o índice das consultas sem TAG.
+
 
 ## Escrevendo e lendo
 

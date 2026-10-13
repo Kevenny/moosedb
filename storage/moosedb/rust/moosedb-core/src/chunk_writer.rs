@@ -197,6 +197,7 @@ impl<'a> ChunkBuilder<'a> {
             series: self.entries,
             bloom,
             cipher: self.cipher,
+            by_id: Default::default(),
         })
     }
 }

@@ -196,8 +196,9 @@ ALTER TABLE m ADD PRIMARY KEY (t2);
 ERROR HY000: MooseDB: index 'PRIMARY' cannot be UNIQUE/PRIMARY: time-series rows are not unique by time
 ALTER TABLE m ADD UNIQUE (v);
 ERROR 42000: Table handler doesn't support NULL in given index. Please change column 'v' to be NOT NULL or use another handler
+# An index on a TAG column is accepted (it serves ref lookups); it can be dropped again
 ALTER TABLE m ADD INDEX (host);
-ERROR HY000: MooseDB: index 'host' is not supported: MooseDB only indexes the timestamp column (TAG columns are indexed implicitly)
+ALTER TABLE m DROP INDEX host;
 ALTER TABLE m ADD COLUMN g GEOMETRY;
 ERROR 42000: The storage engine for the table doesn't support GEOMETRY
 ALTER TABLE m ADD COLUMN id INT NOT NULL AUTO_INCREMENT, ADD KEY (id);

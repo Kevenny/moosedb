@@ -138,6 +138,7 @@ pub(crate) fn read_meta(path: &Path, id: u64) -> Result<ChunkMeta> {
         series,
         bloom,
         cipher,
+        by_id: Default::default(),
     })
 }
 

@@ -49,12 +49,28 @@ struct tf_column
   tf_conv conv;
 };
 
+/*
+  What one MooseDB index is (validated by build_layout()).
+    simple_ts   the legacy index on the time column alone
+    otherwise   tag_fields = the TAG key parts (field indexes, in key order,
+                k >= 1) and has_time = a last key part on the time column.
+                Part k (zero based) is the time part when has_time.
+*/
+struct tf_index_def
+{
+  bool simple_ts= false;
+  bool has_time= false;
+  std::vector<uint> tag_fields;    /* TABLE::field index of each TAG part */
+  std::vector<int> tag_pos;        /* position among the TAG columns      */
+};
+
 /* Maps a MariaDB table definition onto the Rust core's schema. */
 struct tf_layout
 {
   std::vector<tf_column> columns;  /* stored (non-virtual) fields only  */
   uint ts_column= 0;               /* index into `columns`              */
-  uint ts_key= MAX_KEY;            /* key on the timestamp column       */
+  uint ts_key= MAX_KEY;            /* a key on the timestamp column alone */
+  std::vector<tf_index_def> indexes;   /* one per key of the table       */
 
   /* Position of a field among the TAG columns, or -1. */
   int tag_position(uint field_index) const;
@@ -131,6 +147,40 @@ struct tf_tag_cache
 };
 
 /*
+  Cardinalities behind KEY::rec_per_key of the composite indexes: series
+  count and distinct values per (TAG column, collation); rebuilt only when
+  the series version moves. Guarded by `mutex`.
+*/
+struct tf_index_stats
+{
+  std::mutex mutex;
+  bool valid= false;
+  uint64_t version= 0;
+  uint64_t epoch= 0;
+  uint64_t series= 0;
+  std::map<std::pair<int, const CHARSET_INFO *>, uint64_t> distinct;
+};
+
+/*
+  The series of a composite index sorted by their tag tuple (the order of the
+  index), tuple-equal series merged: what an ordered read (MIN/MAX of a tag,
+  index_first/last, a range on a tag) walks. Rebuilt when the series version
+  moves; entries are sorted with the columns' own comparison.
+*/
+struct tf_tuple_entry
+{
+  std::vector<std::string> tuple;  /* tag texts, one per tag part of the key */
+  std::vector<uint64_t> ids;       /* series_id, sorted                      */
+};
+struct tf_tuple_index
+{
+  uint64_t version= 0;
+  size_t bytes= 0;                 /* charged to the process-wide budget */
+  std::vector<tf_tuple_entry> entries;
+  ~tf_tuple_index();               /* gives the bytes back                 */
+};
+
+/*
   Per-table state shared by every handler instance of one TABLE_SHARE.
   The Rust table is opened once here and is thread-safe.
 */
@@ -143,6 +193,9 @@ public:
   std::string path;      /* table directory, as given to open()      */
   std::string display;   /* db.table, for messages (no host paths)    */
   tf_tag_cache tag_cache; /* TAG pushdown lookup, see pushed_series()  */
+  tf_index_stats index_stats; /* cardinalities for rec_per_key          */
+  std::mutex tuple_mutex;                        /* guards tuples              */
+  std::map<uint, std::shared_ptr<const tf_tuple_index>> tuples;  /* by key  */
 
   MooseDB_share();
   ~MooseDB_share() override;
@@ -188,6 +241,7 @@ public:
   int index_read_map(uchar *buf, const uchar *key, key_part_map keypart_map,
                      enum ha_rkey_function find_flag) override;
   int index_next(uchar *buf) override;
+  int index_next_same(uchar *buf, const uchar *key, uint keylen) override;
   int index_prev(uchar *buf) override;
   int index_first(uchar *buf) override;
   int index_last(uchar *buf) override;
@@ -223,13 +277,10 @@ public:
            HA_BINLOG_ROW_CAPABLE | HA_BINLOG_STMT_CAPABLE |
            HA_CAN_TABLE_CONDITION_PUSHDOWN | HA_PARTIAL_COLUMN_READ;
   }
-  ulong index_flags(uint, uint, bool) const override
-  {
-    return HA_READ_NEXT | HA_READ_PREV | HA_READ_ORDER | HA_READ_RANGE;
-  }
-  uint max_supported_keys() const override { return 2; }
-  uint max_supported_key_parts() const override { return 1; }
-  uint max_supported_key_length() const override { return 16; }
+  ulong index_flags(uint idx, uint part, bool all_parts) const override;
+  uint max_supported_keys() const override { return 8; }
+  uint max_supported_key_parts() const override { return 16; }
+  uint max_supported_key_length() const override { return 3072; }
 
   /* ── MooseDB specific ────────────────────────────────────────────── */
   bool moosedb_is_timestamp_column(const Field *field) const;
@@ -248,18 +299,39 @@ private:
   void reset_batch_state();
   void build_projection(bool index_scan);
   void recheck_projection();
-  int key_to_ts(uint idx, const uchar *key, longlong *out);
+  int key_to_ts(uint idx, const uchar *key, uint part, longlong *out);
   int map_status(TFStatus status, const char *name= nullptr);
   int commit_batch();   /* publish + sync the open statement batch, if any */
 
   void collect_tag_predicates(const Item *cond,
                               std::vector<tf_tag_predicate> *out);
   bool pushed_series(const std::vector<uint64_t> **ids);
+  bool resolve_series(const std::vector<const tf_tag_predicate *> &preds,
+                      std::vector<uint64_t> *out);
   bool pushed_series_scan(MooseDBSeriesList *list,
                           const std::vector<const tf_tag_predicate *> &preds,
-                          const std::vector<CHARSET_INFO *> &tag_cs);
+                          const std::vector<CHARSET_INFO *> &tag_cs,
+                          std::vector<uint64_t> *out);
   bool pushed_series_cached(const std::vector<const tf_tag_predicate *> &preds,
-                            const std::vector<CHARSET_INFO *> &tag_cs);
+                            const std::vector<CHARSET_INFO *> &tag_cs,
+                            std::vector<uint64_t> *out);
+
+  /* Composite (TAG..., time) indexes, see composite_read(). */
+  const tf_index_def *index_def(uint idx) const;
+  int key_tag_predicates(uint idx, const uchar *key, uint ntags,
+                         std::vector<tf_tag_predicate> *out);
+  bool series_for_index(const std::vector<uint64_t> **ids);
+  std::shared_ptr<const tf_tuple_index> tuple_index(uint idx);
+  bool pick_entry(const std::vector<uint64_t> *filter, int64_t entry,
+                  bool backward);
+  bool walk_entry(const std::vector<uint64_t> *filter, bool backward);
+  int composite_read(uchar *buf, const uchar *key, key_part_map map,
+                     enum ha_rkey_function find_flag);
+  int composite_ends(uchar *buf, bool last);
+  int advance_group(uchar *buf, bool backward);
+  bool estimate_series(const std::vector<tf_tag_predicate> &preds,
+                       uint64_t *matched, uint64_t *total);
+  void update_rec_per_key(uint64_t rows);
 
   THR_LOCK_DATA lock_data_;
   MooseDB_share *share_= nullptr;
@@ -301,6 +373,31 @@ private:
   uchar *tag_buf_= nullptr;       /* record buffer the memo refers to      */
   std::vector<String> str_bufs_;
   std::vector<TFValue> values_;
+
+  /*
+    State of the current index scan on a composite index. `preds` are the
+    TAG equalities of the key; `ordered` marks a read that depends on the
+    order BETWEEN tag values (MIN/MAX of a tag, index_first/last): then the
+    series of the extreme tag tuple (the ones that compare equal to it) are
+    scanned, and index_next/prev move on to the neighbouring tuple.
+  */
+  enum class idx_op : uint8_t { NONE, EQ, GE, GT, LE, LT };
+  struct idx_request
+  {
+    bool active= false;
+    uint index= MAX_KEY;
+    std::vector<tf_tag_predicate> preds;   /* TAG equalities of the key        */
+    bool ordered= false;                /* depends on the order between tags */
+    bool exact= false;                  /* KEY_EXACT / PREFIX read: every row equals the key */
+    idx_op op= idx_op::NONE;            /* how the tag-only key is compared  */
+    bool backward= false;               /* direction of the first pick       */
+    bool walk= false;                   /* moving on from `cur`, no new pick */
+    bool have_cur= false;
+    std::vector<std::string> cur;       /* tag tuple of the scanned series   */
+    std::shared_ptr<const tf_tuple_index> tix;   /* sorted tuples, if used   */
+    longlong lo= LONGLONG_MIN, hi= LONGLONG_MAX;
+  } idx_req_;
+  std::vector<uint64_t> idx_ids_;       /* series of idx_req_                   */
 
   /* Pushed-down TAG predicates: one entry per cond_push() call. */
   std::vector<std::vector<tf_tag_predicate>> pushed_;

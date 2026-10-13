@@ -1,0 +1,714 @@
+#
+# Composite indexes (TAG_1, ..., TAG_k [, time]): which definitions are
+# accepted, the plans the optimizer builds with them (ref / range /
+# "optimized away"), and that every access path gives the answer an InnoDB
+# mirror gives -- for integer and VARCHAR TAGs, DATETIME and integer time
+# axes, series in the MemTable and in sealed chunks, rows of the statement
+# itself, TRUNCATE, retention and a restart.
+#
+# The Handler_read_* counters prove the lookups are index lookups: a full
+# scan would show Handler_read_rnd_next of the table size.
+#
+--source include/not_embedded.inc
+--source include/have_innodb.inc
+--source include/have_sequence.inc
+--source suite/moosedb/include/have_moosedb.inc
+
+--exec $MYSQL test < $MOOSEDB_INSTALL_SQL
+
+--echo ##################################################################
+--echo # DDL: which indexes are accepted
+--echo ##################################################################
+--echo # TAG columns followed by the time column, any number of them
+CREATE TABLE a1 (clock INT NOT NULL, itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG', value DOUBLE,
+                 INDEX clock_idx (clock), INDEX item_clock (itemid, clock))
+  ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+SHOW CREATE TABLE a1;
+SHOW INDEX FROM a1;
+CREATE TABLE a2 (ts DATETIME NOT NULL, host VARCHAR(20) NOT NULL COMMENT 'TAG', item INT NOT NULL COMMENT 'TAG',
+                 v INT, INDEX (ts), INDEX (host, item, ts), INDEX (item, host, ts), INDEX (host, ts))
+  ENGINE=MooseDB;
+--echo # TAG columns without the time column
+CREATE TABLE a3 (ts TIMESTAMP NOT NULL, host CHAR(8) NOT NULL COMMENT 'TAG', item SMALLINT NOT NULL COMMENT 'TAG',
+                 INDEX (ts), INDEX (host), INDEX (host, item))
+  ENGINE=MooseDB;
+--echo # The indexes survive ALTER TABLE ... ADD/DROP INDEX
+ALTER TABLE a3 DROP INDEX host, ADD INDEX (item, host, ts);
+SHOW INDEX FROM a3;
+DROP TABLE a1, a2, a3;
+
+--echo # Refused: UNIQUE / PRIMARY (rows are not unique by tags + time)
+--error ER_ILLEGAL_HA_CREATE_OPTION
+CREATE TABLE e (clock INT NOT NULL, itemid BIGINT NOT NULL COMMENT 'TAG', INDEX (clock), UNIQUE (itemid, clock)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+--error ER_ILLEGAL_HA_CREATE_OPTION
+CREATE TABLE e (clock INT NOT NULL, itemid BIGINT NOT NULL COMMENT 'TAG', INDEX (clock), PRIMARY KEY (itemid, clock)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+--error ER_ILLEGAL_HA_CREATE_OPTION
+CREATE TABLE e (clock INT NOT NULL, itemid BIGINT NOT NULL COMMENT 'TAG', INDEX (clock), UNIQUE (itemid)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+--echo # Refused: the time column must be the last part
+--error ER_ILLEGAL_HA_CREATE_OPTION
+CREATE TABLE e (clock INT NOT NULL, itemid BIGINT NOT NULL COMMENT 'TAG', INDEX (clock), INDEX (clock, itemid)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+--echo # Refused: a part that is neither a TAG nor the time column
+--error ER_ILLEGAL_HA_CREATE_OPTION
+CREATE TABLE e (clock INT NOT NULL, itemid BIGINT NOT NULL COMMENT 'TAG', v INT NOT NULL, INDEX (clock), INDEX (itemid, v)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+--error ER_ILLEGAL_HA_CREATE_OPTION
+CREATE TABLE e (clock INT NOT NULL, itemid BIGINT NOT NULL COMMENT 'TAG', v INT NOT NULL, INDEX (clock), INDEX (itemid, v, clock)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+--echo # Refused: TAG columns of an unsupported type, or only partly indexed
+--error ER_NULL_COLUMN_IN_INDEX
+CREATE TABLE e (clock INT NOT NULL, itemid BIGINT COMMENT 'TAG', INDEX (clock), INDEX (itemid, clock)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+--error ER_ILLEGAL_HA_CREATE_OPTION
+CREATE TABLE e (clock INT NOT NULL, d DOUBLE NOT NULL COMMENT 'TAG', INDEX (clock), INDEX (d, clock)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+--error ER_ILLEGAL_HA_CREATE_OPTION
+CREATE TABLE e (clock INT NOT NULL, d DECIMAL(10,2) NOT NULL COMMENT 'TAG', INDEX (clock), INDEX (d)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+--error ER_ILLEGAL_HA_CREATE_OPTION
+CREATE TABLE e (clock INT NOT NULL, y YEAR NOT NULL COMMENT 'TAG', INDEX (clock), INDEX (y)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+--error ER_ILLEGAL_HA_CREATE_OPTION
+CREATE TABLE e (clock INT NOT NULL, e ENUM('a','b') NOT NULL COMMENT 'TAG', INDEX (clock), INDEX (e)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+--error ER_BLOB_USED_AS_KEY
+CREATE TABLE e (clock INT NOT NULL, t TEXT NOT NULL COMMENT 'TAG', INDEX (clock), INDEX (t(8))) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+--error ER_ILLEGAL_HA_CREATE_OPTION
+CREATE TABLE e (clock INT NOT NULL, n VARCHAR(40) NOT NULL COMMENT 'TAG', INDEX (clock), INDEX (n(8), clock)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+--echo # Refused: a column twice, descending parts, FULLTEXT
+--error ER_DUP_FIELDNAME
+CREATE TABLE e (clock INT NOT NULL, itemid BIGINT NOT NULL COMMENT 'TAG', INDEX (clock), INDEX (itemid, itemid, clock)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+--error ER_ILLEGAL_HA_CREATE_OPTION
+CREATE TABLE e (clock INT NOT NULL, itemid BIGINT NOT NULL COMMENT 'TAG', INDEX (clock), INDEX (itemid, clock DESC)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+--error ER_ILLEGAL_HA_CREATE_OPTION
+CREATE TABLE e (clock INT NOT NULL, itemid BIGINT NOT NULL COMMENT 'TAG', INDEX (clock DESC)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+--error ER_TABLE_CANT_HANDLE_FT
+CREATE TABLE e (clock INT NOT NULL, n VARCHAR(40) NOT NULL COMMENT 'TAG', INDEX (clock), FULLTEXT (n)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+--echo # The index on the time column alone is still required
+--error ER_ILLEGAL_HA_CREATE_OPTION
+CREATE TABLE e (clock INT NOT NULL, itemid BIGINT NOT NULL COMMENT 'TAG', INDEX (itemid, clock)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+
+--echo ##################################################################
+--echo # Data: 60 items on 4 hosts, 120 samples each, 3 chunks (1 HOUR),
+--echo # first half sealed, second half in the MemTable
+--echo ##################################################################
+CREATE TABLE m (
+  hostid BIGINT UNSIGNED NOT NULL COMMENT 'TAG',
+  itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG',
+  clock  INT NOT NULL,
+  value  DOUBLE NOT NULL,
+  ns     INT NOT NULL,
+  INDEX clock_idx (clock),
+  INDEX item_clock (itemid, clock)
+) ENGINE=MooseDB TIMESTAMP_COLUMN='clock' CHUNK_INTERVAL='1 HOUR';
+CREATE TABLE i (
+  hostid BIGINT UNSIGNED NOT NULL,
+  itemid BIGINT UNSIGNED NOT NULL,
+  clock  INT NOT NULL,
+  value  DOUBLE NOT NULL,
+  ns     INT NOT NULL,
+  KEY clock_idx (clock)
+) ENGINE=InnoDB;
+--let $gen= SELECT 1 + (a.seq MOD 4), 100 + a.seq, 1700000000 + b.seq * 60, ROUND(a.seq * 1000 + b.seq + (b.seq MOD 7) / 10, 1), (a.seq * 7919 + b.seq * 104729) MOD 1000000000
+eval INSERT INTO m $gen FROM seq_1_to_60 a, seq_0_to_59 b;
+eval INSERT INTO i $gen FROM seq_1_to_60 a, seq_0_to_59 b;
+FLUSH TABLES m;
+eval INSERT INTO m $gen FROM seq_1_to_60 a, seq_60_to_119 b;
+eval INSERT INTO i $gen FROM seq_1_to_60 a, seq_60_to_119 b;
+--echo # Item 105 also has two samples at the same second (different ns), item 999 one sample
+INSERT INTO m VALUES (2, 105, 1700000600, -1, 5), (2, 105, 1700000600, -2, 999999999), (3, 999, 1700003000, 9, 9);
+INSERT INTO i VALUES (2, 105, 1700000600, -1, 5), (2, 105, 1700000600, -2, 999999999), (3, 999, 1700003000, 9, 9);
+SELECT COUNT(*), COUNT(DISTINCT itemid), MIN(clock), MAX(clock) FROM m;
+SELECT COUNT(*), COUNT(DISTINCT itemid), MIN(clock), MAX(clock) FROM i;
+
+--let $mt= m
+--let $it= i
+--let $agg= COUNT(*), ROUND(SUM(value), 3), BIT_XOR(CRC32(CONCAT(itemid, '|', clock, '|', ns, '|', value)))
+--let $show= 1
+--let $status= 1
+
+--echo ##################################################################
+--echo # EXPLAIN: the optimizer uses the composite index
+--echo ##################################################################
+EXPLAIN SELECT * FROM m WHERE itemid = 105;
+EXPLAIN SELECT * FROM m WHERE itemid = 105 AND clock BETWEEN 1700001000 AND 1700002000;
+EXPLAIN SELECT * FROM m WHERE itemid = 105 AND clock > 1700005000;
+EXPLAIN SELECT * FROM m WHERE itemid = 105 AND clock < 1700000500;
+EXPLAIN SELECT * FROM m WHERE itemid = 105 AND clock = 1700000600;
+EXPLAIN SELECT * FROM m WHERE itemid IN (101, 105, 110) AND clock >= 1700006000;
+EXPLAIN SELECT * FROM m WHERE itemid = 105 ORDER BY clock DESC LIMIT 1;
+EXPLAIN SELECT * FROM m WHERE itemid = 105 ORDER BY clock LIMIT 3;
+EXPLAIN SELECT MAX(clock) FROM m WHERE itemid = 105 AND clock > 1700000000;
+EXPLAIN SELECT MIN(clock) FROM m WHERE itemid = 105;
+--echo # Without the item the time-only index serves the range, as before
+EXPLAIN SELECT * FROM m WHERE clock BETWEEN 1700001000 AND 1700002000;
+--echo # A nonexistent item: estimated at one row
+EXPLAIN SELECT * FROM m WHERE itemid = 424242;
+
+--echo ##################################################################
+--echo # Answers against InnoDB: equality, IN, every time operator
+--echo ##################################################################
+--let $q= SELECT $agg FROM {T} WHERE itemid = 105
+--let $label= itemid = 105
+--source suite/moosedb/include/cmp_query.inc
+--let $status= 0
+--let $show= 0
+--let $q= SELECT $agg FROM {T} WHERE itemid = '105'
+--let $label= itemid = '105'
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT $agg FROM {T} WHERE itemid = 105.0
+--let $label= itemid = 105.0
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT $agg FROM {T} WHERE itemid = 424242
+--let $label= itemid = 424242 (no such series)
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT $agg FROM {T} WHERE itemid IN (101, 105, 160, 424242, 105)
+--let $label= itemid IN (101, 105, 160, 424242, 105)
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT $agg FROM {T} WHERE itemid = 105 OR itemid = 106
+--let $label= itemid = 105 OR itemid = 106
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT $agg FROM {T} WHERE itemid <> 105
+--let $label= itemid <> 105 (not an index lookup)
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT $agg FROM {T} WHERE itemid > 150
+--let $label= itemid > 150 (a range on a TAG: not an index lookup)
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT $agg FROM {T} WHERE itemid BETWEEN 120 AND 125
+--let $label= itemid BETWEEN 120 AND 125
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT $agg FROM {T} WHERE itemid IS NULL
+--let $label= itemid IS NULL
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT $agg FROM {T} WHERE itemid <=> 105
+--let $label= itemid <=> 105
+--source suite/moosedb/include/cmp_query.inc
+
+--let $c= 1700003000
+--let $lo= 1700001500
+--let $hi= 1700004500
+--let $ops= =,<,<=,>,>=,<>
+--let $n= 6
+--let $k= 1
+while ($k <= $n)
+{
+  --let $op= `SELECT ELT($k, '=', '<', '<=', '>', '>=', '<>')`
+  --let $q= SELECT $agg FROM {T} WHERE itemid = 105 AND clock $op $c
+  --let $label= itemid = 105 AND clock $op $c
+  --source suite/moosedb/include/cmp_query.inc
+  --let $q= SELECT $agg FROM {T} WHERE itemid = 999 AND clock $op $c
+  --let $label= itemid = 999 AND clock $op $c
+  --source suite/moosedb/include/cmp_query.inc
+  --let $q= SELECT $agg FROM {T} WHERE itemid IN (103, 105, 106) AND clock $op $c
+  --let $label= itemid IN (103, 105, 106) AND clock $op $c
+  --source suite/moosedb/include/cmp_query.inc
+  inc $k;
+}
+--let $q= SELECT $agg FROM {T} WHERE itemid = 105 AND clock BETWEEN $lo AND $hi
+--let $label= itemid = 105 AND clock BETWEEN $lo AND $hi
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT $agg FROM {T} WHERE itemid = 105 AND clock > $lo AND clock < $hi
+--let $label= itemid = 105 AND clock > $lo AND clock < $hi
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT $agg FROM {T} WHERE itemid = 105 AND clock >= $hi AND clock <= $lo
+--let $label= itemid = 105, empty window (lo > hi)
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT $agg FROM {T} WHERE itemid = 105 AND clock NOT BETWEEN $lo AND $hi
+--let $label= itemid = 105 AND clock NOT BETWEEN
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT $agg FROM {T} WHERE itemid = 105 AND clock IN (1700000600, 1700001200, 1700001201)
+--let $label= itemid = 105 AND clock IN (...), one inside the duplicated second
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT $agg FROM {T} WHERE itemid = 105 AND clock = 1700000600
+--let $label= itemid = 105 AND clock = 1700000600 (two rows with that second)
+--let $show= 1
+--source suite/moosedb/include/cmp_query.inc
+--let $show= 0
+--echo # Bounds beyond the representable axis saturate, never wrap
+--let $q= SELECT $agg FROM {T} WHERE itemid = 105 AND clock < 4294967296
+--let $label= itemid = 105 AND clock < 4294967296
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT $agg FROM {T} WHERE itemid = 105 AND clock > -4294967296
+--let $label= itemid = 105 AND clock > -4294967296
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT $agg FROM {T} WHERE itemid = 105 AND clock >= 9223372036854775807
+--let $label= itemid = 105 AND clock >= 9223372036854775807
+--source suite/moosedb/include/cmp_query.inc
+
+--echo ##################################################################
+--echo # ORDER BY clock DESC/ASC LIMIT per item (served by the index)
+--echo ##################################################################
+--let $show= 1
+--let $status= 1
+--let $q= SELECT clock, ns, value FROM {T} WHERE itemid = 110 ORDER BY clock DESC LIMIT 3
+--let $label= itemid = 110 ORDER BY clock DESC LIMIT 3
+--source suite/moosedb/include/cmp_query.inc
+--let $status= 0
+--let $q= SELECT clock, ns, value FROM {T} WHERE itemid = 110 ORDER BY clock LIMIT 3
+--let $label= itemid = 110 ORDER BY clock LIMIT 3
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT clock, value FROM {T} WHERE itemid = 110 AND clock < 1700000300 ORDER BY clock DESC LIMIT 2
+--let $label= itemid = 110 AND clock < 1700000300 ORDER BY clock DESC LIMIT 2
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT clock, value FROM {T} WHERE itemid = 110 AND clock > 1700007000 ORDER BY clock LIMIT 2 OFFSET 1
+--let $label= itemid = 110 AND clock > 1700007000 ORDER BY clock LIMIT 2 OFFSET 1
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT clock, ns FROM {T} WHERE itemid = 105 AND clock BETWEEN 1700000540 AND 1700000660 ORDER BY clock DESC, ns DESC
+--let $label= item with two samples in one second, ORDER BY clock DESC, ns DESC
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT clock, ns FROM {T} WHERE itemid = 105 AND clock BETWEEN 1700000540 AND 1700000660 ORDER BY clock, ns
+--let $label= same, ascending
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT clock, ns, value FROM {T} WHERE itemid = 105 AND clock > 1700000000 ORDER BY clock DESC, ns DESC LIMIT 1
+--let $label= Zabbix getLastValuesFromSqlWithPk shape (ns decides ties, so a sort)
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT itemid, clock FROM {T} WHERE itemid IN (110, 111, 112) ORDER BY clock DESC, itemid DESC LIMIT 4
+--let $label= several items ORDER BY clock DESC LIMIT 4 (a sort, not the index order)
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT itemid FROM {T} WHERE itemid = 424242 ORDER BY clock DESC LIMIT 1
+--let $label= nonexistent item ORDER BY clock DESC LIMIT 1
+--source suite/moosedb/include/cmp_query.inc
+
+--echo ##################################################################
+--echo # MAX / MIN per item: one index call each (no scan)
+--echo ##################################################################
+--let $status= 1
+--let $q= SELECT MAX(clock) FROM {T} WHERE itemid = 110 AND clock > 1700000000
+--let $label= MAX(clock) WHERE itemid = 110 AND clock > N
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT MIN(clock) FROM {T} WHERE itemid = 110
+--let $label= MIN(clock) WHERE itemid = 110
+--source suite/moosedb/include/cmp_query.inc
+--let $status= 0
+--let $q= SELECT MAX(clock), MIN(clock) FROM {T} WHERE itemid = 110 AND clock BETWEEN 1700001000 AND 1700002000
+--let $label= MAX/MIN(clock) in a window
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT MAX(clock) FROM {T} WHERE itemid = 110 AND clock > 1700009999
+--let $label= MAX(clock) over an empty window
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT MAX(clock) FROM {T} WHERE itemid = 424242
+--let $label= MAX(clock) of a nonexistent item
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT MIN(clock) FROM {T} WHERE itemid = 105 AND clock >= 1700000600
+--let $label= MIN(clock) with a duplicated second
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT MIN(clock) FROM {T} WHERE itemid = 105 AND clock > 1700000600
+--let $label= MIN(clock) AFTER the duplicated second
+--source suite/moosedb/include/cmp_query.inc
+--echo # MIN/MAX of the TAG itself need the order BETWEEN tag values
+--let $status= 1
+--let $q= SELECT MAX(itemid), MIN(itemid) FROM {T}
+--let $label= MAX(itemid), MIN(itemid)
+--source suite/moosedb/include/cmp_query.inc
+--let $status= 0
+--let $q= SELECT MAX(itemid) FROM {T} WHERE itemid < 130
+--let $label= MAX(itemid) WHERE itemid < 130 (not an index read)
+--source suite/moosedb/include/cmp_query.inc
+
+--echo ##################################################################
+--echo # The Zabbix self-join (getAggregationByIntervalFromSql, AGGREGATE_LAST)
+--echo ##################################################################
+--let $zq= SELECT h.itemid,h.value,h.clock,h.ns,s.tick FROM {T} h JOIN (SELECT h2.itemid,h2.clock,MAX(h2.ns) AS ns,s2.tick FROM {T} h2 JOIN (SELECT itemid,CAST(clock AS SIGNED)-MOD(CAST(clock AS SIGNED),3600) AS tick,MAX(clock) AS clock FROM {T} WHERE itemid=105 AND clock BETWEEN 1700000000 AND 1700007200 GROUP BY itemid,CAST(clock AS SIGNED)-MOD(CAST(clock AS SIGNED),3600)) s2 ON h2.itemid=s2.itemid AND h2.clock=s2.clock WHERE h2.clock BETWEEN 1700000000 AND 1700007200 GROUP BY h2.itemid,h2.clock,s2.tick) s ON h.itemid=s.itemid AND h.clock=s.clock AND h.ns=s.ns WHERE h.clock BETWEEN 1700000000 AND 1700007200
+--let $q= $zq ORDER BY h.itemid, h.clock, h.ns
+--let $label= AGGREGATE_LAST for one item, 2 hours
+--let $show= 1
+--let $status= 1
+--source suite/moosedb/include/cmp_query.inc
+EXPLAIN SELECT h.itemid,h.value,h.clock,h.ns,s.tick FROM m h JOIN (SELECT h2.itemid,h2.clock,MAX(h2.ns) AS ns,s2.tick FROM m h2 JOIN (SELECT itemid,CAST(clock AS SIGNED)-MOD(CAST(clock AS SIGNED),3600) AS tick,MAX(clock) AS clock FROM m WHERE itemid=105 AND clock BETWEEN 1700000000 AND 1700007200 GROUP BY itemid,CAST(clock AS SIGNED)-MOD(CAST(clock AS SIGNED),3600)) s2 ON h2.itemid=s2.itemid AND h2.clock=s2.clock WHERE h2.clock BETWEEN 1700000000 AND 1700007200 GROUP BY h2.itemid,h2.clock,s2.tick) s ON h.itemid=s.itemid AND h.clock=s.clock AND h.ns=s.ns WHERE h.clock BETWEEN 1700000000 AND 1700007200;
+--let $show= 0
+--let $status= 0
+--let $q= SELECT x.itemid, x.tick, x.v FROM (SELECT h.itemid, CAST(h.clock AS SIGNED)-MOD(CAST(h.clock AS SIGNED),3600) AS tick, h.value AS v FROM {T} h JOIN (SELECT itemid, MAX(clock) AS clock FROM {T} WHERE itemid IN (101,102,103) GROUP BY itemid, CAST(clock AS SIGNED)-MOD(CAST(clock AS SIGNED),3600)) s ON h.itemid=s.itemid AND h.clock=s.clock) x ORDER BY x.itemid, x.tick
+--let $label= last value per hour for three items
+--source suite/moosedb/include/cmp_query.inc
+--echo # Join with a driving table: one index lookup per outer row
+CREATE TABLE d (itemid BIGINT UNSIGNED NOT NULL, since INT NOT NULL, KEY (itemid)) ENGINE=InnoDB;
+INSERT INTO d VALUES (101, 1700006000), (120, 1700000000), (424242, 0), (160, 1700007100);
+EXPLAIN SELECT COUNT(*), ROUND(SUM(m.value), 3) FROM d JOIN m ON m.itemid = d.itemid AND m.clock >= d.since;
+FLUSH STATUS;
+SELECT COUNT(*), ROUND(SUM(m.value), 3) FROM d JOIN m ON m.itemid = d.itemid AND m.clock >= d.since;
+--echo # 4 driving rows = 4 index lookups (Handler_read_key counts the InnoDB side too: its 4-row scan is rnd_next)
+SHOW SESSION STATUS WHERE Variable_name IN ('Handler_read_key', 'Handler_read_next', 'Handler_read_rnd_next');
+SELECT COUNT(*), ROUND(SUM(i.value), 3) FROM d JOIN i ON i.itemid = d.itemid AND i.clock >= d.since;
+--let $q= SELECT d.itemid, d.since, (SELECT MAX(t.clock) FROM {T} t WHERE t.itemid = d.itemid AND t.clock >= d.since) AS last, (SELECT COUNT(*) FROM {T} t WHERE t.itemid = d.itemid) AS n FROM d ORDER BY d.itemid
+--let $label= correlated MAX(clock) and COUNT per driving row
+--source suite/moosedb/include/cmp_query.inc
+DROP TABLE d;
+
+--echo ##################################################################
+--echo # Several TAGs: a prefix of the tags merges the series by time
+--echo ##################################################################
+CREATE TABLE m2 (
+  hostid BIGINT UNSIGNED NOT NULL COMMENT 'TAG',
+  itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG',
+  clock  INT NOT NULL,
+  value  DOUBLE NOT NULL,
+  ns     INT NOT NULL,
+  INDEX clock_idx (clock),
+  INDEX host_item_clock (hostid, itemid, clock)
+) ENGINE=MooseDB TIMESTAMP_COLUMN='clock' CHUNK_INTERVAL='1 HOUR';
+INSERT INTO m2 SELECT * FROM m;
+FLUSH TABLES m2;
+INSERT INTO m2 SELECT hostid, itemid, clock + 7200, value, ns FROM m WHERE clock < 1700001800;
+CREATE TABLE i2 LIKE i;
+INSERT INTO i2 SELECT * FROM i;
+INSERT INTO i2 SELECT hostid, itemid, clock + 7200, value, ns FROM i WHERE clock < 1700001800;
+--let $mt= m2
+--let $it= i2
+EXPLAIN SELECT * FROM m2 WHERE hostid = 2;
+EXPLAIN SELECT * FROM m2 WHERE hostid = 3 AND itemid = 106 AND clock > 1700000000;
+EXPLAIN SELECT * FROM m2 WHERE hostid = 2 AND clock > 1700000000;
+--let $status= 1
+--let $q= SELECT $agg FROM {T} WHERE hostid = 2
+--let $label= hostid = 2 (15 series merged)
+--source suite/moosedb/include/cmp_query.inc
+--let $status= 0
+--let $q= SELECT $agg FROM {T} WHERE hostid = 3 AND itemid = 106
+--let $label= hostid = 3 AND itemid = 106
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT $agg FROM {T} WHERE hostid = 2 AND itemid = 106
+--let $label= hostid = 2 AND itemid = 106 (the item belongs to host 3: no such series)
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT $agg FROM {T} WHERE hostid = 3 AND clock BETWEEN 1700001000 AND 1700002000
+--let $label= hostid = 3 AND clock BETWEEN (partial prefix + a time condition the index cannot use)
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT $agg FROM {T} WHERE hostid IN (1, 4) AND itemid IN (101, 104, 108, 109, 110) AND clock >= 1700003000
+--let $label= hostid IN (1, 4) AND itemid IN (...) AND clock >= N
+--source suite/moosedb/include/cmp_query.inc
+--let $show= 1
+--let $q= SELECT clock, itemid FROM {T} WHERE hostid = 3 ORDER BY clock DESC, itemid LIMIT 5
+--let $label= hostid = 3 ORDER BY clock DESC (merge of 15 series, newest first)
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT clock, itemid FROM {T} WHERE hostid = 3 AND clock < 1700000100 ORDER BY clock, itemid LIMIT 5
+--let $label= hostid = 3 ORDER BY clock LIMIT 5
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT MIN(itemid), MAX(itemid), COUNT(*) FROM {T} WHERE hostid = 3
+--let $label= MIN/MAX(itemid) WHERE hostid = 3 (the order between the tuples of the free tag)
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT MAX(clock) FROM {T} WHERE hostid = 3 AND itemid = 107
+--let $label= MAX(clock) with both tags fixed, no such series
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT MAX(itemid) FROM {T} WHERE hostid = 3 AND itemid < 140
+--let $label= MAX(itemid) with a range on the tag (not an index read)
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT MAX(hostid), MIN(hostid), MAX(itemid) FROM {T}
+--let $label= MIN/MAX of the first tag, MAX of the second
+--source suite/moosedb/include/cmp_query.inc
+--let $show= 0
+--let $q= SELECT $agg FROM {T} WHERE hostid = 3 AND itemid = 106 AND clock > 1700000000
+--let $label= hostid = 3 AND itemid = 106 AND clock > N
+--source suite/moosedb/include/cmp_query.inc
+--let $mt= m
+--let $it= i
+
+--echo ##################################################################
+--echo # VARCHAR TAG, DATETIME axis, case-insensitive collation
+--echo ##################################################################
+CREATE TABLE v (
+  ts   DATETIME(3) NOT NULL,
+  name VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci NOT NULL COMMENT 'TAG',
+  v    INT NOT NULL,
+  INDEX (ts), INDEX name_ts (name, ts)
+) ENGINE=MooseDB CHUNK_INTERVAL='1 HOUR';
+CREATE TABLE vi (
+  ts   DATETIME(3) NOT NULL,
+  name VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci NOT NULL,
+  v    INT NOT NULL,
+  KEY (ts)
+) ENGINE=InnoDB;
+--echo # 'alpha' and 'Alpha' are two series that compare equal; 'ALPHA ' too (PAD SPACE)
+--let $vgen= SELECT '2026-03-01 00:00:00' + INTERVAL seq * 5 MINUTE, ELT(1 + seq MOD 6, 'alpha', 'Alpha', 'beta', 'ALPHA ', 'Gamma', 'delta'), seq
+eval INSERT INTO v $vgen FROM seq_0_to_59;
+eval INSERT INTO vi $vgen FROM seq_0_to_59;
+FLUSH TABLES v;
+eval INSERT INTO v $vgen FROM seq_60_to_119;
+eval INSERT INTO vi $vgen FROM seq_60_to_119;
+--let $mt= v
+--let $it= vi
+EXPLAIN SELECT * FROM v WHERE name = 'ALPHA' AND ts > '2026-03-01 05:00:00';
+--let $agg= COUNT(*), SUM(v), BIT_XOR(CRC32(CONCAT(ts, '|', name, '|', v)))
+--let $q= SELECT $agg FROM {T} WHERE name = 'ALPHA'
+--let $label= name = 'ALPHA' (three series)
+--let $show= 1
+--source suite/moosedb/include/cmp_query.inc
+--let $show= 0
+--let $q= SELECT $agg FROM {T} WHERE name = 'alpha ' AND ts >= '2026-03-01 02:00:00' AND ts < '2026-03-01 04:30:00'
+--let $label= name = 'alpha ' AND ts in a window
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT $agg FROM {T} WHERE name IN ('BETA', 'gamma', 'nothing') AND ts BETWEEN '2026-03-01 01:00:00' AND '2026-03-01 08:00:00'
+--let $label= name IN (...) AND ts BETWEEN
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT $agg FROM {T} WHERE name = _utf8mb4'ALPHA' COLLATE utf8mb4_bin
+--let $label= name = _utf8mb4'ALPHA' COLLATE utf8mb4_bin (a different comparison: not the index)
+--source suite/moosedb/include/cmp_query.inc
+--let $show= 1
+--let $q= SELECT ts, name FROM {T} WHERE name = 'Alpha' ORDER BY ts DESC LIMIT 4
+--let $label= name = 'Alpha' ORDER BY ts DESC LIMIT 4 (series 'alpha', 'Alpha', 'ALPHA ' merged by time)
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT MAX(ts), MIN(ts) FROM {T} WHERE name = 'ALPHA'
+--let $label= MAX/MIN(ts) of a name
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT MAX(name), MIN(name) FROM {T}
+--let $label= MAX/MIN(name) in collation order (ci: 'Gamma' > 'delta', 'alpha' = 'Alpha' = 'ALPHA ')
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT MIN(ts) FROM {T} WHERE name = 'beta' AND ts > '2026-03-01 07:00:00'
+--let $label= MIN(ts) after a time
+--source suite/moosedb/include/cmp_query.inc
+--let $mt= m
+--let $it= i
+DROP TABLE v, vi;
+
+--echo ##################################################################
+--echo # TIMESTAMP axis with two TAGs of different kinds (CHAR + SMALLINT); the
+--echo # CHAR tag has series 'a' and 'A' that the case-insensitive collation says are equal
+--echo ##################################################################
+SET time_zone = '+03:00';
+CREATE TABLE tt (
+  ts   TIMESTAMP(2) NOT NULL DEFAULT '2026-01-01 00:00:00',
+  site CHAR(6) NOT NULL COMMENT 'TAG',
+  n    SMALLINT NOT NULL COMMENT 'TAG',
+  v    INT NOT NULL,
+  INDEX (ts), INDEX (site, n, ts)
+) ENGINE=MooseDB CHUNK_INTERVAL='1 HOUR';
+CREATE TABLE tti LIKE tt;
+ALTER TABLE tti ENGINE=InnoDB;
+ALTER TABLE tti DROP INDEX site;
+--let $tgen= SELECT '2026-03-01 00:00:00' + INTERVAL seq * 10 MINUTE, ELT(1 + seq MOD 4, 'a', 'b', 'c', 'A'), CAST(seq MOD 5 AS SIGNED) - 2, seq
+eval INSERT INTO tt $tgen FROM seq_0_to_89;
+eval INSERT INTO tti $tgen FROM seq_0_to_89;
+--let $mt= tt
+--let $it= tti
+--let $agg= COUNT(*), SUM(v), BIT_XOR(CRC32(CONCAT(ts, '|', site, '|', n, '|', v)))
+--let $q= SELECT $agg FROM {T} WHERE site = 'b' AND n = -1
+--let $label= site = 'b' AND n = -1 (a negative SMALLINT tag)
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT $agg FROM {T} WHERE site = 'b' AND n = -1 AND ts > '2026-03-01 05:00:00' AND ts <= '2026-03-01 11:00:00'
+--let $label= site = 'b' AND n = -1 AND ts in a window (TIMESTAMP in +03:00)
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT $agg FROM {T} WHERE site = 'c' AND n IN (-2, 0, 2, 7)
+--let $label= site = 'c' AND n IN (-2, 0, 2, 7)
+--source suite/moosedb/include/cmp_query.inc
+--let $show= 1
+--let $q= SELECT ts, n FROM {T} WHERE site = 'a' AND n = 1 ORDER BY ts DESC LIMIT 3
+--let $label= site = 'a' AND n = 1 ORDER BY ts DESC LIMIT 3 (series 'a' and 'A' merged)
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT $agg FROM {T} WHERE site = 'A'
+--let $label= site = 'A' (the CHAR column compares equal to the series 'a', byte-wise they differ)
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT $agg FROM {T} WHERE site = 'a' AND n = 1
+--let $label= site = 'a' AND n = 1
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT ts, site FROM {T} WHERE site = 'a' AND n = -2 ORDER BY ts LIMIT 4
+--let $label= site = 'a' AND n = -2 ORDER BY ts LIMIT 4 (both spellings, merged)
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT MIN(n), MAX(n), LOWER(MIN(site)), MAX(site) FROM {T}
+--let $label= MIN/MAX of a signed SMALLINT tag (-2 < 2, not '-2' > '2') and of a CHAR tag
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT MAX(n) FROM {T} WHERE site = 'b'
+--let $label= MAX(n) WHERE site = 'b' (partial prefix, numeric order)
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT MIN(n) FROM {T} WHERE site = 'b'
+--let $label= MIN(n) WHERE site = 'b'
+--source suite/moosedb/include/cmp_query.inc
+SET time_zone = DEFAULT;
+DROP TABLE tt, tti;
+--let $mt= m
+--let $it= i
+--let $agg= COUNT(*), ROUND(SUM(value), 3), BIT_XOR(CRC32(CONCAT(itemid, '|', clock, '|', ns, '|', value)))
+
+--echo ##################################################################
+--echo # MIN/MAX of a TAG with a range condition: the ordered index reads
+--echo ##################################################################
+--echo # 105 is a series, 500 and 0 are not (160 and 999 are the last ones, 101 the first)
+EXPLAIN SELECT MAX(itemid) FROM m WHERE itemid <= 500;
+EXPLAIN SELECT MIN(itemid) FROM m WHERE itemid > 105;
+--let $c= 0
+while ($c < 4)
+{
+  --let $v= `SELECT ELT(1 + $c, 105, 500, 1000, 0)`
+  --let $k= 1
+  while ($k <= 4)
+  {
+    --let $op= `SELECT ELT($k, '<', '<=', '>', '>=')`
+    --let $q= SELECT MAX(itemid), MIN(itemid) FROM {T} WHERE itemid $op $v
+    --let $label= MAX/MIN(itemid) WHERE itemid $op $v
+    --source suite/moosedb/include/cmp_query.inc
+    inc $k;
+  }
+  inc $c;
+}
+--let $q= SELECT MAX(itemid) FROM {T} WHERE itemid <= 105 AND clock > 0
+--let $label= MAX(itemid) WHERE itemid <= 105 AND clock > 0 (an extra condition: not the index)
+--source suite/moosedb/include/cmp_query.inc
+--echo # Two TAGs: the neighbouring tuple within / beyond the fixed first tag
+--let $mt= m2
+--let $it= i2
+--let $q= SELECT MIN(itemid) FROM {T} WHERE hostid = 3 AND itemid > 110
+--let $label= MIN(itemid) WHERE hostid = 3 AND itemid > 110
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT MAX(itemid) FROM {T} WHERE hostid = 3 AND itemid <= 112
+--let $label= MAX(itemid) WHERE hostid = 3 AND itemid <= 112
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT MIN(itemid) FROM {T} WHERE hostid = 3 AND itemid >= 111
+--let $label= MIN(itemid) WHERE hostid = 3 AND itemid >= 111
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT MAX(itemid) FROM {T} WHERE hostid = 3 AND itemid < 102
+--let $label= MAX(itemid) WHERE hostid = 3 AND itemid < 102 (nothing below the first item of host 3)
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT MIN(hostid), MAX(hostid) FROM {T} WHERE hostid > 1 AND hostid < 4
+--let $label= MIN/MAX(hostid) WHERE hostid > 1 AND hostid < 4
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT MAX(clock) FROM {T} WHERE hostid = 3 AND itemid = 106 AND clock < 1700008000
+--let $label= MAX(clock) WHERE hostid = 3 AND itemid = 106 AND clock < N
+--source suite/moosedb/include/cmp_query.inc
+--let $mt= m
+--let $it= i
+
+--echo ##################################################################
+--echo # No order between TAG values is announced: ORDER BY / GROUP BY on a
+--echo # TAG are sorts (never an index scan that would return a wrong order)
+--echo ##################################################################
+EXPLAIN SELECT itemid, clock FROM m ORDER BY itemid, clock LIMIT 3;
+EXPLAIN SELECT itemid, MAX(clock) FROM m GROUP BY itemid;
+EXPLAIN SELECT DISTINCT itemid FROM m;
+--let $q= SELECT itemid, clock FROM {T} ORDER BY itemid, clock LIMIT 4
+--let $label= ORDER BY itemid, clock LIMIT 4
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT itemid, clock FROM {T} ORDER BY itemid DESC, clock DESC LIMIT 4
+--let $label= ORDER BY itemid DESC, clock DESC LIMIT 4
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT itemid, MAX(clock), MIN(clock), COUNT(*) FROM {T} GROUP BY itemid ORDER BY itemid DESC LIMIT 5
+--let $label= GROUP BY itemid, newest ids
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT COUNT(*), MIN(itemid), MAX(itemid) FROM (SELECT DISTINCT itemid FROM {T}) x
+--let $label= DISTINCT itemid
+--source suite/moosedb/include/cmp_query.inc
+
+--echo ##################################################################
+--echo # Descending range reads end at the first row of the series
+--echo ##################################################################
+EXPLAIN SELECT clock FROM m WHERE itemid = 110 AND clock BETWEEN 1700001000 AND 1700002000 ORDER BY clock DESC;
+--let $show= 0
+--let $q= SELECT clock FROM {T} WHERE itemid = 110 AND clock BETWEEN 1700001000 AND 1700002000 ORDER BY clock DESC
+--let $label= itemid = 110 AND clock BETWEEN ... ORDER BY clock DESC
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT COUNT(*), MIN(clock), MAX(clock) FROM (SELECT clock FROM {T} WHERE itemid = 110 AND clock > 1700006500 ORDER BY clock DESC) x
+--let $label= itemid = 110 AND clock > N ORDER BY clock DESC
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT clock FROM {T} WHERE itemid = 110 AND clock < 1700000300 ORDER BY clock DESC
+--let $label= itemid = 110 AND clock < N ORDER BY clock DESC (reaches the first row)
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT clock FROM {T} WHERE itemid = 110 AND clock <= 1700000000 ORDER BY clock DESC
+--let $label= itemid = 110 AND clock <= first sample ORDER BY clock DESC
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT clock FROM {T} WHERE itemid = 424242 AND clock < 1700000300 ORDER BY clock DESC
+--let $label= nonexistent item ORDER BY clock DESC
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT itemid, clock FROM {T} WHERE itemid IN (110, 111) AND clock < 1700000200 ORDER BY itemid DESC, clock DESC
+--let $label= two items, descending ranges
+--source suite/moosedb/include/cmp_query.inc
+
+--echo ##################################################################
+--echo # TAG-only index: ref lookups for joins on the tag
+--echo ##################################################################
+CREATE TABLE ti (itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG', clock INT NOT NULL, value DOUBLE NOT NULL, INDEX (clock), INDEX (itemid))
+  ENGINE=MooseDB TIMESTAMP_COLUMN='clock' CHUNK_INTERVAL='1 HOUR';
+INSERT INTO ti SELECT itemid, clock, value FROM m;
+CREATE TABLE d (itemid BIGINT UNSIGNED NOT NULL, KEY (itemid)) ENGINE=InnoDB;
+INSERT INTO d VALUES (101), (130), (424242);
+EXPLAIN SELECT d.itemid, COUNT(*) FROM d JOIN ti ON ti.itemid = d.itemid GROUP BY d.itemid;
+EXPLAIN SELECT * FROM ti WHERE itemid = 130;
+FLUSH STATUS;
+SELECT COUNT(*), ROUND(SUM(ti.value), 3) FROM d JOIN ti ON ti.itemid = d.itemid;
+SHOW SESSION STATUS WHERE Variable_name IN ('Handler_read_key', 'Handler_read_next', 'Handler_read_rnd_next');
+SELECT COUNT(*), ROUND(SUM(m.value), 3) FROM d JOIN m ON m.itemid = d.itemid;
+SELECT MAX(itemid), MIN(itemid) FROM ti;
+SELECT MAX(itemid) FROM ti WHERE itemid < 130;
+DROP TABLE d, ti;
+
+--echo ##################################################################
+--echo # Rows of the statement itself stay invisible to its own index reads
+--echo ##################################################################
+SELECT COUNT(*) FROM m WHERE itemid = 105;
+INSERT INTO m SELECT hostid, itemid, clock + 100000, value, ns FROM m WHERE itemid = 105;
+INSERT INTO i SELECT hostid, itemid, clock + 100000, value, ns FROM i WHERE itemid = 105;
+SELECT COUNT(*) FROM m WHERE itemid = 105;
+--echo # A self-join through the index while inserting: the join sees the old rows only
+INSERT INTO m SELECT a.hostid, a.itemid, a.clock + 200000, a.value, b.ns FROM m a JOIN m b ON a.itemid = b.itemid AND a.clock = b.clock WHERE a.itemid = 106;
+INSERT INTO i SELECT a.hostid, a.itemid, a.clock + 200000, a.value, b.ns FROM i a JOIN i b ON a.itemid = b.itemid AND a.clock = b.clock WHERE a.itemid = 106;
+SELECT COUNT(*) FROM m WHERE itemid = 106;
+--let $q= SELECT $agg FROM {T} WHERE itemid IN (105, 106)
+--let $label= items 105 and 106 after the self-inserts
+--source suite/moosedb/include/cmp_query.inc
+
+--echo # A new series is visible to the next statement at once
+INSERT INTO m VALUES (1, 7777, 1700000001, 1, 1);
+INSERT INTO i VALUES (1, 7777, 1700000001, 1, 1);
+--let $q= SELECT $agg FROM {T} WHERE itemid = 7777
+--let $label= itemid = 7777 (series created by the previous statement)
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT MAX(itemid), MAX(clock) FROM {T} WHERE itemid >= 7777
+--let $label= MAX(itemid) sees the new series
+--source suite/moosedb/include/cmp_query.inc
+
+--echo ##################################################################
+--echo # Restart: the same answers from the WAL and the sealed chunks
+--echo ##################################################################
+FLUSH TABLES m;
+INSERT INTO m VALUES (4, 8888, 1700000005, 2, 2);
+INSERT INTO i VALUES (4, 8888, 1700000005, 2, 2);
+--source include/restart_mysqld.inc
+--let $q= SELECT $agg FROM {T} WHERE itemid IN (105, 7777, 8888, 130)
+--let $label= after restart: itemid IN (105, 7777, 8888, 130)
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT MAX(clock), MIN(clock) FROM {T} WHERE itemid = 8888
+--let $label= after restart: MAX/MIN(clock) of a series that only lived in the WAL
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT MAX(itemid), MIN(itemid) FROM {T}
+--let $label= after restart: MAX/MIN(itemid)
+--source suite/moosedb/include/cmp_query.inc
+CHECK TABLE m;
+
+--echo ##################################################################
+--echo # Retention: series without rows are skipped by the ordered reads
+--echo ##################################################################
+CREATE TABLE r (
+  ts DATETIME NOT NULL, k INT NOT NULL COMMENT 'TAG', v INT NOT NULL,
+  INDEX (ts), INDEX (k, ts)
+) ENGINE=MooseDB CHUNK_INTERVAL='1 DAY' RETENTION_PERIOD='30 DAYS';
+INSERT INTO r VALUES (NOW() - INTERVAL 400 DAY, 1, 10), (NOW() - INTERVAL 399 DAY, 2, 20),
+                     (NOW() - INTERVAL 1 DAY, 3, 30), (NOW(), 4, 40), (NOW() - INTERVAL 398 DAY, 5, 50);
+FLUSH TABLES r;
+SELECT SERIES, ROW_COUNT FROM information_schema.MOOSEDB_TABLES WHERE TABLE_NAME = 'r';
+SELECT MIN(k), MAX(k), COUNT(*) FROM r;
+SELECT COUNT(*) FROM r WHERE k = 1;
+CALL moosedb_apply_retention('test.r');
+--echo # the series 1, 2 and 5 are still registered, but hold no rows now
+SELECT SERIES, ROW_COUNT FROM information_schema.MOOSEDB_TABLES WHERE TABLE_NAME = 'r';
+SELECT MIN(k), MAX(k), COUNT(*) FROM r;
+SELECT MAX(ts) IS NULL AS no_rows FROM r WHERE k = 1;
+SELECT v FROM r WHERE k = 1;
+SELECT v FROM r WHERE k = 3 AND ts > NOW() - INTERVAL 2 DAY;
+SELECT MIN(k) FROM r WHERE ts > NOW() - INTERVAL 2 DAY;
+DROP TABLE r;
+
+--echo ##################################################################
+--echo # TRUNCATE
+--echo ##################################################################
+SELECT COUNT(*) FROM m WHERE itemid = 105;
+TRUNCATE TABLE m;
+TRUNCATE TABLE i;
+SELECT COUNT(*) FROM m WHERE itemid = 105;
+SELECT MAX(itemid), MAX(clock) FROM m;
+INSERT INTO m VALUES (1, 105, 1700000000, 1, 1), (1, 105, 1700000060, 2, 2), (2, 106, 1700000030, 3, 3);
+INSERT INTO i VALUES (1, 105, 1700000000, 1, 1), (1, 105, 1700000060, 2, 2), (2, 106, 1700000030, 3, 3);
+--let $q= SELECT $agg FROM {T} WHERE itemid IN (105, 106)
+--let $label= after TRUNCATE and new rows: itemid IN (105, 106)
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT MAX(clock), MIN(clock) FROM {T} WHERE itemid = 105
+--let $label= after TRUNCATE: MAX/MIN(clock) of 105
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT MAX(itemid), MIN(itemid) FROM {T}
+--let $label= after TRUNCATE: MAX/MIN(itemid)
+--source suite/moosedb/include/cmp_query.inc
+
+--echo ##################################################################
+--echo # Estimates: rec_per_key and ranges follow the data
+--echo ##################################################################
+SELECT INDEX_NAME, SEQ_IN_INDEX, COLUMN_NAME, CARDINALITY FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = 'test' AND TABLE_NAME = 'm2' ORDER BY INDEX_NAME, SEQ_IN_INDEX;
+DROP TABLE m, i, m2, i2;
+DROP PROCEDURE moosedb_compact;
+DROP PROCEDURE moosedb_apply_retention;
+DROP FUNCTION moosedb_compact_impl;
+DROP FUNCTION moosedb_retention_impl;

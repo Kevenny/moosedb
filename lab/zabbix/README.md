@@ -132,6 +132,12 @@ docker compose down -v           # apaga também os volumes (esquema recriado do
 | duplicata (itemid,clock,ns) | InnoDB: ERROR 1062; MooseDB: **aceita** (2 linhas) |
 | `alter table history modify value DOUBLE PRECISION …` (dbupgrade 6050008) | OK (ALTER por cópia) |
 
+> Atualização (índice composto): a tabela acima é o registro da rodada de
+> 2026-10-07. Hoje a engine aceita `INDEX (itemid)` e `INDEX (itemid, clock)`
+> (TAG + tempo, não únicos); `PRIMARY KEY`/`UNIQUE` seguem recusados. As
+> variantes `h_moose_v3` e `adapted_history_v3.sql` passaram a declarar
+> `INDEX (itemid, clock)` além de `INDEX (clock)`.
+
 Com a variante adaptada o Zabbix 7.0.31 roda sem mudança de código:
 300.000 valores trapper (500/s por 600 s) processados, 0 falhas, todos gravados;
 `history.get`, `item.get` (lastvalue), `chart.php` e *Latest data* OK. Log do

@@ -277,6 +277,59 @@ Segmento cifrado só com header não exige a chave no replay.
   descendente. Cada série só é decodificada quando chega ao topo do heap, então
   `ORDER BY ts DESC LIMIT n` lê apenas os dados mais novos. Se a direção muda
   no meio (`index_next` após `index_prev`), o intervalo é materializado.
+* **Índices compostos `(TAG…, tempo)`** (`index_read_map`, `read_range_*`,
+  `records_in_range`, `info`). A chave do índice (formato *key image* do
+  campo) é convertida, pelo próprio campo, no texto canônico que a TAG grava
+  (`val_str`: decimal para inteiros, bytes na charset da coluna para strings) e
+  vira um predicado de igualdade no **mesmo cache de séries por TAG** do
+  pushdown (`hash_sort` + `strnncollsp`, invalidado por *epoch*), então a busca
+  de um valor é O(1) e usa a collation da coluna (`'ALPHA'` casa as séries
+  `alpha`, `Alpha` e `ALPHA ` de uma coluna `_ci`). O scan é o k-way merge
+  ordenado por tempo sobre essas séries, com a faixa de tempo da chave
+  (`=`, `>`, `>=`, `<`, `<=`; o `end_range` aperta o limite superior) — dentro de um prefixo
+  fixo de tags as linhas saem em ordem de tempo, crescente ou decrescente
+  (`ORDER BY clock DESC LIMIT n`, `MAX/MIN(clock)` por item: uma chamada de
+  índice). Prefixo parcial de tags (`hostid = 2` num `(hostid, itemid, clock)`)
+  mistura as séries por tempo. O scan usa o lote/snapshot privado do statement
+  (as linhas do `INSERT … SELECT` da própria tabela não são vistas) e refaz a
+  resolução de séries se uma série nova apareceu entre a resolução e o
+  snapshot (sem o *fallback* sem filtro do pushdown: aqui as séries são o
+  significado da leitura; após 64 tentativas falha com `HA_ERR_LOCK_WAIT_TIMEOUT`).
+  As colunas do índice entram sempre na projeção do scan (o servidor as lê do
+  registro em `compare_key`/`key_cmp_if_same`).
+  **O que a engine promete sobre ordem.** Tags fixas + tempo: ordem de tempo.
+  **Ordem entre valores diferentes de TAG** só em *leituras ordenadas*, pedidas
+  pelo servidor quando ele depende dela: `MIN/MAX(tag)`, `MIN/MAX(tag) WHERE
+  tag <op> const` (otimização de `opt_sum`, que pergunta `index_flags(idx,
+  parte, 0)`), `index_first/last` e `index_read_map` só com tags e
+  `KEY_OR_NEXT/AFTER_KEY/KEY_OR_PREV/BEFORE_KEY`. Elas usam uma visão
+  ordenada das séries (tuplas de tag ordenadas pela comparação da coluna —
+  numérica para TAG inteira com ou sem sinal, collation para string —, séries
+  de tupla igual fundidas), reconstruída só quando a versão das séries muda
+  (O(S log S), fora do mutex da tabela; teto de 512 MiB de heap para todas as visões do processo, com estimativa conservadora e cobrança em dobro durante a construção; acima disso a leitura falha com erro). A versão comparada é `moosedb_series_version()`, o mesmo contador que `moosedb_series_list_version()` informa para a lista usada na construção, e `index_next/prev` passam à tupla
+  vizinha quando a atual acaba. **Cada tupla é lida num snapshot próprio** (não há um corte único no statement para leituras ordenadas que atravessam tuplas: linhas commitadas por outra sessão no meio podem aparecer só nas tuplas seguintes; cada tupla individualmente é consistente e atômica por statement). Se a tupla da
+  chave existe (o caso comum: `MAX(clock)` de um item) a leitura não toca a
+  visão ordenada. `index_flags(idx, parte, 1)` — a pergunta de `ORDER BY` /
+  `GROUP BY` — **não** inclui `HA_READ_ORDER` para parte TAG, e nenhuma parte
+  TAG tem `HA_READ_RANGE`: `ORDER BY itemid`, `GROUP BY itemid` e
+  `itemid > 5` nunca usam o índice (filesort / outro índice), então nenhuma
+  ordem errada pode ser devolvida. `index_next_same` de leitura exata não
+  recompara as partes (todas as linhas já casam).
+  **Estimativas.** `records_in_range` = linhas da janela de tempo (estimativa
+  por chunk, já existente) × séries casadas ÷ séries da tabela (as séries
+  casadas vêm do mesmo cache); nunca 0. `rec_per_key` das partes (`info`):
+  linhas ÷ tuplas distintas, onde tuplas = `min(séries, produto dos
+  distintos por TAG)` (contagens do cache de TAG, recalculadas só quando a
+  versão das séries muda) e a parte de tempo = séries por tupla — daí o
+  `ref` por `(itemid, clock)` em joins é custeado como ~1 linha.
+  Medido (3000 itens × 2 dias × 60 s = 8,6 M linhas, MemTable com 300 k
+  linhas): lookup por `(itemid, clock)` ≈ 20 µs, `MAX(clock)` de um item
+  ≈ 15 µs; self-join `AGGREGATE_LAST` de 1 item/24 h 1,40 s → 0,97 ms
+  (InnoDB 0,90 ms). Para isso o core passou a achar as séries pedidas dentro
+  de um chunk por índice (`ChunkMeta::entries_of`, busca binária) e as
+  linhas da MemTable por índice por segmento (`MemSnapshot::rows_of_series`)
+  em vez de varrer todas as entradas/linhas a cada abertura de scan.
+  O índice por segmento da MemTable só existe em segmentos de ≥ 64 linhas com no máximo 1 série por 4 linhas (senão o segmento é percorrido), e seu custo (24 B por linha) entra no `row_bytes` da MemTable, então flush e o orçamento global dos lotes continuam honestos. Se o cache de TAG passa de 32 índices ou 256 MiB, o pushdown e o lookup caem na comparação direta, O(séries) por sondagem (correto, só mais lento).
 * **Pushdown de TAG** (`cond_push`): igualdades, `IN` e igualdades múltiplas
   sobre colunas TAG com constantes string viram um conjunto de `series_id`,
   calculado comparando os valores de cada série **com a collation da
@@ -359,7 +412,7 @@ v3. Salvaguardas atuais:
 | 4 | `MYSQL_ADD_PLUGIN(... DEFAULT)` | `MODULE_ONLY` | `DEFAULT` compila a engine *dentro* do servidor; a spec exige `INSTALL SONAME`. |
 | 5 | Glob em `DEPENDS` do `add_custom_command` | `FILE(GLOB_RECURSE … CONFIGURE_DEPENDS)` | CMake não expande globs em `DEPENDS`. |
 | 6 | TINYINT(1) → BOOL | TINYINT → INT64 | `TINYINT(1)` aceita -128..127; a codificação delta comprime igualmente. |
-| 7 | `max_supported_key_parts = 4` | `1`, só índice no timestamp, não-UNIQUE | O otimizador remove condições usadas em `ref`; um índice composto exigiria igualdade exata em todas as partes. TAGs são filtradas por pushdown. |
+| 7 | `max_supported_key_parts = 4` | `16`, mas só 3 formas de índice, todas **não-UNIQUE**: o tempo sozinho (obrigatório), `(tag_1..tag_k, tempo)` e `(tag_1..tag_k)` — ver #29 | Originalmente `1` (só o tempo): o otimizador remove do `WHERE` as condições usadas em `ref`, e um índice composto só vale se a engine honrar igualdade exata nas TAGs; passou a honrar (#29). `UNIQUE`/`PRIMARY` seguem recusados (linhas não são únicas por tag+tempo; é outro item). |
 | 8 | `HA_CAN_INDEX_BLOBS` | removido; `+HA_BINLOG_*_CAPABLE`, `HA_NO_AUTO_INCREMENT`, `HA_READ_ORDER`, `HA_CAN_TABLE_CONDITION_PUSHDOWN` | Binlog (§13), `ORDER BY ts DESC` pelo índice, pushdown de TAG. |
 | 9 | TFValue com `bool`/enum/união anônima | `uint8_t bool_val`, `uint8_t kind`, união `data` | Ler `bool`/enum inválido vindo do C é UB no Rust; cbindgen não gera união anônima. |
 | 10 | — | `TF_ERR_INTERNAL`, `TF_ERR_UNSUPPORTED`, `TF_ERR_CRYPTO` (10) | Panic capturado / recurso indisponível / falha de decriptação ou chave indisponível (vira `HA_ERR_DECRYPTION_FAILED`). |
@@ -381,6 +434,7 @@ v3. Salvaguardas atuais:
 | 26 | Leitura linha a linha | leitura colunar projetada e em lote pela FFI (`TFBatch`), poda por ts dentro da série | O custo dominante era montar linhas (4 mallocs/linha), não decodificar. |
 | 27 | Eixo de tempo só `DATETIME`/`TIMESTAMP` | + `INT`/`BIGINT` (signed/unsigned, `NOT NULL`, armazenada) **somente** via `TIMESTAMP_COLUMN='col'`, lido como segundos epoch UTC (`ts_us = secs × 10⁶`); índice simples sobre a coluna continua obrigatório; `ns` não é dobrado no eixo | Zabbix guarda `clock INT` + `ns INT`. Exigir `TIMESTAMP_COLUMN` evita que um índice qualquer sobre um inteiro mude o significado de tabelas existentes. Produto que estoura `i64` (ou `BIGINT UNSIGNED` > 2⁶³) é erro explícito, não truncamento; limites de range vindos do índice saturam. O core não mudou (mesmo `TF_COL_TIMESTAMP`, sem mudança de FFI); o IS exibe o eixo como DATETIME (clampa em 0000/9999 nos extremos). |
 | 28 | Pushdown de TAG só para strings | + TAG inteira (`TINYINT`..`BIGINT`) com constantes `INT`/`DECIMAL`/`DOUBLE`/string-inteira-limpa em `=`, `IN`, igualdade múltipla; comparação binária do texto canônico | O Zabbix consulta `itemid = 123` sem aspas; cada query varria todas as séries. Regra de correção: o servidor reavalia o WHERE, então só se poda uma série quando é certo que o servidor não a casaria (ver §Leitura). Tipos mistos: em `IN`, uma constante de módulo ≥ 2⁵³ junto de constante `DOUBLE`/string (a lista pode ser comparada como DOUBLE) recusa o pushdown; em igualdade múltipla, todos os membros precisam ser colunas inteiras (membro `DOUBLE`/`DECIMAL`/string recusa). |
+| 29 | Índice só no timestamp | Índices compostos não-UNIQUE `(tag_1..tag_k [, tempo])`, até 8 por tabela. TAG do índice: `COMMENT 'TAG'`, `NOT NULL`, inteira (`TINYINT`..`BIGINT`) ou `CHAR`/`VARCHAR` inteira (sem prefixo), sem repetição, sem `DESC`; qualquer subconjunto/ordem das TAGs (não precisa ser prefixo da ordem do schema); o tempo, se presente, é a **última** parte. O índice só no tempo continua obrigatório. `index_flags`: parte de tempo = `NEXT\|PREV\|ORDER\|RANGE`; parte TAG = `NEXT\|PREV`, e `+ORDER` só para `all_parts=0` (pergunta do `MIN/MAX(col)`); **nenhuma** parte TAG anuncia `RANGE`. Detalhes em §Leitura (índices compostos) | Zabbix lê `WHERE itemid=X AND clock BETWEEN …`, `MAX(clock) … itemid=X`, e faz self-join em `(itemid, clock)`; sem índice cada linha do join varria a série inteira (4,1 s vs 0,7 ms no InnoDB). A engine não tem estrutura de índice: a leitura é "quais séries casam as TAGs da chave" (cache de TAG, O(1)) + faixa de tempo (poda por busca binária), servida pelo k-way merge que já existia. Por isso a ordem que o servidor pode assumir é só a que isso dá de graça (ver §Leitura), e **não** se anuncia ordem nem faixa entre valores de TAG. |
 
 ## Limitações conhecidas
 
@@ -394,6 +448,17 @@ v3. Salvaguardas atuais:
   Sem pushdown: TAG `ZEROFILL`, TAG `VARCHAR` comparada com número, TAG
   `DECIMAL`/`DOUBLE`/`YEAR`/`BIT`, strings inteiras ≥ 2⁵³ ou não limpas e
   `DOUBLE` ≥ 2⁵³.
+* Índices compostos: sem `UNIQUE`/`PRIMARY`; TAG nullable, `DECIMAL`/`DOUBLE`/`YEAR`/
+  `ENUM`/`BLOB` ou prefixo (`col(8)`) não são aceitos em índice; o tempo é sempre
+  a última parte. Uma faixa sobre TAG (`itemid > 5`) não vira faixa de índice, e
+  `ORDER BY`/`GROUP BY` por TAG não são servidos pelo índice. `ORDER BY clock
+  DESC, ns DESC LIMIT 1` (o `ns` não está no índice) lê a faixa do item e ordena
+  (≈ 1440 linhas/dia a 60 s): ~210 µs por item contra ~55 µs no InnoDB (PK com `ns`);
+  a forma do frontend sem PK (`MAX(clock)` + `clock = X ORDER BY ns DESC LIMIT 1`)
+  fica em ~60 µs por item, incluindo o PREPARE/EXECUTE. A visão ordenada de tuplas (leituras `MIN/MAX(tag)`) é refeita quando
+  surge série nova e custa O(S log S); acima de 512 MiB a leitura falha com erro
+  em vez de devolver ordem errada. O estimador supõe séries de tamanho
+  parecido.
 * Eixo de tempo inteiro: só `INT`/`BIGINT` e só por `TIMESTAMP_COLUMN`; intervalo
   ±9223372036854 s (≈ ano 292277); `SMALLINT`/`MEDIUMINT`/`TINYINT` não são
   aceitos como eixo. `ns` do Zabbix é coluna comum (não há `TIMESTAMP_NS_COLUMN`);

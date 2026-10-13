@@ -6,15 +6,56 @@
 //! stay resolvable even after the MemTable is flushed: the snapshot keeps its
 //! segments alive. Grouping by bucket/series and sorting happen at flush.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::mem;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::schema::{Row, Schema, Value};
 
 pub(crate) struct MemRow {
     pub series_id: u64,
     pub row: Row,
+}
+
+/// An immutable run of rows. Segments are shared by every snapshot taken while
+/// they exist, so the per-series row index built for one scan serves all the
+/// next ones (it is built on first use, once, from the immutable rows).
+pub(crate) struct Segment {
+    rows: Vec<MemRow>,
+    by_series: OnceLock<Option<HashMap<u64, Vec<u32>>>>,
+}
+
+/// Segments shorter than this are walked, never indexed.
+const MIN_INDEXED_ROWS: usize = 64;
+
+impl Segment {
+    fn new(rows: Vec<MemRow>) -> Segment {
+        Segment { rows, by_series: OnceLock::new() }
+    }
+
+    /// Positions (within the segment) of the rows of each series. `None` for a
+    /// segment that is too short, too long for `u32` positions or with too
+    /// many distinct series for the charged memory: the caller walks its rows.
+    fn index(&self) -> Option<&HashMap<u64, Vec<u32>>> {
+        self.by_series
+            .get_or_init(|| {
+                if self.rows.len() < MIN_INDEXED_ROWS || u32::try_from(self.rows.len()).is_err() {
+                    return None;
+                }
+                let mut m: HashMap<u64, Vec<u32>> = HashMap::new();
+                for (i, r) in self.rows.iter().enumerate() {
+                    m.entry(r.series_id).or_default().push(i as u32);
+                    // Memory stays within `INDEX_BYTES_PER_ROW` (already charged
+                    // to the MemTable) only while series are much fewer than
+                    // rows; otherwise walking the rows is as cheap.
+                    if m.len() > self.rows.len() / 4 {
+                        return None;
+                    }
+                }
+                Some(m)
+            })
+            .as_ref()
+    }
 }
 
 /// Frozen segments are merged once there are more than this many, so a
@@ -55,7 +96,7 @@ impl SegStats {
 }
 
 pub(crate) struct MemTable {
-    frozen: Vec<Arc<Vec<MemRow>>>,
+    frozen: Vec<Arc<Segment>>,
     /// Statistics of each `frozen` segment, same order.
     frozen_stats: Vec<SegStats>,
     active: Vec<MemRow>,
@@ -81,35 +122,79 @@ impl Default for MemTable {
 #[derive(Clone, Default)]
 pub(crate) struct MemSnapshot {
     pub generation: u64,
-    segments: Vec<Arc<Vec<MemRow>>>,
+    segments: Vec<Arc<Segment>>,
 }
 
 impl MemSnapshot {
     /// `(ordinal, row)` in arrival order.
     pub(crate) fn iter(&self) -> impl Iterator<Item = (u64, &MemRow)> {
-        self.segments.iter().flat_map(|s| s.iter()).enumerate().map(|(i, r)| (i as u64, r))
+        self.segments.iter().flat_map(|s| s.rows.iter()).enumerate().map(|(i, r)| (i as u64, r))
+    }
+
+    /// Number of rows in the snapshot, in O(segments).
+    pub(crate) fn row_total(&self) -> usize {
+        self.segments.iter().map(|s| s.rows.len()).sum()
+    }
+
+    pub(crate) fn segment_count(&self) -> usize {
+        self.segments.len()
+    }
+
+    /// `(ordinal, row)` of the rows of the given series, in no particular
+    /// order. O(wanted series x segments + matching rows), not O(rows): the
+    /// first call on a segment indexes it, later scans reuse the index.
+    pub(crate) fn rows_of_series(&self, ids: &HashSet<u64>) -> Vec<(u64, &MemRow)> {
+        let mut out = Vec::new();
+        let mut base = 0u64;
+        for seg in &self.segments {
+            match seg.index() {
+                Some(index) => {
+                    for id in ids {
+                        for &i in index.get(id).map(Vec::as_slice).unwrap_or(&[]) {
+                            if let Some(r) = seg.rows.get(i as usize) {
+                                out.push((base + u64::from(i), r));
+                            }
+                        }
+                    }
+                }
+                None => {
+                    for (i, r) in seg.rows.iter().enumerate() {
+                        if ids.contains(&r.series_id) {
+                            out.push((base + i as u64, r));
+                        }
+                    }
+                }
+            }
+            base += seg.rows.len() as u64;
+        }
+        out
     }
 
     pub(crate) fn get(&self, ordinal: u64) -> Option<&MemRow> {
         let mut idx = usize::try_from(ordinal).ok()?;
         for s in &self.segments {
-            if idx < s.len() {
-                return s.get(idx);
+            if idx < s.rows.len() {
+                return s.rows.get(idx);
             }
-            idx -= s.len();
+            idx -= s.rows.len();
         }
         None
     }
 
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
-        self.segments.iter().map(|s| s.len()).sum()
+        self.segments.iter().map(|s| s.rows.len()).sum()
     }
 }
 
-/// Accounting size of one row.
+/// Bytes charged per row for the lazily built per-segment series index (a
+/// `u32` position plus the amortized map entry; see `Segment::index`, which
+/// refuses to index a segment where that bound would not hold).
+const INDEX_BYTES_PER_ROW: usize = 24;
+
+/// Accounting size of one row (including its share of the series index).
 pub(crate) fn row_bytes(row: &[Value]) -> usize {
-    mem::size_of::<MemRow>() + row.iter().map(Value::mem_size).sum::<usize>()
+    mem::size_of::<MemRow>() + INDEX_BYTES_PER_ROW + row.iter().map(Value::mem_size).sum::<usize>()
 }
 
 /// Batches at least this long become their own segment instead of being
@@ -127,7 +212,7 @@ impl MemTable {
 
     fn freeze_active(&mut self) {
         if !self.active.is_empty() {
-            self.frozen.push(Arc::new(mem::take(&mut self.active)));
+            self.frozen.push(Arc::new(Segment::new(mem::take(&mut self.active))));
             self.frozen_stats.push(mem::replace(&mut self.active_stats, SegStats::EMPTY));
         }
     }
@@ -143,7 +228,7 @@ impl MemTable {
             self.freeze_active();
             let mut stats = SegStats::EMPTY;
             stats.add(rows.len(), ts_min, ts_max);
-            self.frozen.push(Arc::new(rows));
+            self.frozen.push(Arc::new(Segment::new(rows)));
             self.frozen_stats.push(stats);
         } else {
             self.active_stats.add(rows.len(), ts_min, ts_max);
@@ -168,7 +253,7 @@ impl MemTable {
     }
 
     fn rows(&self) -> impl Iterator<Item = &MemRow> {
-        self.frozen.iter().flat_map(|s| s.iter()).chain(self.active.iter())
+        self.frozen.iter().flat_map(|s| s.rows.iter()).chain(self.active.iter())
     }
 
     /// Freezes the active segment and returns a view sharing all segments.
@@ -183,7 +268,7 @@ impl MemTable {
             for s in &self.frozen_stats {
                 stats.add(s.len, s.ts_min, s.ts_max);
             }
-            self.frozen = vec![Arc::new(merged)];
+            self.frozen = vec![Arc::new(Segment::new(merged))];
             self.frozen_stats = vec![stats];
         }
         MemSnapshot { generation, segments: self.frozen.clone() }

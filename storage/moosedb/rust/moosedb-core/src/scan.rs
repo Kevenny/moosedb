@@ -466,7 +466,16 @@ impl Scan {
                 if !f.chunk_wanted(c) {
                     continue;
                 }
-                for (si, e) in c.series.iter().enumerate() {
+                // A few wanted series in a chunk with many: look them up instead
+                // of testing every entry (the cost of opening one lookup scan).
+                let picked = f.series.as_ref().filter(|s| s.len().saturating_mul(16) < c.series.len());
+                let picked = picked.and_then(|s| c.entries_of(s));
+                let visit: Box<dyn Iterator<Item = usize> + '_> = match &picked {
+                    Some(v) => Box::new(v.iter().copied()),
+                    None => Box::new(0..c.series.len()),
+                };
+                for si in visit {
+                    let Some(e) = c.series.get(si) else { continue };
                     if e.ts_min > f.ts_max || e.ts_max < f.ts_min || !f.series_matches(e.series_id) {
                         continue;
                     }
@@ -483,13 +492,27 @@ impl Scan {
             }
             let source = MEM_SOURCE | self.snap.mem.generation;
             let schema = &self.snap.schema;
-            let mut keys: Vec<Key> = self
-                .snap
-                .mem
-                .iter()
-                .filter(|(_, m)| f.series_matches(m.series_id) && f.ts_matches(schema.row_ts(&m.row)))
-                .map(|(o, m)| key_of(schema.row_ts(&m.row), Position { source, ordinal: o }))
-                .collect();
+            let mem = &self.snap.mem;
+            // Few wanted series in a large MemTable: per-segment series index
+            // (built once per segment, shared by all scans) instead of a pass
+            // over every row.
+            let indexed = f
+                .series
+                .as_ref()
+                .filter(|s| s.len().saturating_mul(mem.segment_count().max(1)).saturating_mul(4) <= mem.row_total());
+            let mut keys: Vec<Key> = match indexed {
+                Some(s) => mem
+                    .rows_of_series(s)
+                    .into_iter()
+                    .filter(|(_, m)| f.ts_matches(schema.row_ts(&m.row)))
+                    .map(|(o, m)| key_of(schema.row_ts(&m.row), Position { source, ordinal: o }))
+                    .collect(),
+                None => mem
+                    .iter()
+                    .filter(|(_, m)| f.series_matches(m.series_id) && f.ts_matches(schema.row_ts(&m.row)))
+                    .map(|(o, m)| key_of(schema.row_ts(&m.row), Position { source, ordinal: o }))
+                    .collect(),
+            };
             keys.sort_unstable();
             if desc {
                 keys.reverse();
@@ -708,6 +731,99 @@ mod batch_cap_tests {
             let mut s = t.scan(&ScanFilter::default(), sorted).unwrap();
             s.set_bytes_cap(10);
             assert_eq!(s.next_batch(1000, false).unwrap().rows(), 1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod selective_scan_tests {
+    use super::*;
+    use crate::options::RawOptions;
+    use crate::schema::{Column, ColumnType};
+    use crate::{Table, TableConfig};
+
+    fn table(dir: &std::path::Path) -> Table {
+        let schema = Schema::new(
+            vec![
+                Column { name: "ts".into(), ty: ColumnType::Timestamp },
+                Column { name: "host".into(), ty: ColumnType::Tag },
+                Column { name: "v".into(), ty: ColumnType::Int64 },
+            ],
+            0,
+        )
+        .unwrap();
+        let cfg = TableConfig::new(dir.join("t"), schema, &RawOptions::default()).unwrap();
+        Table::create(&cfg).unwrap();
+        Table::open(cfg).unwrap()
+    }
+
+    fn rows(s: &mut Scan, backward: bool) -> Vec<(i64, i64)> {
+        let mut out = Vec::new();
+        loop {
+            let b = s.next_batch(100, backward).unwrap();
+            if b.rows() == 0 {
+                return out;
+            }
+            for i in 0..b.rows() {
+                let r = b.row_at(i);
+                let (Value::Timestamp(ts), Value::Int(v)) = (&r[0], &r[2]) else { panic!("{r:?}") };
+                out.push((*ts, *v));
+            }
+        }
+    }
+
+    /// Looking up a few series of many through the per-chunk and per-segment
+    /// indexes returns exactly what testing every entry / every row returns.
+    #[test]
+    fn a_few_wanted_series_match_a_full_pass_over_chunks_and_memtable() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = table(dir.path());
+        let write = |round: i64| {
+            for h in 0..400i64 {
+                for k in 0..6i64 {
+                    let ts = round * 1000 + k * 7 + h % 5;
+                    let row = vec![Value::Timestamp(ts), Value::Bytes(format!("h{h}").into_bytes()), Value::Int(h * 100 + ts)];
+                    t.write(row).unwrap();
+                }
+            }
+        };
+        write(0);
+        t.flush().unwrap(); // sealed chunk with 400 series
+        write(1); // MemTable, first segment
+        let _ = t.snapshot().unwrap();
+        write(2); // a second segment
+        let ids: Vec<u64> = t.series().unwrap().into_iter().map(|(id, _)| id).collect();
+        assert_eq!(ids.len(), 400);
+        let wanted = |sel: &[u64]| ScanFilter { series: Some(sel.to_vec()), ..ScanFilter::default() };
+        for sel in [vec![ids[7]], vec![ids[0], ids[399]], vec![ids[3], ids[3], ids[250]], vec![u64::MAX]] {
+            for (lo, hi) in [(i64::MIN, i64::MAX), (1000, 1999), (5, 5000)] {
+                let mut f = wanted(&sel);
+                f.ts_min = lo;
+                f.ts_max = hi;
+                // reference: the whole table, series filtered by the caller
+                let mut all = t.scan(&ScanFilter::range(lo, hi), true).unwrap();
+                let want: Vec<(i64, i64)> = {
+                    let mut v = Vec::new();
+                    while let Some((_, r)) = all.next_row().unwrap() {
+                        let (Value::Timestamp(ts), Value::Bytes(h), Value::Int(x)) = (&r[0], &r[1], &r[2]) else {
+                            panic!()
+                        };
+                        let name = String::from_utf8(h.clone()).unwrap();
+                        let idx: usize = name[1..].parse().unwrap();
+                        if sel.contains(&ids[idx]) {
+                            v.push((*ts, *x));
+                        }
+                    }
+                    v
+                };
+                let mut fwd = t.scan(&f, true).unwrap();
+                assert_eq!(rows(&mut fwd, false), want, "forward {sel:?} {lo}..{hi}");
+                let mut bwd = t.scan(&f, true).unwrap();
+                bwd.seek_end().unwrap();
+                let mut rev = want.clone();
+                rev.reverse();
+                assert_eq!(rows(&mut bwd, true), rev, "backward {sel:?} {lo}..{hi}");
+            }
         }
     }
 }

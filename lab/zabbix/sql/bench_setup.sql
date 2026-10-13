@@ -6,7 +6,9 @@
 --   h_moose_int  variante adaptada usada com o Zabbix (itemid BIGINT TAG, clock INT, ts DATETIME(6))
 --   h_moose_str  itemid VARCHAR TAG (pushdown só com constante entre aspas)
 --   h_moose_v3   esquema v3: itemid BIGINT TAG (pushdown numérico) e clock INT
---                como eixo de tempo (TIMESTAMP_COLUMN='clock'), sem ts/trigger
+--                como eixo de tempo (TIMESTAMP_COLUMN='clock'), sem ts/trigger;
+--                INDEX (clock) + INDEX (itemid, clock): o índice composto dá ref
+--                por item, self-join e MAX(clock) por item sem varrer a série
 --
 -- RETENTION_PERIOD='6 DAYS' nas MooseDB: o teste de housekeeping descarta o
 -- 1º dia (parcial) dos 7 carregados. A varredura automática é desligada
@@ -44,7 +46,8 @@ CREATE TABLE h_moose_v3 (
   clock  integer DEFAULT '0' NOT NULL,
   value  DOUBLE PRECISION DEFAULT '0.0000' NOT NULL,
   ns     integer DEFAULT '0' NOT NULL,
-  INDEX clock_idx (clock)
+  INDEX clock_idx (clock),
+  INDEX item_clock (itemid, clock)
 ) ENGINE=MooseDB TIMESTAMP_COLUMN='clock' CHUNK_INTERVAL='1 DAY' RETENTION_PERIOD='6 DAYS' HOT_THRESHOLD='1 DAY';
 
 DELIMITER //

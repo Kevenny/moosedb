@@ -64,7 +64,7 @@ ERROR 42000: Table handler doesn't support NULL in given index. Please change co
 CREATE TABLE t1 (ts DATETIME NOT NULL, PRIMARY KEY(ts)) ENGINE=MooseDB;
 ERROR HY000: MooseDB: index 'PRIMARY' cannot be UNIQUE/PRIMARY: time-series rows are not unique by time
 CREATE TABLE t1 (ts DATETIME NOT NULL, v INT NOT NULL, INDEX(ts), INDEX(v)) ENGINE=MooseDB;
-ERROR HY000: MooseDB: index 'v' is not supported: MooseDB only indexes the timestamp column (TAG columns are indexed implicitly)
+ERROR HY000: MooseDB: index 'v' is not supported: column 'v' is not a TAG column or the timestamp column. MooseDB indexes the timestamp column alone, or TAG columns optionally followed by the timestamp (INDEX (itemid, clock))
 CREATE TABLE t1 (ts DATETIME NOT NULL, INDEX(ts)) ENGINE=MooseDB TIMESTAMP_COLUMN='nope';
 ERROR HY000: MooseDB: TIMESTAMP_COLUMN 'nope' does not exist
 CREATE TABLE t1 (ts DATETIME NOT NULL, v DOUBLE NOT NULL, INDEX(ts)) ENGINE=MooseDB TIMESTAMP_COLUMN='v';

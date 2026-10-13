@@ -471,3 +471,132 @@ fn an_unchecked_statement_that_does_not_commit_leaves_no_phantom_keys() {
     assert!(is_dup(insert_one(&t, r("a", 10, 1))));
     assert_eq!(t.stats().unwrap().row_count, 3);
 }
+
+/// Sorted scans hand out whole stretches of a run at once; the rows (and their
+/// order, ties included) must not depend on how big the batches are.
+#[test]
+fn sorted_scans_return_the_same_rows_whatever_the_batch_size() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_new(&dir.path().join("t"), false);
+    // Overlapping chunks (rounds interleave in time), timestamps repeated with
+    // different ns, a MemTable tail, three series.
+    for round in 0..4i64 {
+        for item in ["a", "b", "c"] {
+            let mut b = t.begin_batch().unwrap();
+            for k in 0..120i64 {
+                let clock = k * 4 + round;
+                put(&mut b, r(item, clock, 1)).unwrap();
+                if k % 5 == 0 {
+                    put(&mut b, r(item, clock, 2)).unwrap();
+                }
+            }
+            b.commit(false).unwrap();
+        }
+        if round < 3 {
+            t.flush().unwrap();
+        }
+    }
+    let collect = |filter: &ScanFilter, max: usize| -> Vec<(i64, String, i64)> {
+        let mut s = t.scan(filter, true).unwrap();
+        let mut out = Vec::new();
+        loop {
+            let b = s.next_batch(max, false).unwrap();
+            if b.rows() == 0 {
+                return out;
+            }
+            for i in 0..b.rows() {
+                let row = b.row_at(i);
+                let (Value::Timestamp(ts), Value::Bytes(item), Value::Int(ns)) = (&row[0], &row[1], &row[3]) else {
+                    panic!("{row:?}")
+                };
+                out.push((*ts, String::from_utf8(item.clone()).unwrap(), *ns));
+            }
+        }
+    };
+    let series: Vec<u64> = t.series().unwrap().into_iter().map(|(id, _)| id).collect();
+    let filters = [
+        ScanFilter::default(),
+        ScanFilter::range(100 * 1_000_000, 300 * 1_000_000),
+        ScanFilter { series: Some(vec![series[1]]), ..ScanFilter::default() },
+        ScanFilter { series: Some(vec![series[0], series[2]]), ..ScanFilter::range(0, 200 * 1_000_000) },
+    ];
+    for f in &filters {
+        let one = collect(f, 1);
+        assert!(!one.is_empty());
+        assert!(one.windows(2).all(|w| (w[0].0, w[0].2) <= (w[1].0, w[1].2) || w[0].0 < w[1].0), "ordered by time");
+        for max in [2, 3, 7, 64, 100_000] {
+            assert_eq!(collect(f, max), one, "batch size {max}");
+        }
+    }
+    assert_eq!(collect(&ScanFilter::default(), 1).len() as u64, t.stats().unwrap().row_count);
+}
+
+/// A projection without the extra key columns does not decode them unless rows
+/// of one timestamp meet; the rows still leave in the tie order (the value
+/// column encodes `ns`, so the projected scan shows the order).
+#[test]
+fn tie_order_does_not_need_the_extra_columns_in_the_projection() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_new(&dir.path().join("t"), false);
+    for round in 0..3i64 {
+        let mut b = t.begin_batch().unwrap();
+        for item in ["a", "b"] {
+            for k in 0..50i64 {
+                // timestamps repeat across rounds (different ns), so runs of
+                // different chunks hold rows of the same timestamp
+                let clock = k * 3;
+                put(&mut b, r(item, clock, 10 - round)).unwrap();
+            }
+        }
+        b.commit(false).unwrap();
+        if round < 2 {
+            t.flush().unwrap();
+        }
+    }
+    let only_clock_and_value = [true, false, true, false];
+    let mut full = t.scan(&ScanFilter::default(), true).unwrap();
+    let mut proj = t.scan_projected(&ScanFilter::default(), true, Some(&only_clock_and_value)).unwrap();
+    let mut n = 0;
+    loop {
+        let (a, b) = (full.next_row().unwrap(), proj.next_row().unwrap());
+        match (a, b) {
+            (None, None) => break,
+            (Some((pa, ra)), Some((pb, rb))) => {
+                assert_eq!(pa, pb);
+                assert_eq!((&ra[0], &ra[2]), (&rb[0], &rb[2]));
+                assert_eq!(rb[3], Value::Null, "ns was not asked for");
+                n += 1;
+            }
+            other => panic!("different lengths: {other:?}"),
+        }
+    }
+    assert_eq!(n, 300);
+}
+
+/// A UNIQUE statement reuses the series ids it resolved while admitting rows.
+/// Even when it spills (which clears that bookkeeping) and keeps writing the
+/// same new series, and when a second statement creates other series meanwhile,
+/// every row ends up in the right series.
+#[test]
+fn a_spilling_statement_and_a_concurrent_one_keep_every_row_in_its_series() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_new(&dir.path().join("t"), true); // 8 KiB MemTable: spills early
+    let mut b1 = t.begin_batch().unwrap();
+    let mut b2 = t.begin_batch().unwrap();
+    put(&mut b2, r("other", 1, 1)).unwrap();
+    for clock in 0..400i64 {
+        put(&mut b1, r("new", clock, 1)).unwrap(); // spills part-way, keeps writing "new"
+        put(&mut b1, r(&format!("s{}", clock % 7), clock, 1)).unwrap();
+    }
+    b1.commit(false).unwrap();
+    put(&mut b2, r("new", 1000, 1)).unwrap(); // "new" is free now
+    b2.commit(false).unwrap();
+    let all = scan_all(&t, true, false);
+    let count = |name: &str| all.iter().filter(|x| x.0 == name).count();
+    assert_eq!(count("new"), 401);
+    assert_eq!(count("other"), 1);
+    assert_eq!((0..7).map(|i| count(&format!("s{i}"))).sum::<usize>(), 400);
+    assert_eq!(t.series().unwrap().len(), 9);
+    assert!(is_dup(insert_one(&t, r("new", 1000, 1))));
+    assert!(is_dup(insert_one(&t, r("new", 399, 1))));
+}

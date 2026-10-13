@@ -292,6 +292,9 @@ pub struct Table {
     /// Signalled when a statement gives back the series it claimed (UNIQUE
     /// tables); waits on it use the table mutex.
     pub(crate) claims_cv: Condvar,
+    /// Size of the last committed (unspilled) batch: `rows << 32 | series`. The
+    /// next batch reserves that much up front instead of growing its buffers.
+    pub(crate) batch_hint: AtomicU64,
 }
 
 /// Deletes WAL segments `<= upto`, logging (not failing) on errors: leftover
@@ -626,6 +629,7 @@ impl Table {
             last_retention: AtomicI64::new(crate::time::now_micros() / crate::time::MICROS_PER_SEC),
             queued: AtomicBool::new(false),
             claims_cv: Condvar::new(),
+            batch_hint: AtomicU64::new(0),
         })
     }
 

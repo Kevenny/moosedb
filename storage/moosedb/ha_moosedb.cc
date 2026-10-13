@@ -1486,8 +1486,16 @@ int ha_moosedb::fill_from_batch(uchar *buf, uint32_t row)
         restore_record, ...) always gets a fresh store.
       */
       const enum_field_types rt= f->real_type();
+      /*
+        Integer TAG columns hold the canonical decimal text of their series; the
+        store parses it. Rows of a run repeat the same text, so they take the
+        same memo as strings (the snapshot is the field's fixed-width image).
+      */
+      const bool fixed_int= rt == MYSQL_TYPE_TINY || rt == MYSQL_TYPE_SHORT ||
+                            rt == MYSQL_TYPE_INT24 || rt == MYSQL_TYPE_LONG ||
+                            rt == MYSQL_TYPE_LONGLONG;
       const bool memo= c.conv == tf_conv::TAG &&
-                       (rt == MYSQL_TYPE_VARCHAR || rt == MYSQL_TYPE_STRING) &&
+                       (rt == MYSQL_TYPE_VARCHAR || rt == MYSQL_TYPE_STRING || fixed_int) &&
                        f->pack_length() <= 1024;
       if (memo && tag_last_ok_[ci] && tag_last_start_[ci] == st && tag_last_len_[ci] == len &&
           tag_snap_[ci].size() == f->pack_length() &&

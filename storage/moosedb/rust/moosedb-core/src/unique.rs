@@ -31,12 +31,13 @@
 //!
 //! The key has at most [`MAX_EXTRAS`] extra columns, all `INT64`, `NOT NULL`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::chunk::ChunkMeta;
 use crate::chunk_reader::load_window;
 use crate::error::{invalid, Result};
+use crate::fasthash::FastMap;
 use crate::scan::Snapshot;
 use crate::schema::{ColumnType, Schema, Value};
 
@@ -156,11 +157,11 @@ pub(crate) enum Claim {
 /// Unique-key state of a table, guarded by the table mutex.
 #[derive(Debug, Default)]
 pub(crate) struct UniqueState {
-    series: HashMap<u64, SeriesTop>,
+    series: FastMap<u64, SeriesTop>,
     /// series id -> id of the statement (batch) that holds it
-    claims: HashMap<u64, u64>,
+    claims: FastMap<u64, u64>,
     /// batch id -> batch id it waits for
-    waiting: HashMap<u64, u64>,
+    waiting: FastMap<u64, u64>,
 }
 
 impl UniqueState {

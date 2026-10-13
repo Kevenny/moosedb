@@ -12,6 +12,7 @@ use std::sync::{Arc, RwLock};
 
 use crate::codec::encode_value;
 use crate::error::{corrupt, Result};
+use crate::fasthash::FastMap;
 use crate::schema::{Schema, Value};
 
 /// Canonical byte encoding of a series' tag values.
@@ -115,7 +116,7 @@ fn next_version() -> u64 {
 
 pub(crate) struct SeriesIndex {
     by_key: HashMap<Vec<u8>, u64>,
-    tags_by_id: HashMap<u64, Arc<[Value]>>,
+    tags_by_id: FastMap<u64, Arc<[Value]>>,
     next_id: u64,
     log: Arc<SeriesLog>,
     /// Number of entries of `log`.
@@ -129,7 +130,7 @@ impl Default for SeriesIndex {
     fn default() -> Self {
         SeriesIndex {
             by_key: HashMap::new(),
-            tags_by_id: HashMap::new(),
+            tags_by_id: FastMap::default(),
             next_id: 0,
             log: Arc::default(),
             logged: 0,
@@ -184,14 +185,15 @@ impl SeriesIndex {
     }
 
     /// [`SeriesIndex::get_or_insert`] for a caller that already has the key
-    /// (`series_key(tags)`): a known series costs one lookup, no allocation.
-    pub(crate) fn get_or_insert_keyed(&mut self, key: &[u8], tags: &[Value]) -> u64 {
+    /// (`series_key(tags)`) and builds the tag values only when
+    /// the series is new: a known series costs one lookup and builds nothing.
+    pub(crate) fn get_or_insert_keyed_with(&mut self, key: &[u8], tags: impl FnOnce() -> Vec<Value>) -> u64 {
         if let Some(&id) = self.by_key.get(key) {
             return id;
         }
         let id = self.next_id;
         self.next_id += 1;
-        self.add(key.to_vec(), id, tags);
+        self.add(key.to_vec(), id, &tags());
         id
     }
 

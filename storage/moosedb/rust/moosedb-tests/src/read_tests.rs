@@ -285,3 +285,106 @@ fn partial_batches_at_the_ends_keep_the_cursor_on_the_last_returned_row() {
         }
     }
 }
+
+/// A sorted scan emits stretches of one run per step; the sequence must be the
+/// one the row-at-a-time scan produces, for any batch size, with and without a
+/// series or time filter.
+#[test]
+fn sorted_batches_of_any_size_match_the_row_at_a_time_scan() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = build(dir.path());
+    let ids: Vec<u64> = t.series().unwrap().into_iter().map(|(id, _)| id).collect();
+    let filters = [
+        ScanFilter::default(),
+        ScanFilter::range(base_ts() + 3_600 * 1_000_000, base_ts() + 9_000 * 1_000_000),
+        ScanFilter { series: Some(vec![ids[1]]), ..ScanFilter::default() },
+        ScanFilter {
+            series: Some(vec![ids[0], ids[3]]),
+            ..ScanFilter::range(base_ts(), base_ts() + 7_200 * 1_000_000)
+        },
+    ];
+    for f in &filters {
+        let mut s = t.scan(f, true).unwrap();
+        let want: Vec<(Position, Row)> = drain_rows(&mut s, false);
+        assert!(!want.is_empty());
+        assert!(want.windows(2).all(|w| ts(&w[0].1) <= ts(&w[1].1)));
+        for max in [2usize, 5, 64, 100_000] {
+            let mut s = t.scan(f, true).unwrap();
+            let mut got = Vec::new();
+            loop {
+                let b = s.next_batch(max, false).unwrap();
+                if b.rows() == 0 {
+                    break;
+                }
+                for i in 0..b.rows() {
+                    got.push((Position::from_bytes(&b.positions()[i]), b.row_at(i)));
+                }
+            }
+            assert_eq!(got, want, "batch size {max}");
+        }
+    }
+}
+
+/// Narrow reads leave decoded columns in the shared cache; after compaction
+/// rewrote the chunks and after TRUNCATE (same timestamps, other values) the
+/// next narrow read must show the current data, never a cached older one.
+#[test]
+fn the_column_cache_never_serves_data_of_a_replaced_chunk() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = create_open(&dir.path().join("t"), RawOptions { chunk_interval: Some("1 HOUR"), ..Default::default() });
+    let narrow = |t: &Table, sec: i64| -> Vec<(i64, f64)> {
+        let lo = base_ts() + sec * 1_000_000;
+        let mut s = t.scan(&ScanFilter::range(lo, lo + 2_000_000), true).unwrap();
+        drain_rows(&mut s, false)
+            .into_iter()
+            .map(|(_, r)| match (&r[0], &r[3]) {
+                (Value::Timestamp(ts), Value::Float64(v)) => (*ts, *v),
+                other => panic!("{other:?}"),
+            })
+            .collect()
+    };
+    let fill = |t: &Table, from: i64, to: i64, bias: f64| {
+        for sec in from..to {
+            t.write(row(sec, "a", sec as f64 + bias)).unwrap();
+        }
+    };
+    fill(&t, 0, 400, 0.0);
+    t.flush().unwrap();
+    let before = narrow(&t, 100);
+    assert_eq!(before.iter().map(|x| x.1).collect::<Vec<_>>(), vec![100.0, 101.0, 102.0]);
+    assert_eq!(narrow(&t, 100), before, "second read, served from the cache");
+    // A second chunk of the same bucket, then compaction merges and rewrites both.
+    fill(&t, 400, 800, 0.0);
+    t.flush().unwrap();
+    t.compact(i64::MIN, i64::MAX, base_ts() + 10 * 86_400 * 1_000_000).unwrap();
+    assert_eq!(narrow(&t, 100), before);
+    assert_eq!(narrow(&t, 500).iter().map(|x| x.1).collect::<Vec<_>>(), vec![500.0, 501.0, 502.0]);
+    // TRUNCATE and the same timestamps with other values.
+    t.truncate().unwrap();
+    assert!(narrow(&t, 100).is_empty());
+    fill(&t, 0, 400, 0.5);
+    t.flush().unwrap();
+    assert_eq!(narrow(&t, 100).iter().map(|x| x.1).collect::<Vec<_>>(), vec![100.5, 101.5, 102.5]);
+    assert_eq!(narrow(&t, 100).iter().map(|x| x.1).collect::<Vec<_>>(), vec![100.5, 101.5, 102.5]);
+}
+
+/// The descending merge goes one row at a time; batch size must not matter
+/// (same rows, same order, same positions as the row-at-a-time `prev_row`).
+#[test]
+fn descending_batches_of_any_size_match_the_row_at_a_time_scan() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = build(dir.path());
+    let ids: Vec<u64> = t.series().unwrap().into_iter().map(|(id, _)| id).collect();
+    for f in [ScanFilter::default(), ScanFilter { series: Some(vec![ids[2]]), ..ScanFilter::default() }] {
+        let mut s = t.scan(&f, true).unwrap();
+        s.seek_end().unwrap();
+        let want = drain_rows(&mut s, true);
+        assert!(!want.is_empty());
+        assert!(want.windows(2).all(|w| ts(&w[0].1) >= ts(&w[1].1)));
+        for max in [2usize, 7, 100_000] {
+            let mut s = t.scan(&f, true).unwrap();
+            s.seek_end().unwrap();
+            assert_eq!(drain_batches(&mut s, max, true), want, "batch size {max}");
+        }
+    }
+}

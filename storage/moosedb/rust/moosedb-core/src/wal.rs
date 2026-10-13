@@ -76,12 +76,20 @@ pub(crate) fn set_max_entry(n: usize) {
     ENTRY_LIMIT.with(|l| l.set(n));
 }
 
-/// Payload of a ROW entry (a row of batch `batch`, not yet committed).
+/// Payload of a ROW entry (a row of batch `batch`, not yet committed), into a
+/// reused buffer (cleared first).
+pub(crate) fn row_entry_into(p: &mut Vec<u8>, batch: u64, row: &[Value]) {
+    p.clear();
+    p.push(K_ROW);
+    put_u64(p, batch);
+    encode_row(p, row);
+}
+
+/// [`row_entry_into`] into a fresh buffer.
+#[cfg(test)]
 pub(crate) fn row_entry(batch: u64, row: &[Value]) -> Vec<u8> {
     let mut p = Vec::with_capacity(9 + 16 * row.len());
-    p.push(K_ROW);
-    put_u64(&mut p, batch);
-    encode_row(&mut p, row);
+    row_entry_into(&mut p, batch, row);
     p
 }
 
@@ -761,6 +769,31 @@ pub(crate) fn replay_committed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The reusable-buffer encoder writes exactly the WAL v2 ROW payload layout:
+    /// `K_ROW`, batch id (u64 LE), column count (u16 LE), tagged values.
+    #[test]
+    fn row_entry_into_matches_the_v2_layout_byte_for_byte() {
+        let row =
+            vec![Value::Timestamp(-5), Value::Bytes(b"ab".to_vec()), Value::Float64(1.5), Value::Null, Value::Int(7)];
+        let mut want = vec![K_ROW];
+        want.extend_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
+        want.extend_from_slice(&5u16.to_le_bytes());
+        want.push(1);
+        want.extend_from_slice(&(-5i64).to_le_bytes());
+        want.push(6);
+        want.extend_from_slice(&2u32.to_le_bytes());
+        want.extend_from_slice(b"ab");
+        want.push(3);
+        want.extend_from_slice(&1.5f64.to_bits().to_le_bytes());
+        want.push(0);
+        want.push(2);
+        want.extend_from_slice(&7i64.to_le_bytes());
+        let mut buf = vec![9u8; 100]; // stale contents are discarded
+        row_entry_into(&mut buf, 0x0102_0304_0506_0708, &row);
+        assert_eq!(buf, want);
+        assert_eq!(row_entry(0x0102_0304_0506_0708, &row), want);
+    }
 
     fn collect(dir: &Path, seq: u64, truncate: bool) -> Result<(Vec<Vec<u8>>, ReplayOutcome)> {
         let mut got = Vec::new();

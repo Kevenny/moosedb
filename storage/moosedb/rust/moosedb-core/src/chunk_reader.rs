@@ -229,11 +229,18 @@ pub(crate) struct Window {
     pub hi: usize,
     /// By schema column. Each present column is indexed by the row number
     /// *within the series* and holds at least rows `[0, hi)`.
-    pub cols: Vec<Option<block::ColumnData>>,
+    pub cols: Vec<Option<Arc<block::ColumnData>>>,
     ts_index: usize,
+    /// A narrow read: columns decoded later are kept whole in the cache.
+    narrow: bool,
 }
 
 impl Window {
+    /// The timestamps of rows `[0, hi)` of the series, when decoded.
+    pub(crate) fn ts_slice(&self) -> Option<&[i64]> {
+        self.cols.get(self.ts_index).and_then(Option::as_ref).and_then(|c| c.ints())
+    }
+
     /// Timestamp of row `i` of the series (`lo <= i < hi`), when the window
     /// decoded the timestamp column (always, if `need_ts` was set).
     pub(crate) fn ts_at(&self, i: usize) -> Result<i64> {
@@ -247,6 +254,10 @@ impl Window {
     }
 }
 
+/// Series up to this many rows keep their decoded columns in the cache when a
+/// read touches a small part of them (see [`load_window`]).
+const COLUMN_CACHE_MAX_ROWS: usize = 1 << 16;
+
 /// Decodes the rows of series `idx` whose timestamp lies in `[ts_min, ts_max]`
 /// and only the columns flagged in `want`.
 ///
@@ -256,6 +267,14 @@ impl Window {
 ///   neither wanted nor `need_ts`, it is not decoded at all.
 /// * Other columns decode only rows `[0, hi)`: Delta and Gorilla streams
 ///   cannot be entered in the middle, but nothing past the range is expanded.
+/// * A **narrow** read (the range holds at most 1/8 of a series of up to
+///   [`COLUMN_CACHE_MAX_ROWS`] rows: a point lookup, the last hour of a day)
+///   decodes the whole column once and keeps it in the shared cache, so the
+///   next read of the same series (joins, repeated lookups, the same graph
+///   refreshed) does not decode again. A wide read decodes only what it needs
+///   the first time it meets a series and keeps the whole column from the
+///   second time on (`cache::touched_before`), so a scan that visits each
+///   series once cannot flush the cache while repeated queries stop decoding.
 ///
 /// Returns `None` when no row of the series is in range.
 pub(crate) fn load_window(
@@ -277,24 +296,47 @@ pub(crate) fn load_window(
     block::check_materialization(n, 9 * schema.data_indices().len().max(1))
         .map_err(|e| corrupt(format!("{}: {e}", meta.path().display())))?;
     let ts_idx = schema.ts_index();
-    let mut cols: Vec<Option<block::ColumnData>> = (0..schema.columns().len()).map(|_| None).collect();
+    let uid = meta.file.uid;
+    let series_key = u32::try_from(idx).map_err(|_| corrupt("series entry index out of range"))?;
+    let column_key = |col: usize| u32::try_from(col).unwrap_or(u32::MAX);
+    let cacheable = n <= COLUMN_CACHE_MAX_ROWS;
+    let mut cols: Vec<Option<Arc<block::ColumnData>>> = (0..schema.columns().len()).map(|_| None).collect();
     let decode_err = |b: BlockRef, e: Error| corrupt(format!("{} at offset {}: {e}", meta.path().display(), b.offset));
 
     let covers_all = entry.ts_min >= ts_min && entry.ts_max <= ts_max;
     let want_ts = need_ts || want.get(ts_idx).copied().unwrap_or(false);
+    // The timestamp column when it had to be decoded here (not found in the cache).
+    let mut fresh_ts: Option<Arc<block::ColumnData>> = None;
     let (lo, hi) = if covers_all && !want_ts {
         (0, n)
     } else {
-        let pos =
-            schema.data_indices().iter().position(|&c| c == ts_idx).ok_or_else(|| corrupt("no timestamp block"))?;
-        let b = entry.blocks[pos];
-        let payload = read_block(meta, b)?;
-        let data = block::decode_compact(ColumnType::Timestamp, n, &payload).map_err(|e| decode_err(b, e))?;
-        let ts = data.ints().filter(|t| t.len() == n && data.null_flags().is_none());
-        let ts = ts.ok_or_else(|| corrupt(format!("{}: bad timestamp block", meta.path().display())))?;
-        if !ts.windows(2).all(|w| w[0] <= w[1]) {
-            return Err(corrupt(format!("{}: series rows are not sorted by timestamp", meta.path().display())));
-        }
+        let cached = if cacheable { cache::get_column(uid, series_key, column_key(ts_idx)) } else { None };
+        let data = match cached.filter(|c| c.len() == n) {
+            Some(c) => c,
+            None => {
+                let pos = schema
+                    .data_indices()
+                    .iter()
+                    .position(|&c| c == ts_idx)
+                    .ok_or_else(|| corrupt("no timestamp block"))?;
+                let b = entry.blocks[pos];
+                let payload = read_block(meta, b)?;
+                let data =
+                    Arc::new(block::decode_compact(ColumnType::Timestamp, n, &payload).map_err(|e| decode_err(b, e))?);
+                let ts = data.ints().filter(|t| t.len() == n && data.null_flags().is_none());
+                let ts = ts.ok_or_else(|| corrupt(format!("{}: bad timestamp block", meta.path().display())))?;
+                if !ts.windows(2).all(|w| w[0] <= w[1]) {
+                    return Err(corrupt(format!("{}: series rows are not sorted by timestamp", meta.path().display())));
+                }
+                fresh_ts = Some(data.clone());
+                data
+            }
+        };
+        // Only a validated column (here or when it was cached) is ever searched.
+        let ts = data
+            .ints()
+            .filter(|t| t.len() == n)
+            .ok_or_else(|| corrupt(format!("{}: bad timestamp block", meta.path().display())))?;
         let lo = ts.partition_point(|&t| t < ts_min);
         let hi = ts.partition_point(|&t| t <= ts_max);
         if want_ts {
@@ -305,19 +347,80 @@ pub(crate) fn load_window(
     if lo >= hi {
         return Ok(None);
     }
-    for (&col, &b) in schema.data_indices().iter().zip(&entry.blocks) {
-        if col == ts_idx || !want.get(col).copied().unwrap_or(false) {
-            continue;
+    let narrow = cacheable && (hi - lo).saturating_mul(8) <= n;
+    if let Some(ts) = fresh_ts {
+        // The whole timestamp column is in hand anyway: keep it when the read is
+        // narrow or the series was read before.
+        if narrow || (cacheable && cache::touched_before(uid, series_key, column_key(ts_idx))) {
+            cache::put_column(uid, series_key, column_key(ts_idx), ts);
         }
-        let payload = read_block(meta, b)?;
-        let data =
-            block::decode_compact_prefix(schema.columns()[col].ty, n, hi, &payload).map_err(|e| decode_err(b, e))?;
-        if data.len() != hi {
+    }
+    let mut window = Window { lo, hi, cols, ts_index: ts_idx, narrow };
+    for &col in schema.data_indices() {
+        if col != ts_idx && want.get(col).copied().unwrap_or(false) {
+            load_column(schema, meta, idx, &mut window, col)?;
+        }
+    }
+    Ok(Some(window))
+}
+
+/// Decodes data column `col` of series `idx` into `win` (rows `[0, hi)` at
+/// least), through the column cache. See [`load_window`] for what is kept.
+fn load_column(schema: &Schema, meta: &ChunkMeta, idx: usize, win: &mut Window, col: usize) -> Result<()> {
+    let entry = meta.series.get(idx).ok_or_else(|| corrupt("series entry index out of range"))?;
+    let n = entry.row_count as usize;
+    let pos = schema.data_indices().iter().position(|&c| c == col).ok_or_else(|| corrupt("not a data column"))?;
+    let b = *entry.blocks.get(pos).ok_or_else(|| corrupt("series entry has too few blocks"))?;
+    let uid = meta.file.uid;
+    let series_key = u32::try_from(idx).map_err(|_| corrupt("series entry index out of range"))?;
+    let column_key = u32::try_from(col).unwrap_or(u32::MAX);
+    let cacheable = n <= COLUMN_CACHE_MAX_ROWS;
+    if cacheable {
+        if let Some(c) = cache::get_column(uid, series_key, column_key).filter(|c| c.len() == n) {
+            win.cols[col] = Some(c);
+            return Ok(());
+        }
+    }
+    let decode_err = |e: Error| corrupt(format!("{} at offset {}: {e}", meta.path().display(), b.offset));
+    let payload = read_block(meta, b)?;
+    let ty = schema.columns()[col].ty;
+    let keep = cacheable && (win.narrow || cache::touched_before(uid, series_key, column_key));
+    let data = if keep {
+        let data = block::decode_compact(ty, n, &payload).map_err(decode_err)?;
+        if data.len() != n {
             return Err(corrupt("column block too short"));
         }
-        cols[col] = Some(data);
+        let data = Arc::new(data);
+        cache::put_column(uid, series_key, column_key, data.clone());
+        data
+    } else {
+        let data = block::decode_compact_prefix(ty, n, win.hi, &payload).map_err(decode_err)?;
+        if data.len() != win.hi {
+            return Err(corrupt("column block too short"));
+        }
+        Arc::new(data)
+    };
+    win.cols[col] = Some(data);
+    Ok(())
+}
+
+/// Decodes the data columns of `extra` that `win` does not hold yet. A sorted
+/// scan of a UNIQUE table calls this the first time a run meets rows of the
+/// same timestamp: only then does it need the key's extra columns, which a
+/// scan without ties never decodes.
+pub(crate) fn load_more_columns(
+    schema: &Schema,
+    meta: &ChunkMeta,
+    idx: usize,
+    win: &mut Window,
+    extra: &[usize],
+) -> Result<()> {
+    for &col in extra {
+        if win.cols.get(col).is_some_and(Option::is_none) {
+            load_column(schema, meta, idx, win, col)?;
+        }
     }
-    Ok(Some(Window { lo, hi, cols, ts_index: ts_idx }))
+    Ok(())
 }
 
 /// Decodes series `idx` into compact columns, through the cache.
@@ -415,6 +518,56 @@ mod tests {
         let at = index_offset + 8 + 16 + 4 + 8;
         data[at..at + 4].copy_from_slice(&rows.to_le_bytes());
         std::fs::write(path, data).unwrap();
+    }
+
+    /// One series of `n` rows (ts = 10 * i, v = i), written to a chunk.
+    fn build_long(dir: &Path, n: i64) -> (Schema, ChunkMeta) {
+        let schema = schema();
+        let mut b = ChunkBuilder::new(&schema, Codec::Lz4, None);
+        let rows: Vec<Row> = (0..n)
+            .map(|i| vec![Value::Timestamp(10 * i), Value::Bytes(b"a".to_vec()), Value::Float64(i as f64)])
+            .collect();
+        let refs: Vec<&Row> = rows.iter().collect();
+        b.add_series(1, &[Value::Bytes(b"a".to_vec())], &refs).unwrap();
+        let meta = b.finish(dir, 7, 0, (0, 100_000)).unwrap();
+        (schema, meta)
+    }
+
+    fn floats(w: &Window) -> Vec<f64> {
+        let col = w.cols[2].as_ref().unwrap();
+        (w.lo..w.hi)
+            .map(|i| match col.value_at(i) {
+                Some(Value::Float64(f)) => f,
+                other => panic!("{other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn narrow_and_repeated_reads_decode_once_and_return_the_same_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let (schema, meta) = build_long(dir.path(), 400);
+        let want = [true, false, true];
+        // Narrow (3 of 400 rows): the whole column is kept for the next read.
+        let first = load_window(&schema, &meta, 0, (1000, 1020), &want, true).unwrap().unwrap();
+        assert_eq!(floats(&first), vec![100.0, 101.0, 102.0]);
+        assert!(
+            cache::get_column(meta.file.uid, 0, 2).is_some() || crate::settings::get().chunk_cache_bytes() == 0,
+            "a narrow read leaves its columns in the cache"
+        );
+        let again = load_window(&schema, &meta, 0, (1000, 1020), &want, true).unwrap().unwrap();
+        assert_eq!((again.lo, again.hi), (first.lo, first.hi));
+        assert_eq!(floats(&again), floats(&first));
+        // A different narrow range of the same series is served from the same columns.
+        let other = load_window(&schema, &meta, 0, (3500, 3520), &want, true).unwrap().unwrap();
+        assert_eq!(floats(&other), vec![350.0, 351.0, 352.0]);
+        // A wide read agrees with the data whatever the cache holds.
+        let wide = load_window(&schema, &meta, 0, (i64::MIN, i64::MAX), &want, true).unwrap().unwrap();
+        assert_eq!(floats(&wide), (0..400).map(f64::from).collect::<Vec<_>>());
+        let wide2 = load_window(&schema, &meta, 0, (500, 3000), &want, true).unwrap().unwrap();
+        assert_eq!(floats(&wide2), (50..=300).map(f64::from).collect::<Vec<_>>());
+        // Nothing in range.
+        assert!(load_window(&schema, &meta, 0, (100_000, 200_000), &want, true).unwrap().is_none());
     }
 
     #[test]

@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::mem;
 use std::sync::{Arc, OnceLock};
 
+use crate::fasthash::FastMap;
 use crate::schema::{Row, Schema, Value};
 
 pub(crate) struct MemRow {
@@ -22,7 +23,7 @@ pub(crate) struct MemRow {
 /// next ones (it is built on first use, once, from the immutable rows).
 pub(crate) struct Segment {
     rows: Vec<MemRow>,
-    by_series: OnceLock<Option<HashMap<u64, Vec<u32>>>>,
+    by_series: OnceLock<Option<FastMap<u64, Vec<u32>>>>,
 }
 
 /// Segments shorter than this are walked, never indexed.
@@ -36,13 +37,13 @@ impl Segment {
     /// Positions (within the segment) of the rows of each series. `None` for a
     /// segment that is too short, too long for `u32` positions or with too
     /// many distinct series for the charged memory: the caller walks its rows.
-    fn index(&self) -> Option<&HashMap<u64, Vec<u32>>> {
+    fn index(&self) -> Option<&FastMap<u64, Vec<u32>>> {
         self.by_series
             .get_or_init(|| {
                 if self.rows.len() < MIN_INDEXED_ROWS || u32::try_from(self.rows.len()).is_err() {
                     return None;
                 }
-                let mut m: HashMap<u64, Vec<u32>> = HashMap::new();
+                let mut m: FastMap<u64, Vec<u32>> = FastMap::default();
                 for (i, r) in self.rows.iter().enumerate() {
                     m.entry(r.series_id).or_default().push(i as u32);
                     // Memory stays within `INDEX_BYTES_PER_ROW` (already charged
@@ -252,7 +253,7 @@ impl MemTable {
         *self = MemTable::default();
     }
 
-    fn rows(&self) -> impl Iterator<Item = &MemRow> {
+    fn rows(&self) -> impl Iterator<Item = &MemRow> + Clone {
         self.frozen.iter().flat_map(|s| s.rows.iter()).chain(self.active.iter())
     }
 
@@ -294,19 +295,45 @@ impl MemTable {
 
 /// Groups rows by `bucket(ts)` and then by `series_id`, each series sorted by
 /// timestamp (stable, so equal timestamps keep arrival order).
+///
+/// Two passes over the rows: the first finds each row's group (one hash lookup
+/// per row) and counts, the second fills vectors that already have their final
+/// size, so a flush does not pay for the growth of thousands of small vectors.
 pub(crate) fn group_rows<'a>(
-    rows: impl Iterator<Item = &'a MemRow>,
+    rows: impl Iterator<Item = &'a MemRow> + Clone,
     schema: &Schema,
     bucket: impl Fn(i64) -> (i64, i64),
 ) -> BTreeMap<(i64, i64), BTreeMap<u64, Vec<&'a Row>>> {
-    let mut out: BTreeMap<(i64, i64), BTreeMap<u64, Vec<&Row>>> = BTreeMap::new();
-    for r in rows {
-        out.entry(bucket(schema.row_ts(&r.row))).or_default().entry(r.series_id).or_default().push(&r.row);
-    }
-    for series in out.values_mut() {
-        for rows in series.values_mut() {
-            rows.sort_by_key(|r| schema.row_ts(r));
+    // (bucket start, series) -> index in `groups`.
+    let mut index: HashMap<(i64, u64), u32> = HashMap::new();
+    let mut groups: Vec<((i64, i64), u64, usize)> = Vec::new();
+    let mut of_row: Vec<u32> = Vec::new();
+    let mut last: Option<(i64, i64)> = None;
+    for r in rows.clone() {
+        let ts = schema.row_ts(&r.row);
+        // Rows of a bucket arrive together far more often than not.
+        let b = match last {
+            Some(b) if ts >= b.0 && ts < b.1 => b,
+            _ => bucket(ts),
+        };
+        last = Some(b);
+        let next = groups.len();
+        let g = *index.entry((b.0, r.series_id)).or_insert(next as u32) as usize;
+        if g == next {
+            groups.push((b, r.series_id, 0));
         }
+        groups[g].2 += 1;
+        of_row.push(g as u32);
+    }
+    let mut filled: Vec<Vec<&Row>> = groups.iter().map(|&(_, _, n)| Vec::with_capacity(n)).collect();
+    for (r, &g) in rows.zip(&of_row) {
+        filled[g as usize].push(&r.row);
+    }
+    debug_assert_eq!(filled.iter().map(Vec::len).sum::<usize>(), of_row.len(), "both passes saw the same rows");
+    let mut out: BTreeMap<(i64, i64), BTreeMap<u64, Vec<&Row>>> = BTreeMap::new();
+    for ((b, sid, _), mut rows) in groups.into_iter().zip(filled) {
+        rows.sort_by_key(|r| schema.row_ts(r));
+        out.entry(b).or_default().insert(sid, rows);
     }
     out
 }

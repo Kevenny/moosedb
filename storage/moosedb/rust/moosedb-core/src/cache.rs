@@ -1,12 +1,12 @@
 //! Process-wide LRU caches: decoded chunk blocks (and decoded series, for
-//! random row fetches) and open chunk files.
+//! random row fetches, decoded columns of narrow reads) and open chunk files.
 //!
 //! All are keyed by a chunk file's `uid`, a process-unique number assigned
 //! when the file is opened, so entries never alias across tables or across a
-//! deleted-and-recreated path. Blocks and decoded series share one LRU and one
+//! deleted-and-recreated path. Blocks, decoded series and columns share one LRU and one
 //! byte budget (`moosedb_chunk_cache_size`).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::hash::Hash;
 use std::path::Path;
@@ -14,10 +14,11 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::block::ColumnData;
 use crate::error::Result;
+use crate::fasthash::{FastMap, FastState};
 use crate::settings;
 
 struct Lru<K, V> {
-    map: HashMap<K, (V, u64, usize)>,
+    map: FastMap<K, (V, u64, usize)>,
     order: BTreeMap<u64, K>,
     tick: u64,
     used: usize,
@@ -25,13 +26,24 @@ struct Lru<K, V> {
 
 impl<K: Hash + Eq + Clone, V: Clone> Lru<K, V> {
     fn new() -> Self {
-        Lru { map: HashMap::new(), order: BTreeMap::new(), tick: 0, used: 0 }
+        Lru { map: FastMap::default(), order: BTreeMap::new(), tick: 0, used: 0 }
     }
 
     fn get(&mut self, k: &K) -> Option<V> {
         self.tick += 1;
         let tick = self.tick;
+        // An entry among the most recently used ~6% keeps its place: a hot
+        // entry read in a loop would otherwise rewrite the order map on every
+        // hit. The LRU is therefore approximate: ticks count every get and
+        // insert, so an entry touched within the last `len / 16` ticks is
+        // treated as fresh and its recency is not updated; it can be evicted
+        // up to that many ticks "too early" relative to exact LRU. (Small
+        // caches, `len < 16`, always refresh, so their order stays exact.)
+        let fresh = (self.map.len() / 16) as u64;
         let (v, t, _) = self.map.get_mut(k)?;
+        if tick - *t <= fresh {
+            return Some(v.clone());
+        }
         self.order.remove(t);
         *t = tick;
         self.order.insert(tick, k.clone());
@@ -101,12 +113,14 @@ enum CacheKey {
     Block(u64, u64),
     /// (file uid, series entry index)
     Series(u64, u32),
+    /// (file uid, series entry index, schema column)
+    Column(u64, u32, u32),
 }
 
 impl CacheKey {
     fn uid(&self) -> u64 {
         match self {
-            CacheKey::Block(uid, _) | CacheKey::Series(uid, _) => *uid,
+            CacheKey::Block(uid, _) | CacheKey::Series(uid, _) | CacheKey::Column(uid, _, _) => *uid,
         }
     }
 }
@@ -115,6 +129,7 @@ impl CacheKey {
 enum Cached {
     Block(Arc<BlockPayload>),
     Series(Arc<DecodedSeries>),
+    Column(Arc<ColumnData>),
 }
 
 fn blocks() -> &'static Mutex<Lru<CacheKey, Cached>> {
@@ -130,7 +145,7 @@ fn files() -> &'static Mutex<Lru<u64, Arc<File>>> {
 pub(crate) fn get_block(uid: u64, offset: u64) -> Option<Arc<BlockPayload>> {
     match blocks().lock().ok()?.get(&CacheKey::Block(uid, offset))? {
         Cached::Block(b) => Some(b),
-        Cached::Series(_) => None,
+        _ => None,
     }
 }
 
@@ -152,7 +167,7 @@ pub(crate) fn put_block(uid: u64, offset: u64, block: Arc<BlockPayload>) {
 pub(crate) fn get_series(uid: u64, index: u32) -> Option<Arc<DecodedSeries>> {
     match blocks().lock().ok()?.get(&CacheKey::Series(uid, index))? {
         Cached::Series(s) => Some(s),
-        Cached::Block(_) => None,
+        _ => None,
     }
 }
 
@@ -166,6 +181,47 @@ pub(crate) fn put_series(uid: u64, index: u32, series: Arc<DecodedSeries>) {
     if let Ok(mut c) = blocks().lock() {
         c.insert(CacheKey::Series(uid, index), Cached::Series(series), size, capacity);
     }
+}
+
+/// A fully decoded data column of one series (all its rows), kept for the
+/// narrow reads that would otherwise decode the same column again and again.
+pub(crate) fn get_column(uid: u64, series: u32, col: u32) -> Option<Arc<ColumnData>> {
+    match blocks().lock().ok()?.get(&CacheKey::Column(uid, series, col))? {
+        Cached::Column(c) => Some(c),
+        _ => None,
+    }
+}
+
+/// Keeps a decoded column; one bigger than the whole cache is not kept.
+pub(crate) fn put_column(uid: u64, series: u32, col: u32, data: Arc<ColumnData>) {
+    let capacity = capacity();
+    if capacity == 0 {
+        return;
+    }
+    let size = data.heap_bytes() + 64;
+    if let Ok(mut c) = blocks().lock() {
+        c.insert(CacheKey::Column(uid, series, col), Cached::Column(data), size, capacity);
+    }
+}
+
+/// Slots of the "touched once" table (8 bytes each).
+const TOUCH_SLOTS: usize = 1 << 16;
+
+/// Whether this (chunk file, series, column) was decoded before; marks it as
+/// touched. A column read for the first time is decoded for the rows at hand
+/// and not kept; one read again is decoded whole and cached (see
+/// `chunk_reader::load_window`), so a scan that visits every series once never
+/// fills the cache, while queries that repeat do. Fixed-size, direct-mapped:
+/// a collision can only make a column look seen (it gets cached) or forget it.
+pub(crate) fn touched_before(uid: u64, series: u32, col: u32) -> bool {
+    static SLOTS: OnceLock<Mutex<Vec<u64>>> = OnceLock::new();
+    let hash = std::hash::BuildHasher::hash_one(&FastState::default(), (uid, series, col)) | 1;
+    let slots = SLOTS.get_or_init(|| Mutex::new(vec![0; TOUCH_SLOTS]));
+    let Ok(mut slots) = slots.lock() else { return false };
+    let slot = &mut slots[(hash >> 1) as usize % TOUCH_SLOTS];
+    let seen = *slot == hash;
+    *slot = hash;
+    seen
 }
 
 /// Applies a new capacity at once: entries over it are evicted now, not at

@@ -29,7 +29,7 @@ use std::collections::{BinaryHeap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use crate::chunk::ChunkMeta;
-use crate::chunk_reader::{fetch_row, load_window, Window};
+use crate::chunk_reader::{fetch_row, load_more_columns, load_window, Window};
 use crate::error::{invalid, Error, Result};
 use crate::memtable::MemSnapshot;
 use crate::rowbatch::{Plan, ScanBatch, DEFAULT_BATCH_ROWS, MAX_BATCH_ROWS};
@@ -308,18 +308,10 @@ impl Scan {
                 )));
             }
         }
-        // Tie-ordered scans must decode the tie columns even when not asked for.
+        // Tie-ordered scans need the tie columns only for rows of equal timestamp
+        // (decoded then, per run: see `merge_fill_tie`), not for every row.
         let tie: Vec<usize> = if sorted { tie.to_vec() } else { Vec::new() };
-        let forced: Option<Vec<bool>> = (!tie.is_empty()).then(|| {
-            let mut m: Vec<bool> = projection.map_or_else(|| vec![true; snap.schema.columns().len()], <[bool]>::to_vec);
-            for &c in &tie {
-                if let Some(w) = m.get_mut(c) {
-                    *w = true;
-                }
-            }
-            m
-        });
-        let plan = Plan::new(&snap.schema, forced.as_deref().or(projection));
+        let plan = Plan::new(&snap.schema, projection);
         let mut scan = Scan {
             snap,
             filter,
@@ -589,16 +581,45 @@ impl Scan {
                     let i = if desc { c.back - 1 } else { c.front };
                     let entry = &meta.series[*series];
                     let key = run_key(*chunk, *series);
-                    if !batch.tags_room(plan, key, &entry.tags) || batch.fit_window(plan, &c.win, i, 1) == 0 {
+                    // Ascending: every row of this run that sorts before the best
+                    // row of the other runs leaves in one go (a run is sorted, and
+                    // the keys of different rows never tie).
+                    let mut n = 1;
+                    if !desc {
+                        if let Some(ts) = c.win.ts_slice() {
+                            debug_assert!(c.back <= ts.len(), "the window holds the timestamps of rows [0, hi)");
+                            let rest = ts.get(i..c.back).unwrap_or(&[]);
+                            n = match m.heap.peek() {
+                                None => rest.len(),
+                                Some(best) => {
+                                    let bound = best.key;
+                                    let (mut lo, mut hi) = (0usize, rest.len());
+                                    while lo < hi {
+                                        let mid = lo + (hi - lo) / 2;
+                                        if (rest[mid], meta.id, base + (i + mid) as u64) < bound {
+                                            lo = mid + 1;
+                                        } else {
+                                            hi = mid;
+                                        }
+                                    }
+                                    lo
+                                }
+                            }
+                            .clamp(1, max - batch.rows());
+                        }
+                    }
+                    let n = batch.fit_window(plan, &c.win, i, n);
+                    if !batch.tags_room(plan, key, &entry.tags) || n == 0 {
                         m.heap.push(top);
                         break;
                     }
-                    batch.push_window(plan, &c.win, &entry.tags, key, meta.id, base, i, 1);
-                    m.last = Some((c.win.ts_at(i)?, meta.id, base + i as u64));
+                    batch.push_window(plan, &c.win, &entry.tags, key, meta.id, base, i, n);
+                    let last_i = if desc { i } else { i + n - 1 };
+                    m.last = Some((c.win.ts_at(last_i)?, meta.id, base + last_i as u64));
                     if desc {
                         c.back -= 1;
                     } else {
-                        c.front += 1;
+                        c.front += n;
                     }
                     if c.front < c.back {
                         m.heap.push(HeapEntry { key: next_key(c)?, run: top.run, desc });
@@ -691,6 +712,51 @@ impl Scan {
                 continue;
             }
 
+            // Fast path (ascending): rows of the run on top whose timestamp is
+            // below everything the other runs hold and differs from the next row
+            // of the run are single-row groups: no tie to break, no group to build.
+            let mut first = heap.pop();
+            if !desc {
+                if let Some(top_run) = first.as_ref().map(|h| h.run) {
+                    if let Some(Run::Chunk { chunk, series, loaded: true, cur: Some(c) }) = runs.get_mut(top_run) {
+                        let meta = &snap.chunks[*chunk];
+                        let base = meta.series_offsets[*series];
+                        let entry = &meta.series[*series];
+                        let key = run_key(*chunk, *series);
+                        if let Some(ts) = c.win.ts_slice() {
+                            debug_assert!(c.back <= ts.len(), "the window holds the timestamps of rows [0, hi)");
+                            let rest = ts.get(c.front..c.back).unwrap_or(&[]);
+                            let below = match heap.peek() {
+                                None => rest.len(),
+                                Some(best) => rest.partition_point(|&t| t < best.key.0),
+                            };
+                            let mut n = below.min(max - batch.rows());
+                            // A row followed by one of the same timestamp starts a group.
+                            if let Some(pos) = rest[..(n + 1).min(rest.len())].windows(2).position(|w| w[0] == w[1]) {
+                                n = pos;
+                            }
+                            let n = if n > 0 && batch.tags_room(plan, key, &entry.tags) {
+                                batch.fit_window(plan, &c.win, c.front, n)
+                            } else {
+                                0
+                            };
+                            if n > 0 {
+                                batch.push_window(plan, &c.win, &entry.tags, key, meta.id, base, c.front, n);
+                                let l = c.front + n - 1;
+                                *last = Some((ts[l], meta.id, base + l as u64));
+                                c.front += n;
+                                if c.front < c.back {
+                                    let j = c.front;
+                                    heap.push(HeapEntry { key: (ts[j], meta.id, base + j as u64), run: top_run, desc });
+                                }
+                                first = None;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+
             // Collect every row of the next timestamp.
             let mut group: Vec<Pend> = Vec::new();
             let mut t0: Option<i64> = None;
@@ -700,7 +766,7 @@ impl Scan {
                         Some(h) if h.key.0 == t => heap.pop(),
                         _ => None,
                     },
-                    None => heap.pop(),
+                    None => first.take().or_else(|| heap.pop()),
                 };
                 let Some(top) = entry else { break };
                 let Some(run) = runs.get_mut(top.run) else { continue };
@@ -724,6 +790,7 @@ impl Scan {
                             continue;
                         }
                         let Some(c) = cur else { continue };
+                        load_more_columns(&snap.schema, meta, *series, &mut c.win, tie)?;
                         let i = if desc { c.back - 1 } else { c.front };
                         let ts = c.win.ts_at(i)?;
                         let mut x = [i64::MIN; 2];

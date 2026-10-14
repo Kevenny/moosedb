@@ -352,6 +352,91 @@ Segmento cifrado só com header não exige a chave no replay.
   constantes string em inteiras antes de `cond_push` (`convert_const_to_int`),
   então o handler já recebe a constante `INT`.
 
+## Desempenho: ingestão e leitura em série
+
+Medido com o benchmark do laboratório Zabbix (`lab/zabbix/scripts/bench.sh`:
+10.080 statements `INSERT … SELECT` de 5.000 linhas em autocommit, em ordem de
+clock; depois agregações por hora sobre 100 itens × 24 h). Nenhuma mudança de
+ABI (`moosedb_ffi.h` intacto), de formato em disco ou do protocolo de
+durabilidade: o COMMIT do WAL continua sendo gravado e sincronizado antes de a
+MemTable publicar as linhas, e o `fsync` por statement continua (o mesmo que o
+`innodb_flush_log_at_trx_commit=1` do InnoDB no laboratório).
+
+**Perfil da ingestão** (`perf record --call-graph dwarf` no `mariadbd`, tabela
+com `PRIMARY KEY`; ~85 % das amostras no thread do statement): avaliação das
+expressões do `SELECT` pelo servidor 18 % (fora do engine), `batch_write` 26 %,
+flush em linha na hora do commit (MemTable cheia → chunk, sob o mutex) 23 %,
+commit sem flush 10 %, compactação em background 15 % (outro thread). Por
+função: `gorilla::encode` bit a bit 8,8 %, `malloc/free` ≈ 15 % (tags clonadas,
+chave da série, payload do WAL e vetor de ids **por linha**), SipHash 6 %,
+CRC32 3 %, ZSTD de blocos pequenos 6 %, `Arc<Segment>::drop` 2,7 %.
+
+O que mudou (ganho medido no reprodutor, 5.000 itens, v4 com PK, ~485 → ~628
+k linhas/s no conjunto; InnoDB ~570 k na mesma sessão):
+
+* **Hash rápido só para chaves internas** (`fasthash.rs`): multiplicação
+  dobrada com uma semente por processo, sem garantia contra colisões forjadas,
+  por isso usada apenas em mapas cujas chaves o cliente não escolhe (ids de
+  série, uids de chunk, posições): `tags_by_id`, estado de unicidade, índice por
+  segmento da MemTable, LRU do cache. Mapas com chaves vindas do cliente
+  (`SeriesIndex::by_key`, `Batch::local_ids`, `Batch::own`, agrupamento do
+  flush) usam `std::collections::HashMap` (SipHash, `RandomState` por mapa);
+  o custo medido dessa escolha na carga foi ~4 % (v4: ~650 → ~625 k linhas/s).
+* **`Batch::write` sem alocação por linha**: a chave da série e o payload do
+  WAL são codificados em buffers reutilizados do lote (`wal::row_entry_into`);
+  as tags só são materializadas quando a série é nova (a série guarda a
+  posição da primeira linha em `local_first`, em vez de uma cópia das tags).
+  No commit, tabelas com chave única reaproveitam os ids globais resolvidos em
+  `admit`; as demais resolvem por chave já codificada, na ordem de chegada
+  (os ids continuam sendo atribuídos como antes).
+* **Dica de tamanho do lote** (`Table::batch_hint`): o statement seguinte
+  reserva linhas/séries do anterior (teto 4096, `try_reserve`: se o alocador recusar, cresce normalmente), fora do orçamento dos lotes por ser < 1 MiB.
+* **Gorilla com acumulador de 64 bits** (`BitWriter`), byte a byte idêntico ao
+  formato anterior (teste contra o escritor bit a bit); `group_rows` do flush
+  em duas passadas (contagem e preenchimento com capacidade exata).
+
+**Leitura** (agregação de 100 itens × 24 h e self-join `AGGREGATE_LAST`):
+
+* **Merge por corridas** (`Scan::merge_fill`, `merge_fill_tie`): em varredura
+  ascendente, as linhas da série no topo que ordenam antes da melhor linha das
+  outras corridas saem juntas (busca binária no `ts` da janela + um
+  `push_window` de k linhas), em vez de um push/pop de heap por linha. Em
+  tabelas com chave única, uma linha cujo timestamp difere do próximo da
+  corrida e é menor que o das outras é um grupo de um elemento (sem
+  desempate, sem `Vec<Pend>`); só timestamps repetidos usam o caminho de
+  grupos, e as colunas extras da chave são **decodificadas sob demanda**
+  (`chunk_reader::load_more_columns`) em vez de forçadas na projeção. Descendente
+  segue linha a linha.
+* **Cache de colunas decodificadas** (`cache::get_column/put_column`, compartilha
+  o orçamento de `moosedb_chunk_cache_size`): leitura **estreita** (≤ 1/8 de uma
+  série de até 65.536 linhas: lookup por `(itemid, clock)`, última hora de um
+  dia) decodifica a coluna inteira uma vez e a guarda; leitura larga só guarda
+  a partir da 2ª vez que vê a mesma (arquivo, série, coluna)
+  (`cache::touched_before`, tabela direta de 64 K slots) — uma varredura que
+  passa por cada série uma vez não polui o cache. O LRU não reordena entradas
+  entre as ~6 % mais recentes.
+* **Handler**: coluna TAG inteira usa o mesmo memo de `fill_from_batch` que as
+  TAGs string (o texto da série é parseado uma vez por corrida, não por linha).
+
+Resultados (mesmo container, 5.000 itens × 7 d × 60 s; `lab/zabbix/README.md`):
+
+| | InnoDB | v3 antes → depois | v4 antes → depois |
+|---|---:|---:|---:|
+| carga (linhas/s) | 497 k → 527 k | 409 k → 652 k | 371 k → 644 k |
+| `agg_hour` (ms) | 27,6 → 27,8 | 32,0 → 25,2 | 35,9 → 27,2 |
+| `agg_last` (ms) | 0,76 → 0,78 | 1,05 → 0,86 | 1,15 → 0,93 (0,75–0,85 em 15 repetições) |
+
+**O que sobrou.** (1) O flush ainda é síncrono, sob o mutex da tabela, no commit
+que enche a MemTable: ~19 % do tempo do statement, dos quais ZSTD de blocos
+pequenos (~570 B por série/coluna) é a maior parte e a liberação das 350 mil
+linhas (`Arc<Segment>::drop`) ~3 %. Escrever o flush de dados "frios por idade" com
+LZ4 e deixar a recodificação para a compactação cortaria ~5 %, mas muda o codec
+observável logo após o flush (testes MTR de compressão) — não feito. (2)
+`ha_moosedb::fill_from_batch` custa ~14 % da agregação (um `Field::store` virtual
+por coluna e linha). (3) `agg_last` com PK segue ~5–10 % acima do InnoDB: ~50
+lookups `(itemid, clock[, ns])` por consulta, cada um abre um scan (alocação de
+um `ScanBatch` por scan); reaproveitar os buffers entre scans é o próximo passo.
+
 ## Manutenção em background
 
 `moosedb_compaction_threads` workers + um agendador (tick de 1 s) percorrem

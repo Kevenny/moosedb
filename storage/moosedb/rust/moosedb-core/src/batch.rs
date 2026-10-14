@@ -44,17 +44,18 @@
 //!   keeps them until it commits or aborts (the warning is logged once per batch).
 //!   Evicting it instead would fail a statement the binlog already recorded.
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, MutexGuard};
 use std::time::{Duration, Instant};
 
 use crate::chunk::ChunkMeta;
 use crate::chunk_writer::{chunks_needed, write_bucket, SeriesParts};
+use crate::codec::encode_value;
 use crate::compaction::split_series;
 use crate::error::{corrupt, invalid, Error, Result};
+use crate::fasthash::FastMap;
 use crate::fsutil::{is_fsync_error, sync_dir};
-use crate::index::series::{row_tags, series_key};
+use crate::index::series::row_tags;
 use crate::log::warn;
 use crate::memtable::{group_rows, row_bytes, MemRow};
 use crate::scan::Snapshot;
@@ -62,11 +63,25 @@ use crate::schema::{Row, Schema, Value};
 use crate::table::{Inner, OpenBatch, Table};
 use crate::unique::{existing_extras, Claim, Extras, Plan, UniqueSpec};
 use crate::wal;
+use std::collections::HashMap;
 
 /// Bytes held by the row buffers of every open batch of the process.
 static BATCH_BYTES: AtomicU64 = AtomicU64::new(0);
 /// A batch smaller than this is never spilled because of the global budget.
 const MIN_FORCED_SPILL: usize = 1 << 20;
+/// Most rows / series a new batch reserves up front from the previous one
+/// (4096 rows x 40 B + 4096 series x ~50 B: well under a MiB per statement).
+const BATCH_HINT_CAP: usize = 4096;
+
+/// An empty vector with room for `n` items when `wanted`; an allocator that
+/// refuses leaves it empty (normal growth), never aborts.
+fn reserved<T>(n: usize, wanted: bool) -> Vec<T> {
+    let mut v = Vec::new();
+    if wanted && n >= 16 {
+        let _ = v.try_reserve(n);
+    }
+    v
+}
 
 /// Bytes the open batches of this process hold in memory right now (rows plus
 /// series bookkeeping): what `moosedb_batch_memory_budget` limits.
@@ -79,13 +94,13 @@ fn budget() -> u64 {
 }
 
 /// Memory of one new series in a batch: the key in `local_ids`, its map
-/// entry, and the tag values in `local_tags`.
-fn series_cost(key_len: usize, tags: &[Value]) -> usize {
+/// entry, and the tag values (held by the first row of the series).
+fn series_cost<'a>(key_len: usize, tags: impl Iterator<Item = &'a Value>) -> usize {
     key_len
         + std::mem::size_of::<Vec<u8>>()
         + 16
         + std::mem::size_of::<Vec<Value>>()
-        + tags.iter().map(Value::mem_size).sum::<usize>()
+        + tags.map(Value::mem_size).sum::<usize>()
 }
 
 pub struct Batch {
@@ -93,11 +108,11 @@ pub struct Batch {
     id: u64,
     /// `Inner::epoch` when the batch began.
     epoch: u64,
-    /// Buffered rows; `series_id` is an index into `local_tags` until commit.
+    /// Buffered rows; `series_id` is an index into `local_first` until commit.
     rows: Vec<MemRow>,
     /// Sum of `row_bytes` over `rows` (what the MemTable will account).
     bytes: usize,
-    /// Bytes of `local_ids` and `local_tags`.
+    /// Bytes of `local_ids` and the tag values of the first rows of the series.
     series_bytes: usize,
     /// What this batch has added to `BATCH_BYTES` and not yet given back.
     accounted: usize,
@@ -107,7 +122,14 @@ pub struct Batch {
     /// Set by a flush when this batch pins too many WAL segments.
     spill_hint: Arc<AtomicBool>,
     local_ids: HashMap<Vec<u8>, u64>,
-    local_tags: Vec<Vec<Value>>,
+    /// Position in `rows` of the first row of each local series: its tag
+    /// values are read from there when a series needs them (a new global
+    /// series at commit, a spill), so a series costs one key allocation per
+    /// statement, not a copy of its tags.
+    local_first: Vec<usize>,
+    /// Reused encoding buffers of `write` (series key, WAL payload).
+    key_buf: Vec<u8>,
+    wal_buf: Vec<u8>,
     /// Rows were logged to the WAL and the batch is registered as open there.
     logged: bool,
     /// The batch moved to the spill path: no more WAL logging.
@@ -161,28 +183,41 @@ impl Table {
         let epoch = inner.epoch;
         drop(guard);
         let spill_limit = usize::try_from(self.config.opts.memtable_size_bytes).unwrap_or(usize::MAX).max(1);
+        // A statement like the last one: reserve its buffers now. The reserve is
+        // small (a few hundred KiB at most, outside the batch budget by design)
+        // and degrades to normal growth if the allocator refuses it.
+        let hint = self.batch_hint.load(Ordering::Relaxed);
+        let (hint_rows, hint_series) = ((hint >> 32) as usize, (hint & 0xFFFF_FFFF) as usize);
+        let (hint_rows, hint_series) = (hint_rows.min(BATCH_HINT_CAP), hint_series.min(BATCH_HINT_CAP));
+        let unique_hint = self.config.unique.is_some();
+        let mut local_ids = HashMap::new();
+        if hint_series >= 16 {
+            let _ = local_ids.try_reserve(hint_series);
+        }
         Ok(Batch {
             table: self.clone(),
             id,
             epoch,
-            rows: Vec::new(),
+            rows: reserved(hint_rows, true),
             bytes: 0,
             series_bytes: 0,
             accounted: 0,
             ts_min: i64::MAX,
             ts_max: i64::MIN,
             spill_hint: Arc::new(AtomicBool::new(false)),
-            local_ids: HashMap::new(),
-            local_tags: Vec::new(),
+            local_ids,
+            local_first: reserved(hint_series, true),
+            key_buf: Vec::new(),
+            wal_buf: Vec::new(),
             logged: false,
             spilled: false,
             staged: Vec::new(),
             spill_limit,
             finished: false,
             unique_checks: true,
-            claimed: Vec::new(),
+            claimed: reserved(hint_series, unique_hint),
             unchecked: std::collections::HashSet::new(),
-            local_gid: Vec::new(),
+            local_gid: reserved(hint_series, unique_hint),
             own: None,
         })
     }
@@ -243,21 +278,38 @@ impl Batch {
         if !self.rows.is_empty() && self.should_spill() {
             self.spill()?;
         }
+        // The series key and the WAL payload are encoded into buffers the batch
+        // keeps between rows (no allocation per row once they have grown).
+        let mut key = std::mem::take(&mut self.key_buf);
+        let mut wal_buf = std::mem::take(&mut self.wal_buf);
+        let result = self.write_row(&table, row, &mut key, &mut wal_buf);
+        self.key_buf = key;
+        self.wal_buf = wal_buf;
+        result
+    }
+
+    fn write_row(&mut self, table: &Arc<Table>, row: Row, key: &mut Vec<u8>, wal_buf: &mut Vec<u8>) -> Result<()> {
         let payload = if self.spilled {
             None
         } else {
-            let p = wal::row_entry(self.id, &row);
+            wal::row_entry_into(wal_buf, self.id, &row);
             // An oversized row is the caller's mistake, not a storage failure.
-            if p.len() > wal::max_entry() {
-                return Err(invalid(format!("row of {} bytes exceeds the {} byte limit", p.len(), wal::max_entry())));
+            if wal_buf.len() > wal::max_entry() {
+                return Err(invalid(format!(
+                    "row of {} bytes exceeds the {} byte limit",
+                    wal_buf.len(),
+                    wal::max_entry()
+                )));
             }
-            Some(p)
+            Some(&wal_buf[..])
         };
-        let tags = row_tags(&table.schema, &row);
-        let key = series_key(&tags);
+        key.clear();
+        for &i in table.schema.tag_indices() {
+            encode_value(key, &row[i]);
+        }
         let ts = table.schema.row_ts(&row);
         let gid = match table.config.unique.as_ref() {
-            Some(spec) => Some(self.admit(spec, &key, &tags, &row, ts, payload.as_deref())?),
+            Some(spec) => Some(self.admit(spec, key, &row, ts, payload)?),
             None => {
                 if let Some(p) = payload {
                     let mut guard = table.lock()?;
@@ -266,22 +318,23 @@ impl Batch {
                     if inner.epoch != self.epoch {
                         return Err(stale());
                     }
-                    self.log_row(inner, &p)?;
+                    self.log_row(inner, p)?;
                 }
                 None
             }
         };
         let rb = row_bytes(&row);
         let mut added = rb;
-        let local = match self.local_ids.get(&key) {
+        let local = match self.local_ids.get(&key[..]) {
             Some(&l) => l,
             None => {
-                let l = self.local_tags.len() as u64;
-                let cost = series_cost(key.len(), &tags);
+                let l = self.local_first.len() as u64;
+                let tags = table.schema.tag_indices().iter().map(|&i| &row[i]);
+                let cost = series_cost(key.len(), tags);
                 self.series_bytes += cost;
                 added += cost;
-                self.local_tags.push(tags);
-                self.local_ids.insert(key, l);
+                self.local_first.push(self.rows.len());
+                self.local_ids.insert(key.clone(), l);
                 if let Some(g) = gid {
                     self.local_gid.push(g);
                 }
@@ -304,6 +357,12 @@ impl Batch {
         Ok(())
     }
 
+    /// Tag values of every local series, in local-id order (read from the
+    /// first buffered row of each).
+    fn local_tags(&self) -> Vec<Vec<Value>> {
+        self.local_first.iter().map(|&i| row_tags(&self.table.schema, &self.rows[i].row)).collect()
+    }
+
     /// Appends the row to the WAL and registers the batch as open there.
     fn log_row(&mut self, inner: &mut Inner, p: &[u8]) -> Result<()> {
         if let Err(e) = inner.wal.append(p) {
@@ -321,15 +380,7 @@ impl Batch {
 
     /// UNIQUE tables: claims the row's series, checks the key, logs the row and
     /// records the key. Returns the global id of the series.
-    fn admit(
-        &mut self,
-        spec: &UniqueSpec,
-        key: &[u8],
-        tags: &[Value],
-        row: &Row,
-        ts: i64,
-        payload: Option<&[u8]>,
-    ) -> Result<u64> {
+    fn admit(&mut self, spec: &UniqueSpec, key: &[u8], row: &Row, ts: i64, payload: Option<&[u8]>) -> Result<u64> {
         let table = self.table.clone();
         let Some(ex) = spec.extras_of(row) else {
             return Err(invalid("a column of the UNIQUE key is NULL"));
@@ -344,7 +395,7 @@ impl Batch {
             if inner.epoch != self.epoch {
                 return Err(stale());
             }
-            sid = inner.series.get_or_insert_keyed(key, tags);
+            sid = inner.series.get_or_insert_keyed_with(key, || row_tags(&table.schema, row));
             if checks {
                 match inner.uniq.claim(sid, self.id) {
                     Claim::Held { new } => {
@@ -483,7 +534,8 @@ impl Batch {
 
     /// Writes the buffered rows as staged chunks and drops them from memory.
     fn spill(&mut self) -> Result<()> {
-        let metas = stage_rows(&self.table, &self.rows, &self.local_tags, self.epoch)?;
+        let local_tags = self.local_tags();
+        let metas = stage_rows(&self.table, &self.rows, &local_tags, self.epoch)?;
         self.staged.extend(metas.into_iter().map(Arc::new));
         self.rows = Vec::new();
         self.bytes = 0;
@@ -492,7 +544,7 @@ impl Batch {
         self.ts_max = i64::MIN;
         self.release_budget();
         self.local_ids = HashMap::new();
-        self.local_tags = Vec::new();
+        self.local_first = Vec::new();
         self.local_gid = Vec::new();
         self.own = None;
         if !self.spilled {
@@ -553,7 +605,28 @@ impl Batch {
             }
             self.finished = true;
             inner.open_batches.remove(&self.id);
-            let ids: Vec<u64> = self.local_tags.iter().map(|tags| inner.series.get_or_insert(tags)).collect();
+            // Global id of each local series. A UNIQUE table already resolved
+            // them while admitting the rows (same epoch, checked above).
+            let ids: Vec<u64> = if self.local_gid.len() == self.local_first.len() {
+                std::mem::take(&mut self.local_gid)
+            } else {
+                // Arrival order, so ids are assigned as they always were.
+                let mut ids = Vec::with_capacity(self.local_first.len());
+                let mut key = std::mem::take(&mut self.key_buf);
+                for &first in &self.local_first {
+                    let row = &self.rows[first].row;
+                    key.clear();
+                    for &i in table.schema.tag_indices() {
+                        encode_value(&mut key, &row[i]);
+                    }
+                    ids.push(inner.series.get_or_insert_keyed_with(&key, || row_tags(&table.schema, row)));
+                }
+                self.key_buf = key;
+                ids
+            };
+            let hint =
+                ((self.rows.len() as u64).min(u64::from(u32::MAX)) << 32) | (ids.len() as u64).min(u64::from(u32::MAX));
+            table.batch_hint.store(hint, Ordering::Relaxed);
             let mut rows = std::mem::take(&mut self.rows);
             for r in &mut rows {
                 r.series_id = ids[r.series_id as usize];
@@ -670,7 +743,7 @@ fn stage_rows(table: &Table, rows: &[MemRow], local_tags: &[Vec<Value>], epoch: 
         if inner.epoch != epoch {
             return Err(stale());
         }
-        let mut global: HashMap<u64, u64> = HashMap::new();
+        let mut global: FastMap<u64, u64> = FastMap::default();
         for series in groups.values() {
             for &local in series.keys() {
                 global.entry(local).or_insert_with(|| inner.series.get_or_insert(&local_tags[local as usize]));

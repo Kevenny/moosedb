@@ -10,27 +10,49 @@ use crate::error::{corrupt, Result};
 
 struct BitWriter {
     buf: Vec<u8>,
-    /// Bits already used in the last byte (0 = start a new byte).
+    /// Pending bits not yet in `buf`: the low `used` (< 8) bits of `acc`.
+    acc: u64,
     used: u32,
 }
 
 impl BitWriter {
-    fn bit(&mut self, b: bool) {
-        if self.used == 0 {
-            self.buf.push(0);
-        }
-        if b {
-            if let Some(last) = self.buf.last_mut() {
-                *last |= 0x80 >> self.used;
-            }
-        }
-        self.used = (self.used + 1) % 8;
+    fn new(capacity: usize) -> BitWriter {
+        BitWriter { buf: Vec::with_capacity(capacity), acc: 0, used: 0 }
     }
 
+    #[inline]
+    fn bit(&mut self, b: bool) {
+        self.bits(u64::from(b), 1);
+    }
+
+    /// Appends the low `n <= 64` bits of `v`, most significant first.
+    #[inline]
     fn bits(&mut self, v: u64, n: u32) {
-        for i in (0..n).rev() {
-            self.bit((v >> i) & 1 == 1);
+        if n == 0 {
+            return;
         }
+        if n > 32 {
+            // `used < 8` plus 32 new bits always fits the 64-bit accumulator.
+            self.bits(v >> 32, n - 32);
+            self.bits(v & 0xFFFF_FFFF, 32);
+            return;
+        }
+        let v = v & ((1u64 << n) - 1);
+        self.acc = (self.acc << n) | v;
+        self.used += n;
+        while self.used >= 8 {
+            self.used -= 8;
+            self.buf.push((self.acc >> self.used) as u8);
+        }
+        self.acc &= (1u64 << self.used) - 1;
+    }
+
+    /// Flushes the partial last byte (padded with zero bits) and returns the stream.
+    fn finish(mut self) -> Vec<u8> {
+        if self.used > 0 {
+            self.buf.push((self.acc << (8 - self.used)) as u8);
+        }
+        self.buf
     }
 }
 
@@ -84,7 +106,7 @@ impl BitReader<'_> {
 
 pub(crate) fn encode(values: &[u64], width: u32, out: &mut Vec<u8>) {
     let Some(&first) = values.first() else { return };
-    let mut w = BitWriter { buf: Vec::with_capacity(values.len() * 2), used: 0 };
+    let mut w = BitWriter::new(values.len() * 2);
     w.bits(first, width);
     let mut prev = first;
     let mut window: Option<(u32, u32)> = None; // (leading, trailing) of the last stored XOR
@@ -113,7 +135,7 @@ pub(crate) fn encode(values: &[u64], width: u32, out: &mut Vec<u8>) {
             }
         }
     }
-    out.extend_from_slice(&w.buf);
+    out.extend_from_slice(&w.finish());
 }
 
 #[cfg(test)]
@@ -221,6 +243,71 @@ mod tests {
             assert_eq!(decode_prefix(&buf, bits.len(), upto, 64).unwrap(), bits[..upto.min(500)], "upto {upto}");
         }
         assert!(decode_prefix(&buf[..buf.len() / 2], bits.len(), 499, 64).is_err());
+    }
+
+    #[test]
+    fn bit_writer_matches_the_bit_by_bit_layout() {
+        // Reference: one bit at a time, most significant first, zero padded.
+        let mut state = 0x1234_5678_9ABC_DEF0u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut w = BitWriter::new(0);
+        let mut reference: Vec<bool> = Vec::new();
+        for _ in 0..5000 {
+            let n = (next() % 65) as u32;
+            let v = next();
+            w.bits(v, n);
+            for i in (0..n).rev() {
+                reference.push((v >> i) & 1 == 1);
+            }
+            let b = next() % 2 == 1;
+            w.bit(b);
+            reference.push(b);
+        }
+        let mut want = vec![0u8; reference.len().div_ceil(8)];
+        for (i, &b) in reference.iter().enumerate() {
+            if b {
+                want[i / 8] |= 0x80 >> (i % 8);
+            }
+        }
+        assert_eq!(w.finish(), want);
+    }
+
+    /// Streams written by the bit-by-bit writer that preceded the 64-bit
+    /// accumulator (bytes captured from it): the new encoder must reproduce
+    /// them exactly and the decoder must read them.
+    #[test]
+    #[allow(clippy::approx_constant)] // arbitrary values of the captured fixture
+    fn streams_of_the_old_bit_writer_are_unchanged() {
+        let f64s: Vec<u64> =
+            [20.0f64, 20.0, 20.25, 20.5, 20.5, 19.75, -0.0, 0.0, 1e-300, f64::MAX, 3.14159, 3.14159, 2.71828]
+                .iter()
+                .map(|f| f.to_bits())
+                .collect();
+        let old64: &[u8] = &[
+            0x40, 0x34, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x71, 0x03, 0xc0, 0x1d, 0xb4, 0x4e, 0xe0, 0x47, 0x00, 0xcf,
+            0xa0, 0x00, 0x0c, 0xfc, 0x69, 0x5b, 0x87, 0xf0, 0xbe, 0x3c, 0xd6, 0x70, 0xfb, 0xf9, 0x2a, 0x47, 0x80, 0xf4,
+            0x1c, 0x32, 0x9e, 0x2f, 0x7f, 0xe6, 0xde, 0x06, 0x0f, 0xe4, 0x79, 0x91, 0x40, 0x06, 0x4f, 0x78, 0x32, 0xd8,
+            0xb8, 0xff, 0x00,
+        ];
+        let mut out = Vec::new();
+        encode(&f64s, 64, &mut out);
+        assert_eq!(out, old64);
+        assert_eq!(decode(old64, f64s.len(), 64).unwrap(), f64s);
+
+        let f32s: Vec<u64> = [1.5f32, 1.5, -2.25, 0.1, 3.4e38, 0.1].iter().map(|f| u64::from(f.to_bits())).collect();
+        let old32: &[u8] = &[
+            0x3f, 0xc0, 0x00, 0x00, 0x60, 0x2f, 0xff, 0x70, 0x3f, 0xfb, 0xb9, 0x99, 0x9b, 0x21, 0x59, 0x82, 0xa9, 0xc8,
+            0x56, 0x60, 0xaa, 0x60,
+        ];
+        let mut out = Vec::new();
+        encode(&f32s, 32, &mut out);
+        assert_eq!(out, old32);
+        assert_eq!(decode(old32, f32s.len(), 32).unwrap(), f32s);
     }
 
     #[test]

@@ -211,3 +211,46 @@ chave existente também são recusados.
 | Agregação por hora (`agg_hour`, ms) | 27,9 | 35,3 | 37,1 |
 | Agregação LAST (`agg_last`, ms) | 0,71 | 1,19 | 1,31 |
 | Expirar 1 dia | 16,3 s | 14,5 ms | 14,5 ms |
+
+## Atualização: ingestão e agregação (item 6) — v4 passa o InnoDB na carga
+
+Perfilando a carga (`perf` no `mariadbd`) e a agregação, o tempo estava em: gorilla
+bit a bit no flush, SipHash e alocação por linha no `Batch::write`, um push/pop de
+heap por linha no merge ordenado (e um grupo `Vec` por linha em tabelas com chave
+única), e decodificação repetida das mesmas colunas. As correções (hash rápido com
+semente, buffers reutilizados, dica de tamanho do lote, `BitWriter` de 64 bits,
+merge por corridas, colunas de desempate sob demanda, cache de colunas decodificadas,
+memo de TAG inteira no handler) estão em `docs/architecture.md` §Desempenho. Sem
+mudança de formato em disco nem do protocolo de durabilidade (mesmo `fsync` por
+statement do `innodb_flush_log_at_trx_commit=1`).
+
+Mesmo container descartável (`mariadb:11.4.13`, mesmos parâmetros do
+`docker-compose.yml`: `innodb_buffer_pool_size=4G`, `moosedb_chunk_cache_size=1 GiB`),
+5.000 itens × 7 d × 60 s, `bench.sh` completo. `antes` = plugin do commit
+`3538347` (`results/bench_item6_antes_5000x7d.txt`); `depois` = working tree
+(`results/bench_item6_5000x7d.txt`). Consultas em melhor de 5, cache quente.
+
+| Métrica | InnoDB antes → depois | v3 antes → depois | v4 (PK) antes → depois |
+|---|---:|---:|---:|
+| Carga (linhas/s) | 497.364 → 527.224 | 408.783 → 652.441 | 370.973 → 643.802 |
+| Carga relativa ao InnoDB da mesma rodada | 1,00 | 0,82 → 1,24 | 0,75 → 1,22 |
+| `agg_hour` (100 itens × 24 h, ms) | 27,6 → 27,8 | 32,0 → 25,2 | 35,9 → 27,2 |
+| `agg_last` (1 item × 24 h, ms) | 0,76 → 0,78 | 1,05 → 0,86 | 1,15 → 0,93 |
+| `vc_read_1h` (ms) | 0,36 → 0,40 | 0,42 → 0,33 | 0,37 → 0,43 |
+| Disco após `moosedb_compact` (MiB) | 2.384 | 395,0 | 395,0 |
+
+Rodada original do item 5 (outra hora, mesma máquina): InnoDB 524.949, v3 463.456,
+v4 433.342 linhas/s; `agg_hour` 27,9 / 35,3 / 37,1 ms; `agg_last` 0,71 / 1,19 / 1,31 ms.
+
+`agg_last` é uma consulta de menos de 1 ms (≈ 50 lookups `(itemid, clock[, ns])`) e
+varia ±10 % entre rodadas; reexecutando só as consultas sobre as mesmas tabelas
+(`results/bench_item6_agg_15runs.txt`, 3 × melhor de 15): InnoDB 0,69–0,75 ms,
+v3 0,73–0,78 ms, v4 0,75–0,80 ms (`agg_hour`: InnoDB 27,4–27,8, v3 25,3–25,7, v4
+26,6–27,2 ms). Ou seja, a agregação por hora empata/ganha do InnoDB e o `AGGREGATE_LAST`
+ficou a ~5–10 % (antes: +85 %). Com `SKIP_LOAD=1` (`results/bench_item6_consultas_skipload.txt`,
+depois do teste destrutivo de housekeeping): `agg_last` 0,77 / 0,93 / 0,85 ms.
+Nenhuma outra consulta regrediu além do ruído (gráficos 1 h / 24 h / 7 d, último valor; `vc_read_1h` do v4 mediu 0,43 ms na rodada completa e 0,36–0,37 ms nas repetições).
+
+**Para reproduzir sem tocar nos volumes `zbxlab-*`**: container próprio com
+`--plugin-dir` apontando para uma cópia do `ha_moosedb.so` e os mesmos `-v` de `sql/` e
+`scripts/`, depois `docker exec -e ITEMS=5000 -e DAYS=7 -e STEP=60 <container> bash /lab/scripts/bench.sh`.

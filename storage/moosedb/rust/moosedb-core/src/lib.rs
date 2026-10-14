@@ -23,6 +23,7 @@ pub mod compaction;
 pub mod compression;
 pub mod crypto;
 pub mod error;
+mod fasthash;
 mod fsutil;
 pub mod index;
 pub mod inspect;

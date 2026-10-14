@@ -1,0 +1,93 @@
+#
+# DELETE next to INSERT on the same table and series: the housekeeper deletes
+# old data while the syncer keeps inserting recent data. Neither waits for the
+# other, nothing inserted during the deletes is lost, a key deleted and
+# inserted again is a single row, and the deleted rows are gone for good.
+#
+--source include/not_embedded.inc
+--source include/have_sequence.inc
+--source suite/moosedb/include/have_moosedb.inc
+
+CREATE TABLE h (itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG', clock INT NOT NULL, value DOUBLE NOT NULL, ns INT NOT NULL, PRIMARY KEY (itemid, clock, ns))
+  ENGINE=MooseDB TIMESTAMP_COLUMN='clock' CHUNK_INTERVAL='1 DAY';
+INSERT INTO h SELECT 1 + a.seq, 1700000000 + b.seq, b.seq, 0 FROM seq_0_to_19 a, seq_0_to_999 b;
+FLUSH TABLES h;
+INSERT INTO h SELECT 1 + a.seq, 1700000000 + 1000 + b.seq, b.seq, 0 FROM seq_0_to_19 a, seq_0_to_999 b;
+
+DELIMITER |;
+CREATE PROCEDURE syncer()
+BEGIN
+  DECLARE i INT DEFAULT 0;
+  WHILE i < 300 DO
+    INSERT INTO h SELECT 1 + a.seq, 1700100000 + i, i, 0 FROM seq_0_to_19 a;
+    SET i = i + 1;
+  END WHILE;
+END|
+CREATE PROCEDURE housekeeper()
+BEGIN
+  DECLARE i INT DEFAULT 1;
+  WHILE i <= 20 DO
+    DELETE FROM h WHERE itemid = i AND clock < 1700000000 + 1500;
+    DELETE FROM h WHERE itemid = i AND clock < 1700000000 + 1500 LIMIT 5000;
+    SET i = i + 1;
+  END WHILE;
+END|
+DELIMITER ;|
+
+connect (con1,localhost,root,,test);
+connection con1;
+--echo # the syncer: 300 statements of 20 rows (items 1..20, clock 1700100000..)
+--send CALL syncer()
+connection default;
+--echo # the housekeeper: one DELETE per item, twice, while the syncer runs
+CALL housekeeper();
+connection con1;
+--reap
+connection default;
+SELECT COUNT(*) FROM h;
+SELECT COUNT(*) FROM h WHERE clock < 1700000000 + 1500;
+SELECT COUNT(*), MIN(clock), MAX(clock) FROM h WHERE clock >= 1700100000;
+SELECT itemid, COUNT(*) FROM h GROUP BY itemid ORDER BY itemid LIMIT 3;
+
+--echo # delete and insert the same keys from two sessions at once
+connection con1;
+DELIMITER |;
+CREATE PROCEDURE reinsert()
+BEGIN
+  DECLARE i INT DEFAULT 0;
+  WHILE i < 200 DO
+    INSERT IGNORE INTO h VALUES (1, 1700000000 + 3000 + i, i, 0);
+    SET i = i + 1;
+  END WHILE;
+END|
+DELIMITER ;|
+--send CALL reinsert()
+connection default;
+DELIMITER |;
+CREATE PROCEDURE cleaner()
+BEGIN
+  DECLARE i INT DEFAULT 0;
+  WHILE i < 100 DO
+    DELETE FROM h WHERE itemid = 1 AND clock >= 1700000000 + 3000 AND clock < 1700000000 + 3200;
+    SET i = i + 1;
+  END WHILE;
+END|
+DELIMITER ;|
+CALL cleaner();
+connection con1;
+--reap
+connection default;
+--echo # whatever is there is unique, and a final delete leaves none of it
+SELECT COUNT(*) = COUNT(DISTINCT clock) AS unique_keys FROM h WHERE itemid = 1 AND clock >= 1700000000 + 3000;
+DELETE FROM h WHERE itemid = 1 AND clock >= 1700000000 + 3000 AND clock < 1700000000 + 3200;
+SELECT COUNT(*) FROM h WHERE itemid = 1 AND clock >= 1700000000 + 3000 AND clock < 1700000000 + 3200;
+INSERT INTO h VALUES (1, 1700000000 + 3000, 1, 0);
+--error ER_DUP_ENTRY
+INSERT INTO h VALUES (1, 1700000000 + 3000, 1, 0);
+CHECK TABLE h;
+disconnect con1;
+DROP PROCEDURE syncer;
+DROP PROCEDURE housekeeper;
+DROP PROCEDURE reinsert;
+DROP PROCEDURE cleaner;
+DROP TABLE h;

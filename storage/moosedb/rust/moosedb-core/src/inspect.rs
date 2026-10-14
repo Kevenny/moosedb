@@ -96,7 +96,7 @@ fn status(c: &ChunkMeta, opts: Option<&TableOptions>, compacting: &HashSet<u64>,
     }
 }
 
-fn chunk_info(c: &ChunkMeta, st: ChunkStatus) -> ChunkInfo {
+fn chunk_info(c: &ChunkMeta, st: ChunkStatus, dead: u64) -> ChunkInfo {
     let sealed_at = fs::metadata(c.path())
         .and_then(|m| m.modified())
         .ok()
@@ -108,7 +108,7 @@ fn chunk_info(c: &ChunkMeta, st: ChunkStatus) -> ChunkInfo {
         file_name: c.file_name(),
         ts_min: c.header.ts_min,
         ts_max: c.header.ts_max,
-        rows: c.header.row_count,
+        rows: c.header.row_count.saturating_sub(dead),
         series: c.header.series_count,
         data_bytes: c.raw_bytes,
         file_bytes: c.file_size,
@@ -133,9 +133,12 @@ pub fn inspect(dir: &Path, now: i64) -> Result<TableInfo> {
                 inner.memtable.bytes() as u64,
             )
         };
-        return Ok(build(true, &chunks, Some(opts), &compacting, pending, Some(series), mem_bytes, now));
+        let tombs = t.lock()?.tombs.clone();
+        return Ok(build(true, &chunks, Some(opts), &compacting, pending, Some(series), mem_bytes, now, &tombs));
     }
 
+    // A closed table is described from its files: deletes still only in the WAL are not
+    // subtracted from `row_count` (they are not applied without opening the table).
     let manifest = Manifest::load(dir)?;
     let options = fs::read_to_string(dir.join(OPTIONS_FILE)).ok().and_then(|t| TableOptions::from_text(&t).ok());
     let mut files = std::collections::HashMap::new();
@@ -157,7 +160,14 @@ pub fn inspect(dir: &Path, now: i64) -> Result<TableInfo> {
         pending += 1;
         Ok(())
     })?;
-    Ok(build(false, &chunks, options, &HashSet::new(), pending, None, 0, now))
+    let mut tombs = crate::tomb::TombSet::default();
+    for t in &manifest.ranges {
+        tombs.add_range(t.clone());
+    }
+    for t in &manifest.rows {
+        tombs.add_rows(t.clone());
+    }
+    Ok(build(false, &chunks, options, &HashSet::new(), pending, None, 0, now, &tombs))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -170,9 +180,10 @@ fn build(
     series_count: Option<u64>,
     pending_bytes: u64,
     now: i64,
+    tombs: &crate::tomb::TombSet,
 ) -> TableInfo {
     let infos: Vec<ChunkInfo> =
-        chunks.iter().map(|c| chunk_info(c, status(c, options.as_ref(), compacting, now))).collect();
+        chunks.iter().map(|c| chunk_info(c, status(c, options.as_ref(), compacting, now), tombs.dead_rows(c.id))).collect();
     let series_count = series_count.unwrap_or_else(|| {
         chunks.iter().flat_map(|c| c.series.iter().map(|e| e.series_id)).collect::<HashSet<_>>().len() as u64
     });

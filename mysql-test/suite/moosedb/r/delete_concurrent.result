@@ -1,0 +1,88 @@
+CREATE TABLE h (itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG', clock INT NOT NULL, value DOUBLE NOT NULL, ns INT NOT NULL, PRIMARY KEY (itemid, clock, ns))
+ENGINE=MooseDB TIMESTAMP_COLUMN='clock' CHUNK_INTERVAL='1 DAY';
+INSERT INTO h SELECT 1 + a.seq, 1700000000 + b.seq, b.seq, 0 FROM seq_0_to_19 a, seq_0_to_999 b;
+FLUSH TABLES h;
+INSERT INTO h SELECT 1 + a.seq, 1700000000 + 1000 + b.seq, b.seq, 0 FROM seq_0_to_19 a, seq_0_to_999 b;
+CREATE PROCEDURE syncer()
+BEGIN
+DECLARE i INT DEFAULT 0;
+WHILE i < 300 DO
+INSERT INTO h SELECT 1 + a.seq, 1700100000 + i, i, 0 FROM seq_0_to_19 a;
+SET i = i + 1;
+END WHILE;
+END|
+CREATE PROCEDURE housekeeper()
+BEGIN
+DECLARE i INT DEFAULT 1;
+WHILE i <= 20 DO
+DELETE FROM h WHERE itemid = i AND clock < 1700000000 + 1500;
+DELETE FROM h WHERE itemid = i AND clock < 1700000000 + 1500 LIMIT 5000;
+SET i = i + 1;
+END WHILE;
+END|
+connect  con1,localhost,root,,test;
+connection con1;
+# the syncer: 300 statements of 20 rows (items 1..20, clock 1700100000..)
+CALL syncer();
+connection default;
+# the housekeeper: one DELETE per item, twice, while the syncer runs
+CALL housekeeper();
+connection con1;
+connection default;
+SELECT COUNT(*) FROM h;
+COUNT(*)
+16000
+SELECT COUNT(*) FROM h WHERE clock < 1700000000 + 1500;
+COUNT(*)
+0
+SELECT COUNT(*), MIN(clock), MAX(clock) FROM h WHERE clock >= 1700100000;
+COUNT(*)	MIN(clock)	MAX(clock)
+6000	1700100000	1700100299
+SELECT itemid, COUNT(*) FROM h GROUP BY itemid ORDER BY itemid LIMIT 3;
+itemid	COUNT(*)
+1	800
+2	800
+3	800
+# delete and insert the same keys from two sessions at once
+connection con1;
+CREATE PROCEDURE reinsert()
+BEGIN
+DECLARE i INT DEFAULT 0;
+WHILE i < 200 DO
+INSERT IGNORE INTO h VALUES (1, 1700000000 + 3000 + i, i, 0);
+SET i = i + 1;
+END WHILE;
+END|
+CALL reinsert();
+connection default;
+CREATE PROCEDURE cleaner()
+BEGIN
+DECLARE i INT DEFAULT 0;
+WHILE i < 100 DO
+DELETE FROM h WHERE itemid = 1 AND clock >= 1700000000 + 3000 AND clock < 1700000000 + 3200;
+SET i = i + 1;
+END WHILE;
+END|
+CALL cleaner();
+connection con1;
+connection default;
+# whatever is there is unique, and a final delete leaves none of it
+SELECT COUNT(*) = COUNT(DISTINCT clock) AS unique_keys FROM h WHERE itemid = 1 AND clock >= 1700000000 + 3000;
+unique_keys
+1
+DELETE FROM h WHERE itemid = 1 AND clock >= 1700000000 + 3000 AND clock < 1700000000 + 3200;
+SELECT COUNT(*) FROM h WHERE itemid = 1 AND clock >= 1700000000 + 3000 AND clock < 1700000000 + 3200;
+COUNT(*)
+0
+INSERT INTO h VALUES (1, 1700000000 + 3000, 1, 0);
+INSERT INTO h VALUES (1, 1700000000 + 3000, 1, 0);
+ERROR 23000: Duplicate entry '1-1700003000-0' for key 'PRIMARY'
+CHECK TABLE h;
+Table	Op	Msg_type	Msg_text
+test.h	check	status	OK
+disconnect con1;
+DROP PROCEDURE syncer;
+DROP PROCEDURE housekeeper;
+DROP PROCEDURE reinsert;
+DROP PROCEDURE cleaner;
+DROP TABLE h;

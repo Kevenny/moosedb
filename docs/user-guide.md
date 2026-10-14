@@ -198,8 +198,8 @@ Semântica:
   detectados. Como a engine não é transacional, um `INSERT` de várias linhas que
   falha **mantém as linhas anteriores à duplicata** (o InnoDB desfaz o statement);
 * `REPLACE` e `INSERT … ON DUPLICATE KEY UPDATE` funcionam quando a chave **não**
-  existe; quando existe, falham com `ER_ILLEGAL_HA` (a engine não tem
-  `UPDATE`/`DELETE`) — nunca com semântica errada;
+  existe (inclusive depois de um `DELETE` dela); quando existe, falham com
+  `ER_ILLEGAL_HA` (a engine não tem `UPDATE`) — nunca com semântica errada;
 * duas sessões inserindo a mesma chave: exatamente uma vence. O primeiro
   statement a escrever numa série a "reserva" até terminar; outro que precise da
   mesma série **espera** (até `moosedb_unique_lock_wait_timeout` s, padrão 50,
@@ -252,9 +252,8 @@ SELECT host, AVG(value) FROM metricas
 SELECT * FROM metricas WHERE host = 'srv01' ORDER BY ts DESC LIMIT 10;
 ```
 
-* `UPDATE` e `DELETE ... WHERE` retornam `ER_ILLEGAL_HA`: os dados são
-  imutáveis. Use `RETENTION_PERIOD` para expirar e `TRUNCATE TABLE` (ou
-  `DELETE` sem `WHERE`) para esvaziar.
+* `UPDATE` retorna `ER_ILLEGAL_HA` (os dados não são alterados no lugar). `DELETE`
+  é suportado — ver [DELETE](#delete).
 * Cada statement é **atômico para leitura e para crash**: outras sessões veem
   todas as linhas de um INSERT de uma vez, e um crash no meio dele não deixa
   nada. Não há transações (`BEGIN`/`ROLLBACK` não desfazem) e, se o statement
@@ -262,6 +261,51 @@ SELECT * FROM metricas WHERE host = 'srv01' ORDER BY ts DESC LIMIT 10;
 * Uma linha está durável quando o statement retorna OK
   (`moosedb_wal_sync_mode=fsync`). Com `write`, sobrevive a um crash do
   `mysqld`, mas não a uma queda do sistema operacional.
+
+## DELETE
+
+`DELETE` funciona com qualquer `WHERE`, `LIMIT`, `ORDER BY` e `DELETE` de várias
+tabelas (`DELETE a FROM a JOIN b ...`). A exclusão é **lógica**: a engine grava um
+*tombstone* (série(s) + intervalo de tempo, ou as linhas exatas) no WAL, as linhas
+somem para todas as leituras no mesmo instante, e o espaço só volta quando uma
+compactação reescreve os chunks afetados (`OPTIMIZE TABLE`, ou o background quando
+um quarto de um chunk está morto) — um chunk inteiramente apagado é simplesmente
+descartado. Existem dois caminhos:
+
+| Forma do `WHERE` | Caminho | Custo |
+|---|---|---|
+| só igualdade/`IN` em colunas TAG e limites (`< <= > >= = BETWEEN`) na coluna de tempo (`INT` via `TIMESTAMP_COLUMN`, ou `DATETIME`), sem `ORDER BY`, sem `LIMIT` (ou com um `LIMIT` que o intervalo não alcança), sem triggers, sem `binlog_format=ROW` | **direto** (*direct delete*): um tombstone, `ROW_COUNT()` exato | O(chunks tocados), independe do número de linhas; ~µs–ms |
+| qualquer outro (`value > 10`, `OR`, `LIMIT` menor que o intervalo, `ORDER BY`, subconsulta, multi-tabela, `DELETE` sem `WHERE` com binlog em ROW, coluna `TIMESTAMP` como eixo) | **linha a linha**: o servidor lê as linhas e a engine as acha por conteúdo ao fim do statement | O(linhas apagadas) |
+
+`DELETE FROM t` sem `WHERE` (sem binlog em ROW) continua sendo `TRUNCATE`.
+
+* **Atomicidade e crash**: igual ao `INSERT`. O statement vira *uma* entrada do
+  WAL sincronizada antes de as linhas sumirem; um `kill -9` deixa a tabela como
+  antes ou como depois, nunca no meio. Um `DELETE` linha a linha que apague mais de
+  ~32 MiB de linhas é aplicado em etapas (cada uma atômica e durável); uma falha no
+  meio mantém as etapas já aplicadas, como um `INSERT` que falha no meio.
+* **Concorrência**: um `DELETE` com `WHERE` roda ao lado de `INSERT`s da mesma
+  tabela e da mesma série (o *syncer* não espera o *housekeeper*); só afeta linhas
+  que já estavam gravadas quando ele terminou. Dois `DELETE`s da mesma tabela se
+  serializam. Leituras já abertas não veem o resultado parcial nem quebram.
+* **Chave única**: uma chave apagada pode ser inserida de novo (também por `REPLACE`
+  e `ON DUPLICATE KEY UPDATE`, que passam a ver "chave inexistente").
+* **`LIMIT`**: no caminho direto só é usado se o intervalo apagaria menos linhas que
+  o `LIMIT`; senão o servidor apaga linha a linha, exatamente `N` linhas (a escolha
+  de quais, sem `ORDER BY`, é arbitrária, como em qualquer engine).
+* **Leitura com apagados pendentes**: custo proporcional ao número de tombstones da
+  série lida (≈ 0 para o housekeeper, que gera um por item). Estatísticas
+  (`COUNT(*)`, `information_schema.MOOSEDB_TABLES.ROW_COUNT`) já descontam as linhas
+  apagadas.
+* **Zabbix**: o housekeeper de histórico pode ficar **ligado** (o `DELETE ... WHERE
+  itemid=X AND clock<CUT [LIMIT n]` por item é o caminho direto). Para expirar só
+  por idade, `RETENTION_PERIOD` continua melhor — descarta o chunk inteiro sem um
+  tombstone por item — e o housekeeper de histórico do Zabbix pode ser desligado
+  (`HousekeepingFrequency`/`Data storage` → *Override item history period* desativado).
+  Use o housekeeper apenas para apagar por item (`history.clear`, itens removidos).
+* **Limites**: o statement direto com milhões de séries selecionadas é recusado
+  (`Unsupported`, o tombstone caberia mal numa entrada de log de 8 MiB); `UPDATE`
+  segue sem suporte; `mariadb-backup` segue não copiando tabelas MooseDB.
 
 ## Manutenção
 

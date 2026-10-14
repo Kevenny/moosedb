@@ -9,8 +9,8 @@
 --   * ORDER BY clock DESC, ns DESC LIMIT n sem filesort (getLastValuesFromSqlWithPk);
 --   * itemid+clock+ns exatos (const/eq_ref em joins).
 -- Limitações: REPLACE / INSERT ... ON DUPLICATE KEY UPDATE sobre chave existente
--- são recusados (a engine não tem UPDATE/DELETE); housekeeper do Zabbix desligado,
--- expiração por RETENTION_PERIOD.
+-- são recusados (a engine não tem UPDATE); o DELETE do housekeeper/history.clear funciona (tombstones);
+-- a expiração por idade é mais barata por RETENTION_PERIOD.
 --
 -- Uso (no banco do Zabbix, com o zabbix_server parado):
 --   USE zabbix; SOURCE /lab/sql/adapted_history_v4.sql;

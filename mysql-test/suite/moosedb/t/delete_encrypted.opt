@@ -1,0 +1,1 @@
+--plugin-load-add=file_key_management --file-key-management-filename=$MYSQL_TEST_DIR/suite/moosedb/std_data/keys.txt

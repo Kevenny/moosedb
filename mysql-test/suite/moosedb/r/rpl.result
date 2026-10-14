@@ -16,16 +16,38 @@ COUNT(*)	SUM(v)	COUNT(DISTINCT host)
 SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_NAME = 'r';
 ENGINE
 MooseDB
-# Row-level UPDATE/DELETE are refused on the master and never replicate
+# UPDATE is refused on the master and never replicates
 connection master;
 UPDATE r SET v = 0;
-ERROR HY000: Storage engine MooseDB of the table `test`.`r` doesn't have this option
-DELETE FROM r WHERE host = 'h1';
 ERROR HY000: Storage engine MooseDB of the table `test`.`r` doesn't have this option
 connection slave;
 SELECT COUNT(*) FROM r;
 COUNT(*)
 100
+# DELETE replicates as row events: the replica finds each row by its content
+connection master;
+DELETE FROM r WHERE host = 'h1';
+SELECT ROW_COUNT();
+ROW_COUNT()
+33
+DELETE FROM r WHERE ts < '2026-01-01 00:10:00';
+SELECT ROW_COUNT();
+ROW_COUNT()
+7
+SELECT COUNT(*), SUM(v) FROM r;
+COUNT(*)	SUM(v)
+60	825
+connection slave;
+SELECT COUNT(*), SUM(v), COUNT(DISTINCT host) FROM r;
+COUNT(*)	SUM(v)	COUNT(DISTINCT host)
+60	825	2
+connection master;
+INSERT INTO r VALUES ('2026-01-01 00:02:00', 'h2', 1);
+DELETE FROM r;
+connection slave;
+SELECT COUNT(*) FROM r;
+COUNT(*)
+0
 connection master;
 DROP TABLE r;
 include/rpl_end.inc

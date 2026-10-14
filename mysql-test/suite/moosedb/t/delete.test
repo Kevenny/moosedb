@@ -1,0 +1,535 @@
+#
+# DELETE: the statements the Zabbix housekeeper and history.clear send,
+#   delete from history where itemid=X and clock<CUT [limit N]
+#   delete from history where itemid in (...)
+#   delete from history where clock<CUT
+# plus the general case (any WHERE, LIMIT, ORDER BY, multi-table). Every
+# statement runs on the MooseDB table and on an InnoDB mirror; the affected
+# rows (ROW_COUNT) and the whole table are compared after each step.
+#
+# The data goes through every place a row can be: the MemTable, sealed hot
+# and cold chunks, compacted chunks, a clean restart and kill -9 with the
+# delete only in the WAL. Reinserting a deleted key (PRIMARY KEY), REPLACE /
+# ON DUPLICATE KEY UPDATE after a delete, MIN/MAX/last value, TRUNCATE,
+# retention, INFORMATION_SCHEMA and COUNT(*) are checked as well.
+#
+--source include/not_embedded.inc
+--source include/have_innodb.inc
+--source include/have_sequence.inc
+--source suite/moosedb/include/have_moosedb.inc
+
+--echo # Zabbix 7.0 history, without a key (v3) and with PRIMARY KEY (itemid,clock,ns) (v4), and InnoDB mirrors
+CREATE TABLE h3 (itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG', clock INT NOT NULL DEFAULT 0, value DOUBLE NOT NULL DEFAULT 0, ns INT NOT NULL DEFAULT 0,
+                 INDEX (clock), INDEX (itemid, clock))
+  ENGINE=MooseDB TIMESTAMP_COLUMN='clock' CHUNK_INTERVAL='1 DAY' HOT_THRESHOLD='1 DAY';
+CREATE TABLE h4 (itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG', clock INT NOT NULL DEFAULT 0, value DOUBLE NOT NULL DEFAULT 0, ns INT NOT NULL DEFAULT 0,
+                 PRIMARY KEY (itemid, clock, ns))
+  ENGINE=MooseDB TIMESTAMP_COLUMN='clock' CHUNK_INTERVAL='1 DAY' HOT_THRESHOLD='1 DAY';
+CREATE TABLE i3 (itemid BIGINT UNSIGNED NOT NULL, clock INT NOT NULL DEFAULT 0, value DOUBLE NOT NULL DEFAULT 0, ns INT NOT NULL DEFAULT 0,
+                 INDEX (clock), INDEX (itemid, clock)) ENGINE=InnoDB;
+CREATE TABLE i4 (itemid BIGINT UNSIGNED NOT NULL, clock INT NOT NULL DEFAULT 0, value DOUBLE NOT NULL DEFAULT 0, ns INT NOT NULL DEFAULT 0,
+                 PRIMARY KEY (itemid, clock, ns)) ENGINE=InnoDB;
+
+--echo # 12 items x 3 days (1 value a minute from 2026-01-01 00:00 UTC; 1767225600), the last day only in the MemTable
+--disable_query_log
+let $d= 0;
+while ($d < 3)
+{
+  eval INSERT INTO h3 SELECT 1 + a.seq, 1767225600 + $d * 86400 + b.seq * 60, a.seq * 1000 + b.seq, b.seq MOD 2 FROM seq_0_to_11 a, seq_0_to_1439 b;
+  eval INSERT INTO h4 SELECT 1 + a.seq, 1767225600 + $d * 86400 + b.seq * 60, a.seq * 1000 + b.seq, b.seq MOD 2 FROM seq_0_to_11 a, seq_0_to_1439 b;
+  eval INSERT INTO i3 SELECT 1 + a.seq, 1767225600 + $d * 86400 + b.seq * 60, a.seq * 1000 + b.seq, b.seq MOD 2 FROM seq_0_to_11 a, seq_0_to_1439 b;
+  eval INSERT INTO i4 SELECT 1 + a.seq, 1767225600 + $d * 86400 + b.seq * 60, a.seq * 1000 + b.seq, b.seq MOD 2 FROM seq_0_to_11 a, seq_0_to_1439 b;
+  if ($d < 2)
+  {
+    FLUSH TABLES h3, h4;
+  }
+  inc $d;
+}
+--enable_query_log
+SELECT COUNT(*) FROM h3;
+SELECT COUNT(*) FROM h4;
+SELECT TABLE_NAME, CHUNKS, PENDING_ROWS, ROW_COUNT FROM information_schema.MOOSEDB_TABLES WHERE TABLE_NAME IN ('h3','h4') ORDER BY 1;
+
+# Compares the whole table, then the answers of a few reads, with the mirror.
+--let $all= SELECT itemid, clock, ns, value FROM {T} ORDER BY itemid, clock, ns
+--let $agg= SELECT itemid, COUNT(*), MIN(clock), MAX(clock), SUM(value) FROM {T} GROUP BY itemid ORDER BY itemid
+
+--echo ##################################################################
+--echo # The housekeeper: one DELETE per item, autocommit
+--echo ##################################################################
+DELETE FROM h3 WHERE itemid = 3 AND clock < 1767225600 + 3600;
+SELECT ROW_COUNT();
+DELETE FROM i3 WHERE itemid = 3 AND clock < 1767225600 + 3600;
+SELECT ROW_COUNT();
+DELETE FROM h4 WHERE itemid = 3 AND clock < 1767225600 + 3600;
+SELECT ROW_COUNT();
+DELETE FROM i4 WHERE itemid = 3 AND clock < 1767225600 + 3600;
+SELECT ROW_COUNT();
+--let $mt= h3
+--let $it= i3
+--let $q= $all
+--let $label= v3 after delete itemid=3 clock<CUT
+--source suite/moosedb/include/cmp_query.inc
+--let $q= $agg
+--let $label= v3 per-item aggregates
+--source suite/moosedb/include/cmp_query.inc
+--let $mt= h4
+--let $it= i4
+--let $q= $all
+--let $label= v4 after delete itemid=3 clock<CUT
+--source suite/moosedb/include/cmp_query.inc
+--let $q= $agg
+--let $label= v4 per-item aggregates
+--source suite/moosedb/include/cmp_query.inc
+
+--echo # the statistics follow: COUNT(*) comes from the table's row count
+SELECT (SELECT COUNT(*) FROM h3) = (SELECT COUNT(*) FROM i3) AS v3_count_same, (SELECT COUNT(*) FROM h4) = (SELECT COUNT(*) FROM i4) AS v4_count_same;
+SELECT ROW_COUNT FROM information_schema.MOOSEDB_TABLES WHERE TABLE_NAME = 'h4';
+
+--echo # same item again: nothing left in the range
+DELETE FROM h4 WHERE itemid = 3 AND clock < 1767225600 + 3600;
+SELECT ROW_COUNT();
+--echo # a range that straddles the chunk and the MemTable (days 2 and 3), and a point
+DELETE FROM h3 WHERE itemid = 5 AND clock BETWEEN 1767225600 + 86400 - 600 AND 1767225600 + 2 * 86400 + 600;
+SELECT ROW_COUNT();
+DELETE FROM i3 WHERE itemid = 5 AND clock BETWEEN 1767225600 + 86400 - 600 AND 1767225600 + 2 * 86400 + 600;
+SELECT ROW_COUNT();
+DELETE FROM h4 WHERE itemid = 5 AND clock BETWEEN 1767225600 + 86400 - 600 AND 1767225600 + 2 * 86400 + 600;
+SELECT ROW_COUNT();
+DELETE FROM i4 WHERE itemid = 5 AND clock BETWEEN 1767225600 + 86400 - 600 AND 1767225600 + 2 * 86400 + 600;
+SELECT ROW_COUNT();
+DELETE FROM h4 WHERE itemid = 6 AND clock = 1767225600 + 120 AND ns = 0;
+SELECT ROW_COUNT();
+DELETE FROM i4 WHERE itemid = 6 AND clock = 1767225600 + 120 AND ns = 0;
+SELECT ROW_COUNT();
+DELETE FROM h3 WHERE itemid = 6 AND clock = 1767225600 + 120 AND ns = 0;
+DELETE FROM i3 WHERE itemid = 6 AND clock = 1767225600 + 120 AND ns = 0;
+--let $mt= h3
+--let $it= i3
+--let $q= $all
+--let $label= v3
+--source suite/moosedb/include/cmp_query.inc
+--let $mt= h4
+--let $it= i4
+--source suite/moosedb/include/cmp_query.inc
+
+--echo ##################################################################
+--echo # With a LIMIT (MaxHousekeeperDelete): the range fits, or it does not
+--echo ##################################################################
+DELETE FROM h4 WHERE itemid = 7 AND clock < 1767225600 + 600 LIMIT 5000;
+SELECT ROW_COUNT();
+DELETE FROM i4 WHERE itemid = 7 AND clock < 1767225600 + 600 LIMIT 5000;
+SELECT ROW_COUNT();
+--echo # LIMIT below the matching rows: exactly N rows go, not the whole range
+DELETE FROM h4 WHERE itemid = 8 AND clock < 1767225600 + 3600 LIMIT 7;
+SELECT ROW_COUNT();
+SELECT COUNT(*) FROM h4 WHERE itemid = 8 AND clock < 1767225600 + 3600;
+DELETE FROM h3 WHERE itemid = 8 AND clock < 1767225600 + 3600 LIMIT 7;
+SELECT ROW_COUNT();
+SELECT COUNT(*) FROM h3 WHERE itemid = 8 AND clock < 1767225600 + 3600;
+--echo # (the mirror: the same rows are not comparable, the count is)
+DELETE FROM i4 WHERE itemid = 8 AND clock < 1767225600 + 3600 LIMIT 7;
+SELECT ROW_COUNT();
+SELECT COUNT(*) FROM i4 WHERE itemid = 8 AND clock < 1767225600 + 3600;
+DELETE FROM i3 WHERE itemid = 8 AND clock < 1767225600 + 3600 LIMIT 7;
+--echo # bring the mirrors to the same rows: remove what is left of the range from all four
+DELETE FROM h4 WHERE itemid = 8 AND clock < 1767225600 + 3600;
+DELETE FROM h3 WHERE itemid = 8 AND clock < 1767225600 + 3600;
+DELETE FROM i4 WHERE itemid = 8 AND clock < 1767225600 + 3600;
+DELETE FROM i3 WHERE itemid = 8 AND clock < 1767225600 + 3600;
+--echo # ORDER BY ... LIMIT deletes the oldest rows
+DELETE FROM h4 WHERE itemid = 9 ORDER BY clock LIMIT 10;
+SELECT ROW_COUNT();
+DELETE FROM i4 WHERE itemid = 9 ORDER BY clock LIMIT 10;
+SELECT ROW_COUNT();
+DELETE FROM h3 WHERE itemid = 9 ORDER BY clock LIMIT 10;
+DELETE FROM i3 WHERE itemid = 9 ORDER BY clock LIMIT 10;
+--let $mt= h3
+--let $it= i3
+--let $q= $all
+--let $label= v3
+--source suite/moosedb/include/cmp_query.inc
+--let $mt= h4
+--let $it= i4
+--source suite/moosedb/include/cmp_query.inc
+
+--echo ##################################################################
+--echo # history.clear: itemid IN (...); and clock < CUT for every item
+--echo ##################################################################
+DELETE FROM h3 WHERE itemid IN (1, 2, 11, 999);
+SELECT ROW_COUNT();
+DELETE FROM i3 WHERE itemid IN (1, 2, 11, 999);
+SELECT ROW_COUNT();
+DELETE FROM h4 WHERE itemid IN (1, 2, 11, 999);
+SELECT ROW_COUNT();
+DELETE FROM i4 WHERE itemid IN (1, 2, 11, 999);
+SELECT ROW_COUNT();
+DELETE FROM h4 WHERE itemid IN ('10', 12) AND clock >= 1767225600 + 2 * 86400;
+SELECT ROW_COUNT();
+DELETE FROM i4 WHERE itemid IN ('10', 12) AND clock >= 1767225600 + 2 * 86400;
+SELECT ROW_COUNT();
+DELETE FROM h3 WHERE itemid IN ('10', 12) AND clock >= 1767225600 + 2 * 86400;
+DELETE FROM i3 WHERE itemid IN ('10', 12) AND clock >= 1767225600 + 2 * 86400;
+DELETE FROM h3 WHERE clock < 1767225600 + 1800;
+SELECT ROW_COUNT();
+DELETE FROM i3 WHERE clock < 1767225600 + 1800;
+SELECT ROW_COUNT();
+DELETE FROM h4 WHERE clock < 1767225600 + 1800;
+SELECT ROW_COUNT();
+DELETE FROM i4 WHERE clock < 1767225600 + 1800;
+SELECT ROW_COUNT();
+--let $mt= h3
+--let $it= i3
+--let $q= $all
+--let $label= v3
+--source suite/moosedb/include/cmp_query.inc
+--let $mt= h4
+--let $it= i4
+--source suite/moosedb/include/cmp_query.inc
+--let $q= $agg
+--source suite/moosedb/include/cmp_query.inc
+
+--echo ##################################################################
+--echo # Any other WHERE: row by row, by content
+--echo ##################################################################
+DELETE FROM h3 WHERE value > 8000 AND value < 8100;
+SELECT ROW_COUNT();
+DELETE FROM i3 WHERE value > 8000 AND value < 8100;
+SELECT ROW_COUNT();
+DELETE FROM h4 WHERE value > 8000 AND value < 8100;
+SELECT ROW_COUNT();
+DELETE FROM i4 WHERE value > 8000 AND value < 8100;
+SELECT ROW_COUNT();
+DELETE FROM h3 WHERE (itemid = 4 AND clock < 1767225600 + 3600) OR ns = 1 AND itemid = 5;
+SELECT ROW_COUNT();
+DELETE FROM i3 WHERE (itemid = 4 AND clock < 1767225600 + 3600) OR ns = 1 AND itemid = 5;
+SELECT ROW_COUNT();
+DELETE FROM h4 WHERE itemid <> 4 AND clock MOD 7 = 0 AND itemid > 6;
+SELECT ROW_COUNT();
+DELETE FROM i4 WHERE itemid <> 4 AND clock MOD 7 = 0 AND itemid > 6;
+SELECT ROW_COUNT();
+DELETE FROM h4 WHERE itemid = 4 AND value < 4100 LIMIT 20;
+SELECT ROW_COUNT();
+DELETE FROM i4 WHERE itemid = 4 AND value < 4100 LIMIT 20;
+SELECT ROW_COUNT();
+--echo # LIMIT 20 of rows with value<4100 may pick different rows: finish the job on all four
+DELETE FROM h4 WHERE itemid = 4 AND value < 4100;
+DELETE FROM i4 WHERE itemid = 4 AND value < 4100;
+--let $mt= h3
+--let $it= i3
+--let $q= $all
+--let $label= v3
+--source suite/moosedb/include/cmp_query.inc
+--let $mt= h4
+--let $it= i4
+--source suite/moosedb/include/cmp_query.inc
+--let $q= $agg
+--source suite/moosedb/include/cmp_query.inc
+SELECT ROW_COUNT FROM information_schema.MOOSEDB_TABLES WHERE TABLE_NAME = 'h4';
+SELECT COUNT(*) FROM h4;
+
+--echo # a time comparison with a function, a subquery on the same table, a multi-table DELETE
+DELETE FROM h4 WHERE itemid = 9 AND FROM_UNIXTIME(clock) < '1970-01-01';
+SELECT ROW_COUNT();
+DELETE FROM h4 WHERE itemid = 9 AND clock IN (SELECT clock FROM (SELECT clock FROM h4 WHERE itemid = 9 AND clock < 1767225600 + 86400 + 600) x);
+SELECT ROW_COUNT();
+DELETE FROM i4 WHERE itemid = 9 AND clock IN (SELECT clock FROM (SELECT clock FROM i4 WHERE itemid = 9 AND clock < 1767225600 + 86400 + 600) x);
+SELECT ROW_COUNT();
+CREATE TABLE gone (itemid BIGINT UNSIGNED NOT NULL, clock INT NOT NULL) ENGINE=InnoDB;
+INSERT INTO gone VALUES (8, 1767225600 + 86400 + 60), (8, 1767225600 + 86400 + 120);
+DELETE h4 FROM h4 JOIN gone ON gone.itemid = h4.itemid AND gone.clock = h4.clock;
+SELECT ROW_COUNT();
+DELETE i4 FROM i4 JOIN gone ON gone.itemid = i4.itemid AND gone.clock = i4.clock;
+SELECT ROW_COUNT();
+DROP TABLE gone;
+--let $mt= h4
+--let $it= i4
+--let $q= $all
+--let $label= v4 after subquery and multi-table deletes
+--source suite/moosedb/include/cmp_query.inc
+
+--echo ##################################################################
+--echo # Reading after deletes: last value, MIN/MAX, graph shapes
+--echo ##################################################################
+--let $mt= h4
+--let $it= i4
+--let $q= SELECT itemid, MAX(clock) AS mx, MIN(clock) AS mn FROM {T} GROUP BY itemid ORDER BY itemid
+--let $label= v4 MIN/MAX(clock) per item
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT t.itemid, t.clock, t.value FROM {T} t JOIN (SELECT itemid, MAX(clock) c FROM {T} GROUP BY itemid) m ON m.itemid = t.itemid AND m.c = t.clock ORDER BY t.itemid, t.ns
+--let $label= v4 last value (self join)
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT clock DIV 3600 AS hr, COUNT(*), MIN(value), AVG(value), MAX(value) FROM {T} WHERE itemid = 12 AND clock BETWEEN 1767225600 AND 1767225600 + 3 * 86400 GROUP BY 1 ORDER BY 1
+--let $label= v4 graph: hourly aggregates
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT itemid, clock, ns, value FROM {T} WHERE itemid = 5 ORDER BY clock DESC, ns DESC LIMIT 3
+--let $label= v4 ORDER BY clock DESC LIMIT
+--source suite/moosedb/include/cmp_query.inc
+--let $mt= h3
+--let $it= i3
+--let $label= v3 ORDER BY clock DESC LIMIT
+--source suite/moosedb/include/cmp_query.inc
+
+--echo ##################################################################
+--echo # PRIMARY KEY: a deleted key can be inserted again, a live one cannot
+--echo ##################################################################
+SELECT COUNT(*) FROM h4 WHERE itemid = 5 AND clock = 1767225600 + 86400 + 60;
+INSERT INTO h4 VALUES (5, 1767225600 + 86400 + 60, 1.5, 0);
+--error ER_DUP_ENTRY
+INSERT INTO h4 VALUES (5, 1767225600 + 86400 + 60, 2.5, 0);
+INSERT INTO i4 VALUES (5, 1767225600 + 86400 + 60, 1.5, 0);
+--echo # the newest key of a series, deleted and reinserted
+INSERT INTO h4 VALUES (8, 1767225600 + 2 * 86400 + 1439 * 60, 6.5, 1);
+INSERT INTO i4 VALUES (8, 1767225600 + 2 * 86400 + 1439 * 60, 6.5, 1);
+DELETE FROM h4 WHERE itemid = 8 AND clock = 1767225600 + 2 * 86400 + 1439 * 60 AND ns = 1;
+SELECT ROW_COUNT();
+DELETE FROM i4 WHERE itemid = 8 AND clock = 1767225600 + 2 * 86400 + 1439 * 60 AND ns = 1;
+SELECT ROW_COUNT();
+INSERT INTO h4 VALUES (8, 1767225600 + 2 * 86400 + 1439 * 60, 7.5, 1);
+INSERT INTO i4 VALUES (8, 1767225600 + 2 * 86400 + 1439 * 60, 7.5, 1);
+--error ER_DUP_ENTRY
+INSERT INTO h4 VALUES (8, 1767225600 + 2 * 86400 + 1439 * 60, 8.5, 1);
+INSERT IGNORE INTO h4 VALUES (8, 1767225600 + 2 * 86400 + 1439 * 60, 8.5, 1);
+SHOW WARNINGS;
+--echo # REPLACE and ON DUPLICATE KEY UPDATE of a deleted key insert it; of a live key they are still refused
+DELETE FROM h4 WHERE itemid = 11 AND clock = 1767225600 AND ns = 0;
+REPLACE INTO h4 VALUES (11, 1767225600, 3.5, 0);
+DELETE FROM h4 WHERE itemid = 11 AND clock = 1767225600 AND ns = 0;
+INSERT INTO h4 VALUES (11, 1767225600, 4.5, 0) ON DUPLICATE KEY UPDATE value = 9;
+SELECT value FROM h4 WHERE itemid = 11 AND clock = 1767225600 AND ns = 0;
+--error ER_ILLEGAL_HA
+REPLACE INTO h4 VALUES (11, 1767225600, 3.5, 0);
+INSERT INTO i4 VALUES (11, 1767225600, 4.5, 0);
+--let $mt= h4
+--let $it= i4
+--let $q= SELECT itemid, clock, ns, value FROM {T} WHERE itemid IN (5, 8, 11) AND clock >= 1767225600 + 86400 ORDER BY itemid, clock, ns
+--let $label= v4 reinserted keys (REPLACE/ODKU rows are not in the mirror: items 5, 8 and 11 hold them)
+--source suite/moosedb/include/cmp_query.inc
+--echo # no phantom duplicate after the delete of every row of a series
+DELETE FROM h4 WHERE itemid = 12;
+INSERT INTO h4 VALUES (12, 1767225600 + 5, 1, 0), (12, 1767225600 + 5, 1, 1);
+--error ER_DUP_ENTRY
+INSERT INTO h4 VALUES (12, 1767225600 + 5, 2, 1);
+SELECT COUNT(*) FROM h4 WHERE itemid = 12;
+DELETE FROM i4 WHERE itemid = 12;
+INSERT INTO i4 VALUES (12, 1767225600 + 5, 1, 0), (12, 1767225600 + 5, 1, 1);
+
+--echo ##################################################################
+--echo # Chunks and the MemTable: flush, seal cold, compact -- the answers do not move
+--echo ##################################################################
+SET @before= (SELECT COUNT(*) FROM h4);
+SELECT ROW_COUNT, PENDING_ROWS FROM information_schema.MOOSEDB_TABLES WHERE TABLE_NAME = 'h4';
+FLUSH TABLES h3, h4;
+--let $mt= h3
+--let $it= i3
+--let $q= $all
+--let $label= v3 after FLUSH
+--source suite/moosedb/include/cmp_query.inc
+--let $mt= h4
+--let $it= i4
+--let $label= v4 after FLUSH
+--source suite/moosedb/include/cmp_query.inc
+OPTIMIZE TABLE h3;
+OPTIMIZE TABLE h4;
+--let $mt= h3
+--let $it= i3
+--let $label= v3 after OPTIMIZE (the rows are removed physically)
+--source suite/moosedb/include/cmp_query.inc
+--let $mt= h4
+--let $it= i4
+--let $label= v4 after OPTIMIZE
+--source suite/moosedb/include/cmp_query.inc
+SELECT @before = (SELECT COUNT(*) FROM h4) AS count_unchanged_by_optimize;
+SELECT ROW_COUNT = (SELECT COUNT(*) FROM i4) AS stats_match_mirror FROM information_schema.MOOSEDB_TABLES WHERE TABLE_NAME = 'h4';
+--echo # the chunks are sealed and cold now (ZSTD): a delete over them
+DELETE FROM h3 WHERE itemid = 9 AND clock >= 1767225600 + 86400;
+SELECT ROW_COUNT();
+DELETE FROM i3 WHERE itemid = 9 AND clock >= 1767225600 + 86400;
+SELECT ROW_COUNT();
+DELETE FROM h4 WHERE itemid = 9 AND clock >= 1767225600 + 86400;
+SELECT ROW_COUNT();
+DELETE FROM i4 WHERE itemid = 9 AND clock >= 1767225600 + 86400;
+SELECT ROW_COUNT();
+SELECT COMPRESSION, COLD_CHUNKS FROM information_schema.MOOSEDB_TABLES WHERE TABLE_NAME = 'h4';
+--let $mt= h3
+--let $it= i3
+--let $label= v3 after a delete over cold chunks
+--source suite/moosedb/include/cmp_query.inc
+--let $mt= h4
+--let $it= i4
+--let $label= v4 after a delete over cold chunks
+--source suite/moosedb/include/cmp_query.inc
+
+--echo ##################################################################
+--echo # Restart: tombstones are in the MANIFEST; kill -9: the delete is only in the WAL
+--echo ##################################################################
+DELETE FROM h3 WHERE itemid = 7;
+DELETE FROM i3 WHERE itemid = 7;
+DELETE FROM h4 WHERE itemid = 7;
+DELETE FROM i4 WHERE itemid = 7;
+--source include/restart_mysqld.inc
+--let $mt= h3
+--let $it= i3
+--let $q= $all
+--let $label= v3 after a clean restart
+--source suite/moosedb/include/cmp_query.inc
+--let $mt= h4
+--let $it= i4
+--let $label= v4 after a clean restart
+--source suite/moosedb/include/cmp_query.inc
+DELETE FROM h3 WHERE itemid = 6 AND clock >= 1767225600 + 86400;
+DELETE FROM i3 WHERE itemid = 6 AND clock >= 1767225600 + 86400;
+DELETE FROM h4 WHERE itemid = 6 AND clock >= 1767225600 + 86400;
+DELETE FROM i4 WHERE itemid = 6 AND clock >= 1767225600 + 86400;
+INSERT INTO h4 VALUES (6, 1767225600 + 2 * 86400 + 5, 1, 0);
+INSERT INTO i4 VALUES (6, 1767225600 + 2 * 86400 + 5, 1, 0);
+INSERT INTO h3 VALUES (6, 1767225600 + 2 * 86400 + 5, 1, 0);
+INSERT INTO i3 VALUES (6, 1767225600 + 2 * 86400 + 5, 1, 0);
+--source include/kill_mysqld.inc
+--source include/start_mysqld.inc
+--let $mt= h3
+--let $it= i3
+--let $label= v3 after kill -9 (delete and later insert replayed in order)
+--source suite/moosedb/include/cmp_query.inc
+--let $mt= h4
+--let $it= i4
+--let $label= v4 after kill -9
+--source suite/moosedb/include/cmp_query.inc
+--error ER_DUP_ENTRY
+INSERT INTO h4 VALUES (6, 1767225600 + 2 * 86400 + 5, 1, 0);
+INSERT INTO h4 VALUES (6, 1767225600 + 86400 + 5, 1, 0);
+--echo # a second kill -9 with the delete already folded into the MANIFEST by a flush
+FLUSH TABLES h4;
+DELETE FROM h4 WHERE itemid = 3;
+--source include/kill_mysqld.inc
+--source include/start_mysqld.inc
+SELECT COUNT(*) FROM h4 WHERE itemid = 3;
+SELECT COUNT(*) FROM h4 WHERE itemid = 6;
+CHECK TABLE h4;
+CHECK TABLE h3;
+
+--echo ##################################################################
+--echo # TRUNCATE forgets the deletes; new rows are not hidden by them
+--echo ##################################################################
+DELETE FROM h3 WHERE clock < 1767225600 + 10 * 86400;
+SELECT COUNT(*) FROM h3;
+TRUNCATE TABLE h3;
+INSERT INTO h3 VALUES (1, 1767225600, 1, 0), (2, 1767225660, 2, 0);
+SELECT itemid, clock FROM h3 ORDER BY itemid;
+DELETE FROM h3;
+SELECT COUNT(*) FROM h3;
+INSERT INTO h3 VALUES (3, 1767225600, 1, 0);
+SELECT itemid, clock FROM h3;
+
+--echo ##################################################################
+--echo # Retention covers a deleted range: nothing is left to delete
+--echo ##################################################################
+CREATE TABLE r (itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG', clock INT NOT NULL, value DOUBLE NOT NULL, PRIMARY KEY (itemid, clock))
+  ENGINE=MooseDB TIMESTAMP_COLUMN='clock' CHUNK_INTERVAL='1 DAY' RETENTION_PERIOD='30 DAYS';
+--disable_query_log
+eval INSERT INTO r SELECT 1 + a.seq, UNIX_TIMESTAMP() - 40 * 86400 + b.seq * 60, b.seq FROM seq_0_to_2 a, seq_0_to_99 b;
+eval INSERT INTO r SELECT 1 + a.seq, UNIX_TIMESTAMP() - 3600 + b.seq * 20, b.seq FROM seq_0_to_2 a, seq_0_to_99 b;
+--enable_query_log
+FLUSH TABLES r;
+DELETE FROM r WHERE itemid = 1 AND clock < UNIX_TIMESTAMP() - 20 * 86400;
+SELECT ROW_COUNT();
+SELECT COUNT(*) FROM r;
+OPTIMIZE TABLE r;
+SELECT COUNT(*) FROM r;
+SELECT CHUNKS, ROW_COUNT FROM information_schema.MOOSEDB_TABLES WHERE TABLE_NAME = 'r';
+DROP TABLE r;
+
+--echo ##################################################################
+--echo # Which path ran: Handler_delete counts the rows the server deleted one by
+--echo # one (delete_row); the direct delete leaves it at 0. A WHERE the engine
+--echo # cannot capture whole never becomes a delete of the whole table.
+--echo ##################################################################
+CREATE TABLE p4 (itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG', clock INT NOT NULL, value DOUBLE NOT NULL, ns INT NOT NULL, PRIMARY KEY (itemid, clock, ns))
+  ENGINE=MooseDB TIMESTAMP_COLUMN='clock' CHUNK_INTERVAL='1 DAY';
+CREATE TABLE pi (itemid BIGINT UNSIGNED NOT NULL, clock INT NOT NULL, value DOUBLE NOT NULL, ns INT NOT NULL, PRIMARY KEY (itemid, clock, ns)) ENGINE=InnoDB;
+INSERT INTO p4 SELECT 1 + a.seq, 1700000000 + b.seq, b.seq, 0 FROM seq_0_to_5 a, seq_0_to_99 b;
+INSERT INTO pi SELECT * FROM p4;
+FLUSH TABLES p4;
+INSERT INTO p4 SELECT 1 + a.seq, 1700000100 + b.seq, b.seq, 0 FROM seq_0_to_5 a, seq_0_to_99 b;
+INSERT INTO pi SELECT * FROM p4 WHERE clock >= 1700000100;
+--let $mt= p4
+--let $it= pi
+--let $q= SELECT itemid, clock, ns, value FROM {T} ORDER BY itemid, clock, ns
+--let $label= p4 after all of the deletes
+
+FLUSH STATUS;
+DELETE FROM p4 WHERE itemid = 1 AND clock < 1700000010;
+SELECT ROW_COUNT();
+SHOW SESSION STATUS LIKE 'Handler_delete';
+--echo # ^ housekeeper form: direct
+FLUSH STATUS;
+DELETE FROM p4 WHERE itemid = 2 AND clock < 1700000010 LIMIT 5000;
+SELECT ROW_COUNT();
+SHOW SESSION STATUS LIKE 'Handler_delete';
+--echo # ^ housekeeper form with MaxHousekeeperDelete: direct (the range fits)
+FLUSH STATUS;
+DELETE FROM p4 WHERE itemid IN (3, 4) AND clock >= 1700000190;
+SELECT ROW_COUNT();
+SHOW SESSION STATUS LIKE 'Handler_delete';
+--echo # ^ history.clear form: direct
+FLUSH STATUS;
+DELETE FROM p4 WHERE itemid = 5 AND clock BETWEEN 1700000020 AND 1700000029;
+SELECT ROW_COUNT();
+SHOW SESSION STATUS LIKE 'Handler_delete';
+--echo # ^ BETWEEN: direct
+FLUSH STATUS;
+DELETE FROM p4 WHERE itemid = 6 AND clock < 1700000010 LIMIT 4;
+SELECT ROW_COUNT();
+SHOW SESSION STATUS LIKE 'Handler_delete';
+--echo # ^ LIMIT below the range: row by row (exactly 4)
+FLUSH STATUS;
+DELETE FROM p4 WHERE itemid = 6 AND value = 50;
+SELECT ROW_COUNT();
+SHOW SESSION STATUS LIKE 'Handler_delete';
+--echo # ^ a non-key column: row by row
+FLUSH STATUS;
+DELETE FROM p4 WHERE itemid = 6 AND clock >= 1700000010 ORDER BY clock LIMIT 3;
+SELECT ROW_COUNT();
+SHOW SESSION STATUS LIKE 'Handler_delete';
+--echo # ^ ORDER BY: row by row
+
+--echo # conditions the engine does not capture whole: the other conjunct still decides
+SELECT COUNT(*) FROM p4;
+DELETE FROM p4 WHERE itemid = 1 AND value > 1e12;
+SELECT ROW_COUNT();
+DELETE FROM p4 WHERE clock < 1700000010 AND value < -1;
+SELECT ROW_COUNT();
+DELETE FROM p4 WHERE FROM_UNIXTIME(clock) < '1970-01-01';
+SELECT ROW_COUNT();
+DELETE FROM p4 WHERE itemid = 1 OR value < -5;
+SELECT ROW_COUNT();
+DELETE FROM p4 WHERE NOT (itemid > 0);
+SELECT ROW_COUNT();
+DELETE FROM p4 WHERE itemid = 1 AND clock < 1700000010 AND ns = 7;
+SELECT ROW_COUNT();
+DELETE FROM p4 WHERE itemid = 2 AND clock MOD 1000000000 = 12345;
+SELECT ROW_COUNT();
+DELETE FROM p4 WHERE (SELECT COUNT(*) FROM pi WHERE value = -99) > 0;
+SELECT ROW_COUNT();
+SELECT COUNT(*) FROM p4;
+--echo # a prepared statement with parameters takes the same decisions
+PREPARE st FROM 'DELETE FROM p4 WHERE itemid = ? AND clock < ? LIMIT 5000';
+SET @i = 3, @c = 1700000005;
+FLUSH STATUS;
+EXECUTE st USING @i, @c;
+SELECT ROW_COUNT();
+SHOW SESSION STATUS LIKE 'Handler_delete';
+DEALLOCATE PREPARE st;
+DELETE FROM pi WHERE itemid = 1 AND clock < 1700000010;
+DELETE FROM pi WHERE itemid = 2 AND clock < 1700000010;
+DELETE FROM pi WHERE itemid IN (3, 4) AND clock >= 1700000190;
+DELETE FROM pi WHERE itemid = 5 AND clock BETWEEN 1700000020 AND 1700000029;
+DELETE FROM pi WHERE itemid = 3 AND clock < 1700000005;
+DELETE FROM pi WHERE itemid = 1;
+--echo # (the LIMIT 4 / value = 50 / ORDER BY LIMIT 3 deletes of item 6: same rows are not guaranteed; finish both)
+DELETE FROM p4 WHERE itemid = 6;
+DELETE FROM pi WHERE itemid = 6;
+--source suite/moosedb/include/cmp_query.inc
+DROP TABLE p4, pi;
+
+DROP TABLE h3, h4, i3, i4;

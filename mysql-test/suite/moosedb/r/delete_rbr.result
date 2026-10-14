@@ -1,0 +1,105 @@
+RESET MASTER;
+CREATE TABLE h (itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG', clock INT NOT NULL, value DOUBLE NOT NULL, ns INT NOT NULL, PRIMARY KEY (itemid, clock, ns))
+ENGINE=MooseDB TIMESTAMP_COLUMN='clock' CHUNK_INTERVAL='1 DAY';
+CREATE TABLE n (itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG', clock INT NOT NULL, value DOUBLE NOT NULL, ns INT NOT NULL, INDEX (clock))
+ENGINE=MooseDB TIMESTAMP_COLUMN='clock' CHUNK_INTERVAL='1 DAY';
+CREATE TABLE ih LIKE h;
+ALTER TABLE ih ENGINE=InnoDB;
+CREATE TABLE inn LIKE n;
+ALTER TABLE inn ENGINE=InnoDB;
+INSERT INTO h SELECT 1 + a.seq, 1767225600 + b.seq * 60, a.seq * 1000 + b.seq, b.seq MOD 2 FROM seq_0_to_4 a, seq_0_to_599 b;
+FLUSH TABLES h;
+INSERT INTO h SELECT 1 + a.seq, 1767225600 + 86400 + b.seq * 60, a.seq * 1000 + b.seq, b.seq MOD 2 FROM seq_0_to_4 a, seq_0_to_599 b;
+INSERT INTO n SELECT * FROM h;
+INSERT INTO ih SELECT * FROM h;
+INSERT INTO inn SELECT * FROM h;
+FLUSH BINARY LOGS;
+SELECT @@binlog_format;
+@@binlog_format
+ROW
+# the housekeeper statement
+DELETE FROM h WHERE itemid = 2 AND clock < 1767225600 + 3600;
+SELECT ROW_COUNT();
+ROW_COUNT()
+60
+DELETE FROM ih WHERE itemid = 2 AND clock < 1767225600 + 3600;
+SELECT ROW_COUNT();
+ROW_COUNT()
+60
+# with MaxHousekeeperDelete's LIMIT
+DELETE FROM h WHERE itemid = 3 AND clock < 1767225600 + 3600 LIMIT 5000;
+SELECT ROW_COUNT();
+ROW_COUNT()
+60
+DELETE FROM ih WHERE itemid = 3 AND clock < 1767225600 + 3600 LIMIT 5000;
+SELECT ROW_COUNT();
+ROW_COUNT()
+60
+# history.clear, any WHERE, a subquery
+DELETE FROM h WHERE itemid IN (1, 5);
+SELECT ROW_COUNT();
+ROW_COUNT()
+2400
+DELETE FROM ih WHERE itemid IN (1, 5);
+SELECT ROW_COUNT();
+ROW_COUNT()
+2400
+DELETE FROM h WHERE value BETWEEN 3100 AND 3200 OR clock = 1767225600 + 86400;
+SELECT ROW_COUNT();
+ROW_COUNT()
+205
+DELETE FROM ih WHERE value BETWEEN 3100 AND 3200 OR clock = 1767225600 + 86400;
+SELECT ROW_COUNT();
+ROW_COUNT()
+205
+# v4 with row-based binlog
+result_rows	vs_innodb
+3275	SAME
+SELECT COUNT(*) = (SELECT COUNT(*) FROM ih) AS count_same FROM h;
+count_same
+1
+# the table without a key; duplicates of (itemid, clock) differ only in value
+INSERT INTO n VALUES (2, 1767225600 + 5, 1, 0), (2, 1767225600 + 5, 2, 0), (2, 1767225600 + 5, 2, 0);
+INSERT INTO inn VALUES (2, 1767225600 + 5, 1, 0), (2, 1767225600 + 5, 2, 0), (2, 1767225600 + 5, 2, 0);
+DELETE FROM n WHERE itemid = 2 AND clock = 1767225600 + 5 AND value = 2 LIMIT 1;
+SELECT ROW_COUNT();
+ROW_COUNT()
+1
+DELETE FROM inn WHERE itemid = 2 AND clock = 1767225600 + 5 AND value = 2 LIMIT 1;
+SELECT ROW_COUNT();
+ROW_COUNT()
+1
+SELECT itemid, clock, value FROM n WHERE clock = 1767225600 + 5 AND itemid = 2 ORDER BY value;
+itemid	clock	value
+2	1767225605	1
+2	1767225605	2
+DELETE FROM n WHERE itemid = 3 AND value > 3100;
+DELETE FROM inn WHERE itemid = 3 AND value > 3100;
+# v3 with row-based binlog
+result_rows	vs_innodb
+6002	SAME
+# DELETE without WHERE is row by row here (no TRUNCATE shortcut)
+DELETE FROM n;
+SELECT ROW_COUNT();
+ROW_COUNT()
+6002
+SELECT COUNT(*) FROM n;
+COUNT(*)
+0
+DELETE FROM h;
+SELECT COUNT(*) FROM h;
+COUNT(*)
+0
+INSERT INTO h VALUES (1, 1767225600, 1, 0);
+SELECT COUNT(*) FROM h;
+COUNT(*)
+1
+# restart: the deletes survive
+# restart
+SELECT COUNT(*) FROM h;
+COUNT(*)
+1
+SELECT COUNT(*) FROM n;
+COUNT(*)
+0
+DROP TABLE h, n, ih, inn;

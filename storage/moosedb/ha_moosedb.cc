@@ -1061,7 +1061,7 @@ int ha_moosedb::close()
   scan_.reset();
   snapshots_.clear();
   int error= 0;
-  if (batch_)
+  if (batch_ || del_)
   {
     sql_print_warning("MooseDB: statement batch still open at close; "
                       "committing it");
@@ -1096,16 +1096,20 @@ int ha_moosedb::rename_table(const char *from, const char *to)
 
 /* ── Row conversion ───────────────────────────────────────────────────── */
 
-int ha_moosedb::write_row(const uchar *buf)
+/*
+  Converts the record in `buf` into values_ (the TFRow handed to the core).
+  Shared by write_row() and delete_row(): a row to delete is found in the
+  table by its content, so it must be converted exactly as it was stored.
+*/
+int ha_moosedb::record_to_row(const uchar *buf, TFRow *out)
 {
-  DBUG_ENTER("ha_moosedb::write_row");
   assert(table);
   if (!table || !buf || !share_ || !share_->table)
-    DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
+    return HA_ERR_INTERNAL_ERROR;
 
   const tf_layout &l= share_->layout;
   if (values_.size() < l.columns.size() || str_bufs_.size() < l.columns.size())
-    DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
+    return HA_ERR_INTERNAL_ERROR;
   const my_ptrdiff_t diff= buf - table->record[0];
   MY_BITMAP *old_map= dbug_tmp_use_all_columns(table, &table->read_set);
   int error= 0;
@@ -1189,9 +1193,18 @@ int ha_moosedb::write_row(const uchar *buf)
   }
   dbug_tmp_restore_column_map(&table->read_set, old_map);
   if (error)
-    DBUG_RETURN(error);
+    return error;
+  *out= TFRow{(uint32_t) values_.size(), values_.data()};
+  return 0;
+}
 
-  TFRow row{(uint32_t) values_.size(), values_.data()};
+int ha_moosedb::write_row(const uchar *buf)
+{
+  DBUG_ENTER("ha_moosedb::write_row");
+  TFRow row{0, nullptr};
+  int error= record_to_row(buf, &row);
+  if (error)
+    DBUG_RETURN(error);
   /*
     Rows of one statement go into a batch: invisible to other sessions until
     the statement ends, and lost as a whole if the server crashes before.
@@ -1304,7 +1317,11 @@ int ha_moosedb::fill_record(uchar *buf, const TFRow &row)
     last_error_= "row shape does not match the table definition";
     return HA_ERR_MOOSEDB_BASE + TF_ERR_CORRUPT;
   }
-  memset(buf, 0, table->s->null_bytes);
+  // keep the unused bits of the null bytes as the table defines them (see fill_from_batch)
+  if (table->s->null_bytes && table->s->default_values)
+    memcpy(buf, table->s->default_values, table->s->null_bytes);
+  else
+    memset(buf, 0, table->s->null_bytes);
   const my_ptrdiff_t diff= buf - table->record[0];
   MY_BITMAP *old_map= dbug_tmp_use_all_columns(table, &table->write_set);
 
@@ -1384,6 +1401,8 @@ int ha_moosedb::fill_from_batch(uchar *buf, uint32_t row)
   const size_t nb= table->s->null_bytes;
   if (null_template_.size() == nb)
     memcpy(buf, null_template_.data(), nb);
+  else if (nb && table->s->default_values)
+    memcpy(buf, table->s->default_values, nb);
   else
     memset(buf, 0, nb);
   const my_ptrdiff_t diff= buf - table->record[0];
@@ -1522,10 +1541,70 @@ int ha_moosedb::fill_from_batch(uchar *buf, uint32_t row)
 
 /* ── Statement end / durability ───────────────────────────────────────── */
 
+void tf_delete_closer::operator()(MooseDBDelete *d) const noexcept
+{
+  moosedb_delete_abort(d);
+}
+
+/*
+  Applies the rows collected by delete_row(). The handle is released also on
+  error. Like an INSERT batch this runs at the end of the statement, whether
+  it succeeded or not: rows the server already counted (and binlogged) as
+  deleted must really go.
+*/
+int ha_moosedb::commit_delete()
+{
+  if (!del_)
+    return 0;
+  MooseDBDelete *d= del_.release();
+  uint64_t n= 0;
+  const uint64_t expected= del_rows_;
+  del_rows_= 0;
+  int error= map_status(moosedb_delete_commit(d, &n));
+  if (error)
+    sql_print_error("MooseDB: DELETE commit failed: %s", last_error_.c_str());
+  else if (n < expected)
+  {
+    /* Rows the server counted as deleted that the table no longer held (a
+       concurrent DELETE took them first): not an error, but never silent. */
+    THD *thd= ha_thd();
+    if (thd)
+      push_warning_printf(thd, Sql_condition::WARN_LEVEL_WARN, ER_UNKNOWN_ERROR,
+                          "MooseDB: %llu of %llu rows to delete were already gone",
+                          (unsigned long long) (expected - n),
+                          (unsigned long long) expected);
+  }
+  return error;
+}
+
+int ha_moosedb::delete_row(const uchar *buf)
+{
+  DBUG_ENTER("ha_moosedb::delete_row");
+  TFRow row{0, nullptr};
+  int error= record_to_row(buf, &row);
+  if (error)
+    DBUG_RETURN(error);
+  if (!del_)
+  {
+    MooseDBDelete *d= nullptr;
+    if ((error= map_status(moosedb_delete_begin(
+           share_->table.get(), srv_wal_sync_mode == WAL_SYNC_FSYNC, &d))))
+      DBUG_RETURN(error);
+    if (!d)
+      DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
+    del_.reset(d);
+  }
+  error= map_status(moosedb_delete_add(del_.get(), &row));
+  if (!error)
+    del_rows_++;
+  DBUG_RETURN(error);
+}
+
 int ha_moosedb::commit_batch()
 {
+  int del_error= commit_delete();
   if (!batch_)
-    return 0;
+    return del_error;
   /* commit always releases the handle, also on error */
   MooseDBBatch *b= batch_.release();
   int error= map_status(
@@ -1535,7 +1614,7 @@ int ha_moosedb::commit_batch()
     sql_print_error("MooseDB: statement commit failed: %s",
                     last_error_.c_str());
   }
-  return error;
+  return error ? error : del_error;
 }
 
 void ha_moosedb::start_bulk_insert(ha_rows, uint)
@@ -1578,6 +1657,20 @@ int ha_moosedb::external_lock(THD *, int lock_type)
   DBUG_RETURN(lock_type == F_UNLCK ? commit_batch() : 0);
 }
 
+/*
+  A DELETE with a WHERE runs next to INSERTs (the housekeeper must not stop the
+  syncer): the core serializes deletes and inserts and a delete only touches
+  rows that existed when it committed. A DELETE without WHERE becomes TRUNCATE
+  (delete_all_rows), which keeps the exclusive lock.
+*/
+static bool delete_needs_exclusive(THD *thd, int cmd)
+{
+  if (cmd != SQLCOM_DELETE)
+    return false;
+  const SELECT_LEX *sl= thd->lex ? thd->lex->first_select_lex() : nullptr;
+  return !sl || !sl->where;
+}
+
 THR_LOCK_DATA **ha_moosedb::store_lock(THD *thd, THR_LOCK_DATA **to,
                                         enum thr_lock_type lock_type)
 {
@@ -1593,7 +1686,7 @@ THR_LOCK_DATA **ha_moosedb::store_lock(THD *thd, THR_LOCK_DATA **to,
     const int cmd= thd_sql_command(thd);
     if (lock_type >= TL_WRITE_CONCURRENT_INSERT && lock_type <= TL_WRITE &&
         !thd_in_lock_tables(thd) && cmd != SQLCOM_TRUNCATE &&
-        cmd != SQLCOM_OPTIMIZE && cmd != SQLCOM_DELETE &&
+        cmd != SQLCOM_OPTIMIZE && !delete_needs_exclusive(thd, cmd) &&
         cmd != SQLCOM_CREATE_TABLE && cmd != SQLCOM_ALTER_TABLE)
       lock_type= TL_WRITE_ALLOW_WRITE;
     else if (lock_type == TL_READ_NO_INSERT && !thd_in_lock_tables(thd))
@@ -1611,6 +1704,18 @@ int ha_moosedb::delete_all_rows()
   DBUG_ENTER("ha_moosedb::delete_all_rows");
   if (!share_ || !share_->table)
     DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
+  /*
+    A DELETE with a WHERE runs next to INSERTs (store_lock). If the server
+    still turns it into delete_all_rows() (the WHERE folded to a constant true
+    only after the lock was chosen), a truncate here would discard rows other
+    sessions are inserting: refuse, and the server deletes row by row.
+  */
+  {
+    THD *thd= ha_thd();
+    if (thd && thd_sql_command(thd) == SQLCOM_DELETE &&
+        lock_data_.type == TL_WRITE_ALLOW_WRITE)
+      DBUG_RETURN(HA_ERR_WRONG_COMMAND);
+  }
   scan_.reset();
   DBUG_RETURN(map_status(moosedb_truncate(share_->table.get())));
 }
@@ -2075,6 +2180,33 @@ const COND *ha_moosedb::cond_push(const COND *cond)
     collect_tag_predicates(cond, &preds);
   pushed_.push_back(std::move(preds));
   pushed_valid_= false;
+  /*
+    A DELETE whose whole WHERE is TAG equalities and time bounds can be done by
+    the engine alone (direct delete). The server asks for that by calling
+    cond_push on the target table of the DELETE and treating a NULL return as
+    "the engine takes the whole condition" (sql_delete.cc); it then calls
+    direct_delete_rows_init(), which may still refuse, and the server goes on
+    with its own evaluation. Anything else (a SELECT, a table that is only
+    read by the DELETE, a condition not fully captured) returns the condition:
+    the server evaluates all of it.
+  */
+  ddel_cap_valid_= false;
+  THD *thd= ha_thd();
+  if (cond && share_ && table && thd && thd_sql_command(thd) == SQLCOM_DELETE &&
+      table->reginfo.lock_type >= TL_FIRST_WRITE)
+  {
+    std::vector<tf_tag_predicate> p;
+    longlong lo= LONGLONG_MIN, hi= LONGLONG_MAX;
+    if (capture_delete_cond(const_cast<Item *>(cond), &p, &lo, &hi))
+    {
+      ddel_cap_preds_= std::move(p);
+      ddel_cap_lo_= lo;
+      ddel_cap_hi_= hi;
+      ddel_cap_item_= cond;
+      ddel_cap_valid_= true;
+      return nullptr;
+    }
+  }
   /* The server keeps evaluating the full condition: we only prune series. */
   return cond;
 }
@@ -2097,13 +2229,15 @@ int ha_moosedb::reset()
   THD *thd= ha_thd();
   if (in_bulk_insert_ && thd && bulk_query_id_ != thd->query_id)
     in_bulk_insert_= false;   /* stale: end_bulk_insert() was never called */
-  if (!in_bulk_insert_ && batch_)
+  if (!in_bulk_insert_ && (batch_ || del_))
   {
     error= commit_batch();
     /* ha_reset()'s return value is ignored by the server: report it here */
     if (error)
       print_error(error, MYF(0));
   }
+  ddel_cap_valid_= false;
+  ddel_cap_item_= nullptr;
   pushed_.clear();
   pushed_valid_= false;
   scan_.reset();
@@ -2451,6 +2585,284 @@ bool ha_moosedb::pushed_series_cached(
   return true;
 }
 
+/* ── Direct DELETE ────────────────────────────────────────────────────── */
+
+/*
+  Does `item` -- one conjunct of a WHERE -- say exactly "TAG column equals one
+  of some constants" or "the time column compares with a constant"? Then it is
+  absorbed into `preds` (series) or [lo, hi] (time) and true is returned; false
+  means the condition has something the engine cannot reproduce exactly (the
+  server evaluates the WHERE row by row then). A direct delete runs without the
+  server re-checking rows, so unlike the scan pushdown nothing may be
+  approximated here.
+*/
+bool ha_moosedb::capture_delete_cond(Item *item,
+                                     std::vector<tf_tag_predicate> *preds,
+                                     longlong *lo, longlong *hi)
+{
+  if (!item || !share_ || !table)
+    return false;
+  if (item->type() == Item::COND_ITEM)
+  {
+    auto *c= static_cast<Item_cond *>(item);
+    if (c->functype() != Item_func::COND_AND_FUNC)
+      return false;
+    List_iterator_fast<Item> it(*c->argument_list());
+    while (Item *arg= it++)
+      if (!capture_delete_cond(arg, preds, lo, hi))
+        return false;
+    return true;
+  }
+  if (item->const_item())
+  {
+    if (item->is_expensive())
+      return false;
+    const bool v= item->val_bool();
+    return !item->null_value && v;
+  }
+  if (item->type() != Item::FUNC_ITEM)
+    return false;
+  auto *fn= static_cast<Item_func *>(item);
+  const tf_layout &l= share_->layout;
+  if (l.ts_column >= l.columns.size())
+    return false;
+  const tf_column &tc= l.columns[l.ts_column];
+
+  /* Time bound: column OP constant, constant on either side. */
+  auto time_bound= [&](Item *fld, Item *cst, Item_func::Functype op) -> bool {
+    const Item_field *f= field_of(fld, table);
+    if (!f || f->field->field_index != tc.field_index || !cst->const_item() ||
+        cst->is_expensive())
+      return false;
+    __int128 key;                    /* the constant, in micros of the axis */
+    __int128 step;                   /* smallest distance between stored values */
+    if (tc.conv == tf_conv::INT_SECS)
+    {
+      if (cst->cmp_type() != INT_RESULT)
+        return false;
+      const longlong v= cst->val_int();
+      if (cst->null_value)
+        return false;
+      key= (cst->unsigned_flag && v < 0) ? (__int128) (ulonglong) v : (__int128) v;
+      key*= MICROS_PER_SEC;
+      step= MICROS_PER_SEC;
+    }
+    else if (tc.conv == tf_conv::DATETIME)
+    {
+      THD *thd= ha_thd();
+      MYSQL_TIME lt;
+      if (!thd || cst->cmp_type() != TIME_RESULT ||
+          cst->get_date(thd, &lt, date_mode_t(0)) || cst->null_value ||
+          lt.month == 0 || lt.day == 0 || lt.neg ||
+          (lt.time_type != MYSQL_TIMESTAMP_DATETIME && lt.time_type != MYSQL_TIMESTAMP_DATE))
+        return false;
+      key= time_to_micros(lt);
+      step= 1;
+    }
+    else
+      return false;                  /* TIMESTAMP axis: left to the server */
+    const __int128 mn= LONGLONG_MIN, mx= LONGLONG_MAX;
+    auto clamp= [&](__int128 v) { return (longlong) (v < mn ? mn : v > mx ? mx : v); };
+    switch (op) {
+    case Item_func::LT_FUNC: *hi= std::min(*hi, clamp(key - step)); break;
+    case Item_func::LE_FUNC: *hi= std::min(*hi, clamp(key)); break;
+    case Item_func::GT_FUNC: *lo= std::max(*lo, clamp(key + step)); break;
+    case Item_func::GE_FUNC: *lo= std::max(*lo, clamp(key)); break;
+    case Item_func::EQ_FUNC:
+      *lo= std::max(*lo, clamp(key));
+      *hi= std::min(*hi, clamp(key));
+      break;
+    default: return false;
+    }
+    return true;
+  };
+  auto flip= [](Item_func::Functype op) {
+    switch (op) {
+    case Item_func::LT_FUNC: return Item_func::GT_FUNC;
+    case Item_func::LE_FUNC: return Item_func::GE_FUNC;
+    case Item_func::GT_FUNC: return Item_func::LT_FUNC;
+    case Item_func::GE_FUNC: return Item_func::LE_FUNC;
+    default: return op;
+    }
+  };
+
+  switch (fn->functype()) {
+  case Item_func::LT_FUNC:
+  case Item_func::LE_FUNC:
+  case Item_func::GT_FUNC:
+  case Item_func::GE_FUNC:
+  case Item_func::EQ_FUNC:
+  {
+    if (fn->argument_count() != 2)
+      return false;
+    Item **a= fn->arguments();
+    if (fn->functype() == Item_func::EQ_FUNC)
+    {
+      /* A TAG equality? (collect_tag_predicates pushes only exact ones.) */
+      const size_t before= preds->size();
+      collect_tag_predicates(item, preds);
+      if (preds->size() > before)
+        return true;
+    }
+    return time_bound(a[0], a[1], fn->functype()) ||
+           time_bound(a[1], a[0], flip(fn->functype()));
+  }
+  case Item_func::IN_FUNC:
+  {
+    const size_t before= preds->size();
+    collect_tag_predicates(item, preds);
+    return preds->size() > before;
+  }
+  case Item_func::MULT_EQUAL_FUNC:
+  {
+    auto *eq= static_cast<Item_equal *>(fn);
+    {
+      Item_equal_fields_iterator chk(*eq);
+      while (Item *m= chk++)
+      {
+        const Item_field *f= field_of(m, table);
+        if (!f || share_->layout.tag_position(f->field->field_index) < 0)
+          return false;
+      }
+    }
+    const size_t before= preds->size();
+    collect_tag_predicates(item, preds);
+    return preds->size() > before;
+  }
+  case Item_func::BETWEEN:
+  {
+    auto *b= static_cast<Item_func_between *>(fn);
+    if (b->negated || fn->argument_count() != 3)
+      return false;
+    Item **a= fn->arguments();
+    longlong l0= *lo, h0= *hi;
+    if (time_bound(a[0], a[1], Item_func::GE_FUNC) &&
+        time_bound(a[0], a[2], Item_func::LE_FUNC))
+      return true;
+    *lo= l0;
+    *hi= h0;
+    return false;
+  }
+  default:
+    return false;
+  }
+}
+
+/*
+  A DELETE the engine can do as one range: only TAG equalities / IN lists and
+  bounds on the time column in the WHERE, no ORDER BY, and either no LIMIT or
+  a LIMIT the range does not reach. Everything else (any other WHERE, a LIMIT
+  that would cut the range, binary logging in ROW format, triggers, RETURNING)
+  makes the server delete row by row through delete_row(), which is always
+  correct, just slower.
+*/
+int ha_moosedb::direct_delete_rows_init()
+{
+  DBUG_ENTER("ha_moosedb::direct_delete_rows_init");
+  ddel_ready_= false;
+  THD *thd= ha_thd();
+  if (!thd || !table || !share_ || !share_->table || !thd->lex)
+    DBUG_RETURN(HA_ERR_WRONG_COMMAND);
+  SELECT_LEX *sl= thd->lex->first_select_lex();
+  if (!sl || sl->order_list.elements)
+    DBUG_RETURN(HA_ERR_WRONG_COMMAND);
+  std::vector<tf_tag_predicate> preds;
+  longlong lo= LONGLONG_MIN, hi= LONGLONG_MAX;
+  /*
+    Fail closed: with a WHERE in the statement the plan is the one cond_push
+    captured, and only if it is the very condition the server handed over.
+    Without a captured plan a WHERE never becomes a delete of the whole table.
+  */
+  if (sl->where)
+  {
+    if (!ddel_cap_valid_ || !pushed_cond || pushed_cond != ddel_cap_item_)
+      DBUG_RETURN(HA_ERR_WRONG_COMMAND);
+    preds= ddel_cap_preds_;
+    lo= ddel_cap_lo_;
+    hi= ddel_cap_hi_;
+  }
+  else if (pushed_cond)
+    DBUG_RETURN(HA_ERR_WRONG_COMMAND);
+  ddel_all_series_= preds.empty();
+  ddel_ids_.clear();
+  if (!preds.empty())
+  {
+    std::vector<const tf_tag_predicate *> ptrs;
+    for (const tf_tag_predicate &p : preds)
+      ptrs.push_back(&p);
+    if (!resolve_series(ptrs, &ddel_ids_))
+      DBUG_RETURN(HA_ERR_WRONG_COMMAND);
+    /* The log entry names every series by its tags (8 MiB at most): a huge
+       selection goes row by row instead of failing after the server said OK. */
+    if (ddel_ids_.size() > 20000)
+      DBUG_RETURN(HA_ERR_WRONG_COMMAND);
+    {
+      /* bytes the log entry needs: every series by its tag values, at their widest */
+      size_t per_series= 8;
+      for (const tf_column &c : share_->layout.columns)
+        if (c.conv == tf_conv::TAG && c.field_index < table->s->fields &&
+            table->field[c.field_index])
+          per_series+= table->field[c.field_index]->pack_length() + 6;
+      if ((double) ddel_ids_.size() * (double) per_series > 4.0 * 1024 * 1024)
+        DBUG_RETURN(HA_ERR_WRONG_COMMAND);
+    }
+  }
+  ddel_lo_= lo;
+  ddel_hi_= hi;
+  ddel_limit_= thd->lex->unit.lim.get_select_limit();
+  if (ddel_limit_ != HA_POS_ERROR)
+  {
+    /* With a LIMIT only a range that stays under it can be deleted at once. */
+    uint64_t n= 0;
+    if (map_status(moosedb_count_range(share_->table.get(),
+                                       ddel_all_series_ ? nullptr : ddel_ids_.data(),
+                                       ddel_all_series_ ? -1 : (int64_t) ddel_ids_.size(),
+                                       lo, hi, &n)) ||
+        n > ddel_limit_)
+      DBUG_RETURN(HA_ERR_WRONG_COMMAND);
+  }
+  ddel_ready_= true;
+  DBUG_RETURN(0);
+}
+
+int ha_moosedb::direct_delete_rows(ha_rows *deleted)
+{
+  DBUG_ENTER("ha_moosedb::direct_delete_rows");
+  *deleted= 0;
+  if (!ddel_ready_ || !share_ || !share_->table)
+  {
+    print_error(HA_ERR_INTERNAL_ERROR, MYF(0));
+    DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
+  }
+  ddel_ready_= false;
+  scan_.reset();
+  uint64_t rows= 0;
+  bool exceeds= false;
+  int error= map_status(moosedb_delete_range(
+      share_->table.get(), ddel_all_series_ ? nullptr : ddel_ids_.data(),
+      ddel_all_series_ ? -1 : (int64_t) ddel_ids_.size(), ddel_lo_, ddel_hi_,
+      ddel_limit_ == HA_POS_ERROR ? -1 : (int64_t) std::min<ha_rows>(ddel_limit_, (ha_rows) INT64_MAX),
+      srv_wal_sync_mode == WAL_SYNC_FSYNC, &rows, &exceeds));
+  /*
+    sql_delete.cc does not report an error of ha_direct_delete_rows(): it only
+    returns failure, and the client would get a plain OK with 0 rows. The
+    handler has to print it itself (print_error) -- fail closed.
+  */
+  if (!error && exceeds)
+  {
+    last_error_= "more rows match the DELETE than its LIMIT allows: rows were "
+                 "inserted while it ran; run it again";
+    error= HA_ERR_LOCK_WAIT_TIMEOUT;
+  }
+  if (error)
+  {
+    print_error(error, MYF(0));
+    DBUG_RETURN(error);
+  }
+  *deleted= (ha_rows) rows;
+  DBUG_RETURN(0);
+}
+
 /* ── Scans ────────────────────────────────────────────────────────────── */
 
 void ha_moosedb::reset_batch_state()
@@ -2488,7 +2900,8 @@ void ha_moosedb::build_projection(bool index_scan)
   if (!table || !share_ || !table->read_set || table->vfield)
     return;
   THD *thd= ha_thd();
-  if (!thd)
+  /* the replication applier reads rows to compare them with a before-image: whole rows */
+  if (!thd || thd->slave_thread)
     return;
   switch (thd_sql_command(thd)) {
   case SQLCOM_SELECT:
@@ -2783,7 +3196,11 @@ int ha_moosedb::refill_batch(bool backward)
   tag_last_len_.assign(n, 0);
   tag_snap_.resize(n);
   const size_t nb= table ? table->s->null_bytes : 0;
+  // The unused bits of the null bytes keep their default value (the replication applier
+  // compares whole null bytes with the before-image of the master).
   null_template_.assign(nb, 0);
+  if (nb && table->s->default_values)
+    memcpy(null_template_.data(), table->s->default_values, nb);
   for (size_t i= 0; i < n; i++)
   {
     if (bat_.columns[i].present)
@@ -3674,9 +4091,19 @@ int ha_moosedb::composite_read(uchar *buf, const uchar *key,
 
   bool backward= false, ordered= false, exact= false;
   idx_op op= idx_op::NONE;
-  if (nextra > 0 && find_flag != HA_READ_KEY_EXACT &&
-      find_flag != HA_READ_PREFIX)
-    goto unsupported;       /* only the exact lookup of a UNIQUE key names them */
+  /*
+    Only the exact lookup of a UNIQUE key filters on the columns after the time
+    part. A range read that names them (clock BETWEEN a AND b AND ns = 1 gives
+    the start key (itemid, a, 1)) starts at the time part: rows of that time
+    with another ns are a superset the server filters out, and no row that
+    belongs is skipped (the server re-evaluates the WHERE after a range read).
+  */
+  /* (a descending ref read, PREFIX_LAST, is an equality: the server does not re-check it) */
+  const bool superset= nextra > 0 && find_flag != HA_READ_KEY_EXACT &&
+                       find_flag != HA_READ_PREFIX &&
+                       find_flag != HA_READ_PREFIX_LAST;
+  if (superset)
+    idx_req_.extra_vals.clear();
   /*
     With the time part given, the tags are equalities of a ref / range / MIN
     or MAX(time) read: the rows are those of the key's series. (The server
@@ -3706,7 +4133,7 @@ int ha_moosedb::composite_read(uchar *buf, const uchar *key,
     {
       if (ts == LONGLONG_MAX)
         goto not_found;
-      lo= ts + 1;
+      lo= superset ? ts : ts + 1;
     }
     else
     {
@@ -3731,7 +4158,7 @@ int ha_moosedb::composite_read(uchar *buf, const uchar *key,
     {
       if (ts == LONGLONG_MIN)
         goto not_found;
-      hi= ts - 1;
+      hi= superset ? ts : ts - 1;
     }
     else
     {

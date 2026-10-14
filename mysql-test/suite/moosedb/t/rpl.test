@@ -19,12 +19,25 @@ SELECT COUNT(*), SUM(v) FROM r;
 SELECT COUNT(*), SUM(v), COUNT(DISTINCT host) FROM r;
 SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_NAME = 'r';
 
---echo # Row-level UPDATE/DELETE are refused on the master and never replicate
+--echo # UPDATE is refused on the master and never replicates
 connection master;
 --error ER_ILLEGAL_HA
 UPDATE r SET v = 0;
---error ER_ILLEGAL_HA
+--sync_slave_with_master
+SELECT COUNT(*) FROM r;
+
+--echo # DELETE replicates as row events: the replica finds each row by its content
+connection master;
 DELETE FROM r WHERE host = 'h1';
+SELECT ROW_COUNT();
+DELETE FROM r WHERE ts < '2026-01-01 00:10:00';
+SELECT ROW_COUNT();
+SELECT COUNT(*), SUM(v) FROM r;
+--sync_slave_with_master
+SELECT COUNT(*), SUM(v), COUNT(DISTINCT host) FROM r;
+connection master;
+INSERT INTO r VALUES ('2026-01-01 00:02:00', 'h2', 1);
+DELETE FROM r;
 --sync_slave_with_master
 SELECT COUNT(*) FROM r;
 

@@ -34,6 +34,7 @@ use crate::error::{invalid, Error, Result};
 use crate::memtable::MemSnapshot;
 use crate::rowbatch::{Plan, ScanBatch, DEFAULT_BATCH_ROWS, MAX_BATCH_ROWS};
 use crate::schema::{Row, Schema, Value};
+use crate::tomb::{split_by_holes, TombSet};
 
 pub const POSITION_LEN: usize = 16;
 /// High bit of `Position::source` marks MemTable rows; the remaining bits
@@ -144,6 +145,8 @@ pub struct Snapshot {
     pub(crate) chunks: Vec<Arc<ChunkMeta>>,
     pub(crate) mem: MemSnapshot,
     pub(crate) version: u64,
+    /// Deletes in force for the chunks above (see `tomb`).
+    pub(crate) tombs: Arc<TombSet>,
 }
 
 impl Snapshot {
@@ -188,6 +191,10 @@ struct ChunkCursor {
     win: Window,
     /// Next row (within the series) to return.
     next: usize,
+    /// End (exclusive) of the stretch being returned.
+    end: usize,
+    /// Later stretches of the window, last first (a window cut by dead rows).
+    rest: Vec<(usize, usize)>,
 }
 
 struct StreamState {
@@ -195,6 +202,25 @@ struct StreamState {
     next_series: usize,
     cur: Option<ChunkCursor>,
     mem_next: u64,
+    /// Timestamp intervals of the entry being visited still to be read, last
+    /// first (only when tombstones cut the wanted range).
+    todo: Vec<(i64, i64)>,
+    todo_holes: Vec<(u32, u32)>,
+    todo_entry: (usize, usize),
+}
+
+impl StreamState {
+    fn new() -> StreamState {
+        StreamState {
+            next_chunk: 0,
+            next_series: 0,
+            cur: None,
+            mem_next: 0,
+            todo: Vec::new(),
+            todo_holes: Vec::new(),
+            todo_entry: (0, 0),
+        }
+    }
 }
 
 // ─── merge mode ─────────────────────────────────────────────────────────────
@@ -208,9 +234,27 @@ struct RunCursor {
 
 enum Run {
     /// A series of a chunk; `cur` is filled when the run first reaches the top.
-    Chunk { chunk: usize, series: usize, loaded: bool, cur: Option<RunCursor> },
+    Chunk {
+        chunk: usize,
+        series: usize,
+        loaded: bool,
+        cur: Option<RunCursor>,
+        /// Timestamp interval of the entry this run reads.
+        range: (i64, i64),
+        /// Dead ordinals of the entry (row tombstones), as sorted runs.
+        holes: Vec<(u32, u32)>,
+    },
     /// MemTable rows, already in scan order.
     Mem { keys: Vec<Key>, next: usize },
+}
+
+/// Cursors over the stretches of `win` that the dead ordinals `holes` leave.
+fn cursors_of(win: Window, holes: &[(u32, u32)]) -> Vec<RunCursor> {
+    if holes.is_empty() {
+        let (front, back) = (win.lo, win.hi);
+        return vec![RunCursor { win, front, back }];
+    }
+    split_by_holes(win.lo, win.hi, holes).into_iter().map(|(front, back)| RunCursor { win: win.clone(), front, back }).collect()
 }
 
 struct HeapEntry {
@@ -315,7 +359,7 @@ impl Scan {
         let mut scan = Scan {
             snap,
             filter,
-            mode: Mode::Stream(StreamState { next_chunk: 0, next_series: 0, cur: None, mem_next: 0 }),
+            mode: Mode::Stream(StreamState::new()),
             plan,
             tie,
             batch: None,
@@ -392,7 +436,7 @@ impl Scan {
     /// unsorted scans; `next_row`/`next_batch` then return the first row.
     pub fn seek_start(&mut self) -> Result<()> {
         self.mode = if matches!(self.mode, Mode::Stream(_)) {
-            Mode::Stream(StreamState { next_chunk: 0, next_series: 0, cur: None, mem_next: 0 })
+            Mode::Stream(StreamState::new())
         } else {
             Mode::Merge(self.new_merge(false))
         };
@@ -419,7 +463,7 @@ impl Scan {
                 let meta = &snap.chunks[cur.chunk];
                 let entry = &meta.series[cur.series];
                 let key = run_key(cur.chunk, cur.series);
-                let want = (cur.win.hi - cur.next).min(max - batch.rows());
+                let want = (cur.end - cur.next).min(max - batch.rows());
                 if !batch.tags_room(plan, key, &entry.tags) {
                     return Ok(());
                 }
@@ -438,11 +482,30 @@ impl Scan {
                     k,
                 );
                 cur.next += k;
-                if cur.next >= cur.win.hi {
-                    st.cur = None;
+                if cur.next >= cur.end {
+                    match cur.rest.pop() {
+                        Some((a, b)) => {
+                            cur.next = a;
+                            cur.end = b;
+                        }
+                        None => st.cur = None,
+                    }
                 }
                 if k < want {
                     return Ok(());
+                }
+                continue;
+            }
+            // Intervals of an entry that tombstones cut up, one window each.
+            if let Some((a, b)) = st.todo.pop() {
+                let (ci, si) = st.todo_entry;
+                let meta = &snap.chunks[ci];
+                if let Some(win) = load_window(&snap.schema, meta, si, (a, b), &plan.want, false)? {
+                    let mut stretches = split_by_holes(win.lo, win.hi, &st.todo_holes);
+                    stretches.reverse();
+                    if let Some((x, y)) = stretches.pop() {
+                        st.cur = Some(ChunkCursor { chunk: ci, series: si, next: x, end: y, rest: stretches, win });
+                    }
                 }
                 continue;
             }
@@ -459,8 +522,25 @@ impl Scan {
                 let idx = st.next_series;
                 st.next_series += 1;
                 if entry.ts_min <= f.ts_max && entry.ts_max >= f.ts_min && f.series_matches(entry.series_id) {
-                    if let Some(win) = load_window(&snap.schema, meta, idx, (f.ts_min, f.ts_max), &plan.want, false)? {
-                        st.cur = Some(ChunkCursor { chunk: st.next_chunk, series: idx, next: win.lo, win });
+                    if snap.tombs.is_empty() {
+                        if let Some(win) =
+                            load_window(&snap.schema, meta, idx, (f.ts_min, f.ts_max), &plan.want, false)?
+                        {
+                            st.cur = Some(ChunkCursor {
+                                chunk: st.next_chunk,
+                                series: idx,
+                                next: win.lo,
+                                end: win.hi,
+                                rest: Vec::new(),
+                                win,
+                            });
+                        }
+                    } else {
+                        let p = snap.tombs.plan(meta, idx, entry.series_id, f.ts_min, f.ts_max);
+                        st.todo = p.ivs;
+                        st.todo.reverse();
+                        st.todo_holes = p.holes;
+                        st.todo_entry = (st.next_chunk, idx);
                     }
                 }
                 continue;
@@ -507,13 +587,39 @@ impl Scan {
                     }
                     let base = c.series_offsets[si];
                     // A bound that sorts no later than the run's real first row.
-                    let key = if desc {
-                        (e.ts_max.min(f.ts_max), c.id, (base + u64::from(e.row_count)).saturating_sub(1))
-                    } else {
-                        (e.ts_min.max(f.ts_min), c.id, base)
+                    let bound = |lo: i64, hi: i64| {
+                        if desc {
+                            (e.ts_max.min(hi), c.id, (base + u64::from(e.row_count)).saturating_sub(1))
+                        } else {
+                            (e.ts_min.max(lo), c.id, base)
+                        }
                     };
-                    heap.push(HeapEntry { key, run: runs.len(), desc });
-                    runs.push(Run::Chunk { chunk: ci, series: si, loaded: false, cur: None });
+                    if self.snap.tombs.is_empty() {
+                        heap.push(HeapEntry { key: bound(f.ts_min, f.ts_max), run: runs.len(), desc });
+                        runs.push(Run::Chunk {
+                            chunk: ci,
+                            series: si,
+                            loaded: false,
+                            cur: None,
+                            range: (f.ts_min, f.ts_max),
+                            holes: Vec::new(),
+                        });
+                        continue;
+                    }
+                    // Tombstones cut the wanted range into the intervals still
+                    // alive: one run each (a run is one sorted stretch of the entry).
+                    let p = self.snap.tombs.plan(c, si, e.series_id, f.ts_min, f.ts_max);
+                    for (a, b) in p.ivs {
+                        heap.push(HeapEntry { key: bound(a, b), run: runs.len(), desc });
+                        runs.push(Run::Chunk {
+                            chunk: ci,
+                            series: si,
+                            loaded: false,
+                            cur: None,
+                            range: (a, b),
+                            holes: p.holes.clone(),
+                        });
+                    }
                 }
             }
             let source = MEM_SOURCE | self.snap.mem.generation;
@@ -552,14 +658,14 @@ impl Scan {
     }
 
     fn merge_fill(&mut self, batch: &mut ScanBatch, max: usize) -> Result<()> {
-        let Scan { snap, filter: f, mode, plan, .. } = self;
+        let Scan { snap, mode, plan, .. } = self;
         let Mode::Merge(m) = mode else { return Ok(()) };
         let desc = m.desc;
         while batch.rows() < max {
             let Some(top) = m.heap.pop() else { break };
             let Some(run) = m.runs.get_mut(top.run) else { continue };
             match run {
-                Run::Chunk { chunk, series, loaded, cur } => {
+                Run::Chunk { chunk, series, loaded, cur, range, holes } => {
                     let meta = &snap.chunks[*chunk];
                     let base = meta.series_offsets[*series];
                     // Key of the row the cursor returns next.
@@ -569,11 +675,25 @@ impl Scan {
                     };
                     if !*loaded {
                         *loaded = true;
-                        let range = (f.ts_min, f.ts_max);
-                        if let Some(win) = load_window(&snap.schema, meta, *series, range, &plan.want, true)? {
-                            let c = RunCursor { front: win.lo, back: win.hi, win };
-                            m.heap.push(HeapEntry { key: next_key(&c)?, run: top.run, desc });
-                            *cur = Some(c);
+                        if let Some(win) = load_window(&snap.schema, meta, *series, *range, &plan.want, true)? {
+                            let mut stretches = cursors_of(win, holes).into_iter();
+                            if let Some(c) = stretches.next() {
+                                m.heap.push(HeapEntry { key: next_key(&c)?, run: top.run, desc });
+                                *cur = Some(c);
+                            }
+                            // Dead rows split the window: each further stretch is a run of its own.
+                            let (ci, si, r) = (*chunk, *series, *range);
+                            for c in stretches {
+                                m.heap.push(HeapEntry { key: next_key(&c)?, run: m.runs.len(), desc });
+                                m.runs.push(Run::Chunk {
+                                    chunk: ci,
+                                    series: si,
+                                    loaded: true,
+                                    cur: Some(c),
+                                    range: r,
+                                    holes: Vec::new(),
+                                });
+                            }
                         }
                         continue;
                     }
@@ -661,7 +781,7 @@ impl Scan {
     /// put in order and handed out from `pending`, which survives the end of a
     /// batch.
     fn merge_fill_tie(&mut self, batch: &mut ScanBatch, max: usize) -> Result<()> {
-        let Scan { snap, filter: f, mode, plan, tie, .. } = self;
+        let Scan { snap, mode, plan, tie, .. } = self;
         let Mode::Merge(m) = mode else { return Ok(()) };
         let MergeState { desc, runs, heap, last, pending } = m;
         let desc = *desc;
@@ -718,7 +838,7 @@ impl Scan {
             let mut first = heap.pop();
             if !desc {
                 if let Some(top_run) = first.as_ref().map(|h| h.run) {
-                    if let Some(Run::Chunk { chunk, series, loaded: true, cur: Some(c) }) = runs.get_mut(top_run) {
+                    if let Some(Run::Chunk { chunk, series, loaded: true, cur: Some(c), .. }) = runs.get_mut(top_run) {
                         let meta = &snap.chunks[*chunk];
                         let base = meta.series_offsets[*series];
                         let entry = &meta.series[*series];
@@ -771,21 +891,33 @@ impl Scan {
                 let Some(top) = entry else { break };
                 let Some(run) = runs.get_mut(top.run) else { continue };
                 match run {
-                    Run::Chunk { chunk, series, loaded, cur } => {
+                    Run::Chunk { chunk, series, loaded, cur, range, holes } => {
                         let meta = &snap.chunks[*chunk];
                         let base = meta.series_offsets[*series];
                         if !*loaded {
                             *loaded = true;
-                            let range = (f.ts_min, f.ts_max);
-                            if let Some(win) = load_window(&snap.schema, meta, *series, range, &plan.want, true)? {
-                                let c = RunCursor { front: win.lo, back: win.hi, win };
-                                let i = if desc { c.back - 1 } else { c.front };
-                                heap.push(HeapEntry {
-                                    key: (c.win.ts_at(i)?, meta.id, base + i as u64),
-                                    run: top.run,
-                                    desc,
-                                });
-                                *cur = Some(c);
+                            if let Some(win) = load_window(&snap.schema, meta, *series, *range, &plan.want, true)? {
+                                let first_key = |c: &RunCursor| -> Result<Key> {
+                                    let i = if desc { c.back - 1 } else { c.front };
+                                    Ok((c.win.ts_at(i)?, meta.id, base + i as u64))
+                                };
+                                let mut stretches = cursors_of(win, holes).into_iter();
+                                if let Some(c) = stretches.next() {
+                                    heap.push(HeapEntry { key: first_key(&c)?, run: top.run, desc });
+                                    *cur = Some(c);
+                                }
+                                let (ci, si, r) = (*chunk, *series, *range);
+                                for c in stretches {
+                                    heap.push(HeapEntry { key: first_key(&c)?, run: runs.len(), desc });
+                                    runs.push(Run::Chunk {
+                                        chunk: ci,
+                                        series: si,
+                                        loaded: true,
+                                        cur: Some(c),
+                                        range: r,
+                                        holes: Vec::new(),
+                                    });
+                                }
                             }
                             continue;
                         }

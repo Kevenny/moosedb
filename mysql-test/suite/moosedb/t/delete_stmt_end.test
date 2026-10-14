@@ -1,0 +1,83 @@
+#
+# A DELETE done row by row (a WHERE the engine cannot take whole) is applied
+# when the statement ends, wherever the statement runs: under LOCK TABLES, in a
+# stored procedure, in a trigger, in a stored function. The next statement of
+# the same session -- a read, or the insert of the key just deleted -- must see
+# it, with no false duplicate key.
+#
+--source include/not_embedded.inc
+--source include/have_innodb.inc
+--source include/have_sequence.inc
+--source suite/moosedb/include/have_moosedb.inc
+
+CREATE TABLE t (itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG', clock INT NOT NULL, value DOUBLE NOT NULL, ns INT NOT NULL, PRIMARY KEY (itemid, clock, ns))
+  ENGINE=MooseDB TIMESTAMP_COLUMN='clock' CHUNK_INTERVAL='1 DAY';
+CREATE TABLE ctl (v DOUBLE) ENGINE=InnoDB;
+INSERT INTO t SELECT 1, 1700000000 + seq, seq, 0 FROM seq_0_to_9;
+
+--echo # LOCK TABLES: no per-statement unlock, the next statement still sees the delete
+LOCK TABLES t WRITE;
+DELETE FROM t WHERE value = 3;
+SELECT ROW_COUNT();
+SELECT COUNT(*) FROM t;
+INSERT INTO t VALUES (1, 1700000003, 33, 0);
+SELECT value FROM t WHERE itemid = 1 AND clock = 1700000003;
+DELETE FROM t WHERE value > 7;
+SELECT COUNT(*) FROM t;
+UNLOCK TABLES;
+SELECT COUNT(*) FROM t;
+LOCK TABLES t READ;
+SELECT COUNT(*) FROM t;
+UNLOCK TABLES;
+
+--echo # stored procedure: delete and insert the same key in one call
+DELIMITER |;
+CREATE PROCEDURE p()
+BEGIN
+  DELETE FROM t WHERE value = 33;
+  INSERT INTO t VALUES (1, 1700000003, 44, 0);
+  SELECT COUNT(*) AS rows_in_proc FROM t;
+END|
+DELIMITER ;|
+CALL p();
+SELECT value FROM t WHERE itemid = 1 AND clock = 1700000003;
+
+--echo # trigger: a statement on another table deletes from t; the next statement sees it
+CREATE TRIGGER trg AFTER INSERT ON ctl FOR EACH ROW DELETE FROM t WHERE value = NEW.v;
+INSERT INTO ctl VALUES (44);
+SELECT COUNT(*) FROM t WHERE clock = 1700000003;
+INSERT INTO t VALUES (1, 1700000003, 55, 0);
+SELECT value FROM t WHERE clock = 1700000003;
+DROP TRIGGER trg;
+
+--echo # stored function used in a SELECT
+DELIMITER |;
+CREATE FUNCTION f(x DOUBLE) RETURNS INT MODIFIES SQL DATA
+BEGIN
+  DELETE FROM t WHERE value = x;
+  RETURN ROW_COUNT();
+END|
+DELIMITER ;|
+SELECT f(55);
+SELECT COUNT(*) FROM t WHERE clock = 1700000003;
+INSERT INTO t VALUES (1, 1700000003, 66, 0);
+SELECT value FROM t WHERE clock = 1700000003;
+
+--echo # a connection that goes away right after the statement keeps the delete
+connect (c2,localhost,root,,test);
+DELETE FROM t WHERE value = 66;
+disconnect c2;
+connection default;
+SELECT COUNT(*) FROM t WHERE clock = 1700000003;
+
+--echo # the same inside one multi-statement transaction block (autocommit off)
+SET autocommit = 0;
+DELETE FROM t WHERE value = 4;
+INSERT INTO t VALUES (1, 1700000004, 77, 0);
+COMMIT;
+SET autocommit = 1;
+SELECT value FROM t WHERE clock = 1700000004;
+
+DROP FUNCTION f;
+DROP PROCEDURE p;
+DROP TABLE t, ctl;

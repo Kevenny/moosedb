@@ -163,7 +163,7 @@ impl SeriesIndex {
         self.version.store(next_version(), Ordering::Release);
     }
 
-    #[cfg(test)]
+    /// Id of the series with these tags, if there is one.
     pub(crate) fn lookup(&self, tags: &[Value]) -> Option<u64> {
         self.by_key.get(&series_key(tags)).copied()
     }

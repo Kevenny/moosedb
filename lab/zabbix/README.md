@@ -196,10 +196,11 @@ sem filesort).
 Uso: `docker exec zbxlab-mariadb mariadb -uroot -pzbxlab zabbix -e "SOURCE /lab/sql/adapted_history_v4.sql"`
 (server parado). `bench.sh` agora inclui `h_moose_v4`.
 
-**Mantenha o housekeeper de histórico DESLIGADO** (`--history-hk off`): o
-`DELETE … WHERE itemid=… AND clock<…` por item continua sem suporte (`ER_ILLEGAL_HA`);
-a expiração é por `RETENTION_PERIOD`. `REPLACE`/`ON DUPLICATE KEY UPDATE` sobre
-chave existente também são recusados.
+~~O housekeeper de histórico tinha de ficar desligado~~ — superado: ver
+"Atualização: DELETE suportado" no fim deste arquivo (o `DELETE … itemid=… AND
+clock<…` por item agora funciona; `RETENTION_PERIOD` segue sendo a forma barata de
+expirar por idade). `REPLACE`/`ON DUPLICATE KEY UPDATE` sobre chave existente
+continuam recusados (sem `UPDATE`).
 
 ### InnoDB x v3 x v4 (`results/bench_v4_5000x7d.txt`, 5.000 itens × 7 d × 60 s)
 
@@ -254,3 +255,68 @@ Nenhuma outra consulta regrediu além do ruído (gráficos 1 h / 24 h / 7 d, úl
 **Para reproduzir sem tocar nos volumes `zbxlab-*`**: container próprio com
 `--plugin-dir` apontando para uma cópia do `ha_moosedb.so` e os mesmos `-v` de `sql/` e
 `scripts/`, depois `docker exec -e ITEMS=5000 -e DAYS=7 -e STEP=60 <container> bash /lab/scripts/bench.sh`.
+
+## Atualização: DELETE suportado (item 5) — o housekeeper pode ficar ligado
+
+`DELETE` passou a funcionar em todas as variantes (v3 sem PK, v4 com PK): o
+`delete from history where itemid=X and clock<CUT [limit N]` do housekeeper e o
+`delete from history where itemid in (...)` do `history.clear` viram **um
+tombstone** (intervalo de tempo × série) gravado no WAL, com `ROW_COUNT()` exato;
+os chunks só são reescritos pela compactação (≥ 25 % do chunk morto, ou
+`OPTIMIZE`), e um chunk inteiramente apagado é descartado sem reescrita. Outros
+`WHERE` (`value > x`, `OR`, multi-tabela, `binlog_format=ROW`) apagam linha a
+linha, achando as linhas por conteúdo. Detalhes: `docs/architecture.md` §DELETE e
+`docs/user-guide.md` §DELETE.
+
+**O housekeeper de histórico pode ser ligado**, mas para expirar só por idade
+`RETENTION_PERIOD` continua melhor: descarta o chunk sem um tombstone por item
+(`retention_drop_chunk` acima: 14 ms) e sem fsync por item. Use o housekeeper para
+o que a retenção não faz: apagar por item (itens removidos, `history.clear`) ou
+períodos por item diferentes (*Override item history period*). As linhas
+"housekeeper (`delete … itemid=X and clock<Y`) ERROR 1031" e "`DELETE … IN (…)`
+ERROR 1031" da tabela de compatibilidade acima são o registro da rodada de
+2026-10-07; o log `[Z3005] query failed: [1031]` e o "Database error" do
+`history.clear` descritos acima não ocorrem mais.
+
+### 5.000 DELETEs do housekeeper (`scripts/bench_delete.sh`, `results/bench_delete_5000x7d.txt`)
+
+5.000 itens × 7 dias × 300 s = 10,08 M linhas por tabela; um `DELETE` por item
+(`delete from t where itemid=X and clock<CUT`, autocommit, via PREPARE/EXECUTE
+num procedimento, como `bench_hk_delete`). Container de teste (mesma máquina,
+mesmo disco), `wal_sync_mode=fsync` (padrão) e `innodb_flush_log_at_trx_commit=1`:
+
+| Métrica | InnoDB | MooseDB v3 | MooseDB v4 |
+|---|---:|---:|---:|
+| Apagar o 1º dia: 5.000 DELETEs (1,44 M linhas) | 6,72 s | 8,97 s | 9,14 s |
+| 20 % do 2º dia, `LIMIT 5000` (0,29 M linhas) | 4,50 s | 8,81 s | 9,08 s |
+| Mesmo com `--moosedb-wal-sync-mode=write` / `innodb_flush_log_at_trx_commit=2` (v4, 576 linhas/item) | 2,98 s | — | **1,41 s** |
+| Linhas depois (estatística `ROW_COUNT`, igual ao `COUNT(*)`) | 8.350.000 | 8.350.000 | 8.350.000 |
+
+O custo do MooseDB é o `fsync` do WAL por statement (≈ 1,8 ms neste disco; com
+`write` o `DELETE` custa 0,28 ms, dos quais o núcleo gasta ~1,3 µs: um tombstone,
+sem tocar nas linhas). O InnoDB também faz fsync por commit, mas no redo log já
+alocado (≈ 1,2 ms); o WAL do MooseDB cresce a cada entrada e o fdatasync paga o
+metadado do arquivo. Ou seja, em fsync estrito o housekeeper do MooseDB é ~1,35×
+**mais lento** que o do InnoDB nesta máquina (no laboratório anterior o InnoDB
+levou 16 s; os números absolutos dependem do disco); sem fsync é ~2× mais rápido.
+
+Leitura com 5.000 tombstones pendentes no mesmo chunk, antes de compactar (ms,
+melhor de 5, cache quente):
+
+| Consulta | antes de apagar | com tombstones pendentes | depois do `OPTIMIZE` |
+|---|---:|---:|---:|
+| Gráfico 1 item, 24 h — v4 | 0,45 | 0,44 | 0,49 |
+| Último valor de 20 itens — v4 | 0,78 | 0,84 | 0,70 |
+| Agregação por hora, 100 itens, 24 h — v4 | 6,82 | 7,01 | 6,92 |
+| Último valor de 20 itens — v3 | 3,28 | 2,82 | 3,04 |
+| `COUNT(*)` — v3/v4 (estatística exata) | 0,25 | 0,25 | 0,26 |
+| (InnoDB, referência: gráfico / último valor / agregação) | 0,43 / 0,75 / 6,8 | 0,47 / 0,77 / 6,6 | 0,52 / 0,90 / 6,6 |
+
+O `OPTIMIZE` que reescreve o chunk com 5.000 tombstones (1,15 M linhas vivas) leva
+0,23 s; o descarte do 1º dia (chunk inteiro morto) não reescreve nada.
+
+O caminho direto foi comprovado por `Handler_delete` (0 no direto, N linha a linha) em
+`mysql-test/suite/moosedb/t/delete.test`. Observação do item: o servidor só chama o
+*direct delete* se `cond_push` devolver NULL para o `WHERE` inteiro; a engine devolve
+NULL **apenas** para o alvo de um `DELETE` com `WHERE` totalmente capturado (TAG exata
++ limites de tempo) e qualquer outra condição volta ao servidor (fail-closed).

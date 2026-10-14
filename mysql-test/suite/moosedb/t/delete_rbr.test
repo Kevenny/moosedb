@@ -1,0 +1,87 @@
+#
+# DELETE with binary logging in ROW format: the server does not use the direct
+# delete then (it must log every row), so every form goes through
+# delete_row(), including DELETE without WHERE and the Zabbix housekeeper
+# statement. Compared with an InnoDB mirror; the binlog is checked for the
+# row events.
+#
+--source include/not_embedded.inc
+--source include/have_innodb.inc
+--source include/have_sequence.inc
+--source include/have_log_bin.inc
+--source suite/moosedb/include/have_moosedb.inc
+
+RESET MASTER;
+CREATE TABLE h (itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG', clock INT NOT NULL, value DOUBLE NOT NULL, ns INT NOT NULL, PRIMARY KEY (itemid, clock, ns))
+  ENGINE=MooseDB TIMESTAMP_COLUMN='clock' CHUNK_INTERVAL='1 DAY';
+CREATE TABLE n (itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG', clock INT NOT NULL, value DOUBLE NOT NULL, ns INT NOT NULL, INDEX (clock))
+  ENGINE=MooseDB TIMESTAMP_COLUMN='clock' CHUNK_INTERVAL='1 DAY';
+CREATE TABLE ih LIKE h;
+ALTER TABLE ih ENGINE=InnoDB;
+CREATE TABLE inn LIKE n;
+ALTER TABLE inn ENGINE=InnoDB;
+INSERT INTO h SELECT 1 + a.seq, 1767225600 + b.seq * 60, a.seq * 1000 + b.seq, b.seq MOD 2 FROM seq_0_to_4 a, seq_0_to_599 b;
+FLUSH TABLES h;
+INSERT INTO h SELECT 1 + a.seq, 1767225600 + 86400 + b.seq * 60, a.seq * 1000 + b.seq, b.seq MOD 2 FROM seq_0_to_4 a, seq_0_to_599 b;
+INSERT INTO n SELECT * FROM h;
+INSERT INTO ih SELECT * FROM h;
+INSERT INTO inn SELECT * FROM h;
+FLUSH BINARY LOGS;
+SELECT @@binlog_format;
+
+--echo # the housekeeper statement
+DELETE FROM h WHERE itemid = 2 AND clock < 1767225600 + 3600;
+SELECT ROW_COUNT();
+DELETE FROM ih WHERE itemid = 2 AND clock < 1767225600 + 3600;
+SELECT ROW_COUNT();
+--echo # with MaxHousekeeperDelete's LIMIT
+DELETE FROM h WHERE itemid = 3 AND clock < 1767225600 + 3600 LIMIT 5000;
+SELECT ROW_COUNT();
+DELETE FROM ih WHERE itemid = 3 AND clock < 1767225600 + 3600 LIMIT 5000;
+SELECT ROW_COUNT();
+--echo # history.clear, any WHERE, a subquery
+DELETE FROM h WHERE itemid IN (1, 5);
+SELECT ROW_COUNT();
+DELETE FROM ih WHERE itemid IN (1, 5);
+SELECT ROW_COUNT();
+DELETE FROM h WHERE value BETWEEN 3100 AND 3200 OR clock = 1767225600 + 86400;
+SELECT ROW_COUNT();
+DELETE FROM ih WHERE value BETWEEN 3100 AND 3200 OR clock = 1767225600 + 86400;
+SELECT ROW_COUNT();
+--let $mt= h
+--let $it= ih
+--let $q= SELECT itemid, clock, ns, value FROM {T} ORDER BY itemid, clock, ns
+--let $label= v4 with row-based binlog
+--source suite/moosedb/include/cmp_query.inc
+SELECT COUNT(*) = (SELECT COUNT(*) FROM ih) AS count_same FROM h;
+
+--echo # the table without a key; duplicates of (itemid, clock) differ only in value
+INSERT INTO n VALUES (2, 1767225600 + 5, 1, 0), (2, 1767225600 + 5, 2, 0), (2, 1767225600 + 5, 2, 0);
+INSERT INTO inn VALUES (2, 1767225600 + 5, 1, 0), (2, 1767225600 + 5, 2, 0), (2, 1767225600 + 5, 2, 0);
+DELETE FROM n WHERE itemid = 2 AND clock = 1767225600 + 5 AND value = 2 LIMIT 1;
+SELECT ROW_COUNT();
+DELETE FROM inn WHERE itemid = 2 AND clock = 1767225600 + 5 AND value = 2 LIMIT 1;
+SELECT ROW_COUNT();
+SELECT itemid, clock, value FROM n WHERE clock = 1767225600 + 5 AND itemid = 2 ORDER BY value;
+DELETE FROM n WHERE itemid = 3 AND value > 3100;
+DELETE FROM inn WHERE itemid = 3 AND value > 3100;
+--let $mt= n
+--let $it= inn
+--let $q= SELECT itemid, clock, ns, value FROM {T} ORDER BY itemid, clock, ns, value
+--let $label= v3 with row-based binlog
+--source suite/moosedb/include/cmp_query.inc
+
+--echo # DELETE without WHERE is row by row here (no TRUNCATE shortcut)
+DELETE FROM n;
+SELECT ROW_COUNT();
+SELECT COUNT(*) FROM n;
+DELETE FROM h;
+SELECT COUNT(*) FROM h;
+INSERT INTO h VALUES (1, 1767225600, 1, 0);
+SELECT COUNT(*) FROM h;
+
+--echo # restart: the deletes survive
+--source include/restart_mysqld.inc
+SELECT COUNT(*) FROM h;
+SELECT COUNT(*) FROM n;
+DROP TABLE h, n, ih, inn;

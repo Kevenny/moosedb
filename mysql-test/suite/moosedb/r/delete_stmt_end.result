@@ -1,0 +1,90 @@
+CREATE TABLE t (itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG', clock INT NOT NULL, value DOUBLE NOT NULL, ns INT NOT NULL, PRIMARY KEY (itemid, clock, ns))
+ENGINE=MooseDB TIMESTAMP_COLUMN='clock' CHUNK_INTERVAL='1 DAY';
+CREATE TABLE ctl (v DOUBLE) ENGINE=InnoDB;
+INSERT INTO t SELECT 1, 1700000000 + seq, seq, 0 FROM seq_0_to_9;
+# LOCK TABLES: no per-statement unlock, the next statement still sees the delete
+LOCK TABLES t WRITE;
+DELETE FROM t WHERE value = 3;
+SELECT ROW_COUNT();
+ROW_COUNT()
+1
+SELECT COUNT(*) FROM t;
+COUNT(*)
+9
+INSERT INTO t VALUES (1, 1700000003, 33, 0);
+SELECT value FROM t WHERE itemid = 1 AND clock = 1700000003;
+value
+33
+DELETE FROM t WHERE value > 7;
+SELECT COUNT(*) FROM t;
+COUNT(*)
+7
+UNLOCK TABLES;
+SELECT COUNT(*) FROM t;
+COUNT(*)
+7
+LOCK TABLES t READ;
+SELECT COUNT(*) FROM t;
+COUNT(*)
+7
+UNLOCK TABLES;
+# stored procedure: delete and insert the same key in one call
+CREATE PROCEDURE p()
+BEGIN
+DELETE FROM t WHERE value = 33;
+INSERT INTO t VALUES (1, 1700000003, 44, 0);
+SELECT COUNT(*) AS rows_in_proc FROM t;
+END|
+CALL p();
+rows_in_proc
+8
+SELECT value FROM t WHERE itemid = 1 AND clock = 1700000003;
+value
+44
+# trigger: a statement on another table deletes from t; the next statement sees it
+CREATE TRIGGER trg AFTER INSERT ON ctl FOR EACH ROW DELETE FROM t WHERE value = NEW.v;
+INSERT INTO ctl VALUES (44);
+SELECT COUNT(*) FROM t WHERE clock = 1700000003;
+COUNT(*)
+0
+INSERT INTO t VALUES (1, 1700000003, 55, 0);
+SELECT value FROM t WHERE clock = 1700000003;
+value
+55
+DROP TRIGGER trg;
+# stored function used in a SELECT
+CREATE FUNCTION f(x DOUBLE) RETURNS INT MODIFIES SQL DATA
+BEGIN
+DELETE FROM t WHERE value = x;
+RETURN ROW_COUNT();
+END|
+SELECT f(55);
+f(55)
+1
+SELECT COUNT(*) FROM t WHERE clock = 1700000003;
+COUNT(*)
+0
+INSERT INTO t VALUES (1, 1700000003, 66, 0);
+SELECT value FROM t WHERE clock = 1700000003;
+value
+66
+# a connection that goes away right after the statement keeps the delete
+connect  c2,localhost,root,,test;
+DELETE FROM t WHERE value = 66;
+disconnect c2;
+connection default;
+SELECT COUNT(*) FROM t WHERE clock = 1700000003;
+COUNT(*)
+0
+# the same inside one multi-statement transaction block (autocommit off)
+SET autocommit = 0;
+DELETE FROM t WHERE value = 4;
+INSERT INTO t VALUES (1, 1700000004, 77, 0);
+COMMIT;
+SET autocommit = 1;
+SELECT value FROM t WHERE clock = 1700000004;
+value
+77
+DROP FUNCTION f;
+DROP PROCEDURE p;
+DROP TABLE t, ctl;

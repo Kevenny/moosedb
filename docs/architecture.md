@@ -19,7 +19,8 @@ mysqld ──► ha_moosedb.so
 | `table` | estado da tabela, protocolo de durabilidade, recuperação |
 | `wal` | segmentos v2 (`ROW`/`COMMIT`/`ROW_COMMIT` com CRC), cifrados opcionalmente; v1 legível |
 | `batch` | lotes por statement: buffer privado, commit atômico, spill para chunks em estágio |
-| `manifest` | MANIFEST v2 (`wal_seq`, `replay_seq`, chunks vivos), troca atômica |
+| `manifest` | MANIFEST v2/v3 (`wal_seq`, `replay_seq`, chunks vivos com `born`, tombstones), troca atômica |
+| `tomb`, `delete` | tombstones (exclusão lógica por faixa ou por linhas), `DELETE` atômico e durável, replay |
 | `fsutil` | `write_atomic`, `sync_dir`, fsync que marca falha (poison) |
 | `memtable` | buffer em segmentos imutáveis (snapshot O(1)) |
 | `chunk`, `chunk_writer`, `chunk_reader`, `block` | formato `.tfl` v2, blocos por coluna |
@@ -47,7 +48,7 @@ Cada tabela é um diretório `<datadir>/<schema>/<tabela>/`:
 
 | Arquivo | Conteúdo |
 |---|---|
-| `MANIFEST` | lista de chunks vivos + checkpoint do WAL (`wal_seq`) + início do replay (`replay_seq`) (v2; CRC32, troca atômica) |
+| `MANIFEST` | lista de chunks vivos + checkpoint do WAL (`wal_seq`) + início do replay (`replay_seq`) (v2; v3 quando há ou houve `DELETE`: + `born` por chunk, `tseq` e os tombstones; CRC32, troca atômica) |
 | `OPTIONS` | TABLE OPTIONS normalizadas (texto), lidas pelo INFORMATION_SCHEMA |
 | `wal_NNNNNN.tfl.wal` | segmentos do WAL |
 | `chunk_<início>_<fim>_<id>.tfl` | chunk selado (formato v2, `chunk.rs`) |
@@ -220,7 +221,7 @@ Segmento cifrado só com header não exige a chave no replay.
 ## Concorrência
 
 * `store_lock` faz como o InnoDB: INSERTs rodam concorrentes entre si e com
-  SELECTs (`TL_WRITE_ALLOW_WRITE`); TRUNCATE/OPTIMIZE/DELETE/ALTER continuam
+  SELECTs (`TL_WRITE_ALLOW_WRITE`); TRUNCATE/OPTIMIZE/ALTER e `DELETE` sem WHERE (vira `delete_all_rows`) continuam
   exclusivos.
 * Escritores acumulam linhas em lotes privados (sem mutex) e só tomam o mutex
   no commit; leitores só seguram o mutex para
@@ -520,7 +521,128 @@ v3. Salvaguardas atuais:
 | 27 | Eixo de tempo só `DATETIME`/`TIMESTAMP` | + `INT`/`BIGINT` (signed/unsigned, `NOT NULL`, armazenada) **somente** via `TIMESTAMP_COLUMN='col'`, lido como segundos epoch UTC (`ts_us = secs × 10⁶`); índice simples sobre a coluna continua obrigatório; `ns` não é dobrado no eixo | Zabbix guarda `clock INT` + `ns INT`. Exigir `TIMESTAMP_COLUMN` evita que um índice qualquer sobre um inteiro mude o significado de tabelas existentes. Produto que estoura `i64` (ou `BIGINT UNSIGNED` > 2⁶³) é erro explícito, não truncamento; limites de range vindos do índice saturam. O core não mudou (mesmo `TF_COL_TIMESTAMP`, sem mudança de FFI); o IS exibe o eixo como DATETIME (clampa em 0000/9999 nos extremos). |
 | 28 | Pushdown de TAG só para strings | + TAG inteira (`TINYINT`..`BIGINT`) com constantes `INT`/`DECIMAL`/`DOUBLE`/string-inteira-limpa em `=`, `IN`, igualdade múltipla; comparação binária do texto canônico | O Zabbix consulta `itemid = 123` sem aspas; cada query varria todas as séries. Regra de correção: o servidor reavalia o WHERE, então só se poda uma série quando é certo que o servidor não a casaria (ver §Leitura). Tipos mistos: em `IN`, uma constante de módulo ≥ 2⁵³ junto de constante `DOUBLE`/string (a lista pode ser comparada como DOUBLE) recusa o pushdown; em igualdade múltipla, todos os membros precisam ser colunas inteiras (membro `DOUBLE`/`DECIMAL`/string recusa). |
 | 29 | Índice só no timestamp | Índices compostos não-UNIQUE `(tag_1..tag_k [, tempo])`, até 8 por tabela. TAG do índice: `COMMENT 'TAG'`, `NOT NULL`, inteira (`TINYINT`..`BIGINT`) ou `CHAR`/`VARCHAR` inteira (sem prefixo), sem repetição, sem `DESC`; qualquer subconjunto/ordem das TAGs (não precisa ser prefixo da ordem do schema); o tempo, se presente, é a **última** parte. O índice só no tempo continua obrigatório. `index_flags`: parte de tempo = `NEXT\|PREV\|ORDER\|RANGE`; parte TAG = `NEXT\|PREV`, e `+ORDER` só para `all_parts=0` (pergunta do `MIN/MAX(col)`); **nenhuma** parte TAG anuncia `RANGE`. Detalhes em §Leitura (índices compostos) | Zabbix lê `WHERE itemid=X AND clock BETWEEN …`, `MAX(clock) … itemid=X`, e faz self-join em `(itemid, clock)`; sem índice cada linha do join varria a série inteira (4,1 s vs 0,7 ms no InnoDB). A engine não tem estrutura de índice: a leitura é "quais séries casam as TAGs da chave" (cache de TAG, O(1)) + faixa de tempo (poda por busca binária), servida pelo k-way merge que já existia. Por isso a ordem que o servidor pode assumir é só a que isso dá de graça (ver §Leitura), e **não** se anuncia ordem nem faixa entre valores de TAG. |
-| 30 | Índices só não-UNIQUE ("linhas não são únicas por tag+tempo") | **Uma** `PRIMARY KEY`/`UNIQUE (todas as TAGs em qualquer ordem, tempo[, 1-2 colunas INT NOT NULL])`, com unicidade verificada de verdade (`ER_DUP_ENTRY`, `INSERT IGNORE`, errkey = a chave). Sem TAGs: só `UNIQUE(tempo)`. TAG de texto na chave exige collation binária NO PAD (ou inteira); `REPLACE`/`ODKU` sobre chave existente → `ER_ILLEGAL_HA` (sem UPDATE/DELETE); `unique_checks=0` pula a checagem. Detalhes em §Chave única | O Zabbix 7.0 declara `PRIMARY KEY (itemid,clock,ns)`; antes só rodava com a PK removida. Subconjunto de TAGs foi recusado: unicidade sobre parte da identidade da série exigiria checar várias séries a cada INSERT. Collation `_ci`/PAD SPACE foi recusada porque duas séries (bytes diferentes) seriam a mesma chave. O índice de tempo isolado deixa de ser obrigatório quando existe a chave única (ela contém o tempo). |
+| 30 | Índices só não-UNIQUE ("linhas não são únicas por tag+tempo") | **Uma** `PRIMARY KEY`/`UNIQUE (todas as TAGs em qualquer ordem, tempo[, 1-2 colunas INT NOT NULL])`, com unicidade verificada de verdade (`ER_DUP_ENTRY`, `INSERT IGNORE`, errkey = a chave). Sem TAGs: só `UNIQUE(tempo)`. TAG de texto na chave exige collation binária NO PAD (ou inteira); `REPLACE`/`ODKU` sobre chave existente → `ER_ILLEGAL_HA` (sem UPDATE; depois de um `DELETE` da chave inserem normalmente); `unique_checks=0` pula a checagem. Detalhes em §Chave única | O Zabbix 7.0 declara `PRIMARY KEY (itemid,clock,ns)`; antes só rodava com a PK removida. Subconjunto de TAGs foi recusado: unicidade sobre parte da identidade da série exigiria checar várias séries a cada INSERT. Collation `_ci`/PAD SPACE foi recusada porque duas séries (bytes diferentes) seriam a mesma chave. O índice de tempo isolado deixa de ser obrigatório quando existe a chave única (ela contém o tempo). |
+| 31 | Engine append-only: sem `DELETE` (a retenção por chunk era a única remoção) | `DELETE` suportado por **tombstones** duráveis (faixa de tempo × séries, ou linhas exatas), com a atomicidade e a visibilidade do `INSERT` e remoção física na compactação. MANIFEST v3 (`born` por chunk, `tseq`, tombstones) só depois do primeiro `DELETE`; entradas WAL 4 e 5. `UPDATE` segue recusado. `DELETE` com `WHERE` roda concorrente com `INSERT`. Detalhes em §DELETE | O housekeeper e `history.clear` do Zabbix apagam por item/intervalo. Reescrever chunks a cada `DELETE` custaria O(chunk) por statement (5.000 por dia); o tombstone custa O(1) e o espaço volta na compactação. |
+
+## DELETE (tombstones)
+
+`DELETE` é **exclusão lógica**: nenhum chunk é alterado (são imutáveis); um
+*tombstone* esconde as linhas até uma compactação (ou a retenção) removê-las
+fisicamente. Implementação em `tomb.rs` (modelo, MANIFEST), `delete.rs` (operações,
+replay), com ganchos em `scan`, `unique`, `compaction`, `table`, `batch`, `wal`.
+
+**Dois tipos de tombstone.**
+
+* *Faixa* (`RangeTomb`): `seq`, `[lo, hi]` de tempo, séries (`Sel::All` ou ids) e
+  `hits` (linhas escondidas por chunk, para as estatísticas). Custa O(séries) de
+  memória e nada por linha. É o que o housekeeper do Zabbix gera (um por item).
+* *Linhas* (`RowsTomb`): `(chunk, entrada de série, ordinais)` em corridas
+  `(início, tamanho)`. Chunks são imutáveis e ids não se repetem, então o par
+  chunk/ordinal nomeia a linha para sempre. Usado pelo `WHERE` arbitrário, em que as
+  linhas são achadas por **conteúdo** (série + `ts` + todas as colunas, floats bit a
+  bit; linhas iguais são apagadas uma de cada vez).
+
+**Ordem em relação aos inserts (`born`).** O tombstone de faixa esconde só linhas que
+já existiam. Cada tombstone tem `seq` (por tabela, estritamente crescente, nunca
+reutilizado: o MANIFEST guarda o maior, `tseq`); cada chunk tem `born`, o maior `seq`
+já refletido nas linhas que ele contém. Um tombstone se aplica a um chunk **sse
+`seq > born`**. Chunk de flush e chunk em estágio (spill) nascem com o `tseq` do
+momento em que são publicados; a saída de uma compactação nasce com o `tseq` do
+início dela (os deletes posteriores ainda a escondem, os anteriores foram aplicados
+fisicamente). Linhas da MemTable são **removidas na hora** do `DELETE` (só os
+segmentos que perdem linhas são reconstruídos; os de snapshots abertos ficam
+intactos), então não precisam de `born`. Reinserir uma chave apagada funciona
+porque a linha nova entra depois do tombstone (MemTable, ou chunk com `born` maior).
+
+**Protocolo de um `DELETE`** (mesma regra do COMMIT de lote):
+
+1. sob `del_gate` (um `DELETE` por vez por tabela, para as contagens ficarem exatas) e
+   **sem** o mutex da tabela, conta/localiza o que ele esconde nos chunks de um
+   snapshot (blocos de `ts` só são decodificados nas entradas cortadas pelo
+   intervalo; entrada inteira dentro dele usa `row_count`);
+2. toma o mutex; se o conjunto de chunks mudou (`layout_gen`: flush, compactação...)
+   refaz o 1; senão
+3. **apenda uma entrada DELETE ao WAL e a sincroniza** (conforme `wal_sync_mode`) —
+   ponto de commit; falha aqui não muda nada em memória (e envenena a tabela como
+   qualquer falha de WAL);
+4. só então aplica: remove da MemTable, adiciona o tombstone, invalida o estado de
+   unicidade das séries tocadas, publica o snapshot.
+
+O `DELETE` **não reescreve o MANIFEST**: o tombstone vive no WAL até a próxima
+mudança estrutural (flush, compactação, retenção, truncate, batch com spill, ou o
+checkpoint da abertura), que o grava no MANIFEST v3. **Todo MANIFEST escrito carrega
+os tombstones** (`Inner::manifest_for`), senão um checkpoint que apaga os segmentos
+do WAL perderia os deletes.
+
+**Formatos.** WAL (a versão do segmento continua 2): `4 DELETE_RANGE = seq lo hi
+(0 | 1 n tags*)` — as séries vão **pelos valores das TAGs**, não por id, porque ids
+de séries só presentes no WAL podem mudar entre execuções; `5 DELETE_ROWS = seq
+n_mem rows* n_hits RowsTomb*` (linhas removidas da MemTable por conteúdo + linhas de
+chunk já resolvidas em ordinais). Entradas de DELETE têm teto de 8 MiB (maior = log
+adulterado = `Corrupt`; o escritor recusa ou quebra antes). MANIFEST v3: ver
+`manifest.rs`. **Compatibilidade**: arquivos antigos (MANIFEST v1/v2, WAL v1/v2)
+abrem sem mudança (`born = 0`, nenhum tombstone). Enquanto a tabela nunca teve um
+`DELETE` (`tseq = 0`) o MANIFEST continua sendo gravado em v2, byte a byte como
+antes; depois do primeiro é v3, e um binário antigo recusa abrir ("MANIFEST version 3
+not supported") em vez de mostrar linhas apagadas. Uma entrada DELETE no WAL faz um
+binário antigo falhar com "unknown kind" (nunca ignora em silêncio). Não há volta
+automática a v2.
+
+**Recuperação.** Abertura: tombstones do MANIFEST + replay das entradas DELETE do WAL
+com `seq > tseq` do MANIFEST, na ordem do log, entre as linhas commitadas. Para
+`seq <= tseq` só a parte da MemTable é reaplicada (o chunk já tem o efeito). A
+posição no log é a ordem em que a tabela viu as coisas porque DELETE e COMMIT são
+apendados e sincronizados sob o mutex. Idempotente: a faixa é idempotente por
+natureza; a de linhas reaplica a MemTable por conteúdo e os ordinais gravados (o
+MANIFEST anterior ao delete é, por construção, o conjunto de chunks do momento
+dele). `kill -9` entre o fsync do WAL e a publicação = o delete vale (está no WAL),
+nunca meio aplicado; antes do fsync = não vale.
+
+**Leitura.** `Snapshot` leva o `TombSet`. Por entrada de série de chunk o scan corta o
+intervalo de tempo pedido nos subintervalos que nenhum tombstone de faixa cobre (um
+*run* por subintervalo no merge ordenado, um `ChunkCursor` por subintervalo no
+stream) e os ordinais mortos viram buracos na janela decodificada (trechos
+separados). Sem tombstones o caminho é o antigo (custo zero); com eles, O(tombstones
+da série) por entrada. Também respeitam os tombstones: o lookup de unicidade
+(`existing_extras`), a compactação, `stats()` (`row_count` exato, que o servidor usa
+para `COUNT(*)` por `HA_STATS_RECORDS_IS_EXACT`) e o INFORMATION_SCHEMA.
+`UniqueState` perde a lista "extras no maior `ts`" das séries afetadas (o limite
+`max_ts` continua válido): sem `ER_DUP_ENTRY` falso depois de apagar nem falso aceite.
+
+**Remoção física.** A compactação filtra as linhas escondidas (`build_merged`), grava
+a saída com `born` = `tseq` do início, move os `hits` dos tombstones mais novos para a
+saída e solta o resto; recusa o commit se surgiu um tombstone de linhas sobre suas
+entradas (tenta no próximo ciclo). Dispara quando ≥ 25 % de um chunk está morto
+(sempre no `OPTIMIZE`). Chunk cujas linhas estão **todas** escondidas é descartado
+sem reescrita (conferido linha a linha antes; `dead_rows` é só estatística).
+Tombstones que nenhum chunk vivo (com `born < seq` e faixa de tempo sobreposta) ainda
+precisa são descartados (`TombSet::prune`), o que cobre a retenção; TRUNCATE zera
+tudo (`tseq` não volta).
+
+**Handler.** `HA_CAN_DIRECT_UPDATE_AND_DELETE`: `cond_push` (só no alvo de um `DELETE`, `SQLCOM_DELETE`
+com lock de escrita) captura o `WHERE` INTEIRO e devolve NULL para o servidor, que só então
+chama `direct_delete_rows_init` (com `WHERE` não capturado inteiro: recusa, fail-closed);
+`direct_delete_rows_init` usa a captura. A análise do
+`WHERE` (`capture_delete_cond`: conjunções de `TAG = const`/`IN` exatos e limites
+`< <= > >= = BETWEEN` na coluna de tempo `INT`/`DATETIME`; nada é aproximado, ao
+contrário do pushdown de leitura) e `direct_delete_rows` chama
+`moosedb_delete_range` (`ROW_COUNT()` exato). `ORDER BY`, `WHERE` que não casa,
+`LIMIT` menor que o intervalo, triggers, `binlog_format=ROW` e `RETURNING` fazem o
+servidor apagar linha a linha: `delete_row` converte o registro como o `write_row` e
+acumula em `DeleteBatch`; o fim do statement (`external_lock(F_UNLCK)`, `reset`,
+`close`) o aplica por conteúdo — mesmo com erro no meio, como o `INSERT` (o binlog já
+registrou as linhas). `delete_row` também atende `DELETE` multi-tabela e a réplica RBR (o applier compara o
+registro lido com a imagem anterior do mestre byte a byte nos bytes de NULL, então os
+bits não usados desses bytes agora vêm de `default_values` em vez de zero, e o applier
+lê linhas inteiras).
+
+**Limites e decisões do endurecimento.** Seleção de mais de 20.000 séries: cai para linha a linha
+(a entrada do log tem teto de 8 MiB). Uma única linha cujo conteúdo codificado passa de 8 MiB e que
+está na MemTable não cabe numa entrada: o `DELETE` falha com erro claro (`Unsupported`), sem efeito.
+O handler avisa (nota) quando o núcleo apagou menos linhas do que o servidor contou. Acima de 4.096
+tombstones de faixa pendentes a compactação reescreve os chunks tocados mesmo abaixo de 25 % mortos.
+Leitura de faixa sobre a chave inteira `(itemid, clock, ns)` com `ns` fixado (`clock BETWEEN a AND b AND
+ns = 1`): a engine começa em `clock = a` sem filtrar `ns` (superconjunto, o servidor reavalia o `WHERE`).
 
 ## Chave única (`PRIMARY KEY` / `UNIQUE`)
 
@@ -583,7 +705,16 @@ de 6 execuções (+8 %, de −8 % a +20 % entre execuções; o InnoDB leva ~21 s
 * A manutenção de background só alcança tabelas **abertas** (no table cache).
   `OPTIMIZE TABLE` e as procedures funcionam sempre.
 * `DELETE FROM t` sem `WHERE` com `binlog_format=ROW` é executado linha a linha
-  pelo servidor e falha (`ER_ILLEGAL_HA`); `TRUNCATE` funciona sempre.
+  pelo servidor (`delete_row`, por conteúdo); `TRUNCATE` é o caminho rápido.
+* `DELETE`: ver §DELETE. Limites: `UPDATE` recusado; `LIMIT` sem `ORDER BY` apaga
+  linhas arbitrárias (as mais antigas só se o intervalo cabe no `LIMIT`); o caminho
+  direto exige o `WHERE` exato descrito no handler (eixo `TIMESTAMP` e funções vão
+  linha a linha); seleção de séries que não cabe em 8 MiB de log é recusada; `DELETE`
+  linha a linha de mais de 32 MiB de linhas é aplicado em etapas atômicas; dois
+  `DELETE`s concorrentes sobre as mesmas linhas fazem o `ROW_COUNT()` do servidor
+  contar linhas que o outro levou (estado final correto); leitura com muitos
+  tombstones sobre a mesma série custa O(tombstones) por entrada até a compactação;
+  chunks com tombstones só são reescritos quando ≥ 25 % mortos ou no `OPTIMIZE`.
 * Pushdown de TAG só em `=`, `IN` (não negado) e igualdades múltiplas ligadas
   por `AND` (OR, `NOT IN`, `<>`, `<=>` são avaliados só pelo servidor), com
   constantes string (colunas string) ou numéricas (TAG inteira, ver §Leitura).
@@ -603,7 +734,7 @@ de 6 execuções (+8 %, de −8 % a +20 % entre execuções; o InnoDB leva ~21 s
   escrevem várias séries em ordens opostas ao mesmo tempo podem receber
   `ER_LOCK_DEADLOCK`; uma sessão que tem dois statements abertos na mesma tabela
   e espera por si mesma só sai pelo timeout; `REPLACE`/`ODKU` sobre chave
-  existente e `UPDATE`/`DELETE` seguem recusados; `unique_checks=0` abre mão da
+  existente e `UPDATE` segue recusado; `unique_checks=0` abre mão da
   checagem sem aviso; ao ler a PK, `ns` com intervalo (`ns > X`) não vira faixa de
   índice (o servidor filtra).
 * Índices compostos não únicos: TAG nullable, `DECIMAL`/`DOUBLE`/`YEAR`/

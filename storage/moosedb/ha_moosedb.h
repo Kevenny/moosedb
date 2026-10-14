@@ -102,7 +102,13 @@ struct tf_batch_closer
 {
   void operator()(MooseDBBatch *b) const noexcept;
 };
+/* Rows of a DELETE statement collected for the core; same safety net as above. */
+struct tf_delete_closer
+{
+  void operator()(MooseDBDelete *d) const noexcept;
+};
 using tf_batch_ptr= std::unique_ptr<MooseDBBatch, tf_batch_closer>;
+using tf_delete_ptr= std::unique_ptr<MooseDBDelete, tf_delete_closer>;
 using tf_table_ptr= std::unique_ptr<MooseDBTable, tf_table_closer>;
 using tf_scan_ptr= std::unique_ptr<MooseDBScan, tf_scan_closer>;
 using tf_snapshot_ptr= std::unique_ptr<MooseDBSnapshot, tf_snapshot_closer>;
@@ -226,8 +232,9 @@ public:
   int write_row(const uchar *buf) override;
   int update_row(const uchar *, const uchar *) override
   { return HA_ERR_WRONG_COMMAND; }   /* append-only: UPDATE not supported */
-  int delete_row(const uchar *) override
-  { return HA_ERR_WRONG_COMMAND; }   /* use RETENTION_PERIOD or TRUNCATE  */
+  int delete_row(const uchar *buf) override;   /* collected, applied at statement end */
+  int direct_delete_rows_init() override;
+  int direct_delete_rows(ha_rows *deleted) override;
   int delete_all_rows() override;
   int truncate() override;
   void start_bulk_insert(ha_rows rows, uint flags) override;
@@ -279,7 +286,8 @@ public:
     return HA_NO_TRANSACTIONS | HA_REC_NOT_IN_SEQ |
            HA_STATS_RECORDS_IS_EXACT | HA_NO_AUTO_INCREMENT |
            HA_BINLOG_ROW_CAPABLE | HA_BINLOG_STMT_CAPABLE |
-           HA_CAN_TABLE_CONDITION_PUSHDOWN | HA_PARTIAL_COLUMN_READ;
+           HA_CAN_TABLE_CONDITION_PUSHDOWN | HA_PARTIAL_COLUMN_READ |
+           HA_CAN_DIRECT_UPDATE_AND_DELETE;
   }
   ulong index_flags(uint idx, uint part, bool all_parts) const override;
   uint max_supported_keys() const override { return 8; }
@@ -306,6 +314,10 @@ private:
   int key_to_ts(uint idx, const uchar *key, uint part, longlong *out);
   int map_status(TFStatus status, const char *name= nullptr);
   int commit_batch();   /* publish + sync the open statement batch, if any */
+  int commit_delete();  /* apply the rows collected by delete_row(), if any */
+  int record_to_row(const uchar *buf, TFRow *out);   /* record -> values_ */
+  bool capture_delete_cond(Item *item, std::vector<tf_tag_predicate> *preds,
+                           longlong *lo, longlong *hi);
   int write_batch_row(const TFRow &row);  /* batch write, waiting for UNIQUE series claims */
   bool extras_equal(const uchar *rec) const;   /* idx_req_.extra_vals vs the row in rec */
   int key_extra_values(uint idx, const uchar *key, uint from, uint to,
@@ -347,6 +359,19 @@ private:
   bool scan_snapshot_saved_= false; /* snapshot of scan_ kept for rnd_pos */
   std::vector<tf_snapshot_ptr> snapshots_;  /* resolve positions in rnd_pos */
   tf_batch_ptr batch_;         /* open statement batch (lazy, per stmt)  */
+  tf_delete_ptr del_;          /* rows of the open DELETE statement       */
+  /* Plan of a direct delete, made by direct_delete_rows_init(). */
+  bool ddel_ready_= false;
+  bool ddel_all_series_= true;
+  std::vector<uint64_t> ddel_ids_;
+  longlong ddel_lo_= LONGLONG_MIN, ddel_hi_= LONGLONG_MAX;
+  ha_rows ddel_limit_= HA_POS_ERROR;
+  /* The WHERE cond_push() accepted whole for a DELETE (see cond_push). */
+  bool ddel_cap_valid_= false;
+  const COND *ddel_cap_item_= nullptr;
+  std::vector<tf_tag_predicate> ddel_cap_preds_;
+  longlong ddel_cap_lo_= LONGLONG_MIN, ddel_cap_hi_= LONGLONG_MAX;
+  uint64_t del_rows_= 0;      /* delete_row() calls of the open DELETE */
   bool in_bulk_insert_= false;
   uint dup_key_= MAX_KEY;     /* key of the last HA_ERR_FOUND_DUPP_KEY (info ERRKEY) */
   query_id_t bulk_query_id_= 0;  /* statement that called start_bulk_insert */

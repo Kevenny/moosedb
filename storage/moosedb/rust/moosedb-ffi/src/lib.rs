@@ -23,6 +23,8 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 use std::sync::Arc;
 
+use moosedb_core::delete::RangeDelete;
+use moosedb_core::DeleteBatch;
 use moosedb_core::compression::Codec;
 use moosedb_core::inspect::{ChunkStatus, TableInfo};
 use moosedb_core::{
@@ -874,6 +876,161 @@ pub unsafe extern "C" fn moosedb_flush(table: *mut MooseDBTable) -> TFStatus {
 #[no_mangle]
 pub unsafe extern "C" fn moosedb_truncate(table: *mut MooseDBTable) -> TFStatus {
     guard(|| table_ref(table)?.table.truncate())
+}
+
+
+// ─── deletes ─────────────────────────────────────────────────────────────────
+
+/// Opaque set of rows a `DELETE` removes one by one (see `moosedb_delete_begin`).
+pub struct MooseDBDelete {
+    del: Option<DeleteBatch>,
+}
+
+/// Deletes every row of the given series (`series_count < 0` = all series) with
+/// `ts_start_us <= ts <= ts_end_us`, as one atomic, logged step. With
+/// `max_rows >= 0` nothing is deleted when more rows match: `*out_exceeds` is
+/// set and `*out_rows` holds the number that match. Otherwise `*out_rows` is
+/// the number deleted. `durable` fsyncs the log before returning.
+///
+/// # Safety
+/// `series_ids` must hold `series_count` ids when `series_count > 0`; the out
+/// pointers must be writable.
+#[no_mangle]
+pub unsafe extern "C" fn moosedb_delete_range(
+    table: *mut MooseDBTable,
+    series_ids: *const u64,
+    series_count: i64,
+    ts_start_us: i64,
+    ts_end_us: i64,
+    max_rows: i64,
+    durable: bool,
+    out_rows: *mut u64,
+    out_exceeds: *mut bool,
+) -> TFStatus {
+    guard(|| {
+        let rows = handle_mut(out_rows, "out_rows")?;
+        let exceeds = handle_mut(out_exceeds, "out_exceeds")?;
+        *rows = 0;
+        *exceeds = false;
+        let t = table_ref(table)?;
+        let ids = if series_count >= 0 {
+            // SAFETY: caller contract.
+            Some(unsafe { slice(series_ids, series_count as usize, "series_ids") }?)
+        } else {
+            None
+        };
+        let max = (max_rows >= 0).then_some(max_rows as u64);
+        match t.table.delete_range(ids, ts_start_us, ts_end_us, max, durable)? {
+            RangeDelete::Deleted(n) => *rows = n,
+            RangeDelete::Exceeds(n) => {
+                *rows = n;
+                *exceeds = true;
+            }
+        }
+        Ok(())
+    })
+}
+
+/// How many rows `moosedb_delete_range` with the same arguments would delete now.
+///
+/// # Safety
+/// As `moosedb_delete_range`.
+#[no_mangle]
+pub unsafe extern "C" fn moosedb_count_range(
+    table: *mut MooseDBTable,
+    series_ids: *const u64,
+    series_count: i64,
+    ts_start_us: i64,
+    ts_end_us: i64,
+    out_rows: *mut u64,
+) -> TFStatus {
+    guard(|| {
+        let rows = handle_mut(out_rows, "out_rows")?;
+        *rows = 0;
+        let t = table_ref(table)?;
+        let ids = if series_count >= 0 {
+            // SAFETY: caller contract.
+            Some(unsafe { slice(series_ids, series_count as usize, "series_ids") }?)
+        } else {
+            None
+        };
+        *rows = t.table.count_range(ids, ts_start_us, ts_end_us)?;
+        Ok(())
+    })
+}
+
+/// Starts collecting the rows of one `DELETE` statement. They are matched by
+/// content and deleted by `moosedb_delete_commit` (also in pieces if the
+/// statement is huge). The handle ends in commit or abort.
+///
+/// # Safety
+/// `table` must be a valid handle; `out_delete` writable.
+#[no_mangle]
+pub unsafe extern "C" fn moosedb_delete_begin(
+    table: *mut MooseDBTable,
+    durable: bool,
+    out_delete: *mut *mut MooseDBDelete,
+) -> TFStatus {
+    guard(|| {
+        let out = handle_mut(out_delete, "out_delete")?;
+        *out = ptr::null_mut();
+        let t = table_ref(table)?;
+        *out = Box::into_raw(Box::new(MooseDBDelete { del: Some(t.table.begin_delete(durable)) }));
+        Ok(())
+    })
+}
+
+/// Adds one row (same value convention as `moosedb_write_row`) to delete.
+///
+/// # Safety
+/// `del` must be a live handle; `row` as in `moosedb_write_row`.
+#[no_mangle]
+pub unsafe extern "C" fn moosedb_delete_add(del: *mut MooseDBDelete, row: *const TFRow) -> TFStatus {
+    guard(|| {
+        let d = handle_mut(del, "delete")?;
+        let b = d.del.as_mut().ok_or_else(|| invalid("the delete is already finished"))?;
+        // SAFETY: caller contract.
+        let row = unsafe { row_from_c(b.schema(), row) }?;
+        b.add(row)
+    })
+}
+
+/// Deletes the collected rows and releases the handle (also on error).
+/// `*out_rows` receives the number of rows deleted.
+///
+/// # Safety
+/// `del` must come from `moosedb_delete_begin` and not be used afterwards.
+#[no_mangle]
+pub unsafe extern "C" fn moosedb_delete_commit(del: *mut MooseDBDelete, out_rows: *mut u64) -> TFStatus {
+    guard(|| {
+        if del.is_null() {
+            return Err(invalid("delete is NULL"));
+        }
+        // SAFETY: ownership is transferred back from C, exactly once.
+        let mut d = unsafe { Box::from_raw(del) };
+        let b = d.del.take().ok_or_else(|| invalid("the delete is already finished"))?;
+        let n = b.commit()?;
+        // SAFETY: caller contract (NULL allowed).
+        if let Some(p) = unsafe { out_rows.as_mut() } {
+            *p = n;
+        }
+        Ok(())
+    })
+}
+
+/// Discards the collected rows and releases the handle. NULL is ignored.
+///
+/// # Safety
+/// `del` must come from `moosedb_delete_begin` and not be used afterwards.
+#[no_mangle]
+pub unsafe extern "C" fn moosedb_delete_abort(del: *mut MooseDBDelete) -> TFStatus {
+    guard(|| {
+        if !del.is_null() {
+            // SAFETY: ownership is transferred back from C, exactly once.
+            drop(unsafe { Box::from_raw(del) });
+        }
+        Ok(())
+    })
 }
 
 // ─── scans ───────────────────────────────────────────────────────────────────

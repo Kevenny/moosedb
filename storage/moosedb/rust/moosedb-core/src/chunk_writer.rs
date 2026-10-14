@@ -84,6 +84,10 @@ impl<'a> ChunkBuilder<'a> {
         ChunkBuilder { schema, codec, cipher, data_start, data: Vec::new(), entries: Vec::new(), raw_bytes: 0 }
     }
 
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     /// Appends one series. `rows` must be sorted by timestamp and non-empty.
     pub(crate) fn add_series(&mut self, series_id: u64, tags: &[Value], rows: &[&Row]) -> Result<()> {
         let (Some(first), Some(last)) = (rows.first(), rows.last()) else {
@@ -198,6 +202,8 @@ impl<'a> ChunkBuilder<'a> {
             bloom,
             cipher: self.cipher,
             by_id: Default::default(),
+            // Callers that publish the chunk set the real value (`Table`).
+            born: u64::MAX,
         })
     }
 }

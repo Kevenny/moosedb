@@ -54,6 +54,9 @@ typedef enum {
 // Opaque statement batch (see `moosedb_batch_begin`). Used by one thread.
 typedef struct MooseDBBatch MooseDBBatch;
 
+// Opaque set of rows a `DELETE` removes one by one (see `moosedb_delete_begin`).
+typedef struct MooseDBDelete MooseDBDelete;
+
 // Opaque diagnostics handle.
 typedef struct MooseDBInfo MooseDBInfo;
 
@@ -367,6 +370,63 @@ TFStatus moosedb_flush(MooseDBTable *table);
 // # Safety
 // `table` must be a valid handle.
 TFStatus moosedb_truncate(MooseDBTable *table);
+
+// Deletes every row of the given series (`series_count < 0` = all series) with
+// `ts_start_us <= ts <= ts_end_us`, as one atomic, logged step. With
+// `max_rows >= 0` nothing is deleted when more rows match: `*out_exceeds` is
+// set and `*out_rows` holds the number that match. Otherwise `*out_rows` is
+// the number deleted. `durable` fsyncs the log before returning.
+//
+// # Safety
+// `series_ids` must hold `series_count` ids when `series_count > 0`; the out
+// pointers must be writable.
+TFStatus moosedb_delete_range(MooseDBTable *table,
+                              const uint64_t *series_ids,
+                              int64_t series_count,
+                              int64_t ts_start_us,
+                              int64_t ts_end_us,
+                              int64_t max_rows,
+                              bool durable,
+                              uint64_t *out_rows,
+                              bool *out_exceeds);
+
+// How many rows `moosedb_delete_range` with the same arguments would delete now.
+//
+// # Safety
+// As `moosedb_delete_range`.
+TFStatus moosedb_count_range(MooseDBTable *table,
+                             const uint64_t *series_ids,
+                             int64_t series_count,
+                             int64_t ts_start_us,
+                             int64_t ts_end_us,
+                             uint64_t *out_rows);
+
+// Starts collecting the rows of one `DELETE` statement. They are matched by
+// content and deleted by `moosedb_delete_commit` (also in pieces if the
+// statement is huge). The handle ends in commit or abort.
+//
+// # Safety
+// `table` must be a valid handle; `out_delete` writable.
+TFStatus moosedb_delete_begin(MooseDBTable *table, bool durable, MooseDBDelete **out_delete);
+
+// Adds one row (same value convention as `moosedb_write_row`) to delete.
+//
+// # Safety
+// `del` must be a live handle; `row` as in `moosedb_write_row`.
+TFStatus moosedb_delete_add(MooseDBDelete *del, const TFRow *row);
+
+// Deletes the collected rows and releases the handle (also on error).
+// `*out_rows` receives the number of rows deleted.
+//
+// # Safety
+// `del` must come from `moosedb_delete_begin` and not be used afterwards.
+TFStatus moosedb_delete_commit(MooseDBDelete *del, uint64_t *out_rows);
+
+// Discards the collected rows and releases the handle. NULL is ignored.
+//
+// # Safety
+// `del` must come from `moosedb_delete_begin` and not be used afterwards.
+TFStatus moosedb_delete_abort(MooseDBDelete *del);
 
 // Opens an unordered full-table scan (forward only).
 //

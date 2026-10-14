@@ -20,11 +20,11 @@ SELECT COUNT(*) FROM t1;
 SELECT * FROM t1 WHERE host = 'srv01';
 SELECT * FROM t1 WHERE ts BETWEEN '2026-10-01 10:00:00' AND '2026-10-01 10:00:01';
 
---echo # UPDATE and row-level DELETE are not supported (append-only engine)
+--echo # UPDATE is not supported; row-level DELETE is (delete.test)
 --error ER_ILLEGAL_HA
 UPDATE t1 SET value = 0 WHERE host = 'srv01';
---error ER_ILLEGAL_HA
 DELETE FROM t1 WHERE host = 'srv01';
+SELECT ROW_COUNT();
 SELECT COUNT(*) FROM t1;
 
 --echo # Rows survive FLUSH TABLES (MemTable sealed into a chunk)

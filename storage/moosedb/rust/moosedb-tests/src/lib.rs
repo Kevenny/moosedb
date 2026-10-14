@@ -1230,3 +1230,6 @@ mod read_tests;
 
 #[cfg(test)]
 mod unique_tests;
+
+#[cfg(test)]
+mod delete_tests;

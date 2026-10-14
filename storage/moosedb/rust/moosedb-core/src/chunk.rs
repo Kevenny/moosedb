@@ -245,6 +245,11 @@ pub struct ChunkMeta {
     /// Indexes of `series`, sorted by `(series_id, index)`; built on first use
     /// (see `entries_of`). `None` when the chunk has more entries than `u32`.
     pub(crate) by_id: OnceLock<Option<Vec<u32>>>,
+    /// Highest tombstone sequence the rows of this chunk already reflect (see
+    /// `tomb`): a range tombstone newer than this hides rows of the chunk.
+    /// Kept in the MANIFEST, not in the chunk file. `u64::MAX` = no tombstone
+    /// applies (a chunk staged by a statement that has not committed yet).
+    pub(crate) born: u64,
 }
 
 impl ChunkMeta {

@@ -19,26 +19,25 @@ SELECT * FROM t1 WHERE ts BETWEEN '2026-10-01 10:00:00' AND '2026-10-01 10:00:01
 ts	host	value
 2026-10-01 10:00:00.000000	srv01	42.5
 2026-10-01 10:00:01.000000	srv01	43.1
-# UPDATE and row-level DELETE are not supported (append-only engine)
+# UPDATE is not supported; row-level DELETE is (delete.test)
 UPDATE t1 SET value = 0 WHERE host = 'srv01';
 ERROR HY000: Storage engine MooseDB of the table `test`.`t1` doesn't have this option
 DELETE FROM t1 WHERE host = 'srv01';
-ERROR HY000: Storage engine MooseDB of the table `test`.`t1` doesn't have this option
+SELECT ROW_COUNT();
+ROW_COUNT()
+2
 SELECT COUNT(*) FROM t1;
 COUNT(*)
-3
+1
 # Rows survive FLUSH TABLES (MemTable sealed into a chunk)
 FLUSH TABLES t1;
 INSERT INTO t1 VALUES ('2026-10-01 11:30:00', 'srv03', NULL);
 SELECT * FROM t1 ORDER BY ts;
 ts	host	value
-2026-10-01 10:00:00.000000	srv01	42.5
-2026-10-01 10:00:01.000000	srv01	43.1
 2026-10-01 10:00:02.000000	srv02	11.2
 2026-10-01 11:30:00.000000	srv03	NULL
 SELECT host, COUNT(*), SUM(value) FROM t1 GROUP BY host ORDER BY host;
 host	COUNT(*)	SUM(value)
-srv01	2	85.6
 srv02	1	11.2
 srv03	1	NULL
 # DELETE without WHERE empties the table

@@ -28,6 +28,7 @@ use crate::memtable::MemTable;
 use crate::options::TableConfig;
 use crate::scan::{check_tag_columns, Position, ResolvedFilter, Scan, ScanFilter, Snapshot};
 use crate::schema::{Row, Schema, Value};
+use crate::tomb::TombSet;
 use crate::unique::UniqueState;
 use crate::wal::{self, list_segments, segment_path, Wal};
 
@@ -140,7 +141,7 @@ pub(crate) struct Inner {
     pub(crate) memtable: MemTable,
     pub(crate) series: SeriesIndex,
     /// Bumped whenever MemTable rows move into chunks or vanish.
-    mem_generation: u64,
+    pub(crate) mem_generation: u64,
     /// Bumped on every change of the table's contents.
     version: u64,
     snapshot_cache: Option<Arc<Snapshot>>,
@@ -162,6 +163,13 @@ pub(crate) struct Inner {
     pub(crate) epoch: u64,
     /// UNIQUE key state (empty and unused when the table declares none).
     pub(crate) uniq: UniqueState,
+    /// Deletes in force against the chunks (see `tomb`). Shared with snapshots;
+    /// changed copy-on-write.
+    pub(crate) tombs: Arc<TombSet>,
+    /// Highest tombstone sequence number assigned so far.
+    pub(crate) tseq: u64,
+    /// Bumped whenever the set of live chunks changes.
+    pub(crate) layout_gen: u64,
 }
 
 /// A batch that has logged rows to the WAL and has not finished.
@@ -254,7 +262,51 @@ impl Inner {
             }
         }
         self.chunks = chunks;
+        self.layout_gen += 1;
         self.changed();
+    }
+
+    /// The MANIFEST describing the state in memory, with `chunks` and `tombs`
+    /// as the live chunks and deletes. Every MANIFEST the table writes starts
+    /// from here: whichever change it makes, it must carry the tombstones, or
+    /// a WAL checkpoint that retires their DELETE entries would lose them.
+    pub(crate) fn manifest_for(&self, chunks: &[Arc<ChunkMeta>], tombs: &TombSet) -> Manifest {
+        build_manifest(&self.manifest, chunks, tombs, self.tseq)
+    }
+
+    /// [`Inner::manifest_for`] the current chunks and tombstones.
+    pub(crate) fn manifest_now(&self) -> Manifest {
+        self.manifest_for(&self.chunks, &self.tombs)
+    }
+
+    /// Commits a new chunk set and tombstone set: `tune` adjusts the MANIFEST
+    /// (checkpoint, next id), which is then switched atomically (the commit
+    /// point), and only then do memory and the obsolete chunks follow. A
+    /// failure to store poisons the table, as in `commit_manifest`.
+    pub(crate) fn publish(
+        &mut self,
+        dir: &Path,
+        mut chunks: Vec<Arc<ChunkMeta>>,
+        mut tombs: TombSet,
+        tune: impl FnOnce(&mut Manifest),
+    ) -> Result<()> {
+        // Chunks created now (flush, staged by a statement, compaction output
+        // whose caller did not choose) reflect every tombstone assigned so far.
+        for c in &mut chunks {
+            if c.born == u64::MAX {
+                Arc::make_mut(c).born = self.tseq;
+            }
+        }
+        let keep: HashSet<u64> = chunks.iter().map(|c| c.id).collect();
+        let gone: HashSet<u64> = self.chunks.iter().map(|c| c.id).filter(|id| !keep.contains(id)).collect();
+        tombs.forget_chunks(&gone);
+        tombs.prune(&chunks);
+        let mut manifest = self.manifest_for(&chunks, &tombs);
+        tune(&mut manifest);
+        self.commit_manifest(dir, manifest)?;
+        self.tombs = Arc::new(tombs);
+        self.replace_chunks(chunks);
+        Ok(())
     }
 
     /// Starts a fresh WAL segment after a checkpoint. Writing to the old
@@ -272,6 +324,20 @@ impl Inner {
             }
         }
     }
+}
+
+/// `base` with the chunk list (and each chunk's `born`), the tombstones and
+/// their highest sequence number replaced by the given state.
+pub(crate) fn build_manifest(base: &Manifest, chunks: &[Arc<ChunkMeta>], tombs: &TombSet, tseq: u64) -> Manifest {
+    let mut m = base.clone();
+    let mut sorted: Vec<&Arc<ChunkMeta>> = chunks.iter().collect();
+    sorted.sort_by_key(|c| c.id);
+    m.chunks = sorted.iter().map(|c| c.id).collect();
+    m.born = sorted.iter().map(|c| if c.born == u64::MAX { tseq } else { c.born }).collect();
+    m.tseq = tseq;
+    m.ranges = tombs.ranges().iter().map(|t| (**t).clone()).collect();
+    m.rows = tombs.rows_tombs().iter().map(|t| (**t).clone()).collect();
+    m
 }
 
 pub struct Table {
@@ -295,6 +361,9 @@ pub struct Table {
     /// Size of the last committed (unspilled) batch: `rows << 32 | series`. The
     /// next batch reserves that much up front instead of growing its buffers.
     pub(crate) batch_hint: AtomicU64,
+    /// Deletes of this table run one at a time (see `delete`); held outside
+    /// the table mutex.
+    pub(crate) del_gate: Mutex<()>,
 }
 
 /// Deletes WAL segments `<= upto`, logging (not failing) on errors: leftover
@@ -420,6 +489,7 @@ impl Table {
             }
         }
 
+        let born_of: HashMap<u64, u64> = manifest.chunks.iter().copied().zip(manifest.born.iter().copied()).collect();
         let mut chunks = Vec::with_capacity(manifest.chunks.len());
         let mut dropped = false;
         for &id in &manifest.chunks {
@@ -451,6 +521,8 @@ impl Table {
                             },
                         )));
                     }
+                    let mut meta = meta;
+                    meta.born = born_of.get(&id).copied().unwrap_or(0);
                     chunks.push(meta);
                 }
                 // Only damage provable without a key (header/footer CRC,
@@ -480,10 +552,28 @@ impl Table {
         if let Some(c) = chunks.iter().find(|c| c.header.schema_fingerprint != fingerprint) {
             return Err(invalid(format!("{} was written with a different table schema", c.path().display())));
         }
+        let mut tombs = TombSet::default();
+        for t in &manifest.ranges {
+            tombs.add_range(t.clone());
+        }
+        for t in &manifest.rows {
+            tombs.add_rows(t.clone());
+        }
+        {
+            // A chunk recovery set aside takes the deletes it held with it.
+            let live: HashSet<u64> = chunks.iter().map(|c| c.id).collect();
+            let missing: HashSet<u64> = manifest.chunks.iter().copied().filter(|id| !live.contains(id)).collect();
+            tombs.forget_chunks(&missing);
+        }
         if dropped {
             manifest.chunks = chunks.iter().map(|c| c.id).collect();
+            manifest.born = chunks.iter().map(|c| c.born).collect();
+            manifest.ranges = tombs.ranges().iter().map(|t| (**t).clone()).collect();
+            manifest.rows = tombs.rows_tombs().iter().map(|t| (**t).clone()).collect();
             manifest.store(&dir)?;
         }
+        let chunks: Vec<Arc<ChunkMeta>> = chunks.into_iter().map(Arc::new).collect();
+        let mut tseq = manifest.tseq.max(tombs.max_seq());
 
         let mut series = SeriesIndex::default();
         let mut uniq = UniqueState::default();
@@ -513,26 +603,40 @@ impl Table {
                     .is_ok_and(|row| row.iter().any(|v| matches!(v, Value::Bytes(b) if b.len() > max_replay_value())))
         };
         let limits = wal::ReplayLimits::standard();
+        let manifest_tseq = manifest.tseq;
         let replayed =
-            wal::replay_committed(&dir, &replay, manifest.wal_seq, true, &limits, &too_big, |seq, payload| {
-                let row = decode_row(&mut ByteReader::new(payload))?;
-                schema.validate_row(&row).map_err(|e| {
-                    corrupt(format!("WAL segment {seq} holds a row that does not match the schema: {e}"))
-                })?;
-                let sid = series.get_or_insert(&row_tags(&schema, &row));
-                if let Some(spec) = &unique {
-                    uniq.note_row(sid, schema.row_ts(&row), spec.extras_of(&row));
-                }
-                memtable.push(schema.row_ts(&row), sid, row);
-                if memtable.bytes() > limits.applied {
-                    // A MemTable flushes long before this: only a forged or damaged
-                    // log holds that many committed rows past the checkpoint.
-                    return Err(corrupt(format!(
+            wal::replay_events(&dir, &replay, manifest.wal_seq, true, &limits, &too_big, |seq, event| match event {
+                wal::ReplayEvent::Row(payload) => {
+                    let row = decode_row(&mut ByteReader::new(payload))?;
+                    schema.validate_row(&row).map_err(|e| {
+                        corrupt(format!("WAL segment {seq} holds a row that does not match the schema: {e}"))
+                    })?;
+                    let sid = series.get_or_insert(&row_tags(&schema, &row));
+                    if let Some(spec) = &unique {
+                        uniq.note_row(sid, schema.row_ts(&row), spec.extras_of(&row));
+                    }
+                    memtable.push(schema.row_ts(&row), sid, row);
+                    if memtable.bytes() > limits.applied {
+                        // A MemTable flushes long before this: only a forged or damaged
+                        // log holds that many committed rows past the checkpoint.
+                        return Err(corrupt(format!(
                     "WAL segment {seq}: the committed rows to replay exceed {} bytes of memory; refusing to load them",
                     limits.applied
                 )));
+                    }
+                    Ok(())
                 }
-                Ok(())
+                wal::ReplayEvent::Delete(payload) => crate::delete::Replay {
+                    schema: &schema,
+                    chunks: &chunks,
+                    tombs: &mut tombs,
+                    tseq: &mut tseq,
+                    manifest_tseq,
+                    series: &series,
+                    memtable: &mut memtable,
+                    uniq: &mut uniq,
+                }
+                .apply(payload),
             })?;
         if !replayed.rejected.is_empty() {
             // Accepted by an older version, but no chunk can hold such a value:
@@ -589,7 +693,9 @@ impl Table {
             // Move the checkpoint past the old segments, which are then
             // deleted, so reopening an idle table does not pile up segments
             // (and no old key version stays referenced by a WAL file).
-            let mut m = manifest.clone();
+            // The manifest it writes carries every delete replayed above: their
+            // log entries are in the segments deleted next.
+            let mut m = build_manifest(&manifest, &chunks, &tombs, tseq);
             m.wal_seq = next_seq - 1;
             m.replay_seq = next_seq;
             match m.store(&dir) {
@@ -606,7 +712,7 @@ impl Table {
             schema,
             inner: Mutex::new(Inner {
                 manifest,
-                chunks: chunks.into_iter().map(Arc::new).collect(),
+                chunks,
                 wal,
                 memtable,
                 series,
@@ -620,6 +726,9 @@ impl Table {
                 open_batches: HashMap::new(),
                 epoch: 0,
                 uniq,
+                tombs: Arc::new(tombs),
+                tseq,
+                layout_gen: 0,
             }),
             series_version,
             maint: Mutex::new(()),
@@ -630,6 +739,7 @@ impl Table {
             queued: AtomicBool::new(false),
             claims_cv: Condvar::new(),
             batch_hint: AtomicU64::new(0),
+            del_gate: Mutex::new(()),
         })
     }
 
@@ -773,21 +883,21 @@ impl Table {
             return Err(e);
         }
 
-        let mut manifest = inner.manifest.clone();
-        manifest.wal_seq = covered;
         // A batch that logged rows before this flush but has not committed
         // yet will put its COMMIT after the flush point: replay must still
         // reach its first row.
         let replay_seq = inner.oldest_pin().map_or(after_covered, |s| s.min(after_covered));
-        manifest.replay_seq = replay_seq;
         inner.flag_laggards(dir, covered);
-        manifest.next_chunk_id = next_id;
-        manifest.chunks.extend(written.iter().map(|m| m.id));
-        inner.commit_manifest(dir, manifest)?;
-
+        // The new chunks are born now: every delete so far is already applied to
+        // the MemTable rows they hold (`publish` stamps them with the sequence).
         let mut chunks = inner.chunks.clone();
         chunks.extend(written.into_iter().map(Arc::new));
-        inner.replace_chunks(chunks);
+        let tombs = (*inner.tombs).clone();
+        inner.publish(dir, chunks, tombs, |m| {
+            m.wal_seq = covered;
+            m.replay_seq = replay_seq;
+            m.next_chunk_id = next_id;
+        })?;
         inner.memtable.clear();
         inner.mem_generation += 1;
         inner.rotate_wal(dir, opts.encryption_key_id)?;
@@ -817,7 +927,7 @@ impl Table {
             if target <= inner.manifest.replay_seq {
                 return Ok(());
             }
-            let mut manifest = inner.manifest.clone();
+            let mut manifest = inner.manifest_now();
             manifest.wal_seq = manifest.wal_seq.max(active.saturating_sub(1));
             manifest.replay_seq = target;
             inner.commit_manifest(dir, manifest)?;
@@ -832,7 +942,7 @@ impl Table {
         }
         let next = succ(active)?;
         let fresh = Wal::create(dir, next, self.config.opts.encryption_key_id)?;
-        let mut manifest = inner.manifest.clone();
+        let mut manifest = inner.manifest_now();
         manifest.wal_seq = active;
         manifest.replay_seq = pin.map_or(next, |p| p.min(next));
         let replay_seq = manifest.replay_seq;
@@ -852,12 +962,12 @@ impl Table {
         let old_seq = inner.wal.seq();
         let after_old = succ(old_seq)?;
 
-        let mut manifest = inner.manifest.clone();
+        let mut manifest = inner.manifest_for(&[], &TombSet::default());
         manifest.wal_seq = old_seq;
         manifest.replay_seq = after_old;
-        manifest.chunks.clear();
         inner.commit_manifest(dir, manifest)?;
 
+        inner.tombs = Arc::new(TombSet::default());
         inner.replace_chunks(Vec::new());
         inner.memtable.clear();
         inner.series.clear();
@@ -886,10 +996,8 @@ impl Table {
         if expired == 0 {
             return Ok(0);
         }
-        let mut manifest = inner.manifest.clone();
-        manifest.chunks = kept.iter().map(|c| c.id).collect();
-        inner.commit_manifest(&self.config.dir, manifest)?;
-        inner.replace_chunks(kept);
+        let tombs = (*inner.tombs).clone();
+        inner.publish(&self.config.dir, kept, tombs, |_| {})?;
         Ok(expired)
     }
 
@@ -910,6 +1018,7 @@ impl Table {
             chunks: inner.chunks.clone(),
             mem,
             version: inner.version,
+            tombs: inner.tombs.clone(),
         });
         inner.snapshot_cache = Some(s.clone());
         s
@@ -1003,6 +1112,7 @@ impl Table {
             s.data_bytes += c.raw_bytes;
             s.compressed_bytes += c.file_size;
         }
+        s.row_count = s.row_count.saturating_sub(inner.tombs.dead_total());
         s.row_count += s.memtable_rows;
         s.data_bytes += inner.memtable.bytes() as u64;
         Ok(s)
@@ -1228,13 +1338,13 @@ mod tests {
         // A MANIFEST whose WAL checkpoint is u64::MAX.
         let path = dir.path().join("walseq");
         drop(open_new(&path));
-        Manifest { wal_seq: u64::MAX, replay_seq: u64::MAX, next_chunk_id: 1, chunks: vec![] }.store(&path).unwrap();
+        Manifest { wal_seq: u64::MAX, replay_seq: u64::MAX, ..Manifest::empty() }.store(&path).unwrap();
         assert!(matches!(Table::open(config(&path)), Err(Error::Corrupt(_))));
 
         // A MANIFEST that has no chunk ids left: the flush fails cleanly.
         let path = dir.path().join("chunkid");
         drop(open_new(&path));
-        Manifest { wal_seq: 0, replay_seq: 1, next_chunk_id: u64::MAX, chunks: vec![] }.store(&path).unwrap();
+        Manifest { next_chunk_id: u64::MAX, ..Manifest::empty() }.store(&path).unwrap();
         let t = Table::open(config(&path)).unwrap();
         t.write(row(1, "a")).unwrap();
         assert!(matches!(t.flush(), Err(Error::Corrupt(_))));

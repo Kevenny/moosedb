@@ -139,6 +139,7 @@ pub(crate) fn read_meta(path: &Path, id: u64) -> Result<ChunkMeta> {
         bloom,
         cipher,
         by_id: Default::default(),
+        born: 0,
     })
 }
 
@@ -224,6 +225,7 @@ pub(crate) fn decode_series(schema: &Schema, meta: &ChunkMeta, idx: usize) -> Re
 
 /// The part of one chunk series a scan needs: rows `[lo, hi)` of the series,
 /// as typed columns (see [`load_window`]).
+#[derive(Clone)]
 pub(crate) struct Window {
     pub lo: usize,
     pub hi: usize,

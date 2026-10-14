@@ -202,12 +202,17 @@ UPDATE t SET v = 0 ORDER BY ts LIMIT 1;
 UPDATE t, c SET t.v = c.v + 100 WHERE t.host = c.host;
 --error ER_ILLEGAL_HA
 UPDATE c, t SET t.v = 7 WHERE t.host = c.host;
---error ER_ILLEGAL_HA
+--echo # DELETE is supported (delete.test): range, ORDER BY/LIMIT and multi-table forms
 DELETE FROM t WHERE ts < '2030-01-01';
---error ER_ILLEGAL_HA
+SELECT ROW_COUNT();
+INSERT INTO t VALUES ('2026-01-01', 'a', 1), ('2026-01-02', 'b', 2);
 DELETE FROM t ORDER BY ts LIMIT 1;
---error ER_ILLEGAL_HA
+SELECT ROW_COUNT();
+SELECT ts, host, v FROM t;
+INSERT INTO t VALUES ('2026-01-01', 'a', 1);
 DELETE t FROM t JOIN c ON t.host = c.host;
+SELECT ROW_COUNT();
+INSERT INTO t VALUES ('2026-01-01', 'a', 1), ('2026-01-02', 'b', 2);
 --echo # An impossible WHERE never reaches the engine
 DELETE FROM t WHERE 1 = 0;
 UPDATE t SET v = 0 WHERE 1 = 0;

@@ -20,10 +20,15 @@
 //!       1 ROW         batch_id:u64 row     row of a batch, not yet committed
 //!       2 COMMIT      batch_id:u64         makes every ROW of the batch count
 //!       3 ROW_COMMIT  row                  a one-row batch (plain `write`)
+//!       4 DELETE_RANGE  seq lo hi series   deletes (see `tomb`), committed on its own
+//!       5 DELETE_ROWS   seq rows hits      deletes of exact rows, committed on its own
 //! ```
 //!
 //! Batches of one table may interleave in the log. Replay applies a batch
 //! only when it reaches its COMMIT; rows of batches without one are dropped.
+//! A DELETE entry is one atomic statement: it is appended and synced under the
+//! table mutex, like a COMMIT, so its position in the log is its position in
+//! the order the table saw things, and replay applies it exactly there.
 //!
 //! A segment number is also the checkpoint unit: the MANIFEST records
 //! `wal_seq = N` once every batch committed in segments `<= N` is in sealed
@@ -35,8 +40,9 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use crate::bytes::{put_u64, ByteReader};
-use crate::codec::encode_row;
+use crate::bytes::{put_i64, put_u32, put_u64, ByteReader};
+use crate::codec::{decode_row, encode_row};
+use crate::tomb::{decode_rows, encode_rows, RowsTomb};
 use crate::crypto::{CipherParams, PARAMS_LEN};
 use crate::error::{corrupt, Error, Result};
 use crate::fsutil::{self, sync_dir};
@@ -51,6 +57,8 @@ const VERSION: u16 = 2;
 const K_ROW: u8 = 1;
 const K_COMMIT: u8 = 2;
 const K_ROW_COMMIT: u8 = 3;
+const K_DELETE_RANGE: u8 = 4;
+const K_DELETE_ROWS: u8 = 5;
 const FLAG_ENCRYPTED: u16 = 1;
 const BASE_HEADER: usize = 8;
 const ENTRY_HEADER: usize = 8;
@@ -109,10 +117,128 @@ pub(crate) fn commit_entry(batch: u64) -> Vec<u8> {
     p
 }
 
+/// A DELETE entry, decoded (the series of a range delete are named by their
+/// tag values, which survive a restart; series ids may not).
+#[derive(Debug, PartialEq)]
+pub(crate) enum DeleteEntry {
+    Range {
+        seq: u64,
+        lo: i64,
+        hi: i64,
+        /// Tag values of each selected series; `None` = every series.
+        series: Option<Vec<Vec<Value>>>,
+    },
+    Rows {
+        seq: u64,
+        /// Rows removed from the MemTable (matched by content).
+        mem: Vec<Vec<Value>>,
+        /// Rows hidden in chunks, already resolved to ordinals.
+        hits: Vec<RowsTomb>,
+    },
+}
+
+/// Payload of a DELETE_RANGE entry.
+pub(crate) fn range_delete_entry(seq: u64, lo: i64, hi: i64, series: Option<&[&[Value]]>) -> Vec<u8> {
+    let mut p = vec![K_DELETE_RANGE];
+    put_u64(&mut p, seq);
+    put_i64(&mut p, lo);
+    put_i64(&mut p, hi);
+    match series {
+        None => p.push(0),
+        Some(list) => {
+            p.push(1);
+            put_u32(&mut p, list.len() as u32);
+            for tags in list {
+                encode_row(&mut p, tags);
+            }
+        }
+    }
+    p
+}
+
+/// Payload of a DELETE_ROWS entry.
+pub(crate) fn rows_delete_entry(seq: u64, mem: &[&[Value]], hits: &[RowsTomb]) -> Vec<u8> {
+    let mut p = vec![K_DELETE_ROWS];
+    put_u64(&mut p, seq);
+    put_u32(&mut p, mem.len() as u32);
+    for row in mem {
+        encode_row(&mut p, row);
+    }
+    put_u32(&mut p, hits.len() as u32);
+    for h in hits {
+        encode_rows(&mut p, h);
+    }
+    p
+}
+
+/// Largest DELETE entry the writer produces; a bigger one is not from us.
+pub(crate) const MAX_DELETE_ENTRY: usize = 8 << 20;
+
+pub(crate) fn decode_delete(payload: &[u8]) -> Result<DeleteEntry> {
+    if payload.len() > MAX_DELETE_ENTRY {
+        return Err(corrupt("DELETE entry larger than any the engine writes"));
+    }
+    let mut r = ByteReader::new(payload);
+    match r.u8()? {
+        K_DELETE_RANGE => {
+            let seq = r.u64()?;
+            let lo = r.i64()?;
+            let hi = r.i64()?;
+            let series = match r.u8()? {
+                0 => None,
+                1 => {
+                    let n = r.u32()? as usize;
+                    // A tag tuple takes at least two bytes (its column count).
+                    if n > r.remaining() / 2 {
+                        return Err(corrupt("DELETE entry lists more series than it has bytes"));
+                    }
+                    let mut v = Vec::with_capacity(n.min(4096));
+                    for _ in 0..n {
+                        v.push(decode_row(&mut r)?);
+                    }
+                    Some(v)
+                }
+                k => return Err(corrupt(format!("DELETE entry with unknown selection {k}"))),
+            };
+            Ok(DeleteEntry::Range { seq, lo, hi, series })
+        }
+        K_DELETE_ROWS => {
+            let seq = r.u64()?;
+            let n = r.u32()? as usize;
+            if n > r.remaining() / 2 {
+                return Err(corrupt("DELETE entry lists more rows than it has bytes"));
+            }
+            let mut mem = Vec::with_capacity(n.min(4096));
+            for _ in 0..n {
+                mem.push(decode_row(&mut r)?);
+            }
+            let m = r.u32()? as usize;
+            if m > r.remaining() {
+                return Err(corrupt("DELETE entry lists more hits than it has bytes"));
+            }
+            let mut hits = Vec::with_capacity(m.min(4096));
+            for _ in 0..m {
+                hits.push(decode_rows(&mut r)?);
+            }
+            Ok(DeleteEntry::Rows { seq, mem, hits })
+        }
+        k => Err(corrupt(format!("not a DELETE entry (kind {k})"))),
+    }
+}
+
 enum Entry<'a> {
     Row(u64, &'a [u8]),
     Commit(u64),
     RowCommit(&'a [u8]),
+    Delete(&'a [u8]),
+}
+
+/// What replay hands to its caller, in log order.
+pub(crate) enum ReplayEvent<'a> {
+    /// A row of a batch that committed (or a single-row commit).
+    Row(&'a [u8]),
+    /// A DELETE entry (see [`decode_delete`]).
+    Delete(&'a [u8]),
 }
 
 fn parse_entry(version: u16, payload: &[u8]) -> Result<Entry<'_>> {
@@ -127,6 +253,7 @@ fn parse_entry(version: u16, payload: &[u8]) -> Result<Entry<'_>> {
         }
         K_COMMIT => Ok(Entry::Commit(r.u64()?)),
         K_ROW_COMMIT => Ok(Entry::RowCommit(&payload[1..])),
+        K_DELETE_RANGE | K_DELETE_ROWS => Ok(Entry::Delete(payload)),
         k => Err(corrupt(format!("WAL entry of unknown kind {k}"))),
     }
 }
@@ -617,6 +744,23 @@ pub(crate) fn replay_committed(
     reject: &dyn Fn(&[u8]) -> bool,
     mut on_row: impl FnMut(u64, &[u8]) -> Result<()>,
 ) -> Result<Replayed> {
+    replay_events(dir, segs, flushed_seq, recover, limits, reject, |seq, ev| match ev {
+        ReplayEvent::Row(p) => on_row(seq, p),
+        ReplayEvent::Delete(_) => Ok(()),
+    })
+}
+
+/// [`replay_committed`] that also reports the DELETE entries after `flushed_seq`,
+/// in log order among the committed rows.
+pub(crate) fn replay_events(
+    dir: &Path,
+    segs: &[u64],
+    flushed_seq: u64,
+    recover: bool,
+    limits: &ReplayLimits,
+    reject: &dyn Fn(&[u8]) -> bool,
+    mut on_event: impl FnMut(u64, ReplayEvent<'_>) -> Result<()>,
+) -> Result<Replayed> {
     let too_much = |what: &str, seq: u64, used: usize, limit: usize| {
         corrupt(format!(
             "WAL segment {seq}: {what} ({used}) exceeds the replay limit of {limit}; \
@@ -660,7 +804,7 @@ pub(crate) fn replay_committed(
                         }
                     }
                 }
-                Entry::RowCommit(_) => {}
+                Entry::RowCommit(_) | Entry::Delete(_) => {}
             }
             Ok(())
         })?;
@@ -738,8 +882,13 @@ pub(crate) fn replay_committed(
                         });
                     } else {
                         for &(rseg, rpos) in &p.rows {
-                            on_row(seq, reader.row(rseg, rpos)?)?;
+                            on_event(seq, ReplayEvent::Row(reader.row(rseg, rpos)?))?;
                         }
+                    }
+                }
+                Entry::Delete(p) => {
+                    if seq > flushed_seq {
+                        on_event(seq, ReplayEvent::Delete(p))?;
                     }
                 }
                 Entry::RowCommit(row) => {
@@ -752,7 +901,7 @@ pub(crate) fn replay_committed(
                                 segments: std::iter::once(seq).collect(),
                             });
                         } else {
-                            on_row(seq, row)?;
+                            on_event(seq, ReplayEvent::Row(row))?;
                         }
                     }
                 }

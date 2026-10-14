@@ -165,6 +165,15 @@ pub(crate) struct UniqueState {
 }
 
 impl UniqueState {
+    /// A DELETE may have removed the rows the extras of any series were
+    /// recorded from: forget them all (the bounds stay valid).
+    pub(crate) fn invalidate_all(&mut self) {
+        for st in self.series.values_mut() {
+            st.complete = false;
+            st.top = Top::Empty;
+        }
+    }
+
     pub(crate) fn clear(&mut self) {
         self.series.clear();
         self.claims.clear();
@@ -332,8 +341,16 @@ pub(crate) fn existing_extras(
             if e.series_id != sid || e.ts_min > ts || e.ts_max < ts {
                 continue;
             }
+            // Rows a DELETE hid are not there any more.
+            if snap.tombs.range_hides(sid, meta.born, ts) {
+                continue;
+            }
             let Some(win) = load_window(schema, meta, si, (ts, ts), &want, false)? else { continue };
+            let holes = snap.tombs.holes(meta.id, si);
             for i in win.lo..win.hi {
+                if crate::tomb::in_runs(holes, i) {
+                    continue;
+                }
                 let mut x = [0i64; MAX_EXTRAS];
                 let mut usable = true;
                 for (slot, &c) in x.iter_mut().zip(spec.extra_columns()) {

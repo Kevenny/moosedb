@@ -29,6 +29,7 @@ use crate::fsutil::sync_dir;
 use crate::log::warn;
 use crate::schema::Row;
 use crate::table::Table;
+use crate::tomb::{Sel, TombSet};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CompactionReport {
@@ -37,6 +38,9 @@ pub struct CompactionReport {
     pub chunks_in: usize,
     pub chunks_out: usize,
 }
+
+/// Range tombstones kept pending (below the 25 % dead-rows trigger) before the chunks they touch are rewritten anyway.
+const MAX_PENDING_TOMBS: usize = 4096;
 
 /// A series is cut into parts of at most this many estimated bytes (a
 /// generous over-estimate of its largest encoded column block) and rows.
@@ -99,10 +103,58 @@ impl Table {
     /// Whether `compact_auto` would do anything (cheap; scheduler use).
     pub(crate) fn compaction_pending(&self, now: i64) -> bool {
         self.lock()
-            .map(|inner| !self.plan(&inner.chunks, now, &|_| true, false, None, &inner.no_gain).is_empty())
+            .map(|inner| {
+                inner.chunks.iter().any(|c| inner.tombs.dead_rows(c.id) >= c.header.row_count)
+                    || !self.plan(&inner.chunks, now, &|_| true, false, None, &inner.no_gain, &inner.tombs).is_empty()
+            })
             .unwrap_or(false)
     }
 
+    /// Drops the chunks whose every row a DELETE has hidden: there is nothing
+    /// left to rewrite. The count is checked row by row before a chunk goes
+    /// (the bookkeeping that nominated it is statistics, not proof). Runs
+    /// under `maint`.
+    pub(crate) fn drop_dead_chunks(&self) -> Result<usize> {
+        let (candidates, tombs) = {
+            let inner = self.lock()?;
+            inner.check_writable()?;
+            let c: Vec<Arc<ChunkMeta>> = inner
+                .chunks
+                .iter()
+                .filter(|c| inner.tombs.dead_rows(c.id) >= c.header.row_count && !inner.compacting.contains(&c.id))
+                .cloned()
+                .collect();
+            (c, inner.tombs.clone())
+        };
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+        let mut dead: HashSet<u64> = HashSet::new();
+        for c in &candidates {
+            let alive =
+                crate::delete::count_hits(&self.schema, std::slice::from_ref(c), &tombs, &Sel::All, i64::MIN, i64::MAX)?;
+            if alive.is_empty() {
+                dead.insert(c.id);
+            }
+        }
+        if dead.is_empty() {
+            return Ok(0);
+        }
+        let mut guard = self.lock()?;
+        let inner = &mut *guard;
+        inner.check_writable()?;
+        // Chunks never change and a delete only hides more: still dead.
+        let kept: Vec<Arc<ChunkMeta>> = inner.chunks.iter().filter(|c| !dead.contains(&c.id)).cloned().collect();
+        let gone = inner.chunks.len() - kept.len();
+        if gone == 0 {
+            return Ok(0);
+        }
+        let tombs = (*inner.tombs).clone();
+        inner.publish(&self.config.dir, kept, tombs, |_| {})?;
+        Ok(gone)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn plan(
         &self,
         chunks: &[Arc<ChunkMeta>],
@@ -111,9 +163,13 @@ impl Table {
         force: bool,
         rekey_below: Option<u32>,
         no_gain: &HashSet<Vec<u64>>,
+        tombs: &TombSet,
     ) -> Vec<Vec<Arc<ChunkMeta>>> {
         let opts = &self.config.opts;
         let trigger = crate::settings::get().compaction_trigger_chunks() as usize;
+        // Thousands of pending tombstones cost every read of their series and every
+        // MANIFEST write: past this many, chunks with dead rows are rewritten at once.
+        let many_tombs = tombs.ranges().len() > MAX_PENDING_TOMBS;
         let mut by_bucket: BTreeMap<(i64, i64), Vec<Arc<ChunkMeta>>> = BTreeMap::new();
         for c in chunks.iter().filter(|c| in_scope(c.bucket)) {
             by_bucket.entry(c.bucket).or_default().push(c.clone());
@@ -133,7 +189,13 @@ impl Table {
                 // (rewriting always uses the latest), so old versions can be retired.
                 let rekey = rekey_below
                     .is_some_and(|v| group.iter().any(|c| c.cipher.as_ref().is_some_and(|k| k.key_version < v)));
-                group.len() >= trigger || (force && group.len() > 1) || recode || rekey
+                // Rows a DELETE hid are only removed by rewriting: when a quarter of
+                // a chunk is dead (or at OPTIMIZE), not for a handful of rows.
+                let dirty = group.iter().any(|c| {
+                    let d = tombs.dead_rows(c.id);
+                    d > 0 && (force || d.saturating_mul(4) >= c.header.row_count || many_tombs)
+                });
+                group.len() >= trigger || (force && group.len() > 1) || recode || rekey || dirty
             })
             .map(|(_, g)| g)
             .collect()
@@ -159,10 +221,12 @@ impl Table {
             },
             _ => None,
         };
+        // Chunks a DELETE emptied need no rewrite.
+        self.drop_dead_chunks()?;
         let groups = {
             let inner = self.lock()?;
             inner.check_writable()?;
-            self.plan(&inner.chunks, now, &in_scope, force, rekey_below, &inner.no_gain)
+            self.plan(&inner.chunks, now, &in_scope, force, rekey_below, &inner.no_gain, &inner.tombs)
         };
         let mut report = CompactionReport::default();
         let mut first_error = None;
@@ -213,7 +277,7 @@ impl Table {
     /// changed concurrently and nothing was done.
     fn compact_group(&self, group: Vec<Arc<ChunkMeta>>, now: i64) -> Result<Option<Vec<u64>>> {
         let ids: Vec<u64> = group.iter().map(|c| c.id).collect();
-        let id = {
+        let (id, tombs, upto) = {
             let mut inner = self.lock()?;
             inner.check_writable()?;
             if !ids.iter().all(|i| inner.chunks.iter().any(|c| c.id == *i)) {
@@ -221,46 +285,99 @@ impl Table {
             }
             let id = inner.reserve_chunk_ids(1)?;
             inner.compacting.extend(ids.iter().copied());
-            id
+            (id, inner.tombs.clone(), inner.tseq)
         };
 
-        let built = self.build_merged(&group, id, now);
+        let built = self.build_merged(&group, id, now, &tombs, upto);
 
-        let mut inner = self.lock()?;
-        for i in &ids {
-            inner.compacting.remove(i);
-        }
-        let metas = match built {
-            Ok(m) => m,
-            Err(e) => {
-                if crate::fsutil::is_fsync_error(&e) {
-                    inner.poison(format!("fsync of a compacted chunk failed: {e}"));
+        let metas = {
+            let mut inner = self.lock()?;
+            for i in &ids {
+                inner.compacting.remove(i);
+            }
+            match built {
+                Ok(m) => m,
+                Err(e) => {
+                    if crate::fsutil::is_fsync_error(&e) {
+                        inner.poison(format!("fsync of a compacted chunk failed: {e}"));
+                    }
+                    return Err(e);
                 }
-                return Err(e);
             }
         };
-        let still_live = ids.iter().all(|i| inner.chunks.iter().any(|c| c.id == *i));
-        if !still_live || self.defunct.load(Ordering::Acquire) {
-            for m in &metas {
+        let out_ids: Vec<u64> = metas.iter().map(|m| m.id).collect();
+        let outputs: Vec<Arc<ChunkMeta>> = metas.into_iter().map(Arc::new).collect();
+        let discard = |outputs: &[Arc<ChunkMeta>]| {
+            for m in outputs {
                 m.file.mark_obsolete();
             }
+        };
+        // The output holds no row of a delete up to `upto`; newer deletes still
+        // hide rows of it (its `born` says so): count, per output chunk, what each
+        // of them hides there (in order, each one excluding what the earlier hid).
+        // Done without the table mutex for the deletes known now; the few that
+        // arrive meanwhile are counted under it.
+        let mut fresh: Vec<(u64, Vec<(u64, u64)>)> = Vec::new();
+        let mut seen = TombSet::default();
+        let mut counted_upto = upto;
+        let count_newer = |newer: &[Arc<crate::tomb::RangeTomb>],
+                           fresh: &mut Vec<(u64, Vec<(u64, u64)>)>,
+                           seen: &mut TombSet|
+         -> Result<()> {
+            for t in newer {
+                let hits = crate::delete::count_hits(&self.schema, &outputs, seen, &t.sel, t.lo, t.hi)?;
+                seen.add_range(crate::tomb::RangeTomb { hits: hits.clone(), ..(**t).clone() });
+                fresh.push((t.seq, hits));
+            }
+            Ok(())
+        };
+        let newer0: Vec<Arc<crate::tomb::RangeTomb>> = {
+            let inner = self.lock()?;
+            inner.tombs.ranges().iter().filter(|t| t.seq > upto).cloned().collect()
+        };
+        if let Err(e) = count_newer(&newer0, &mut fresh, &mut seen) {
+            discard(&outputs);
+            return Err(e);
+        }
+        if let Some(last) = newer0.last() {
+            counted_upto = last.seq;
+        }
+
+        let mut inner = self.lock()?;
+        let still_live = ids.iter().all(|i| inner.chunks.iter().any(|c| c.id == *i));
+        // A delete of exact rows that landed on an input after the snapshot
+        // names ordinals of a file that is about to go: leave it for the next pass.
+        let raced = inner.tombs.rows_tombs().iter().any(|t| t.seq > upto && ids.contains(&t.chunk));
+        if !still_live || raced || self.defunct.load(Ordering::Acquire) {
+            discard(&outputs);
             return Ok(None);
         }
-        let out_ids: Vec<u64> = metas.iter().map(|m| m.id).collect();
+        let mut tombs = (*inner.tombs).clone();
+        let newer1: Vec<Arc<crate::tomb::RangeTomb>> =
+            tombs.ranges().iter().filter(|t| t.seq > counted_upto).cloned().collect();
+        if let Err(e) = count_newer(&newer1, &mut fresh, &mut seen) {
+            discard(&outputs);
+            return Err(e);
+        }
         let mut chunks: Vec<Arc<ChunkMeta>> = inner.chunks.iter().filter(|c| !ids.contains(&c.id)).cloned().collect();
-        let mut manifest = inner.manifest.clone();
-        manifest.chunks = chunks.iter().map(|c| c.id).chain(out_ids.iter().copied()).collect();
-        manifest.chunks.sort_unstable();
-        inner.commit_manifest(&self.config.dir, manifest)?;
-        chunks.extend(metas.into_iter().map(Arc::new));
-        inner.replace_chunks(chunks);
+        chunks.extend(outputs);
+        let inputs: HashSet<u64> = ids.iter().copied().collect();
+        tombs.rehit(&inputs, upto, &fresh);
+        inner.publish(&self.config.dir, chunks, tombs, |_| {})?;
         Ok(Some(out_ids))
     }
 
     /// Merges `group` into one chunk, or into several (all of the same
     /// bucket) when a series is too large for a single column block. `id` is
     /// the first output id; more are reserved on demand.
-    fn build_merged(&self, group: &[Arc<ChunkMeta>], id: u64, now: i64) -> Result<Vec<ChunkMeta>> {
+    fn build_merged(
+        &self,
+        group: &[Arc<ChunkMeta>],
+        id: u64,
+        now: i64,
+        tombs: &TombSet,
+        upto: u64,
+    ) -> Result<Vec<ChunkMeta>> {
         let opts = &self.config.opts;
         let bucket = group[0].bucket;
         let codec = opts.codec_for(bucket.1, now);
@@ -279,8 +396,26 @@ impl Table {
             let mut tags = Vec::new();
             for (c, pos) in group.iter().zip(&positions) {
                 if let Some(&idx) = pos.get(&sid) {
-                    rows.extend(decode_series(&self.schema, c, idx)?);
-                    tags.clone_from(&c.series[idx].tags);
+                    let mut part = decode_series(&self.schema, c, idx)?;
+                    if !tombs.is_empty() {
+                        // Rows a DELETE hid (up to the snapshot `tombs` was taken at) are not copied.
+                        let holes = tombs.holes(c.id, idx);
+                        let mut i = 0usize;
+                        part.retain(|r| {
+                            let t = match r.get(ts) {
+                                Some(crate::schema::Value::Timestamp(t)) => *t,
+                                _ => i64::MIN,
+                            };
+                            let dead = tombs.range_hides(sid, c.born, t)
+                                || crate::tomb::in_runs(holes, i);
+                            i += 1;
+                            !dead
+                        });
+                    }
+                    if !part.is_empty() {
+                        rows.extend(part);
+                        tags.clone_from(&c.series[idx].tags);
+                    }
                 }
             }
             // Inputs are in id (= write) order and each is sorted, so a stable
@@ -300,6 +435,12 @@ impl Table {
             }
         }
         let wal_seq = group.iter().map(|c| c.header.wal_seq).max().unwrap_or(0);
+        // Everything hidden was left out: the output starts clean (a series whose
+        // rows were all deleted leaves nothing, and a bucket of such series no chunk).
+        builders.retain(|b| !b.is_empty());
+        if builders.is_empty() {
+            return Ok(Vec::new());
+        }
 
         // Extra ids (rare) come from the shared counter; the first was reserved up front.
         let extra = builders.len() - 1;
@@ -316,7 +457,10 @@ impl Table {
                     }
                 });
             match done {
-                Ok(m) => metas.push(m),
+                Ok(mut m) => {
+                    m.born = upto;
+                    metas.push(m);
+                }
                 Err(e) => {
                     for m in &metas {
                         m.file.mark_obsolete();

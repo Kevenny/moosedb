@@ -1,0 +1,59 @@
+CREATE TABLE enc (itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG', clock INT NOT NULL, value DOUBLE NOT NULL, ns INT NOT NULL,
+PRIMARY KEY (itemid, clock, ns))
+ENGINE=MooseDB TIMESTAMP_COLUMN='clock' CHUNK_INTERVAL='1 DAY' HOT_THRESHOLD='1 HOUR' ENCRYPTION='YES' ENCRYPTION_KEY_ID=1;
+CREATE TABLE mir (itemid BIGINT UNSIGNED NOT NULL, clock INT NOT NULL, value DOUBLE NOT NULL, ns INT NOT NULL, PRIMARY KEY (itemid, clock, ns)) ENGINE=InnoDB;
+INSERT INTO enc SELECT 1 + a.seq, 1700000000 + b.seq * 10, a.seq * 100 + b.seq, b.seq MOD 3 FROM seq_0_to_9 a, seq_0_to_29 b;
+INSERT INTO mir SELECT * FROM enc;
+FLUSH TABLES enc;
+INSERT INTO enc SELECT 1 + a.seq, 1700000000 + b.seq * 10 + 5, a.seq, 0 FROM seq_0_to_9 a, seq_0_to_29 b;
+INSERT INTO mir SELECT 1 + a.seq, 1700000000 + b.seq * 10 + 5, a.seq, 0 FROM seq_0_to_9 a, seq_0_to_29 b;
+SELECT ENCRYPTED, CHUNKS, COLD_CHUNKS, PENDING_ROWS FROM information_schema.MOOSEDB_TABLES WHERE TABLE_NAME = 'enc';
+ENCRYPTED	CHUNKS	COLD_CHUNKS	PENDING_ROWS
+YES	1	1	300
+# a range over the sealed chunk and the MemTable, and a whole item
+DELETE FROM enc WHERE itemid = 3 AND clock BETWEEN 1700000050 AND 1700000205;
+SELECT ROW_COUNT();
+ROW_COUNT()
+32
+DELETE FROM mir WHERE itemid = 3 AND clock BETWEEN 1700000050 AND 1700000205;
+SELECT ROW_COUNT();
+ROW_COUNT()
+32
+DELETE FROM enc WHERE itemid IN (5, 6);
+DELETE FROM mir WHERE itemid IN (5, 6);
+# after deletes over an encrypted table
+result_rows	vs_innodb
+448	SAME
+# a deleted key can be inserted again; a live one cannot
+INSERT INTO enc VALUES (3, 1700000100, 9, 0);
+INSERT INTO mir VALUES (3, 1700000100, 9, 0);
+INSERT INTO enc VALUES (3, 1700000100, 9, 0);
+ERROR 23000: Duplicate entry '3-1700000100-0' for key 'PRIMARY'
+# exact rows (any other WHERE)
+DELETE FROM enc WHERE value = 4;
+DELETE FROM mir WHERE value = 4;
+# after deletes over an encrypted table
+result_rows	vs_innodb
+448	SAME
+# clean restart, then kill -9 with the delete only in the encrypted WAL
+# restart
+# after a clean restart
+result_rows	vs_innodb
+448	SAME
+DELETE FROM enc WHERE itemid = 8 AND clock < 1700000100;
+DELETE FROM mir WHERE itemid = 8 AND clock < 1700000100;
+# Kill the server
+# restart
+# after kill -9
+result_rows	vs_innodb
+428	SAME
+OPTIMIZE TABLE enc;
+Table	Op	Msg_type	Msg_text
+test.enc	optimize	status	OK
+# after OPTIMIZE (rewritten with the delete applied)
+result_rows	vs_innodb
+428	SAME
+CHECK TABLE enc;
+Table	Op	Msg_type	Msg_text
+test.enc	check	status	OK
+DROP TABLE enc, mir;

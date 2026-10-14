@@ -282,6 +282,107 @@ impl MemTable {
         self.frozen_stats.iter().chain(std::iter::once(&self.active_stats)).map(|s| s.estimate(lo, hi)).sum()
     }
 
+    /// Calls `visit` for every row with `lo <= ts <= hi`, in arrival order.
+    /// Segments whose timestamp range misses `[lo, hi]` are not looked at.
+    pub(crate) fn visit_range(&self, schema: &Schema, lo: i64, hi: i64, mut visit: impl FnMut(&MemRow)) {
+        let stats = self.frozen_stats.iter().chain(std::iter::once(&self.active_stats));
+        let segs = self.frozen.iter().map(|s| &s.rows[..]).chain(std::iter::once(&self.active[..]));
+        for (rows, st) in segs.zip(stats) {
+            if st.len == 0 || hi < st.ts_min || lo > st.ts_max {
+                continue;
+            }
+            for r in rows {
+                let ts = schema.row_ts(&r.row);
+                if lo <= ts && ts <= hi {
+                    visit(r);
+                }
+            }
+        }
+    }
+
+    /// Removes the rows with `lo <= ts <= hi` for which `remove` says yes
+    /// (asked in arrival order, once per row), and returns how many went.
+    /// Only the segments that lose a row are rebuilt; the others, and every
+    /// snapshot taken earlier, keep sharing what they had.
+    pub(crate) fn remove_where(
+        &mut self,
+        schema: &Schema,
+        lo: i64,
+        hi: i64,
+        mut remove: impl FnMut(&MemRow) -> bool,
+    ) -> usize {
+        let mut removed = 0usize;
+        let mut freed = 0usize;
+        let mut judge = |rows: &[MemRow]| -> Vec<bool> {
+            rows.iter()
+                .map(|r| {
+                    let ts = schema.row_ts(&r.row);
+                    lo <= ts && ts <= hi && remove(r)
+                })
+                .collect()
+        };
+        let mut frozen = Vec::with_capacity(self.frozen.len());
+        let mut frozen_stats = Vec::with_capacity(self.frozen.len());
+        for (seg, st) in self.frozen.iter().zip(&self.frozen_stats) {
+            if st.len == 0 || hi < st.ts_min || lo > st.ts_max {
+                frozen.push(seg.clone());
+                frozen_stats.push(*st);
+                continue;
+            }
+            let gone = judge(&seg.rows);
+            let n = gone.iter().filter(|&&g| g).count();
+            if n == 0 {
+                frozen.push(seg.clone());
+                frozen_stats.push(*st);
+                continue;
+            }
+            removed += n;
+            let mut kept = Vec::with_capacity(seg.rows.len() - n);
+            let mut stats = SegStats::EMPTY;
+            for (r, g) in seg.rows.iter().zip(&gone) {
+                if *g {
+                    freed += row_bytes(&r.row);
+                } else {
+                    let ts = schema.row_ts(&r.row);
+                    stats.add(1, ts, ts);
+                    kept.push(MemRow { series_id: r.series_id, row: r.row.clone() });
+                }
+            }
+            if !kept.is_empty() {
+                frozen.push(Arc::new(Segment::new(kept)));
+                frozen_stats.push(stats);
+            }
+        }
+        let gone = if self.active_stats.len == 0 || hi < self.active_stats.ts_min || lo > self.active_stats.ts_max {
+            Vec::new()
+        } else {
+            judge(&self.active)
+        };
+        let n = gone.iter().filter(|&&g| g).count();
+        if n > 0 {
+            removed += n;
+            let old = mem::take(&mut self.active);
+            let mut stats = SegStats::EMPTY;
+            for (r, g) in old.into_iter().zip(gone) {
+                if g {
+                    freed += row_bytes(&r.row);
+                } else {
+                    let ts = schema.row_ts(&r.row);
+                    stats.add(1, ts, ts);
+                    self.active.push(r);
+                }
+            }
+            self.active_stats = stats;
+        }
+        if removed > 0 {
+            self.frozen = frozen;
+            self.frozen_stats = frozen_stats;
+            self.len -= removed;
+            self.bytes = self.bytes.saturating_sub(freed);
+        }
+        removed
+    }
+
     /// Groups rows by `bucket(ts)` and then by series, each series sorted by
     /// timestamp (stable, so equal timestamps keep arrival order).
     pub(crate) fn group(

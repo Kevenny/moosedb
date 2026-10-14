@@ -1,0 +1,235 @@
+#
+# DELETE and the reads that share its code: descending equality reads on a key
+# with extra columns, the same routine deleting and inserting (function and
+# trigger), PREPARE/EXECUTE with other parameters, views, a case-insensitive
+# PAD SPACE TAG, a DATETIME time axis, tables with triggers, constant WHERE.
+# Everything is compared with an InnoDB mirror.
+#
+--source include/not_embedded.inc
+--source include/have_innodb.inc
+--source include/have_sequence.inc
+--source suite/moosedb/include/have_moosedb.inc
+
+--echo ##################################################################
+--echo # Descending ref read (HA_READ_PREFIX_LAST) on a key with 1 and 2 extra columns
+--echo ##################################################################
+CREATE TABLE k1 (itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG', clock INT NOT NULL, ns INT NOT NULL, value DOUBLE NOT NULL, PRIMARY KEY (itemid, clock, ns))
+  ENGINE=MooseDB TIMESTAMP_COLUMN='clock' CHUNK_INTERVAL='1 DAY';
+CREATE TABLE k2 (itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG', clock INT NOT NULL, ns INT NOT NULL, seq INT NOT NULL, value DOUBLE NOT NULL, PRIMARY KEY (itemid, clock, ns, seq))
+  ENGINE=MooseDB TIMESTAMP_COLUMN='clock' CHUNK_INTERVAL='1 DAY';
+CREATE TABLE i1 (itemid BIGINT UNSIGNED NOT NULL, clock INT NOT NULL, ns INT NOT NULL, value DOUBLE NOT NULL, PRIMARY KEY (itemid, clock, ns)) ENGINE=InnoDB;
+CREATE TABLE i2 (itemid BIGINT UNSIGNED NOT NULL, clock INT NOT NULL, ns INT NOT NULL, seq INT NOT NULL, value DOUBLE NOT NULL, PRIMARY KEY (itemid, clock, ns, seq)) ENGINE=InnoDB;
+INSERT INTO k1 SELECT 1 + a.seq, 1700000000 + b.seq, c.seq, a.seq * 100 + b.seq FROM seq_0_to_2 a, seq_0_to_19 b, seq_0_to_3 c;
+INSERT INTO k2 SELECT 1 + a.seq, 1700000000 + b.seq, c.seq, d.seq, a.seq * 100 + b.seq FROM seq_0_to_2 a, seq_0_to_19 b, seq_0_to_3 c, seq_0_to_2 d;
+INSERT INTO i1 SELECT * FROM k1;
+INSERT INTO i2 SELECT * FROM k2;
+FLUSH TABLES k1, k2;
+INSERT INTO k1 SELECT 1 + a.seq, 1700000020 + b.seq, c.seq, a.seq * 100 + b.seq FROM seq_0_to_2 a, seq_0_to_4 b, seq_0_to_3 c;
+INSERT INTO k2 SELECT 1 + a.seq, 1700000020 + b.seq, c.seq, d.seq, a.seq * 100 + b.seq FROM seq_0_to_2 a, seq_0_to_4 b, seq_0_to_3 c, seq_0_to_2 d;
+INSERT INTO i1 SELECT * FROM k1 WHERE clock >= 1700000020;
+INSERT INTO i2 SELECT * FROM k2 WHERE clock >= 1700000020;
+--let $mt= k1
+--let $it= i1
+--let $q= SELECT clock, ns, value FROM {T} WHERE itemid = 1 AND clock = 1700000005 AND ns = 2 ORDER BY clock DESC, ns DESC
+--let $label= k1 const ns = , descending
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT clock, ns FROM {T} WHERE itemid = 2 AND clock = 1700000005 ORDER BY clock DESC, ns DESC
+--let $label= k1 clock =, descending
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT clock, ns FROM {T} WHERE itemid = 2 AND clock = 1700000022 AND ns = 3 ORDER BY ns DESC
+--let $label= k1 MemTable ns = , descending
+--source suite/moosedb/include/cmp_query.inc
+--let $mt= k2
+--let $it= i2
+--let $q= SELECT clock, ns, seq FROM {T} WHERE itemid = 1 AND clock = 1700000005 AND ns = 2 ORDER BY clock DESC, ns DESC, seq DESC
+--let $label= k2 prefix of 3 key parts, descending
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT clock, ns, seq FROM {T} WHERE itemid = 3 AND clock = 1700000021 AND ns = 1 ORDER BY ns DESC, seq DESC
+--let $label= k2 MemTable prefix of 3 parts, descending
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT clock, ns, seq FROM {T} WHERE itemid = 1 AND clock = 1700000005 AND ns = 2 AND seq = 1 ORDER BY seq DESC
+--let $label= k2 whole key
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT clock, ns, seq FROM {T} WHERE itemid = 2 AND clock BETWEEN 1700000004 AND 1700000006 AND ns = 1 AND seq >= 1 ORDER BY clock DESC, ns DESC, seq DESC
+--let $label= k2 range with ns and seq
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT clock, ns, seq FROM {T} WHERE itemid = 2 AND clock = 1700000006 AND ns = 1 AND seq < 2 ORDER BY seq DESC
+--let $label= k2 seq <, descending
+--source suite/moosedb/include/cmp_query.inc
+DROP TABLE k1, k2, i1, i2;
+
+--echo ##################################################################
+--echo # The same routine deletes, then reads and inserts the same key
+--echo ##################################################################
+CREATE TABLE t (itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG', clock INT NOT NULL, value DOUBLE NOT NULL, ns INT NOT NULL, PRIMARY KEY (itemid, clock, ns))
+  ENGINE=MooseDB TIMESTAMP_COLUMN='clock' CHUNK_INTERVAL='1 DAY';
+CREATE TABLE ctl (v DOUBLE) ENGINE=InnoDB;
+CREATE TABLE res (v DOUBLE, n INT) ENGINE=InnoDB;
+INSERT INTO t SELECT 1, 1700000000 + seq, seq, 0 FROM seq_0_to_9;
+DELIMITER |;
+CREATE FUNCTION swap(x DOUBLE) RETURNS INT MODIFIES SQL DATA
+BEGIN
+  DECLARE before_n, after_n INT;
+  SELECT COUNT(*) INTO before_n FROM t;
+  DELETE FROM t WHERE value = x;
+  SELECT COUNT(*) INTO after_n FROM t;
+  INSERT INTO t VALUES (1, 1700000000 + x, x + 100, 0);
+  RETURN before_n * 100 + after_n;
+END|
+CREATE TRIGGER trg AFTER INSERT ON ctl FOR EACH ROW
+BEGIN
+  DECLARE c INT;
+  DELETE FROM t WHERE value = NEW.v;
+  SELECT COUNT(*) INTO c FROM t WHERE clock = 1700000000 + NEW.v;
+  INSERT INTO t VALUES (1, 1700000000 + NEW.v, NEW.v + 200, 0);
+  INSERT INTO res VALUES (NEW.v, c);
+END|
+DELIMITER ;|
+SELECT swap(2);
+SELECT value FROM t WHERE clock = 1700000002;
+--echo # function: 10 rows before, 9 after the delete (the delete is visible in the same routine)
+INSERT INTO ctl VALUES (3);
+SELECT n FROM res WHERE v = 3;
+SELECT value FROM t WHERE clock = 1700000003;
+SELECT COUNT(*) FROM t;
+DROP TRIGGER trg;
+DROP FUNCTION swap;
+
+--echo # PREPARE once, EXECUTE twice with other parameters
+PREPARE st FROM 'DELETE FROM t WHERE itemid = ? AND clock < ?';
+SET @i = 1, @c = 1700000003;
+EXECUTE st USING @i, @c;
+SELECT ROW_COUNT();
+SET @c = 1700000006;
+EXECUTE st USING @i, @c;
+SELECT ROW_COUNT();
+SET @i = 2;
+EXECUTE st USING @i, @c;
+SELECT ROW_COUNT();
+DEALLOCATE PREPARE st;
+SELECT clock FROM t ORDER BY clock;
+
+--echo ##################################################################
+--echo # A view with a WHERE
+--echo ##################################################################
+INSERT INTO t SELECT 1 + seq MOD 4, 1700001000 + seq, seq, 0 FROM seq_0_to_39;
+CREATE TABLE ti (itemid BIGINT UNSIGNED NOT NULL, clock INT NOT NULL, value DOUBLE NOT NULL, ns INT NOT NULL, PRIMARY KEY (itemid, clock, ns)) ENGINE=InnoDB;
+INSERT INTO ti SELECT * FROM t;
+CREATE VIEW v AS SELECT * FROM t WHERE itemid <= 2;
+CREATE VIEW vi AS SELECT * FROM ti WHERE itemid <= 2;
+DELETE FROM v WHERE clock < 1700001020;
+SELECT ROW_COUNT();
+DELETE FROM vi WHERE clock < 1700001020;
+SELECT ROW_COUNT();
+DELETE FROM v WHERE itemid = 3;
+SELECT ROW_COUNT();
+DELETE FROM vi WHERE itemid = 3;
+SELECT ROW_COUNT();
+--let $mt= t
+--let $it= ti
+--let $q= SELECT itemid, clock, ns, value FROM {T} ORDER BY itemid, clock, ns
+--let $label= after deletes through a view (rows of item 3 are outside it)
+--source suite/moosedb/include/cmp_query.inc
+DROP VIEW v, vi;
+
+--echo ##################################################################
+--echo # A constant true WHERE: row by row when the table is open to inserts, never a lost insert
+--echo ##################################################################
+DELETE FROM t WHERE 1;
+SELECT ROW_COUNT();
+SELECT COUNT(*) FROM t;
+INSERT INTO t VALUES (1, 1700002000, 1, 0);
+DELETE FROM t WHERE itemid IS NOT NULL;
+SELECT ROW_COUNT();
+INSERT INTO t VALUES (1, 1700002000, 1, 0);
+DELETE FROM t WHERE 1 = 1 LIMIT 5;
+SELECT ROW_COUNT();
+SELECT COUNT(*) FROM t;
+DROP TABLE t, ti, ctl, res;
+
+--echo ##################################################################
+--echo # A TAG with a case-insensitive PAD SPACE collation
+--echo ##################################################################
+CREATE TABLE ci (host VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci NOT NULL COMMENT 'TAG', ts DATETIME NOT NULL, v INT, INDEX (ts), INDEX (host, ts))
+  ENGINE=MooseDB CHUNK_INTERVAL='1 DAY';
+CREATE TABLE cii (host VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci NOT NULL, ts DATETIME NOT NULL, v INT, INDEX (ts), INDEX (host, ts)) ENGINE=InnoDB;
+INSERT INTO ci VALUES ('alpha', '2026-01-01 00:00:00', 1), ('Alpha ', '2026-01-01 00:00:01', 2), ('ALPHA', '2026-01-01 00:00:02', 3),
+  ('beta', '2026-01-01 00:00:03', 4), ('alphb', '2026-01-01 00:00:04', 5), ('ALPHA', '2026-01-02 00:00:00', 6);
+INSERT INTO cii SELECT * FROM ci;
+FLUSH TABLES ci;
+INSERT INTO ci VALUES ('aLpHa', '2026-01-01 00:00:05', 7), ('Beta', '2026-01-01 00:00:06', 8);
+INSERT INTO cii VALUES ('aLpHa', '2026-01-01 00:00:05', 7), ('Beta', '2026-01-01 00:00:06', 8);
+FLUSH STATUS;
+DELETE FROM ci WHERE host = 'ALPHA' AND ts < '2026-01-02';
+SELECT ROW_COUNT();
+SHOW SESSION STATUS LIKE 'Handler_delete';
+DELETE FROM cii WHERE host = 'ALPHA' AND ts < '2026-01-02';
+SELECT ROW_COUNT();
+DELETE FROM ci WHERE host IN ('BETA ', 'zzz');
+SELECT ROW_COUNT();
+DELETE FROM cii WHERE host IN ('BETA ', 'zzz');
+SELECT ROW_COUNT();
+--let $mt= ci
+--let $it= cii
+--let $q= SELECT host, ts, v FROM {T} ORDER BY ts, v
+--let $label= case-insensitive TAG after the deletes
+--source suite/moosedb/include/cmp_query.inc
+DROP TABLE ci, cii;
+
+--echo ##################################################################
+--echo # DATETIME time axis: direct delete with exact bounds, fractional bounds, a TIMESTAMP-less range
+--echo ##################################################################
+CREATE TABLE dt (host VARCHAR(8) NOT NULL COMMENT 'TAG', ts DATETIME(6) NOT NULL, v INT, INDEX (ts), INDEX (host, ts)) ENGINE=MooseDB CHUNK_INTERVAL='1 HOUR';
+CREATE TABLE dti (host VARCHAR(8) NOT NULL, ts DATETIME(6) NOT NULL, v INT, INDEX (ts), INDEX (host, ts)) ENGINE=InnoDB;
+INSERT INTO dt SELECT CONCAT('h', seq MOD 3), '2026-01-01' + INTERVAL seq SECOND + INTERVAL (seq MOD 7) * 100000 MICROSECOND, seq FROM seq_0_to_599;
+INSERT INTO dti SELECT * FROM dt;
+FLUSH TABLES dt;
+INSERT INTO dt SELECT CONCAT('h', seq MOD 3), '2026-01-01 00:20:00' + INTERVAL seq SECOND, 1000 + seq FROM seq_0_to_59;
+INSERT INTO dti SELECT * FROM dt WHERE v >= 1000;
+FLUSH STATUS;
+DELETE FROM dt WHERE host = 'h1' AND ts < '2026-01-01 00:01:00';
+SELECT ROW_COUNT();
+SHOW SESSION STATUS LIKE 'Handler_delete';
+DELETE FROM dti WHERE host = 'h1' AND ts < '2026-01-01 00:01:00';
+SELECT ROW_COUNT();
+FLUSH STATUS;
+DELETE FROM dt WHERE host = 'h2' AND ts BETWEEN '2026-01-01 00:02:00.300000' AND '2026-01-01 00:03:00.250000';
+SELECT ROW_COUNT();
+SHOW SESSION STATUS LIKE 'Handler_delete';
+DELETE FROM dti WHERE host = 'h2' AND ts BETWEEN '2026-01-01 00:02:00.300000' AND '2026-01-01 00:03:00.250000';
+SELECT ROW_COUNT();
+DELETE FROM dt WHERE ts >= '2026-01-01 00:20:30' AND ts <= '2026-01-01 00:20:40.000001';
+SELECT ROW_COUNT();
+DELETE FROM dti WHERE ts >= '2026-01-01 00:20:30' AND ts <= '2026-01-01 00:20:40.000001';
+SELECT ROW_COUNT();
+DELETE FROM dt WHERE ts = '2026-01-01 00:00:01.100000';
+SELECT ROW_COUNT();
+DELETE FROM dti WHERE ts = '2026-01-01 00:00:01.100000';
+SELECT ROW_COUNT();
+DELETE FROM dt WHERE ts > '2026-01-01 00:05:00' AND ts < '2026-01-01 00:06:00' AND v MOD 2 = 0;
+SELECT ROW_COUNT();
+DELETE FROM dti WHERE ts > '2026-01-01 00:05:00' AND ts < '2026-01-01 00:06:00' AND v MOD 2 = 0;
+SELECT ROW_COUNT();
+--let $mt= dt
+--let $it= dti
+--let $q= SELECT host, ts, v FROM {T} ORDER BY ts, host, v
+--let $label= DATETIME axis after the deletes
+--source suite/moosedb/include/cmp_query.inc
+DROP TABLE dt, dti;
+
+--echo ##################################################################
+--echo # A table with delete triggers: row by row, the trigger fires once per row
+--echo ##################################################################
+CREATE TABLE tr (itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG', clock INT NOT NULL, value DOUBLE NOT NULL, PRIMARY KEY (itemid, clock))
+  ENGINE=MooseDB TIMESTAMP_COLUMN='clock' CHUNK_INTERVAL='1 DAY';
+CREATE TABLE audit (n INT) ENGINE=InnoDB;
+CREATE TRIGGER trd BEFORE DELETE ON tr FOR EACH ROW INSERT INTO audit VALUES (OLD.clock);
+INSERT INTO tr SELECT 1, 1700000000 + seq, seq FROM seq_0_to_9;
+FLUSH TABLES tr;
+FLUSH STATUS;
+DELETE FROM tr WHERE itemid = 1 AND clock < 1700000004;
+SELECT ROW_COUNT();
+SHOW SESSION STATUS LIKE 'Handler_delete';
+SELECT COUNT(*), MIN(n), MAX(n) FROM audit;
+SELECT COUNT(*) FROM tr;
+DROP TABLE tr, audit;

@@ -1,0 +1,59 @@
+#
+# DELETE on an encrypted table (chunks and WAL encrypted with AES-CTR): a
+# range delete over sealed encrypted chunks and the MemTable, reinsertion of a
+# deleted key, a delete only in the encrypted WAL (kill -9), and one folded
+# into the MANIFEST (clean restart). Compared with an InnoDB mirror.
+#
+--source include/not_embedded.inc
+--source include/have_innodb.inc
+--source include/have_sequence.inc
+--source suite/moosedb/include/have_moosedb.inc
+
+CREATE TABLE enc (itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG', clock INT NOT NULL, value DOUBLE NOT NULL, ns INT NOT NULL,
+                  PRIMARY KEY (itemid, clock, ns))
+  ENGINE=MooseDB TIMESTAMP_COLUMN='clock' CHUNK_INTERVAL='1 DAY' HOT_THRESHOLD='1 HOUR' ENCRYPTION='YES' ENCRYPTION_KEY_ID=1;
+CREATE TABLE mir (itemid BIGINT UNSIGNED NOT NULL, clock INT NOT NULL, value DOUBLE NOT NULL, ns INT NOT NULL, PRIMARY KEY (itemid, clock, ns)) ENGINE=InnoDB;
+INSERT INTO enc SELECT 1 + a.seq, 1700000000 + b.seq * 10, a.seq * 100 + b.seq, b.seq MOD 3 FROM seq_0_to_9 a, seq_0_to_29 b;
+INSERT INTO mir SELECT * FROM enc;
+FLUSH TABLES enc;
+INSERT INTO enc SELECT 1 + a.seq, 1700000000 + b.seq * 10 + 5, a.seq, 0 FROM seq_0_to_9 a, seq_0_to_29 b;
+INSERT INTO mir SELECT 1 + a.seq, 1700000000 + b.seq * 10 + 5, a.seq, 0 FROM seq_0_to_9 a, seq_0_to_29 b;
+SELECT ENCRYPTED, CHUNKS, COLD_CHUNKS, PENDING_ROWS FROM information_schema.MOOSEDB_TABLES WHERE TABLE_NAME = 'enc';
+
+--let $mt= enc
+--let $it= mir
+--let $q= SELECT itemid, clock, ns, value FROM {T} ORDER BY itemid, clock, ns
+
+--echo # a range over the sealed chunk and the MemTable, and a whole item
+DELETE FROM enc WHERE itemid = 3 AND clock BETWEEN 1700000050 AND 1700000205;
+SELECT ROW_COUNT();
+DELETE FROM mir WHERE itemid = 3 AND clock BETWEEN 1700000050 AND 1700000205;
+SELECT ROW_COUNT();
+DELETE FROM enc WHERE itemid IN (5, 6);
+DELETE FROM mir WHERE itemid IN (5, 6);
+--let $label= after deletes over an encrypted table
+--source suite/moosedb/include/cmp_query.inc
+--echo # a deleted key can be inserted again; a live one cannot
+INSERT INTO enc VALUES (3, 1700000100, 9, 0);
+INSERT INTO mir VALUES (3, 1700000100, 9, 0);
+--error ER_DUP_ENTRY
+INSERT INTO enc VALUES (3, 1700000100, 9, 0);
+--echo # exact rows (any other WHERE)
+DELETE FROM enc WHERE value = 4;
+DELETE FROM mir WHERE value = 4;
+--source suite/moosedb/include/cmp_query.inc
+--echo # clean restart, then kill -9 with the delete only in the encrypted WAL
+--source include/restart_mysqld.inc
+--let $label= after a clean restart
+--source suite/moosedb/include/cmp_query.inc
+DELETE FROM enc WHERE itemid = 8 AND clock < 1700000100;
+DELETE FROM mir WHERE itemid = 8 AND clock < 1700000100;
+--source include/kill_mysqld.inc
+--source include/start_mysqld.inc
+--let $label= after kill -9
+--source suite/moosedb/include/cmp_query.inc
+OPTIMIZE TABLE enc;
+--let $label= after OPTIMIZE (rewritten with the delete applied)
+--source suite/moosedb/include/cmp_query.inc
+CHECK TABLE enc;
+DROP TABLE enc, mir;

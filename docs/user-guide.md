@@ -305,7 +305,7 @@ descartado. Existem dois caminhos:
   Use o housekeeper apenas para apagar por item (`history.clear`, itens removidos).
 * **Limites**: o statement direto com milhões de séries selecionadas é recusado
   (`Unsupported`, o tombstone caberia mal numa entrada de log de 8 MiB); `UPDATE`
-  segue sem suporte; `mariadb-backup` segue não copiando tabelas MooseDB.
+  segue sem suporte; `mariadb-backup` segue não copiando tabelas MooseDB (mas agora falha em vez de ignorar).
 
 ## Manutenção
 
@@ -367,12 +367,16 @@ de chaves e reabra.
 
 ## Backup
 
-> **Atenção: `mariadb-backup` NÃO copia tabelas MooseDB.** Ele termina com
-> sucesso (rc=0), mas ignora os diretórios `<banco>/<tabela>/` da engine; na
-> restauração as tabelas aparecem em `SHOW TABLES` e falham com
-> `ERROR 1932 ... doesn't exist in engine`. O mariabackup só copia arquivos de
-> uma lista fixa de extensões e pula subdiretórios — não há API para uma engine
-> de terceiros participar.
+> **Atenção: `mariadb-backup` NÃO copia tabelas MooseDB.** Ele só copia uma
+> lista fixa de extensões e pula os diretórios `<banco>/<tabela>/` da engine;
+> não há API para uma engine de terceiros participar. Para não gerar um backup
+> silenciosamente incompleto, a engine **faz o `mariadb-backup --backup`
+> falhar** (rc=1, `FATAL ERROR ... MooseDB tables are not copied by
+> mariadb-backup; use mariadb-dump --lock-all-tables`) quando existe ao menos
+> uma tabela MooseDB. Isso vale também para `FLUSH ENGINE LOGS` durante um
+> `BACKUP STAGE` ativo. **`--no-lock` não é protegido**: ele pula esse
+> statement e sai com rc=0 sem os dados MooseDB — não o use com tabelas
+> MooseDB. Sem tabelas MooseDB o backup roda normalmente.
 
 Métodos suportados hoje:
 

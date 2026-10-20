@@ -768,11 +768,17 @@ de 6 execuções (+8 %, de −8 % a +20 % entre execuções; o InnoDB leva ~21 s
   com valor maior abrem com o valor limitado.
 * O plugin se declara `EXPERIMENTAL`: requer `plugin_maturity=experimental`.
 * Criptografia sem integridade autenticada (ver §Criptografia).
-* **`mariadb-backup` não copia tabelas MooseDB** (sai com rc=0): ele pula
-  subdiretórios do banco (`extra/mariabackup/backup_copy.cc:379`) e só copia
-  extensões fixas (`backup_copy.cc:926-943`, `common_engine.cc:352-361`).
-  A engine ainda não implementa `hton->prepare_for_backup`/`end_backup`
-  (pausar manutenção durante `BACKUP STAGE`). Backup suportado:
+* **`mariadb-backup` não copia tabelas MooseDB**: ele pula subdiretórios do
+  banco (`extra/mariabackup/backup_copy.cc:379`) e só copia extensões fixas
+  (`backup_copy.cc:926-943`, `common_engine.cc:352-361`). Os hooks
+  `hton->prepare_for_backup`/`end_backup` (`sql/handler.cc`) são `void` e não
+  podem falhar o `BACKUP STAGE`; mas `hton->flush_logs` retorna erro, e o
+  mariadb-backup executa `FLUSH NO_WRITE_TO_BINLOG ENGINE LOGS` em
+  BLOCK_COMMIT com `die_on_error`. A engine liga um flag atômico em
+  `prepare_for_backup`/desliga em `end_backup` e `flush_logs` falha só com o
+  flag ligado e ao menos uma tabela MooseDB no datadir (mesma varredura do
+  I_S) — rc=1 em vez de backup incompleto. Limitação: `--no-lock` pula esse
+  statement e continua silencioso. Backup suportado:
   `mariadb-dump --lock-all-tables` — ver user-guide §Backup.
 * Tabelas não podem ser particionadas.
 * `HANDLER ... OPEN` não é suportado (`ER_ILLEGAL_HA`); `IN` com mais de

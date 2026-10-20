@@ -13,6 +13,7 @@
 #include "ha_moosedb.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <climits>
 #include <cmath>
@@ -5102,6 +5103,37 @@ static handler *moosedb_create_handler(handlerton *hton, TABLE_SHARE *table,
 /* Table data lives in a directory, not in files with extensions. */
 static const char *moosedb_exts[]= {NullS};
 
+/*
+  mariadb-backup cannot copy MooseDB tables (it skips table subdirectories),
+  yet exits 0. prepare_for_backup/end_backup are void, but they tell us a
+  BACKUP STAGE is active; mariadb-backup then runs FLUSH ENGINE LOGS
+  (die_on_error) in BLOCK_COMMIT, and flush_logs may fail. So fail it only
+  while a backup is active and a MooseDB table exists. --no-lock skips that
+  statement and stays unprotected (documented).
+*/
+static std::atomic<bool> backup_active{false};
+
+static void moosedb_prepare_for_backup() { backup_active.store(true); }
+static void moosedb_end_backup() { backup_active.store(false); }
+
+static bool moosedb_flush_logs(handlerton *)
+{
+  if (!backup_active.load())
+    return false;
+  bool found= false;
+  for_each_moosedb_table([&](const char *, const char *, const std::string &) {
+    found= true;
+    return true;
+  });
+  if (!found)
+    return false;
+  my_printf_error(ER_UNKNOWN_ERROR,
+                  "MooseDB tables are not copied by mariadb-backup; use "
+                  "mariadb-dump --lock-all-tables (see the user guide, Backup)",
+                  MYF(0));
+  return true;
+}
+
 static int moosedb_init_func(void *p)
 {
   DBUG_ENTER("moosedb_init_func");
@@ -5115,6 +5147,9 @@ static int moosedb_init_func(void *p)
   moosedb_hton->flags= HTON_NO_PARTITION;
   moosedb_hton->table_options= moosedb_table_option_list;
   moosedb_hton->tablefile_extensions= moosedb_exts;
+  moosedb_hton->prepare_for_backup= moosedb_prepare_for_backup;
+  moosedb_hton->end_backup= moosedb_end_backup;
+  moosedb_hton->flush_logs= moosedb_flush_logs;
   push_globals();
   if (moosedb_set_key_callback(moosedb_key_callback) != TF_OK)
   {

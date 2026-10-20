@@ -778,7 +778,9 @@ de 6 execuções (+8 %, de −8 % a +20 % entre execuções; o InnoDB leva ~21 s
   `prepare_for_backup`/desliga em `end_backup` e `flush_logs` falha só com o
   flag ligado e ao menos uma tabela MooseDB no datadir (mesma varredura do
   I_S) — rc=1 em vez de backup incompleto. Limitação: `--no-lock` pula esse
-  statement e continua silencioso. Backup suportado:
+  statement (nem emite `BACKUP STAGE`, então nenhum hook roda) e continua
+  silencioso. Backup suportado: `BACKUP STAGE BLOCK_COMMIT` + snapshot
+  atômico do volume (crash-consistente pelo protocolo de durabilidade) ou
   `mariadb-dump --lock-all-tables` — ver user-guide §Backup.
 * Tabelas não podem ser particionadas.
 * `HANDLER ... OPEN` não é suportado (`ER_ILLEGAL_HA`); `IN` com mais de

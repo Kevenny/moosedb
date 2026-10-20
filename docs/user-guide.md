@@ -382,8 +382,37 @@ Métodos suportados hoje:
 
 | Método | Consistência | Observação |
 |---|---|---|
+| **`BACKUP STAGE` + snapshot atômico do volume (recomendado)** | consistente entre engines (MooseDB + InnoDB no mesmo instante) | escritas pausadas só durante o snapshot (segundos); exige LVM/ZFS/btrfs/EBS com snapshot atômico do volume inteiro do datadir |
 | `mariadb-dump --lock-all-tables` | consistente entre tabelas | bloqueia escritas durante todo o dump; dump em texto claro (mesmo de tabela cifrada) |
-| `BACKUP STAGE` + cópia do diretório (abaixo) | consistente | escritas pausadas só durante a cópia |
+| `BACKUP STAGE` + cópia do diretório (abaixo) | consistente | escritas pausadas só durante a cópia; risco da manutenção em background (ver abaixo) |
+
+### Snapshot atômico do volume
+
+Um snapshot atômico equivale a uma queda de energia congelada: o protocolo
+de durabilidade da MooseDB (`.tmp` → fsync → rename → troca do MANIFEST) já
+recupera desse estado, e o `BACKUP STAGE BLOCK_COMMIT` pausa as escritas de
+MooseDB e InnoDB para os dois saírem do mesmo instante. A manutenção em
+background não atrapalha, porque o snapshot congela o volume inteiro de uma
+vez. Validado com INSERT/DELETE/compactação concorrentes: 10/10 restaurações
+com checksums idênticos aos do `BLOCK_COMMIT`.
+
+```sql
+-- sessão A, mantida aberta até o fim
+BACKUP STAGE START;
+BACKUP STAGE FLUSH;
+BACKUP STAGE BLOCK_DDL;
+BACKUP STAGE BLOCK_COMMIT;   -- INSERT/DELETE ficam em "Waiting for backup lock"
+-- (fora do SQL) snapshot do volume do datadir, ex.:
+--   lvcreate --snapshot -n mdb_snap -L 10G /dev/vg/mariadb
+--   zfs snapshot pool/mariadb@backup
+BACKUP STAGE END;
+-- copie o snapshot para o destino com calma e depois descarte-o
+```
+
+Restauração: suba um servidor sobre a cópia (mesmo `file_key_management`
+se houver tabelas cifradas); a recuperação roda na abertura das tabelas.
+Valide com `CHECK TABLE`. O snapshot precisa cobrir o datadir inteiro num
+único instante: snapshots separados por arquivo ou por disco não servem.
 
 Não use `mariadb-dump --single-transaction` nem `--skip-lock-tables`: a
 engine não é transacional, e tabelas diferentes saem de instantes diferentes.
@@ -409,9 +438,8 @@ fica desencontrado e a restauração falha com `table is marked as crashed`.
 Reduza o risco com `SET GLOBAL moosedb_retention_check_interval = 0` e
 `moosedb_compaction_trigger_chunks = 10000` antes (restaure depois), e
 **sempre** valide a cópia restaurada com `CHECK TABLE`. A recodificação de
-chunks frios não tem como ser desligada hoje. Até a integração com
-`BACKUP STAGE` (pausa da manutenção) ser implementada, prefira
-`mariadb-dump --lock-all-tables` para backups de produção.
+chunks frios não tem como ser desligada hoje. Para produção, prefira o
+snapshot atômico do volume ou `mariadb-dump --lock-all-tables`.
 
 Na restauração, copie os diretórios de volta com o mesmo
 `file_key_management`; o WAL é reaplicado na abertura.

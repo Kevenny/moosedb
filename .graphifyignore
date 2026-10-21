@@ -1,0 +1,13 @@
+# artefatos de build, dados e saídas de medição (não são código-fonte)
+build/
+target/
+PsPadBK/
+graphify-out/
+lab/*/results/
+lab/*/data/
+lab/*/plugin/
+*.so
+*.log
+*.reject
+# chaves de criptografia de teste (não entram no grafo)
+mysql-test/suite/moosedb/std_data/

@@ -2,7 +2,7 @@
 # Builds ha_moosedb.so inside the moosedb-dev image.
 #
 #   docker run --rm -v "$PWD:/work" -v moosedb-build:/build \
-#     -v moosedb-cargo:/usr/local/cargo/registry moosedb-dev docker/build-plugin.sh
+#     -v moosedb-cargo:/usr/local/cargo/registry moosedb-dev docs/docker/build-plugin.sh
 #
 # The MariaDB build directory lives in the moosedb-build volume, so only the
 # first run pays for configuring the server tree.

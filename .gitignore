@@ -8,3 +8,6 @@ target/
 *.log
 PsPadBK/
 .vscode/
+
+# Graphify: grafo local, refeito por `graphify update .` (não versionar)
+graphify-out/

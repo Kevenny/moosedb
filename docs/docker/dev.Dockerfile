@@ -4,7 +4,7 @@
 # source tree matching the server version we target. The plugin must be
 # compiled against the exact same source version as the server that loads it.
 #
-#   docker build -f docker/dev.Dockerfile -t moosedb-dev .
+#   docker build -f docs/docker/dev.Dockerfile -t moosedb-dev .
 #
 FROM rust:1-bookworm
 

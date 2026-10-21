@@ -32,7 +32,7 @@ recuperação, para garantir que a tabela recuperada continua gravável e
 corrompível corretamente.
 
 ```bash
-docker run --rm -v "$PWD:/work" moosedb-test bash /work/docker/run-mtr.sh --do-test=crash_recovery
+docker run --rm -v "$PWD:/work" moosedb-test bash /work/docs/docker/run-mtr.sh --do-test=crash_recovery
 ```
 
 Requer `build/ha_moosedb.so` atualizado (rode `moosedb-build` antes se o

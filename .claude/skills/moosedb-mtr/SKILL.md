@@ -27,12 +27,12 @@ se ainda não existir ou se o código mudou desde o último build.
 
 Suíte completa:
 ```bash
-docker run --rm -v "$PWD:/work" moosedb-test bash /work/docker/run-mtr.sh
+docker run --rm -v "$PWD:/work" moosedb-test bash /work/docs/docker/run-mtr.sh
 ```
 
 Um teste específico (mais rápido ao iterar):
 ```bash
-docker run --rm -v "$PWD:/work" moosedb-test bash /work/docker/run-mtr.sh ddl statement_atomicity
+docker run --rm -v "$PWD:/work" moosedb-test bash /work/docs/docker/run-mtr.sh ddl statement_atomicity
 ```
 
 ## Contrato de saída

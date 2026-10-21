@@ -10,7 +10,7 @@ checksum. Estilo do `lab/zabbix/` (compose, `bench.sh` com melhor-de-N e tempo m
 ```bash
 cd lab/fileaccess
 # 1. plugin do HEAD (fluxo da skill moosedb-build) e cópia própria
-docker run --rm -v "$PWD/../..:/work" -v moosedb-cargo:/usr/local/cargo/registry -v moosedb-build:/build moosedb-dev bash /work/docker/build-plugin.sh
+docker run --rm -v "$PWD/../..:/work" -v moosedb-cargo:/usr/local/cargo/registry -v moosedb-build:/build moosedb-dev bash /work/docs/docker/build-plugin.sh
 cp ../../build/ha_moosedb.so plugin/
 # 2. dados (determinísticos, ~2,8 GB em 20 arquivos TSV de 1 M linhas) e volume de dados
 python scripts/gen_data.py --rows 20000000 --out data/20m     # ~2 min; --rows 2000000 --out data/2m p/ iterar

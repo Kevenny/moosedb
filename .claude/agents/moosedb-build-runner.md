@@ -27,8 +27,8 @@ abaixo assumem isso.
 ### Imagens Docker (uma vez, ou quando os Dockerfiles mudam)
 
 ```bash
-docker build -f docker/dev.Dockerfile  -t moosedb-dev  docker/
-docker build -f docker/test.Dockerfile -t moosedb-test docker/
+docker build -f docs/docker/dev.Dockerfile  -t moosedb-dev  docs/docker/
+docker build -f docs/docker/test.Dockerfile -t moosedb-test docs/docker/
 ```
 
 ### Rust — testes + clippy
@@ -43,7 +43,7 @@ docker run --rm -v "$PWD:/work" -v moosedb-cargo:/usr/local/cargo/registry \
 
 ```bash
 docker run --rm -v "$PWD:/work" -v moosedb-cargo:/usr/local/cargo/registry \
-  -v moosedb-build:/build moosedb-dev bash /work/docker/build-plugin.sh
+  -v moosedb-build:/build moosedb-dev bash /work/docs/docker/build-plugin.sh
 ```
 
 Requer que a imagem `moosedb-dev` já exista. Gera `build/ha_moosedb.so`.
@@ -51,7 +51,7 @@ Requer que a imagem `moosedb-dev` já exista. Gera `build/ha_moosedb.so`.
 ### Suíte MTR (depende do build do plugin acima)
 
 ```bash
-docker run --rm -v "$PWD:/work" moosedb-test bash /work/docker/run-mtr.sh [opções]
+docker run --rm -v "$PWD:/work" moosedb-test bash /work/docs/docker/run-mtr.sh [opções]
 ```
 
 Para um teste específico: `... run-mtr.sh --do-test=<nome>` (ex.:

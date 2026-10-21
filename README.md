@@ -30,8 +30,8 @@ exato do servidor da imagem `mariadb:11.4` (11.4.13).
 
 ```bash
 # Imagens
-docker build -f docker/dev.Dockerfile  -t moosedb-dev  docker/
-docker build -f docker/test.Dockerfile -t moosedb-test docker/
+docker build -f docs/docker/dev.Dockerfile  -t moosedb-dev  docs/docker/
+docker build -f docs/docker/test.Dockerfile -t moosedb-test docs/docker/
 
 # Rust: testes, clippy
 docker run --rm -v "$PWD:/work" -v moosedb-cargo:/usr/local/cargo/registry \
@@ -40,10 +40,10 @@ docker run --rm -v "$PWD:/work" -v moosedb-cargo:/usr/local/cargo/registry \
 
 # Plugin ha_moosedb.so → build/
 docker run --rm -v "$PWD:/work" -v moosedb-cargo:/usr/local/cargo/registry \
-  -v moosedb-build:/build moosedb-dev bash /work/docker/build-plugin.sh
+  -v moosedb-build:/build moosedb-dev bash /work/docs/docker/build-plugin.sh
 
 # Suíte MTR contra o servidor oficial
-docker run --rm -v "$PWD:/work" moosedb-test bash /work/docker/run-mtr.sh
+docker run --rm -v "$PWD:/work" moosedb-test bash /work/docs/docker/run-mtr.sh
 ```
 
 Antes do primeiro commit: `git config core.hooksPath .githooks` (guardrails

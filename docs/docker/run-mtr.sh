@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Runs the MooseDB MTR suite against the official MariaDB server binary.
 #
-#   docker run --rm -v "$PWD:/work" moosedb-test bash /work/docker/run-mtr.sh [mtr options]
+#   docker run --rm -v "$PWD:/work" moosedb-test bash /work/docs/docker/run-mtr.sh [mtr options]
 #
-# Expects build/ha_moosedb.so (see docker/build-plugin.sh).
+# Expects build/ha_moosedb.so (see docs/docker/build-plugin.sh).
 set -euo pipefail
 
 MTR_DIR=/usr/share/mariadb/mariadb-test

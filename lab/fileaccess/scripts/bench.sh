@@ -7,7 +7,7 @@
 # Variáveis:
 #   DATA     subpasta de data/ (e do volume fileacc-data) com events_*.tsv e params.env   (20m)
 #   STAGE    load | query | explain | all                                                  (all)
-#   ENGINES  innodb innodb_f moose moose_h ch   (tabelas evento_innodb[_f], evento_moose[_h], fileacc.evento)
+#   ENGINES  innodb innodb_f moose moose_h moose_hn ch   (tabelas evento_innodb[_f], evento_moose[_h], fileacc.evento)
 #   RUNS     execuções quentes por consulta (melhor de)                                    (5)
 #   COLD     0 = não reinicia; 1 = reinicia o contêiner antes das consultas (BP/cache do
 #            servidor frios, 1ª execução ~ "fria"); 2 = idem + drop_caches do page cache   (1)
@@ -26,7 +26,7 @@ M() { docker exec -i $MC mariadb -uroot -p"$PW" -N -B "$@"; }
 C() { docker exec -i $CC clickhouse-client --max_threads 8 "$@"; }
 RS="results/rs_$DATA"; mkdir -p "$RS"
 set -a; . <(grep -v '^#' "data/$DATA/params.env"); set +a
-table_of() { case $1 in innodb) echo evento_innodb;; innodb_f) echo evento_innodb_f;; moose) echo evento_moose;; moose_h) echo evento_moose_h;; ch) echo fileacc.evento;; esac; }
+table_of() { case $1 in innodb) echo evento_innodb;; innodb_f) echo evento_innodb_f;; moose) echo evento_moose;; moose_h) echo evento_moose_h;; moose_hn) echo evento_moose_hn;; ch) echo fileacc.evento;; esac; }
 render() {   # render <arquivo.sql> <tabela>
   sed -e "s|{{T}}|$2|g" -e "s|{{DAY0}}|$DAY0|g" -e "s|{{DAY1}}|$DAY1|g" -e "s|{{HOUR0}}|$HOUR0|g" \
       -e "s|{{HOUR1}}|$HOUR1|g" -e "s|{{HOST0}}|$HOST0|g" -e "s|{{FILE0}}|$FILE0|g" "$1"
@@ -121,7 +121,7 @@ if [ "$STAGE" = query ] || [ "$STAGE" = all ]; then
         s=$(run_once $e $d/$q.sql); best=$(awk -v a="${best:-$s}" -v c="$s" 'BEGIN{print (c<a)?c:a}')
       done
       g=""
-      case $e in moose*) [ "$GBH" = 1 ] && g="	gbh_engine=$(M fileacc -e "$(pre $(table_of $e)) SHOW STATUS LIKE 'Moosedb_gbh_queries'; $(oneline $d/$q.sql $(table_of $e)); SHOW STATUS LIKE 'Moosedb_gbh_queries'" | grep '^Moosedb_gbh_queries' | awk '{v[NR]=$2} END{print (v[2]>v[1])?"sim":"nao"}')";; esac
+      case $e in moose*) [ "$GBH" = 1 ] && g="	$(M fileacc -e "$(pre $(table_of $e)) SHOW STATUS LIKE 'Moosedb_gbh%'; $(oneline $d/$q.sql $(table_of $e)); SHOW STATUS LIKE 'Moosedb_gbh%'" | grep '^Moosedb_gbh' | awk '{n=NR; if(!($1 in a)){a[$1]=$2; o[++k]=$1} else {b[$1]=$2}} END{for(i=1;i<=k;i++){d=b[o[i]]-a[o[i]]; if(d!=0){x=o[i]; sub("Moosedb_gbh_","",x); printf "%s=%d ", x, d}} if(!(b["Moosedb_gbh_queries"]>a["Moosedb_gbh_queries"])) printf "gbh_engine=nao"}')";; esac
       echo "q	$e	$q	$best	$first	[$TAG]$g"
     done
   done

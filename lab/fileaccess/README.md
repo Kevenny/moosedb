@@ -150,6 +150,54 @@ Onde o tempo vai agora: q04 inteiro é engine (EXPLAIN "Storage engine handles G
 15x), dominado por 3,7 M grupos distintos de `file` (insensível a threads: 1,44 / 1,16 / 1,22 s com 1/4/8). q02 (caminho normal; `ANALYZE`):
 0,49 s na engine (316.990 linhas lidas por `ix_ts`, 52% passam no filtro) + 0,44 s no executor. q05/q05b: varredura de coluna comum sem índice.
 
+## Passo 6 do group_by_handler: WHERE em coluna comum, filtro exato, top-N (working tree, NÃO commitado)
+
+Plugin recompilado do working tree em 2026-10-21 (inclui paralelismo por partição e cache de blocos fragmentado).
+`bench.sh` agora imprime, por consulta, os deltas de `Moosedb_gbh_*` (`queries`, `exact_filters`, `topn`, `dict_us`,
+`agg_us`, `post_us`, `eval_us`) e aceita `ENGINES=moose_hn`. Resultados: `results/p6_off.txt`, `results/p6_on_{1,4,8}.txt`.
+Melhor de 5 quentes, em segundos (entre parênteses, nº de threads do melhor ON). Checksums das 9 consultas **idênticos**
+(InnoDB, ClickHouse, moose, moose_h, moose_hn; OFF e ON 1/4/8; 0 divergências).
+
+| Consulta | InnoDB | MooseDB OFF | MooseDB-h OFF | MooseDB ON | MooseDB-h ON | MooseDB nopad ON (`moose_hn`) | ClickHouse |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| q01 | 3,00 | 3,33 | 1,99 | 0,0345 (8) | 0,0022 (8) | 0,0022 (8) | 0,0150 |
+| q02 | 0,496 | 0,693 | 0,460 | 0,0643 (8) | 0,0110 (8) | 0,0059 (8) | 0,0290 |
+| q03 | 0,286 | 0,401 | 0,222 | 0,0396 (8) | 0,0038 (8) | 0,0039 (8) | 0,0120 |
+| q04 | 14,63 | 17,75 | 14,73 | 0,281 (8) | 0,265 (8) | 0,143 (8) | 0,0760 |
+| q05 | 1,56 | 2,22 | 3,16 | 1,02 (8) | 0,873 (8) | 0,212 (8) | 0,104 |
+| q05b | 2,14 | 3,30 | 1,66 | 0,190 (8) | 0,134 (8) | 0,0083 (8) | 0,0320 |
+| q06 | 0,0132 | 0,0048 | 0,0038 | 0,0045 (8) | 0,0007 (4) | 0,0007 (8) | 0,0030 |
+| q07 | 0,0141 | 0,0056 | 0,0047 | 0,0054 (4) | 0,0045 (4) | 0,0046 (8) | 0,0030 |
+| q07b | 0,0017 | 0,0012 | 0,0009 | 0,0011 (8) | 0,0008 (8) | 0,0009 (4) | 0,0030 |
+
+Pela engine: q01-q06 (q07/q07b ficam no caminho normal: GROUP BY de expressão). Filtro exato (`Moosedb_gbh_exact_filters=1`):
+só em `moose_hn` (q02, q05, q05b). Top-N (`Moosedb_gbh_topn`): **0 em todas as 9 consultas** (ver nota).
+`moose_hn` = cópia de `moose_h` com `folder`, `file` e `op` em `utf8mb4_nopad_bin` (`INSERT...SELECT` por dia, `moosedb_compact`);
+muda a semântica de comparação nessas colunas (espaços finais passam a contar; `utf8mb4_bin` é PAD SPACE, `'a'='a '`), o
+gerador não produz valores que difiram só por espaço final, e os checksums batem.
+
+Tempos por fase da engine, 8 threads (ms; `dict` = máscara de dicionário, `agg` = agregação, `post` = ordenação/emissão):
+
+| | dict | agg | post |
+|---|---:|---:|---:|
+| q04 moose / moose_h / moose_hn | 0 / 0 / 0 | 120 / 116 / 99 | 160 / 189 / 39 |
+| q05 moose / moose_h / moose_hn | 801 / 775 / 0,003 | 284 / 196 / 291 | 7 / 3 / 0,7 |
+| q05b moose / moose_h / moose_hn | 155 / 131 / 0,002 | 28 / 9 / 9 | 5 / 2 / 0,2 |
+| q02 moose / moose_h / moose_hn | 26 / 2,6 / 0,001 | 35 / 4,9 / 4,7 | 3,7 / 3,4 / 0,5 |
+
+`eval_us` fica em 4-86 ms (avaliação do predicado sobre o dicionário, só nas consultas com filtro não exato).
+
+Nota: quando valem os atalhos.
+
+* **Filtro exato** (`col = const` / `col IN (...)` comparado por bytes no core, sem montar o dicionário de valores): só para colunas
+  inteiras ou VARCHAR com collation **binária NO PAD** (`utf8mb4_nopad_bin`). Com `utf8mb4_bin` (PAD SPACE, o padrão do lab) o handler
+  monta a máscara por dicionário: q05 gasta 0,8 s em `dict_us` (2,05 M valores distintos de `file`) e q05b 0,13 s.
+* **Top-N no core**: só `ORDER BY <um agregado> [DESC] LIMIT K` com uma chave de grupo, sem HAVING, sem TAG, sem string de collation
+  que precise de merge (PAD SPACE), sem AVG, sem BIGINT UNSIGNED, e **sem segundo termo no ORDER BY**. As 9 consultas do lab têm o
+  desempate `ORDER BY n DESC, chave`, então nunca disparam. Teste avulso (8 threads, `moose_hn`, sem o desempate): q04 0,084 s
+  (era 0,143; `post` 39 ms para 0,008 ms) e q02 0,0091 s (era 0,0059 com desempate: sem ganho, o `post` já era 0,5 ms). Em `moose_h`
+  (PAD SPACE) o top-N não dispara mesmo sem desempate (0,250 s); resultado desse teste avulso não é conferido por checksum (empates).
+
 ## Onde o tempo vai na MooseDB
 
 `EXPLAIN` (MooseDB host+process TAG; saída completa em `results/bench_20m.txt`):

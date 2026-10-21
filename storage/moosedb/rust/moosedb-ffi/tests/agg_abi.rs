@@ -92,6 +92,27 @@ fn spec(keys: &[TFAggKey], funcs: &[TFAggFunc], filters: &[TFAggFilter], max_mem
         filter_count: filters.len() as u32,
         max_memory,
         threads,
+        top_mode: TF_AGG_TOP_NONE,
+        top_func: 0,
+        top_limit: 0,
+    }
+}
+
+/// A dictionary-mask filter (the tail of the struct zero).
+fn mask_filter(col: u32, mask: *const u8, mask_len: u64) -> TFAggFilter {
+    TFAggFilter {
+        col,
+        mask,
+        mask_len,
+        mode: TF_AGG_FILTER_MASK,
+        int_values: ptr::null(),
+        int_count: 0,
+        value_starts: ptr::null(),
+        value_lens: ptr::null(),
+        value_count: 0,
+        value_data: ptr::null(),
+        value_data_len: 0,
+        pad_space: 0,
     }
 }
 
@@ -178,7 +199,8 @@ fn aggregation_lifecycle_results_dictionaries_and_errors_through_c_abi() {
     assert_eq!((batch.row_count, batch.total_groups), (0, 3));
 
     // dictionary of `name`, then a filtered COUNT(*)
-    let dict = spec(&[column(3)], &[], &[], 1 << 28, 1);
+    let dict_keys = [column(3)];
+    let dict = spec(&dict_keys, &[], &[], 1 << 28, 1);
     check(unsafe { moosedb_agg_run(agg, &dict, None, ptr::null_mut()) }).unwrap();
     check(unsafe { moosedb_agg_result(agg, 0, 100, &mut batch) }).unwrap();
     assert_eq!(batch.row_count, 3, "a, b, NULL");
@@ -198,12 +220,84 @@ fn aggregation_lifecycle_results_dictionaries_and_errors_through_c_abi() {
             u8::from(nulls[i] == 0 && &data[starts[i] as usize..(starts[i] + u64::from(lens[i])) as usize] == b"b")
         })
         .collect();
-    let filtered = [TFAggFilter { col: 3, mask: mask.as_ptr(), mask_len: 3 }];
+    let filtered = [mask_filter(3, mask.as_ptr(), 3)];
     let s = spec(&[], &[func(TF_AGG_COUNT_STAR, 0)], &filtered, 1 << 28, 3);
     check(unsafe { moosedb_agg_run(agg, &s, None, ptr::null_mut()) }).unwrap();
     check(unsafe { moosedb_agg_result(agg, 0, 10, &mut batch) }).unwrap();
     assert_eq!((batch.row_count, batch.key_count), (1, 0));
     assert_eq!(unsafe { *(*batch.funcs).count }, 30, "rows named b");
+
+    // exact byte filter: no dictionary needed, same answer as the mask
+    let (vdata, vstarts, vlens) = (b"bzb", [0u64, 1, 0], [1u32, 1, 1]);
+    let exact = |vs: &[u64], ls: &[u32], n: u64, extra: u64| TFAggFilter {
+        col: 3,
+        mask: ptr::null(),
+        mask_len: 0,
+        mode: TF_AGG_FILTER_VALUES,
+        int_values: ptr::null(),
+        int_count: 0,
+        value_starts: vs.as_ptr(),
+        value_lens: ls.as_ptr(),
+        value_count: n,
+        value_data: vdata.as_ptr(),
+        value_data_len: 3 + extra,
+        pad_space: 0,
+    };
+    let run_count = |f: TFAggFilter| {
+        let fs = [f];
+        let fns = [func(TF_AGG_COUNT_STAR, 0)];
+        let s = spec(&[], &fns, &fs, 1 << 28, 3);
+        check(unsafe { moosedb_agg_run(agg, &s, None, ptr::null_mut()) }).map(|()| {
+            let mut b = TFAggBatch {
+                row_count: 0,
+                total_groups: 0,
+                key_count: 0,
+                func_count: 0,
+                keys: ptr::null(),
+                funcs: ptr::null(),
+            };
+            check(unsafe { moosedb_agg_result(agg, 0, 10, &mut b) }).unwrap();
+            unsafe { *(*b.funcs).count }
+        })
+    };
+    assert_eq!(run_count(exact(&vstarts, &vlens, 3, 0)).unwrap(), 30, "b, z, b (duplicate) -> rows named b");
+    assert_eq!(run_count(exact(&vstarts, &vlens, 0, 0)).unwrap(), 0, "empty set accepts nothing");
+    let oob = run_count(exact(&[2], &[5], 1, 0));
+    assert_eq!(status(oob.map(|_| ())), TFStatus::TF_ERR_INVALID_ARG, "value out of range");
+    let mut bad_mode = exact(&vstarts, &vlens, 3, 0);
+    bad_mode.mode = 7;
+    assert_eq!(status(run_count(bad_mode).map(|_| ())), TFStatus::TF_ERR_INVALID_ARG);
+    // integer set on n (col 2): rows with n = 1 or n = 7
+    let ints = [1i64, 7, 1];
+    let mut int_filter = exact(&vstarts, &vlens, 0, 0);
+    int_filter.col = 2;
+    int_filter.int_values = ints.as_ptr();
+    int_filter.int_count = 3;
+    assert_eq!(run_count(int_filter).unwrap(), 2);
+
+    // top-N through the ABI: series by COUNT(*) is 40 each, so ties come by id
+    let top_funcs = [func(TF_AGG_COUNT_STAR, 0), func(TF_AGG_SUM, 2)];
+    let mut top = spec(&[SERIES], &top_funcs, &[], 1 << 28, 2);
+    top.top_mode = TF_AGG_TOP_DESC;
+    top.top_func = 1;
+    top.top_limit = 2;
+    check(unsafe { moosedb_agg_run(agg, &top, None, ptr::null_mut()) }).unwrap();
+    check(unsafe { moosedb_agg_result(agg, 0, 10, &mut batch) }).unwrap();
+    assert_eq!((batch.row_count, batch.total_groups), (2, 2));
+    let (k, f) = unsafe { (&*batch.keys, std::slice::from_raw_parts(batch.funcs, 2)) };
+    let (lo, hi) = unsafe { (std::slice::from_raw_parts(f[1].sum_lo, 2), std::slice::from_raw_parts(f[1].sum_hi, 2)) };
+    let sums: Vec<i128> = (0..2).map(|g| (i128::from(hi[g]) << 64) | i128::from(lo[g])).collect();
+    assert!(sums[0] >= sums[1], "best first: {sums:?}");
+    let _ = k;
+    top.top_limit = 0;
+    check(unsafe { moosedb_agg_run(agg, &top, None, ptr::null_mut()) }).unwrap();
+    check(unsafe { moosedb_agg_result(agg, 0, 10, &mut batch) }).unwrap();
+    assert_eq!(batch.total_groups, 0);
+    top.keys = ptr::null();
+    top.key_count = 0;
+    assert_eq!(status(check(unsafe { moosedb_agg_run(agg, &top, None, ptr::null_mut()) })), TFStatus::TF_ERR_INVALID_ARG);
+    top.top_mode = 9;
+    assert_eq!(status(check(unsafe { moosedb_agg_run(agg, &top, None, ptr::null_mut()) })), TFStatus::TF_ERR_INVALID_ARG);
 
     // errors: nothing panics, nothing leaks, the handle stays usable
     let bad = |keys: &[TFAggKey], funcs: &[TFAggFunc], filters: &[TFAggFilter], mem: u64| {
@@ -216,11 +310,11 @@ fn aggregation_lifecycle_results_dictionaries_and_errors_through_c_abi() {
     assert_eq!(bad(&[TFAggKey { kind: 9, col: 0 }], &star, &[], 1 << 20), TFStatus::TF_ERR_INVALID_ARG);
     assert_eq!(bad(&[], &[func(42, 0)], &[], 1 << 20), TFStatus::TF_ERR_INVALID_ARG);
     assert_eq!(bad(&[], &[func(TF_AGG_SUM, 4)], &[], 1 << 20), TFStatus::TF_ERR_INVALID_ARG, "SUM of a double");
-    let short = [TFAggFilter { col: 3, mask: mask.as_ptr(), mask_len: 2 }];
+    let short = [mask_filter(3, mask.as_ptr(), 2)];
     assert_eq!(bad(&[], &star, &short, 1 << 20), TFStatus::TF_ERR_INVALID_ARG, "mask of the wrong length");
-    let no_dict = [TFAggFilter { col: 2, mask: mask.as_ptr(), mask_len: 3 }];
+    let no_dict = [mask_filter(2, mask.as_ptr(), 3)];
     assert_eq!(bad(&[], &star, &no_dict, 1 << 20), TFStatus::TF_ERR_INVALID_ARG, "no dictionary for n");
-    let null_mask = [TFAggFilter { col: 3, mask: ptr::null(), mask_len: 3 }];
+    let null_mask = [mask_filter(3, ptr::null(), 3)];
     assert_eq!(bad(&[], &star, &null_mask, 1 << 20), TFStatus::TF_ERR_INVALID_ARG, "NULL mask");
     assert_eq!(bad(&[SERIES], &star, &[], 100), TFStatus::TF_ERR_FULL, "budget");
     let msg = check(unsafe { moosedb_agg_run(agg, &spec(&[SERIES], &star, &[], 100, 1), None, ptr::null_mut()) })

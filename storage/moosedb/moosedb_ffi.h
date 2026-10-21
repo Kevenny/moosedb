@@ -36,6 +36,21 @@
 
 #define TF_AGG_KEYCOL_BYTES 2
 
+// `TFAggFilter::mode`: dictionary mask (the zero value, the original behaviour).
+#define TF_AGG_FILTER_MASK 0
+
+// `TFAggFilter::mode`: exact set of accepted values.
+#define TF_AGG_FILTER_VALUES 1
+
+// `TFAggSpec::top_mode`: no top-N (the zero value).
+#define TF_AGG_TOP_NONE 0
+
+// `TFAggSpec::top_mode`: the `top_limit` smallest groups by `funcs[top_func]`.
+#define TF_AGG_TOP_ASC 1
+
+// `TFAggSpec::top_mode`: the `top_limit` largest groups by `funcs[top_func]`.
+#define TF_AGG_TOP_DESC 2
+
 typedef enum {
   TF_OK = 0,
   TF_ERR_IO = 1,
@@ -244,13 +259,48 @@ typedef struct {
   uint32_t col;
 } TFAggFunc;
 
-// Dictionary mask of a column: `mask[i] != 0` accepts the i-th value of the
-// dictionary that an earlier run with the single key `{COLUMN, col}`, no
-// functions and no filters left in the result (result order).
+// A filter on a column, ANDed with the others.
+//
+// * `mode == TF_AGG_FILTER_MASK` (0): dictionary mask. `mask[i] != 0` accepts
+//   the i-th value of the dictionary that an earlier run with the single key
+//   `{COLUMN, col}`, no functions and no filters left in the result (result
+//   order). The fields after `mask_len` are ignored.
+// * `mode == TF_AGG_FILTER_VALUES` (1): a row is kept iff its value in `col`
+//   is one of the listed values, compared **byte for byte** (a NULL value is
+//   never kept; an empty list keeps nothing; duplicates are harmless). No
+//   dictionary run is needed. For INT64/TIMESTAMP/BOOL columns the values are
+//   `int_values[0..int_count]` (`bool` as 0/1) and `value_count` must be 0;
+//   for VARCHAR/DECIMAL columns value `i` is
+//   `value_data[value_starts[i] .. value_starts[i] + value_lens[i]]`
+//   (`value_starts[i] + value_lens[i] <= value_data_len`) and `int_count`
+//   must be 0. `mask` is ignored. **The caller may use this only when the SQL
+//   comparison it replaces is exactly a byte comparison** (integers, or a
+//   binary / NO PAD collation); with any other collation (case or accent
+//   insensitive, PAD SPACE) it would give wrong answers.
+//
+// A zero-initialized tail (every field after `mask_len` zero) is a plain
+// dictionary mask.
 typedef struct {
   uint32_t col;
   const uint8_t *mask;
   uint64_t mask_len;
+  // `TF_AGG_FILTER_MASK` or `TF_AGG_FILTER_VALUES`.
+  uint8_t mode;
+  const int64_t *int_values;
+  uint64_t int_count;
+  const uint64_t *value_starts;
+  const uint32_t *value_lens;
+  uint64_t value_count;
+  const uint8_t *value_data;
+  uint64_t value_data_len;
+  // `TF_AGG_FILTER_VALUES` only; non-zero = PAD SPACE comparison: trailing
+  // 0x20 bytes are ignored on both sides (the listed values and the row's
+  // value), as a binary PAD SPACE collation (`utf8mb4_bin`, `latin1_bin`,
+  // ...) of a charset whose space is the single byte 0x20 and never a
+  // continuation byte (utf8mb4, utf8mb3, latin1, ascii; NOT ucs2, utf16,
+  // utf32) compares. Other whitespace (tab...) is not trimmed. NULL is
+  // still never accepted. Zero = exact bytes (NO PAD).
+  uint8_t pad_space;
 } TFAggFilter;
 
 typedef struct {
@@ -264,6 +314,22 @@ typedef struct {
   uint64_t max_memory;
   // Worker threads (1 = the calling thread only).
   uint32_t threads;
+  // Top-N: `TF_AGG_TOP_NONE` (0, every group is returned, in no particular
+  // order), `TF_AGG_TOP_ASC` or `TF_AGG_TOP_DESC`. Needs exactly one key
+  // (`TF_ERR_INVALID_ARG` otherwise). Only the `top_limit` best groups by
+  // `funcs[top_func]` are returned, best first (`total_groups` of the
+  // result is that count). The order is the SQL order of the function
+  // value (`COUNT` as a number; `SUM`/`MIN`/`MAX` as numbers with "no
+  // value" = NULL, the smallest, so first when ascending); groups with the
+  // same value come in ascending order of the key: series id, integer
+  // value, or bytes compared as unsigned (a shorter prefix first); a NULL
+  // key first. **The caller may use this only when that order is the one
+  // the query asks for**: integer keys, or byte keys under a binary /
+  // NO PAD collation, and ties that the SQL leaves unspecified anyway.
+  // `top_limit == 0` returns no group.
+  uint8_t top_mode;
+  uint32_t top_func;
+  uint64_t top_limit;
 } TFAggSpec;
 
 // Polled about every 10 ms on the calling thread; a non-zero return cancels
@@ -731,7 +797,8 @@ TFStatus moosedb_agg_run(MooseDBAgg *agg, const TFAggSpec *spec, TFAggCancel can
 
 // Groups `[start, start + max_groups)` of the last result, in columns (an
 // empty batch when `start` is past the end). Order is unspecified but stable
-// until the next run. Valid until the next call on the handle.
+// until the next run, except for a run with a top-N, whose groups come best
+// first. Valid until the next call on the handle.
 //
 // # Safety
 // `agg` valid; `out` writable.

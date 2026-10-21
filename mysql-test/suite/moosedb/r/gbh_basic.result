@@ -94,9 +94,9 @@ same_rows
 # constant on the left of the time comparison
 # SELECT host, COUNT(*) c FROM g WHERE '2024-03-02 00:00:00' <= ts AND ts < '2024-03-02 01:00:00' GROUP BY host ORDER BY host
 # same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
-# a plain column predicate is not captured yet (refused, same answer)
+# a plain column predicate: evaluated by the engine through the column dictionary (gbh_where covers it in depth)
 # SELECT host, COUNT(*) c FROM g WHERE file = '/f/3' GROUP BY host ORDER BY host
-# same output with and without pushdown and on InnoDB; the engine did not run it
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
 ##########################################################
 # SUM / AVG / MIN / MAX
 ##########################################################
@@ -236,7 +236,7 @@ EXPLAIN
 }
 EXPLAIN SELECT host, COUNT(*) c FROM g WHERE file = '/f/1' GROUP BY host;
 id	select_type	table	type	possible_keys	key	key_len	ref	rows	Extra
-1	SIMPLE	g	ALL	NULL	NULL	NULL	NULL	30000	Using where; Using temporary; Using filesort
+1	SIMPLE	NULL	NULL	NULL	NULL	NULL	NULL	NULL	Storage engine handles GROUP BY
 SET SESSION moosedb_group_by_pushdown = 0;
 EXPLAIN SELECT host, COUNT(*) c FROM g GROUP BY host;
 id	select_type	table	type	possible_keys	key	key_len	ref	rows	Extra

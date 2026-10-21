@@ -131,8 +131,7 @@ SELECT (SELECT COUNT(*) FROM test.g) = (SELECT COUNT(*) FROM mirror.g) AS same_r
 --let $q= SELECT host, COUNT(*) c FROM g WHERE '2024-03-02 00:00:00' <= ts AND ts < '2024-03-02 01:00:00' GROUP BY host ORDER BY host
 --source suite/moosedb/include/gbh_diff.inc
 
---let $label= a plain column predicate is not captured yet (refused, same answer)
---let $refused= 1
+--let $label= a plain column predicate: evaluated by the engine through the column dictionary (gbh_where covers it in depth)
 --let $q= SELECT host, COUNT(*) c FROM g WHERE file = '/f/3' GROUP BY host ORDER BY host
 --source suite/moosedb/include/gbh_diff.inc
 

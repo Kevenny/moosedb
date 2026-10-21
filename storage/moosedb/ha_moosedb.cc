@@ -493,8 +493,34 @@ void moosedb_gbh_count()
   __atomic_fetch_add(&srv_gbh_queries, 1, __ATOMIC_RELAXED);
 }
 
+/* Cumulative time of the filter-dictionary phase and of the aggregation proper, and the dictionary values evaluated. */
+static ulonglong srv_gbh_dict_us= 0, srv_gbh_agg_us= 0, srv_gbh_dict_values= 0, srv_gbh_eval_us= 0, srv_gbh_post_us= 0;
+void moosedb_gbh_phase(ulonglong dict_us, ulonglong agg_us, ulonglong dict_values, ulonglong eval_us, ulonglong post_us)
+{
+  __atomic_fetch_add(&srv_gbh_dict_us, dict_us, __ATOMIC_RELAXED);
+  __atomic_fetch_add(&srv_gbh_agg_us, agg_us, __ATOMIC_RELAXED);
+  __atomic_fetch_add(&srv_gbh_dict_values, dict_values, __ATOMIC_RELAXED);
+  __atomic_fetch_add(&srv_gbh_eval_us, eval_us, __ATOMIC_RELAXED);
+  __atomic_fetch_add(&srv_gbh_post_us, post_us, __ATOMIC_RELAXED);
+}
+
+/* Shortcuts taken: exact-value filters sent to the core, and queries whose top-N the core did. */
+static ulonglong srv_gbh_exact_filters= 0, srv_gbh_topn= 0;
+void moosedb_gbh_shortcuts(ulonglong exact, ulonglong topn)
+{
+  __atomic_fetch_add(&srv_gbh_exact_filters, exact, __ATOMIC_RELAXED);
+  __atomic_fetch_add(&srv_gbh_topn, topn, __ATOMIC_RELAXED);
+}
+
 static SHOW_VAR moosedb_status_variables[]= {
   {"gbh_queries", (char *) &srv_gbh_queries, SHOW_LONGLONG},
+  {"gbh_dict_us", (char *) &srv_gbh_dict_us, SHOW_LONGLONG},
+  {"gbh_agg_us", (char *) &srv_gbh_agg_us, SHOW_LONGLONG},
+  {"gbh_dict_values", (char *) &srv_gbh_dict_values, SHOW_LONGLONG},
+  {"gbh_eval_us", (char *) &srv_gbh_eval_us, SHOW_LONGLONG},
+  {"gbh_post_us", (char *) &srv_gbh_post_us, SHOW_LONGLONG},
+  {"gbh_exact_filters", (char *) &srv_gbh_exact_filters, SHOW_LONGLONG},
+  {"gbh_topn", (char *) &srv_gbh_topn, SHOW_LONGLONG},
   {NullS, NullS, SHOW_LONG}
 };
 static struct st_mysql_sys_var *moosedb_system_variables[]= {

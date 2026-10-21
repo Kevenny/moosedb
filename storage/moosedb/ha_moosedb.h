@@ -465,3 +465,5 @@ void moosedb_micros_to_time(longlong us, MYSQL_TIME *lt);
 ulonglong moosedb_agg_max_memory_of(THD *thd);
 uint moosedb_agg_threads_value();
 void moosedb_gbh_count();
+void moosedb_gbh_phase(ulonglong dict_us, ulonglong agg_us, ulonglong dict_values, ulonglong eval_us, ulonglong post_us);
+void moosedb_gbh_shortcuts(ulonglong exact, ulonglong topn);

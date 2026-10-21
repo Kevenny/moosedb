@@ -28,10 +28,15 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
+#include <climits>
 #include <cstring>
 #include <memory>
 #include <numeric>
+#include <atomic>
+#include <functional>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "moosedb_gbh.h"
@@ -145,6 +150,23 @@ struct gorder
   bool desc= false;
 };
 
+/*
+  A filter column: the WHERE conjuncts that reference only this one stored,
+  non-TAG column. They are evaluated by the server's own Items on every
+  distinct value of the column (see build_mask), so the engine and the
+  server agree on collation, PAD and every conversion.
+*/
+struct gfilter
+{
+  Field *field= nullptr;
+  uint32_t col= 0;                 /* layout column                          */
+  bool is_str= false;
+  std::vector<Item *> conds;       /* ANDed                                  */
+  /* `col = const` / `col IN (consts)` compared byte for byte: the core can filter by the values themselves */
+  bool exact= false;
+  std::vector<Item *> consts;
+};
+
 struct gplan
 {
   ha_moosedb *handler= nullptr;
@@ -156,10 +178,13 @@ struct gplan
   std::vector<gitem> items;        /* parallel to all_fields               */
   std::vector<gorder> order;
   std::vector<tf_tag_predicate> preds;
+  std::vector<gfilter> filters;
   longlong lo= LONGLONG_MIN, hi= LONGLONG_MAX;
   ulonglong limit= HA_POS_ERROR;
   bool has_having= false;
   bool need_merge= false;
+  int top_func= -1;                /* core top-N: index into funcs, -1 = off */
+  bool top_desc= false;
 
   bool in_group(const Field *f) const
   {
@@ -383,43 +408,71 @@ const char *item_refusal(gplan *p, Item *item, const char *expr_reason,
   }
 }
 
-/* column OP constant, with the column a stored column of the table. */
-const char *field_vs_const(const gplan *p, Item *field, Item *c)
+/*
+  A constant the predicate evaluation may repeat for every dictionary value:
+  fixed for the statement, cheap, deterministic, no stored routine or UDF, and
+  a bound parameter (an unbound one has type PARAM_ITEM).
+*/
+bool const_safe(Item *it, int depth= 0)
 {
-  if (!p->stored(column_of(field, p->table)))
-    return "WHERE: unsupported predicate";
-  return is_constant(c) ? nullptr : "WHERE: unsupported predicate";
+  if (!it || depth > 16 || !is_constant(it) || it->type() == Item::PARAM_ITEM ||
+      it->is_expensive())
+    return false;
+  if (it->type() == Item::FUNC_ITEM)
+  {
+    Item_func *f= static_cast<Item_func *>(it);
+    if (f->functype() == Item_func::FUNC_SP || f->functype() == Item_func::UDF_FUNC)
+      return false;
+    Item **a= f->arguments();
+    for (uint i= 0; a && i < f->argument_count(); i++)
+      if (!const_safe(a[i], depth + 1))
+        return false;
+  }
+  return true;
 }
 
-/* Shape check of the WHERE: a conjunction of column-vs-constant predicates. */
-const char *where_refusal(const gplan *p, Item *cond)
+/*
+  Shape check of one WHERE predicate that is not a TAG/time condition: AND/OR/NOT
+  of comparisons, BETWEEN, IN, LIKE, IS [NOT] NULL whose operands are a column
+  of the table or a constant. *col collects the one column the whole predicate
+  may reference; a second one is a refusal. A comparison between a string column
+  and a non-string constant (or the reverse) is refused: the server converts
+  per row and warns per row, which a once-per-distinct-value evaluation cannot
+  reproduce.
+*/
+const char *pred_refusal(const gplan *p, Item *it, Field **col, int depth= 0)
 {
-  if (!cond)
-    return nullptr;
-  if (cond->type() == Item::COND_ITEM)
+  if (!it || depth > 16)
+    return "WHERE: unsupported expression";
+  if (it->type() == Item::COND_ITEM)
   {
-    Item_cond *c= static_cast<Item_cond *>(cond);
-    if (c->functype() != Item_func::COND_AND_FUNC)
-      return "WHERE: OR/XOR";
+    Item_cond *c= static_cast<Item_cond *>(it);
+    if (c->functype() != Item_func::COND_AND_FUNC &&
+        c->functype() != Item_func::COND_OR_FUNC)
+      return "WHERE: XOR";
     List_iterator_fast<Item> li(*c->argument_list());
     Item *a;
     while ((a= li++))
     {
-      const char *r= where_refusal(p, a);
+      const char *r= pred_refusal(p, a, col, depth + 1);
       if (r)
         return r;
     }
     return nullptr;
   }
-  if (cond->type() != Item::FUNC_ITEM)
+  if (it->type() != Item::FUNC_ITEM)
     return "WHERE: unsupported expression";
-  Item_func *f= static_cast<Item_func *>(cond);
+  Item_func *f= static_cast<Item_func *>(it);
   Item **a= f->arguments();
   const uint n= f->argument_count();
-  if (!a)
+  if (!a || n == 0)
     return "WHERE: unsupported expression";
+  uint min_args= 2, max_args= 2;
   switch (f->functype())
   {
+  case Item_func::NOT_FUNC:
+    return n == 1 ? pred_refusal(p, a[0], col, depth + 1)
+                  : "WHERE: unsupported predicate";
   case Item_func::EQ_FUNC:
   case Item_func::EQUAL_FUNC:
   case Item_func::NE_FUNC:
@@ -427,42 +480,207 @@ const char *where_refusal(const gplan *p, Item *cond)
   case Item_func::LE_FUNC:
   case Item_func::GE_FUNC:
   case Item_func::GT_FUNC:
-  {
-    if (n != 2)
-      return "WHERE: unsupported predicate";
-    if (column_of(a[0], p->table))
-      return field_vs_const(p, a[0], a[1]);
-    return field_vs_const(p, a[1], a[0]);        /* constant OP column */
-  }
+    break;
   case Item_func::BETWEEN:
-  {
-    if (n != 3)
-      return "WHERE: unsupported predicate";
-    const char *r= field_vs_const(p, a[0], a[1]);
-    return r ? r : field_vs_const(p, a[0], a[2]);
-  }
+    min_args= max_args= 3;
+    break;
   case Item_func::IN_FUNC:
+    max_args= UINT_MAX;
+    break;
   case Item_func::LIKE_FUNC:
-  {
-    if (n < 2)
-      return "WHERE: unsupported predicate";
-    for (uint i= 1; i < n; i++)
-    {
-      const char *r= field_vs_const(p, a[0], a[i]);
-      if (r)
-        return r;
-    }
-    return nullptr;
-  }
+    max_args= 3;                              /* [ESCAPE c] */
+    break;
   case Item_func::ISNULL_FUNC:
   case Item_func::ISNOTNULL_FUNC:
-    return (n == 1 && p->stored(column_of(a[0], p->table)))
-           ? nullptr : "WHERE: unsupported predicate";
-  case Item_func::MULT_EQUAL_FUNC:
-    return nullptr;                      /* judged by the exact capture below */
+    min_args= max_args= 1;
+    break;
   default:
     return "WHERE: unsupported predicate";
   }
+  if (n < min_args || n > max_args)
+    return "WHERE: unsupported predicate";
+  Field *mine= nullptr;
+  bool string_const= false, other_const= false, dec_or_time= false;
+  for (uint i= 0; i < n; i++)
+  {
+    Field *fld= column_of(a[i], p->table);
+    if (fld)
+    {
+      if ((mine && mine != fld) || (*col && *col != fld))
+        return "WHERE: predicate over two columns";
+      mine= *col= fld;
+    }
+    else if (const_safe(a[i]))
+    {
+      if (a[i]->type() == Item::NULL_ITEM || a[i]->is_null())
+        continue;                             /* NULL compares as NULL either way */
+      (a[i]->cmp_type() == STRING_RESULT ? string_const : other_const)= true;
+      if (a[i]->cmp_type() == DECIMAL_RESULT || a[i]->cmp_type() == TIME_RESULT)
+        dec_or_time= true;
+    }
+    else
+      return "WHERE: unsupported predicate";
+  }
+  if (mine)
+  {
+    const Item_result ct= mine->cmp_type();
+    if (ct != STRING_RESULT && ct != INT_RESULT)
+      return "WHERE: predicate on an unsupported column type";
+    if (ct == STRING_RESULT ? other_const : string_const)
+      return "WHERE: comparison across string and number";
+    /* a DECIMAL/TIME constant against an integer column: the server converts per row (and warns per row) */
+    if (ct == INT_RESULT && dec_or_time)
+      return "WHERE: comparison across string and number";
+  }
+  return nullptr;
+}
+
+/* The column of a filter must be one the dictionary phase can enumerate. */
+const char *filter_column_refusal(const gplan *p, Field *f, gfilter *out)
+{
+  tf_conv c;
+  if (!p->handler->moosedb_column_conv(f, &c))
+    return "WHERE: predicate on a column that is not stored";
+  if (p->handler->moosedb_is_timestamp_column(f))
+    return "WHERE: predicate on the time column other than bounds";
+  if (c == tf_conv::TAG)
+    return "WHERE: predicate on a TAG column other than =/IN";
+  const int col= p->layout_col(f);
+  if (col < 0)
+    return "WHERE: predicate on a column that is not stored";
+  if (c == tf_conv::INT && is_int_field(f))
+    out->is_str= false;
+  else if (c == tf_conv::STRING &&
+           (f->real_type() == MYSQL_TYPE_VARCHAR || f->real_type() == MYSQL_TYPE_STRING))
+    out->is_str= true;
+  else
+    return "WHERE: predicate on an unsupported column type";
+  out->field= f;
+  out->col= (uint32_t) col;
+  return nullptr;
+}
+
+void flatten_and(Item *it, std::vector<Item *> *out, int depth= 0)
+{
+  if (it && depth < 64 && it->type() == Item::COND_ITEM &&
+      static_cast<Item_cond *>(it)->functype() == Item_func::COND_AND_FUNC)
+  {
+    List_iterator_fast<Item> li(*static_cast<Item_cond *>(it)->argument_list());
+    Item *a;
+    while ((a= li++))
+      flatten_and(a, out, depth + 1);
+    return;
+  }
+  out->push_back(it);
+}
+
+/*
+  Marks the filter `exact` when its whole predicate is `col = const` or
+  `col IN (consts)` (not negated, no OR/NOT) and the SQL comparison is a byte
+  comparison, so the core can filter by the values with no dictionary phase:
+    - integers: the comparison is on integers (the constants are INT);
+    - strings: a VARCHAR whose collation is binary NO PAD (PAD SPACE ones, even
+      *_bin, ignore trailing spaces: not byte-exact), the comparison collation
+      is that very collation, and the constants are in the column's charset.
+  A NULL constant never matches; it is left to the dictionary path (simpler).
+*/
+void exact_shape(const gplan *p, gfilter *g)
+{
+  if (g->conds.size() != 1 || !g->conds[0] || g->conds[0]->type() != Item::FUNC_ITEM)
+    return;
+  Item_func *f= static_cast<Item_func *>(g->conds[0]);
+  Item **a= f->arguments();
+  const uint n= f->argument_count();
+  if (!a || !g->field)
+    return;
+  std::vector<Item *> cs;
+  if (f->functype() == Item_func::EQ_FUNC && n == 2)
+  {
+    if (column_of(a[0], p->table) == g->field)
+      cs.push_back(a[1]);
+    else if (column_of(a[1], p->table) == g->field)
+      cs.push_back(a[0]);
+    else
+      return;
+  }
+  else if (f->functype() == Item_func::IN_FUNC && n >= 2 &&
+           !static_cast<Item_func_opt_neg *>(f)->negated &&
+           column_of(a[0], p->table) == g->field)
+    cs.assign(a + 1, a + n);
+  else
+    return;
+  const bool is_in= f->functype() == Item_func::IN_FUNC;
+  /* IN: the comparison type is that of its arguments (all of one kind, checked below) */
+  const Type_handler *th= is_in ? nullptr : static_cast<Item_bool_func2 *>(f)->compare_type_handler();
+  CHARSET_INFO *ccs= is_in ? static_cast<Item_func_opt_neg *>(f)->compare_collation()
+                           : static_cast<Item_bool_func2 *>(f)->compare_collation();
+  for (Item *c : cs)
+  {
+    if (!c || column_of(c, p->table) || c->type() == Item::NULL_ITEM || c->is_null())
+      return;
+    if (g->is_str)
+    {
+      if (c->cmp_type() != STRING_RESULT ||
+          !my_charset_same(c->collation.collation, g->field->charset()))
+        return;
+    }
+    else if (c->cmp_type() != INT_RESULT)
+      return;
+  }
+  if (g->is_str)
+  {
+    if (g->field->real_type() != MYSQL_TYPE_VARCHAR || !cs_exact(g->field->charset()) ||
+        (th && th->cmp_type() != STRING_RESULT) || ccs != g->field->charset())
+      return;
+  }
+  else if (th && th->cmp_type() != INT_RESULT)
+    return;
+  g->exact= true;
+  g->consts= std::move(cs);
+}
+
+/*
+  The WHERE is a conjunction. TAG =/IN and bounds on the time axis go to the
+  engine's own series/time selection (exact capture, as for DELETE); every other
+  conjunct must touch exactly one stored non-TAG column and is grouped with the
+  others of that column into one filter, evaluated at init_scan.
+*/
+const char *where_refusal(gplan *p, Item *cond)
+{
+  if (!cond)
+    return nullptr;
+  std::vector<Item *> conj;
+  flatten_and(cond, &conj);
+  for (Item *c : conj)
+  {
+    if (!c)
+      return "WHERE: unsupported expression";
+    if (p->handler->moosedb_gbh_where(c, &p->preds, &p->lo, &p->hi))
+      continue;
+    Field *col= nullptr;
+    const char *r= pred_refusal(p, c, &col);
+    if (r)
+      return r;
+    if (!col)
+      return "WHERE: condition without a column";
+    gfilter *g= nullptr;
+    for (gfilter &x : p->filters)
+      if (x.field == col)
+        g= &x;
+    if (!g)
+    {
+      gfilter fresh;
+      r= filter_column_refusal(p, col, &fresh);
+      if (r)
+        return r;
+      p->filters.push_back(std::move(fresh));
+      g= &p->filters.back();
+    }
+    g->conds.push_back(c);
+  }
+  for (gfilter &g : p->filters)
+    exact_shape(p, &g);
+  return nullptr;
 }
 
 /*
@@ -542,9 +760,6 @@ const char *analyze(THD *thd, Query *q, gplan *p)
   r= where_refusal(p, q->where);
   if (r)
     return r;
-  if (q->where &&
-      !p->handler->moosedb_gbh_where(q->where, &p->preds, &p->lo, &p->hi))
-    return "WHERE: only TAG equality/IN and time bounds";
 
   for (ORDER *o= q->order_by; o; o= o->next)
   {
@@ -568,6 +783,27 @@ const char *analyze(THD *thd, Query *q, gplan *p)
   for (const gkey &k : p->keys)
     if (!k.is_tag && k.is_str && !cs_exact(k.cs))
       p->need_merge= true;
+  /*
+    Core top-N (ORDER BY one aggregate LIMIT K, one key). Ties: the core breaks
+    them by ascending key (signed integer, unsigned bytes, NULL first) which is
+    the handler's own tiebreak (cmp_raw) for these keys, so the K groups kept are
+    the same. Not for a TAG key (tiebreak by series id, not by TAG value, and
+    series may need merging), a collation-merged string, BIGINT UNSIGNED (core
+    compares signed), AVG, HAVING, or a second ORDER BY term.
+  */
+  if (!p->has_having && p->limit != HA_POS_ERROR && p->limit > 0 && !p->has_series &&
+      !p->need_merge && p->keys.size() == 1 && p->order.size() == 1 &&
+      !p->order[0].is_key && p->order[0].idx >= 0 &&
+      (size_t) p->order[0].idx < p->aggs.size() &&
+      p->aggs[p->order[0].idx].k != aggk::AVG &&
+      !(!p->keys[0].is_str && is_ubigint(p->keys[0].field)))
+  {
+    p->top_func= p->aggs[p->order[0].idx].func;
+    p->top_desc= p->order[0].desc;
+  }
+  /* The core's own limits (agg.rs MAX_KEYS, MAX_FUNCS, MAX_FILTERS): beyond them it fails, the normal path must run instead. */
+  if (p->keys.size() > 16 || p->funcs.size() > 64 || p->filters.size() > 16)
+    return "too many keys, aggregates or filtered columns for the engine";
   return nullptr;
 }
 
@@ -614,6 +850,81 @@ std::string i128_to_string(__int128 v)
 int32_t cancel_cb(void *ctx)
 {
   return ctx ? (int32_t) thd_killed(static_cast<THD *>(ctx)) : 0;
+}
+
+/* The values of an exact filter, in the core's layout. */
+struct exact_set
+{
+  std::vector<int64_t> ints;
+  std::vector<uint64_t> starts;
+  std::vector<uint32_t> lens;
+  std::string data;
+};
+
+/*
+  Sorts `v` (group indices) with `less` on up to `threads` threads: the chunks
+  are sorted apart, then merged pairwise. `less` only reads shared data. A
+  thread that cannot be started is replaced by running its job inline, and
+  nothing a job throws leaves it (it would end the process): on a failure the
+  whole vector, still a permutation, is sorted again on this thread.
+  The sort does not poll KILL / max_statement_time: it is not interruptible
+  (about 1 s for a million string groups); the checks resume right after it.
+*/
+template <class Less>
+void parallel_sort(std::vector<uint32_t> &v, const Less &less, unsigned threads)
+{
+  const size_t n= v.size();
+  if (threads < 2 || n < 65536)
+  {
+    std::sort(v.begin(), v.end(), less);
+    return;
+  }
+  threads= std::min(threads, 16u);
+  std::vector<size_t> cut(threads + 1);
+  for (unsigned i= 0; i <= threads; i++)
+    cut[i]= n * i / threads;
+  std::atomic<bool> failed(false);
+  auto run_all= [&](std::vector<std::function<void()>> &jobs) {
+    std::vector<std::thread> ts;
+    ts.reserve(jobs.size());
+    for (size_t i= 1; i < jobs.size(); i++)
+    {
+      try { ts.emplace_back(jobs[i]); }
+      catch (...) { jobs[i](); }
+    }
+    jobs[0]();
+    for (std::thread &t : ts)
+      t.join();
+  };
+  std::vector<std::function<void()>> jobs;
+  for (unsigned i= 0; i < threads; i++)
+    jobs.push_back([&, i] {
+      try { std::sort(v.begin() + cut[i], v.begin() + cut[i + 1], less); }
+      catch (...) { failed= true; }
+    });
+  run_all(jobs);
+  for (unsigned step= 1; step < threads; step*= 2)
+  {
+    jobs.clear();
+    for (unsigned i= 0; i + step < threads; i+= 2 * step)
+      jobs.push_back([&, i, step] {
+        try
+        {
+          std::inplace_merge(v.begin() + cut[i], v.begin() + cut[i + step],
+                             v.begin() + cut[std::min(i + 2 * step, threads)], less);
+        }
+        catch (...) { failed= true; }
+      });
+    run_all(jobs);
+  }
+  if (failed)
+    std::sort(v.begin(), v.end(), less);
+}
+
+uint64_t us_since(std::chrono::steady_clock::time_point t0)
+{
+  return (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+             std::chrono::steady_clock::now() - t0).count();
 }
 
 class moosedb_gbh final : public group_by_handler
@@ -666,9 +977,16 @@ private:
     return code;
   }
   int fail_status(TFStatus st);
+  int budget_exceeded()
+  {
+    msg_= "aggregation exceeds moosedb_agg_max_memory (" + std::to_string(max_memory_) + " bytes)";
+    return HA_ERR_RECORD_FILE_FULL;
+  }
   bool charge(uint64_t bytes);
   int map_slots();
   int compute();
+  int build_mask(const gfilter &f, std::vector<uint8_t> *mask, uint64_t *values);
+  int build_exact(const gfilter &f, exact_set *out);
   int build_groups(const TFAggBatch &b);
   int fetch_tags(const uint64_t *ids, uint64_t n);
   int merge_groups();
@@ -695,6 +1013,7 @@ private:
   size_t nk_= 0, nf_= 0;
   uint64_t max_memory_= 0, used_= 0;
   uint64_t ngroups_= 0;
+  uint64_t eval_us_= 0;                        /* Item evaluation inside the dictionary phase */
   std::vector<kcell> kcells_;
   std::vector<acell> acells_;
   std::string arena_;
@@ -812,6 +1131,7 @@ int moosedb_gbh::do_init_scan()
   release();
   msg_.clear();
   killed_= false;
+  eval_us_= 0;
   if (!thd || !p_.handler)
     return fail("internal: no session");
   moosedb_gbh_count();
@@ -879,15 +1199,91 @@ int moosedb_gbh::compute()
     return fail("the set of series kept changing while the aggregation "
                 "started", HA_ERR_LOCK_WAIT_TIMEOUT);
 
+  /*
+    Filters. `col = const` / `col IN (consts)` on a byte-exact comparison goes
+    to the core as a value set (no dictionary). Every other predicate: one
+    dictionary phase per column on this very snapshot (so the dictionary holds
+    only the values of the WHERE's time range and series), the server's Items
+    decide each value, the engine filters by the mask.
+  */
+  using clk= std::chrono::steady_clock;
+  const auto t_dict= clk::now();
+  uint64_t dict_values= 0;
+  std::vector<std::vector<uint8_t>> masks(p_.filters.size());
+  std::vector<exact_set> sets(p_.filters.size());     /* never resized: the filters point into them */
+  std::vector<TFAggFilter> tfs;
+  for (size_t i= 0; i < p_.filters.size(); i++)
+  {
+    const gfilter &gf= p_.filters[i];
+    TFAggFilter t{};
+    t.col= gf.col;
+    if (gf.exact)
+    {
+      int r= build_exact(gf, &sets[i]);
+      if (r)
+        return r;
+      exact_set &s= sets[i];
+      if (s.ints.empty() && s.lens.empty())
+      {
+        moosedb_gbh_phase(us_since(t_dict), 0, 0, 0, 0);
+        return 0;                           /* nothing can match: no groups */
+      }
+      t.mode= TF_AGG_FILTER_VALUES;
+      if (!gf.is_str)
+      {
+        t.int_values= s.ints.data();
+        t.int_count= s.ints.size();
+      }
+      else
+      {
+        t.value_starts= s.starts.data();
+        t.value_lens= s.lens.data();
+        t.value_count= s.lens.size();
+        t.value_data= (const uint8_t *) s.data.data();
+        t.value_data_len= s.data.size();
+      }
+    }
+    else
+    {
+      int r= build_mask(gf, &masks[i], &dict_values);
+      if (r)
+        return r;
+      if (std::find(masks[i].begin(), masks[i].end(), (uint8_t) 1) == masks[i].end())
+      {
+        moosedb_gbh_phase(us_since(t_dict), 0, dict_values, eval_us_, 0);
+        return 0;                           /* no value passes: no groups */
+      }
+      t.mask= masks[i].data();
+      t.mask_len= masks[i].size();
+    }
+    tfs.push_back(t);
+  }
+  const auto t_agg= clk::now();
+  const uint64_t dict_us= (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(t_agg - t_dict).count();
+
   TFAggSpec spec{};
   spec.keys= keys.empty() ? nullptr : keys.data();
   spec.key_count= (uint32_t) keys.size();
   spec.funcs= p_.funcs.empty() ? nullptr : p_.funcs.data();
   spec.func_count= (uint32_t) p_.funcs.size();
-  spec.filters= nullptr;
-  spec.filter_count= 0;
-  spec.max_memory= max_memory_;
+  spec.filters= tfs.empty() ? nullptr : tfs.data();
+  spec.filter_count= (uint32_t) tfs.size();
+  if (used_ >= max_memory_)
+    return budget_exceeded();
+  spec.max_memory= max_memory_ - used_;
   spec.threads= std::max<uint>(1, moosedb_agg_threads_value());
+  if (p_.top_func >= 0)
+  {
+    spec.top_mode= p_.top_desc ? TF_AGG_TOP_DESC : TF_AGG_TOP_ASC;
+    spec.top_func= (uint32_t) p_.top_func;
+    spec.top_limit= p_.limit;
+  }
+  {
+    uint64_t nex= 0;
+    for (const gfilter &gf : p_.filters)
+      nex+= gf.exact;
+    moosedb_gbh_shortcuts(nex, p_.top_func >= 0 ? 1 : 0);
+  }
   TFStatus st= moosedb_agg_run(agg_.get(), &spec, cancel_cb, thd);
   if (st != TF_OK)
     return fail_status(st);
@@ -896,13 +1292,202 @@ int moosedb_gbh::compute()
   st= moosedb_agg_result(agg_.get(), 0, (uint64_t) 1 << 40, &b);
   if (st != TF_OK)
     return fail_status(st);
+  const auto t_post= clk::now();
+  const uint64_t agg_us= (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(t_post - t_agg).count();
   int r= build_groups(b);
   if (r)
     return r;
   agg_.reset();                             /* the snapshot is not needed any more */
   if (p_.need_merge && (r= merge_groups()))
     return r;
-  return order_groups();
+  r= order_groups();
+  moosedb_gbh_phase(dict_us, agg_us, dict_values, eval_us_, us_since(t_post));
+  return r;
+}
+
+/*
+  Value set of an exact filter (see exact_shape): the constants are evaluated
+  now (parameters are bound at EXECUTE). A NULL never matches. Integers keep
+  the mathematical value: out of the column's range = cannot match = dropped;
+  the core stores BIGINT UNSIGNED as the int64 bit pattern.
+*/
+int moosedb_gbh::build_exact(const gfilter &f, exact_set *out)
+{
+  Field *fld= f.field;
+  if (!fld || !out || f.consts.empty())
+    return fail("internal: exact filter without values");
+  const uint bits= fld->pack_length() * 8;
+  const bool fu= fld->is_unsigned();
+  if (!f.is_str && (bits < 8 || bits > 64))
+    return fail("internal: unexpected integer width");
+  for (Item *c : f.consts)
+  {
+    if (!c || (thd && thd->is_error()))
+      return fail("internal: bad constant");
+    if (f.is_str)
+    {
+      String tmp;
+      String *s= c->val_str(&tmp);
+      if (c->null_value || !s)
+        continue;
+      if (s->length() > UINT32_MAX || !charge(s->length() + 16))
+        return HA_ERR_RECORD_FILE_FULL;
+      out->starts.push_back(out->data.size());
+      out->lens.push_back((uint32_t) s->length());
+      out->data.append(s->ptr(), s->length());
+    }
+    else
+    {
+      const longlong v= c->val_int();
+      if (c->null_value)
+        continue;
+      const __int128 m= (c->unsigned_flag && v < 0) ? (__int128) (ulonglong) v : (__int128) v;
+      const __int128 lo= fu ? 0 : -((__int128) 1 << (bits - 1));
+      const __int128 hi= fu ? (((__int128) 1 << bits) - 1) : (((__int128) 1 << (bits - 1)) - 1);
+      if (m < lo || m > hi)
+        continue;
+      if (!charge(sizeof(int64_t)))
+        return HA_ERR_RECORD_FILE_FULL;
+      out->ints.push_back((int64_t) (uint64_t) m);
+    }
+  }
+  return 0;
+}
+
+/* Puts the table's first record back as it was (the dictionary phase overwrites one column of it). */
+struct record_keeper
+{
+  TABLE *t;
+  std::string saved;
+  explicit record_keeper(TABLE *t_arg) : t(t_arg)
+  {
+    if (t && t->record[0] && t->s)
+      saved.assign((const char *) t->record[0], t->s->reclength);
+  }
+  ~record_keeper()
+  {
+    if (t && t->record[0] && !saved.empty())
+      memcpy(t->record[0], saved.data(), saved.size());
+  }
+};
+
+/*
+  Dictionary phase of one filter column. The engine lists the distinct values of
+  the column over the WHERE's time range and series (same snapshot as the final
+  run); each one is stored in the column's own Field of the table's record, the
+  server's Items of the predicate (val_int, NULL = not true, as in a WHERE) decide,
+  and the verdicts become the mask the engine filters by.
+
+  The server does not re-check the WHERE on the engine's groups, so the Items
+  themselves -- not a reimplementation -- must decide: collation, PAD SPACE,
+  LIKE, NULL logic and every conversion are exactly the server's.
+
+  Cost: one Item evaluation per DISTINCT value (a column with millions of
+  distinct values pays that many evaluations, ~1 us each).
+  (`col = const` / `col IN (consts)` on a byte-exact comparison never gets here:
+  it is sent to the core as a value set, see exact_shape / build_exact.)
+*/
+int moosedb_gbh::build_mask(const gfilter &f, std::vector<uint8_t> *mask,
+                            uint64_t *values)
+{
+  TABLE *src= p_.table;
+  Field *fld= f.field;
+  if (!src || !src->record[0] || !src->s || !fld || !agg_ || !mask || !values ||
+      f.conds.empty())
+    return fail("internal: filter without a column");
+  TFAggKey key{TF_AGG_KEY_COLUMN, f.col};
+  TFAggSpec spec{};
+  spec.keys= &key;
+  spec.key_count= 1;
+  if (used_ >= max_memory_)
+    return budget_exceeded();
+  spec.max_memory= max_memory_ - used_;
+  spec.threads= std::max<uint>(1, moosedb_agg_threads_value());
+  TFStatus st= moosedb_agg_run(agg_.get(), &spec, cancel_cb, thd);
+  if (st != TF_OK)
+    return fail_status(st);
+  TFAggBatch b{};
+  st= moosedb_agg_result(agg_.get(), 0, (uint64_t) 1 << 40, &b);
+  if (st != TF_OK)
+    return fail_status(st);
+  const uint64_t n= b.row_count;
+  if (b.key_count != 1 || !b.keys || b.total_groups != n)
+    return fail("internal: dictionary has an unexpected shape");
+  mask->clear();
+  if (n == 0)
+    return 0;
+  const TFAggKeyBatch &kb= b.keys[0];
+  if (f.is_str ? (kb.kind != TF_AGG_KEYCOL_BYTES || !kb.starts || !kb.lens)
+               : (kb.kind != TF_AGG_KEYCOL_INT || !kb.values))
+    return fail("internal: bad dictionary column");
+  if (!charge(n))
+    return HA_ERR_RECORD_FILE_FULL;
+  mask->assign((size_t) n, 0);
+  *values+= n;
+
+  record_keeper keep(src);
+  MY_BITMAP *old_r= dbug_tmp_use_all_columns(src, &src->read_set);
+  MY_BITMAP *old_w= dbug_tmp_use_all_columns(src, &src->write_set);
+  int rc= 0;
+  const auto t_eval= std::chrono::steady_clock::now();
+  for (uint64_t g= 0; g < n && !rc; g++)
+  {
+    if ((g & 0x3FF) == 0 && check_killed())
+    {
+      rc= HA_ERR_QUERY_INTERRUPTED;
+      break;
+    }
+    if (kb.nulls && kb.nulls[g])
+    {
+      if (!fld->real_maybe_null())
+      {
+        rc= fail("internal: NULL in the dictionary of a NOT NULL column");
+        break;
+      }
+      fld->set_null();
+    }
+    else
+    {
+      if (fld->real_maybe_null())
+        fld->set_notnull();
+      int sr;
+      if (f.is_str)
+      {
+        if ((!kb.data && kb.lens[g]) || kb.starts[g] + kb.lens[g] > kb.data_len)
+        {
+          rc= fail("internal: bad dictionary string");
+          break;
+        }
+        sr= fld->store(kb.lens[g] ? (const char *) kb.data + kb.starts[g] : "",
+                       kb.lens[g], fld->charset());
+      }
+      else
+        sr= fld->store((longlong) static_cast<const int64_t *>(kb.values)[g],
+                       fld->is_unsigned());
+      if (sr)
+      {
+        rc= fail("a stored value of a filtered column does not convert back for the WHERE evaluation (ill-formed data?); run the query with moosedb_group_by_pushdown=OFF");
+        break;
+      }
+    }
+    bool pass= true;
+    for (Item *c : f.conds)
+      if (!c->val_int() || c->null_value)
+      {
+        pass= false;
+        break;
+      }
+    if (thd->is_error())
+    {
+      rc= HA_ERR_INTERNAL_ERROR;      /* the server already set the error */
+      break;
+    }
+    (*mask)[(size_t) g]= pass ? 1 : 0;
+  }
+  eval_us_+= us_since(t_eval);
+  dbug_tmp_restore_column_map(&src->write_set, old_w);
+  dbug_tmp_restore_column_map(&src->read_set, old_r);
+  return rc;
 }
 
 /* Series ids -> the TAG values of the key columns. */
@@ -1081,7 +1666,13 @@ int moosedb_gbh::build_groups(const TFAggBatch &b)
   }
   if (!charge(ngroups_ * sizeof(uint32_t)))
     return HA_ERR_RECORD_FILE_FULL;
-  live_.resize(ngroups_);
+  /* Every group the core returns has at least one row; a COUNT(*) column lets us check it cheaply. */
+  for (size_t fi= 0; fi < nf_; fi++)
+    if (p_.funcs[fi].op == TF_AGG_COUNT_STAR)
+      for (uint64_t g= 0; g < ngroups_; g++)
+        if (!ac((uint32_t) g, (int) fi).count)
+          return fail("internal: the aggregation returned an empty group");
+  live_.resize((size_t) ngroups_);
   std::iota(live_.begin(), live_.end(), 0u);
   return 0;
 }
@@ -1168,21 +1759,20 @@ uint64_t moosedb_gbh::key_hash(uint32_t g) const
 */
 int moosedb_gbh::merge_groups()
 {
-  if (!charge(ngroups_ * (sizeof(uint64_t) + 4)))
+  /* (hash, group) pairs sorted contiguously: no indirection into a hash array during the sort */
+  if (!charge(live_.size() * sizeof(std::pair<uint64_t, uint32_t>)))
     return HA_ERR_RECORD_FILE_FULL;
-  std::vector<uint64_t> h(ngroups_);
-  for (uint64_t g= 0; g < ngroups_; g++)
+  std::vector<std::pair<uint64_t, uint32_t>> hv;
+  hv.reserve(live_.size());
+  for (size_t m= 0; m < live_.size(); m++)
   {
-    h[g]= key_hash((uint32_t) g);
-    if ((g & 0xFFFF) == 0 && thd_killed(thd))
-    {
-      killed_= true;
+    hv.emplace_back(key_hash(live_[m]), live_[m]);
+    if ((m & 0xFFFF) == 0 && check_killed())
       return HA_ERR_QUERY_INTERRUPTED;
-    }
   }
-  std::sort(live_.begin(), live_.end(), [&](uint32_t a, uint32_t b) {
-    return h[a] != h[b] ? h[a] < h[b] : a < b;
-  });
+  std::sort(hv.begin(), hv.end());
+  for (size_t m= 0; m < hv.size(); m++)
+    live_[m]= hv[m].second;
 
   auto absorb = [&](uint32_t into, uint32_t from) -> bool {
     for (size_t f= 0; f < nf_; f++)
@@ -1217,7 +1807,7 @@ int moosedb_gbh::merge_groups()
   while (i < live_.size())
   {
     size_t j= i;
-    while (j < live_.size() && h[live_[j]] == h[live_[i]])
+    while (j < live_.size() && hv[j].first == hv[i].first)
       j++;
     const size_t first= out.size();       /* representatives of this hash */
     for (size_t m= i; m < j; m++)
@@ -1322,7 +1912,7 @@ int moosedb_gbh::order_groups()
     live_.resize((size_t) p_.limit);
   }
   else
-    std::sort(live_.begin(), live_.end(), less);
+    parallel_sort(live_, less, std::max<uint>(1, moosedb_agg_threads_value()));
   return 0;
 }
 

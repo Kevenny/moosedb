@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use moosedb_core::agg::{Agg, AggSpec, ColFilter, FuncSpec, KeyCol, KeySpec};
+use moosedb_core::agg::{Agg, AggSpec, ColFilter, FuncSpec, KeyCol, KeySpec, TopN, ValueFilter};
 use moosedb_core::time::{days_from_civil, MICROS_PER_DAY, MICROS_PER_SEC};
 use moosedb_core::{Column, ColumnType, Error, RawOptions, Row, ScanFilter, Schema, Table, TableConfig, Value};
 
@@ -172,13 +172,13 @@ fn spec(by_series: bool, by_name: bool, threads: usize) -> AggSpec {
     if by_name {
         keys.push(KeySpec::Column(3));
     }
-    AggSpec { keys, funcs: funcs(), filters: Vec::new(), max_memory: 1 << 30, threads }
+    AggSpec { keys, funcs: funcs(), max_memory: 1 << 30, threads, ..AggSpec::default() }
 }
 
-/// The result of an `Agg` in the oracle's shape.
-fn groups_of(agg: &Agg, by_series: bool, by_name: bool) -> Groups {
+/// The result of an `Agg` in the oracle's shape, in result order.
+fn rows_of(agg: &Agg, by_series: bool, by_name: bool) -> Vec<(Key, Stats)> {
     let r = agg.result();
-    let mut out = Groups::new();
+    let mut out = Vec::new();
     for g in 0..r.groups {
         let mut at = 0;
         let mut sid = 0;
@@ -207,7 +207,15 @@ fn groups_of(agg: &Agg, by_series: bool, by_name: bool) -> Groups {
             tmax: opt(&f[6]),
             cf: f[7].count[g],
         };
-        assert!(out.insert((sid, name), st).is_none(), "a group appears twice");
+        out.push(((sid, name), st));
+    }
+    out
+}
+
+fn groups_of(agg: &Agg, by_series: bool, by_name: bool) -> Groups {
+    let mut out = Groups::new();
+    for (k, st) in rows_of(agg, by_series, by_name) {
+        assert!(out.insert(k, st).is_none(), "a group appears twice");
     }
     out
 }
@@ -217,6 +225,7 @@ fn check(t: &Table, lo: i64, hi: i64, series: Option<&[u64]>, by_series: bool, b
     let mut serial = None;
     for threads in [1, 4] {
         let mut agg = t.agg_open(lo, hi, series.map(<[u64]>::to_vec)).unwrap();
+        agg.set_min_parallel_rows(0);
         agg.run(&spec(by_series, by_name, threads), None).unwrap();
         let got = groups_of(&agg, by_series, by_name);
         assert_eq!(got, want, "series={by_series} name={by_name} threads={threads}");
@@ -259,13 +268,14 @@ fn dictionary_filters_keep_only_accepted_values_and_and_together() {
     let t = open_new(&dir.path().join("t"));
     build(&t, 12);
     let mut agg = t.agg_open(i64::MIN, i64::MAX, None).unwrap();
+    agg.set_min_parallel_rows(0);
     // a filter without a dictionary is refused
     let mut s = spec(true, false, 2);
     s.filters = vec![ColFilter { col: 3, mask: vec![true] }];
     assert!(matches!(agg.run(&s, None), Err(Error::InvalidArg(_))));
     // dictionary phase: the distinct values of `name` (NULL included)
     let dict =
-        AggSpec { keys: vec![KeySpec::Column(3)], funcs: vec![], filters: vec![], max_memory: 1 << 30, threads: 3 };
+        AggSpec { keys: vec![KeySpec::Column(3)], max_memory: 1 << 30, threads: 3, ..AggSpec::default() };
     agg.run(&dict, None).unwrap();
     let KeyCol::Bytes { nulls, starts, lens, data } = agg.result().keys[0].clone() else { panic!() };
     assert_eq!(nulls.len(), 8, "k0..k6 and NULL");
@@ -307,6 +317,7 @@ fn an_open_aggregation_keeps_its_snapshot_through_writes_deletes_flush_and_compa
     build(&t, 12);
     let want = naive(&t, i64::MIN, i64::MAX, None, true, true, None);
     let mut agg = t.agg_open(i64::MIN, i64::MAX, None).unwrap();
+    agg.set_min_parallel_rows(0);
     // everything the table can do meanwhile
     put(&t, (100_000..103_000).map(|i| row(i, 12)));
     t.delete_range(None, i64::MIN, i64::MAX, None, true).unwrap();
@@ -321,6 +332,7 @@ fn an_open_aggregation_keeps_its_snapshot_through_writes_deletes_flush_and_compa
     // a new aggregation sees the new state
     let fresh = naive(&t, i64::MIN, i64::MAX, None, true, true, None);
     let mut agg2 = t.agg_open(i64::MIN, i64::MAX, None).unwrap();
+    agg2.set_min_parallel_rows(0);
     agg2.run(&spec(true, true, 2), None).unwrap();
     assert_eq!(groups_of(&agg2, true, true), fresh);
     assert_ne!(fresh, want);
@@ -350,6 +362,7 @@ fn concurrent_writers_and_deleters_never_break_a_running_aggregation() {
         // the aggregation and the scan opened right before it can differ only by
         // writes in between; the aggregation itself must be self-consistent
         let mut agg = t.agg_open(i64::MIN, i64::MAX, None).unwrap();
+        agg.set_min_parallel_rows(0);
         agg.run(&spec(true, true, 4), None).unwrap();
         let a = groups_of(&agg, true, true);
         agg.run(&spec(true, true, 1), None).unwrap();
@@ -365,6 +378,7 @@ fn argument_errors_budget_and_cancellation() {
     let t = open_new(&dir.path().join("t"));
     build(&t, 12);
     let mut agg = t.agg_open(i64::MIN, i64::MAX, None).unwrap();
+    agg.set_min_parallel_rows(0);
     let base_spec = spec(false, false, 1);
     let bad = |f: &dyn Fn(&mut AggSpec)| {
         let mut s = base_spec.clone();
@@ -410,58 +424,407 @@ fn argument_errors_budget_and_cancellation() {
     assert_eq!(groups_of(&agg, true, false), naive(&t, i64::MIN, i64::MAX, None, true, false, None));
 }
 
-/// Throughput on ~10 M synthetic rows: `cargo test --release -p moosedb-tests
-/// agg_throughput -- --ignored --nocapture`.
+fn parallel_agg(t: &Table) -> Agg {
+    let mut agg = t.agg_open(i64::MIN, i64::MAX, None).unwrap();
+    agg.set_min_parallel_rows(0);
+    agg
+}
+
+#[test]
+fn value_filters_match_the_naive_filter_and_never_leave_empty_groups() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_new(&dir.path().join("t"));
+    build(&t, 12);
+    let by_bytes =
+        |vals: &[&[u8]]| ValueFilter { col: 3, bytes: vals.iter().map(|v| v.to_vec()).collect(), ..Default::default() };
+    let cases: Vec<(ValueFilter, Box<Accept<'_>>)> = vec![
+        (by_bytes(&[b"k1"]), Box::new(|v| v.as_deref() == Some(b"k1".as_slice()))),
+        (
+            by_bytes(&[b"k1", b"k4", b"k1", b"", b"k9"]),
+            Box::new(|v| matches!(v.as_deref(), Some(b"k1") | Some(b"k4"))),
+        ),
+        (by_bytes(&[]), Box::new(|_| false)),
+        (by_bytes(&[b"nope"]), Box::new(|_| false)),
+    ];
+    for (vf, accept) in &cases {
+        for (by_series, by_name) in [(false, false), (true, false), (false, true), (true, true)] {
+            let want = naive(&t, i64::MIN, i64::MAX, None, by_series, by_name, Some(accept.as_ref()));
+            for threads in [1, 4] {
+                let mut agg = parallel_agg(&t);
+                let mut sp = spec(by_series, by_name, threads);
+                sp.value_filters = vec![vf.clone()];
+                agg.run(&sp, None).unwrap();
+                let got = groups_of(&agg, by_series, by_name);
+                assert_eq!(got, want, "{vf:?} series={by_series} name={by_name} threads={threads}");
+                assert!(got.values().all(|s| s.star > 0) || (!by_series && !by_name), "empty group");
+            }
+        }
+    }
+    // integer values: n = 7 or n = -500
+    let mut agg = parallel_agg(&t);
+    let mut sp = spec(true, false, 3);
+    sp.value_filters = vec![ValueFilter { col: 2, ints: vec![7, -500, 7], ..Default::default() }];
+    agg.run(&sp, None).unwrap();
+    let mut s = t.scan(&ScanFilter::range(i64::MIN, i64::MAX), false).unwrap();
+    let mut want = 0u64;
+    while let Some((_, r)) = s.next_row().unwrap() {
+        want += u64::from(matches!(r[2], Value::Int(7) | Value::Int(-500)));
+    }
+    assert!(want > 0);
+    assert_eq!(rows_of(&agg, true, false).iter().map(|(_, s)| s.star).sum::<u64>(), want);
+    // wrong kind of values, bad column
+    for vf in [
+        ValueFilter { col: 3, ints: vec![1], ..Default::default() },
+        ValueFilter { col: 2, bytes: vec![b"x".to_vec()], ..Default::default() },
+        ValueFilter { col: 4, ints: vec![1], ..Default::default() },
+        ValueFilter { col: 99, ..Default::default() },
+    ] {
+        let mut sp = spec(false, false, 1);
+        sp.value_filters = vec![vf];
+        assert!(matches!(agg.run(&sp, None), Err(Error::InvalidArg(_))));
+    }
+}
+
+#[test]
+fn pad_space_value_filters_ignore_trailing_spaces_on_both_sides() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_new(&dir.path().join("t"));
+    let names: [&[u8]; 9] = [b"a", b"a ", b"a   ", b" a", b"a\t", b"", b"   ", b"b", b"a b "];
+    let mk = |i: usize| -> Row {
+        vec![
+            Value::Timestamp(base() + i as i64 * MICROS_PER_SEC),
+            Value::Bytes(b"h0".to_vec()),
+            Value::Int(i as i64),
+            Value::Bytes(names[i % names.len()].to_vec()),
+            Value::Float64(0.0),
+        ]
+    };
+    put(&t, (0..45).map(mk));
+    t.flush().unwrap();
+    put(&t, (45..90).map(mk)); // MemTable too
+    let count = |vals: &[&[u8]], pad: bool| -> u64 {
+        let mut agg = parallel_agg(&t);
+        let sp = AggSpec {
+            funcs: vec![FuncSpec::CountStar],
+            value_filters: vec![ValueFilter {
+                col: 3,
+                bytes: vals.iter().map(|v| v.to_vec()).collect(),
+                pad_space: pad,
+                ..Default::default()
+            }],
+            threads: 3,
+            ..AggSpec::default()
+        };
+        agg.run(&sp, None).unwrap();
+        agg.result().funcs[0].count[0]
+    };
+    // naive: how many of the 90 rows equal one of `vals` under the rule
+    let naive = |vals: &[&[u8]], pad: bool| -> u64 {
+        let trim = |v: &[u8]| -> Vec<u8> {
+            let mut v = v.to_vec();
+            while pad && v.last() == Some(&b' ') {
+                v.pop();
+            }
+            v
+        };
+        (0..90).filter(|&i| vals.iter().any(|v| trim(v) == trim(names[i % names.len()]))).count() as u64
+    };
+    for vals in [
+        vec![b"a".as_slice()],
+        vec![b"a "],
+        vec![b"a   ", b"b"],
+        vec![b" a"],
+        vec![b"a\t"],
+        vec![b""],
+        vec![b"   "],
+        vec![b"a b"],
+        vec![b"zz"],
+        vec![],
+    ] {
+        for pad in [false, true] {
+            assert_eq!(count(&vals, pad), naive(&vals, pad), "{vals:?} pad={pad}");
+        }
+    }
+    // spot checks of the rule: 'a' = {'a', 'a ', 'a   '} (10 rows each) and not ' a' / 'a\t'
+    assert_eq!(count(&[b"a"], true), 30);
+    assert_eq!(count(&[b"a"], false), 10);
+    assert_eq!(count(&[b""], true), 20, "'' matches '' and '   '");
+    assert_eq!(count(&[b"a "], true), 30, "a set value with spaces matches 'a'");
+    assert_eq!(count(&[b" a"], true), 10);
+}
+
+#[test]
+fn series_groups_without_an_accepted_row_are_not_returned() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_new(&dir.path().join("t"));
+    build(&t, 12);
+    let mut agg = parallel_agg(&t);
+    let dict = AggSpec { keys: vec![KeySpec::Column(3)], threads: 2, ..AggSpec::default() };
+    agg.run(&dict, None).unwrap();
+    let n = agg.result().groups;
+    let mut sp = spec(true, false, 2);
+    sp.filters = vec![ColFilter { col: 3, mask: vec![false; n] }];
+    agg.run(&sp, None).unwrap();
+    assert_eq!(agg.result().groups, 0);
+    // without keys the implicit group stays, with count 0
+    let mut sp = spec(false, false, 2);
+    sp.filters = vec![ColFilter { col: 3, mask: vec![false; n] }];
+    agg.run(&sp, None).unwrap();
+    assert_eq!(agg.result().groups, 1);
+    assert_eq!(agg.result().funcs[0].count[0], 0);
+}
+
+/// Sorts `rows` as a top-N documents: value (NULL smallest), reversed when
+/// descending, ties by ascending key.
+fn top_oracle(rows: &[(Key, Stats)], func: usize, desc: bool, limit: usize) -> Vec<(Key, Stats)> {
+    let val = |s: &Stats| -> Option<i128> {
+        match func {
+            0 => Some(i128::from(s.star)),
+            1 => Some(i128::from(s.cnt)),
+            2 => (s.cnt > 0).then_some(s.sum),
+            3 => s.min.map(i128::from),
+            4 => s.max.map(i128::from),
+            5 => s.tmin.map(i128::from),
+            6 => s.tmax.map(i128::from),
+            _ => Some(i128::from(s.cf)),
+        }
+    };
+    let mut v = rows.to_vec();
+    v.sort_by(|a, b| {
+        let o = val(&a.1).cmp(&val(&b.1));
+        let o = if desc { o.reverse() } else { o };
+        o.then_with(|| a.0.cmp(&b.0))
+    });
+    v.truncate(limit);
+    v
+}
+
+fn check_top(t: &Table, by_series: bool) {
+    let mut agg = parallel_agg(t);
+    agg.run(&spec(by_series, !by_series, 1), None).unwrap();
+    let all = rows_of(&agg, by_series, !by_series);
+    let groups = all.len();
+    for func in 0..8 {
+        for desc in [false, true] {
+            for limit in [0, 1, 3, groups, groups + 5, 10_000_000] {
+                let want = top_oracle(&all, func, desc, limit);
+                for threads in [1, 4] {
+                    let mut sp = spec(by_series, !by_series, threads);
+                    sp.top = Some(TopN { func, desc, limit });
+                    agg.run(&sp, None).unwrap();
+                    assert_eq!(
+                        rows_of(&agg, by_series, !by_series),
+                        want,
+                        "func={func} desc={desc} limit={limit} threads={threads} series={by_series}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn top_n_equals_the_full_ordering_cut_at_the_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_new(&dir.path().join("t"));
+    build(&t, 12);
+    check_top(&t, false);
+    check_top(&t, true);
+    let mut agg = parallel_agg(&t);
+    let mut sp = spec(true, true, 1);
+    sp.top = Some(TopN { func: 0, desc: true, limit: 3 });
+    assert!(matches!(agg.run(&sp, None), Err(Error::InvalidArg(_))), "two keys");
+    let mut sp = spec(true, false, 1);
+    sp.top = Some(TopN { func: 99, desc: true, limit: 3 });
+    assert!(matches!(agg.run(&sp, None), Err(Error::InvalidArg(_))), "function out of range");
+    sp.keys = vec![];
+    sp.top = Some(TopN { func: 0, desc: true, limit: 3 });
+    assert!(matches!(agg.run(&sp, None), Err(Error::InvalidArg(_))), "no key");
+}
+
+fn top_series(agg: &mut Agg, func: usize, desc: bool, limit: usize, want: &[(Key, Stats)]) {
+    for threads in [1, 4, 8] {
+        let mut sp = spec(true, false, threads);
+        sp.top = Some(TopN { func, desc, limit });
+        agg.run(&sp, None).unwrap();
+        assert_eq!(rows_of(agg, true, false), want, "func={func} desc={desc} threads={threads}");
+    }
+}
+
+#[test]
+fn many_groups_merge_by_partition_like_a_single_thread() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_new(&dir.path().join("t"));
+    // 20 000 series (over the parallel merge threshold), several chunks and the MemTable
+    for k in 0..4 {
+        put(&t, (k * 15_000..(k + 1) * 15_000).map(|i| row(i, 20_000)));
+        if k < 3 {
+            t.flush().unwrap();
+        }
+    }
+    let mut agg = parallel_agg(&t);
+    agg.run(&spec(true, false, 1), None).unwrap();
+    let serial = groups_of(&agg, true, false);
+    assert!(serial.len() >= 19_000);
+    assert_eq!(serial, naive(&t, i64::MIN, i64::MAX, None, true, false, None));
+    for threads in [2, 4, 8] {
+        agg.run(&spec(true, false, threads), None).unwrap();
+        assert_eq!(groups_of(&agg, true, false), serial, "threads={threads}");
+    }
+    // top-N across partitions
+    let all = rows_of(&agg, true, false);
+    for (func, desc) in [(0, true), (2, false), (3, true), (4, false)] {
+        top_series(&mut agg, func, desc, 25, &top_oracle(&all, func, desc, 25));
+    }
+    // a name key (8 distinct values): few groups, many partitions
+    let one_sp = spec(false, true, 1);
+    agg.run(&one_sp, None).unwrap();
+    let one = groups_of(&agg, false, true);
+    let mut sp = one_sp.clone();
+    sp.threads = 6;
+    agg.run(&sp, None).unwrap();
+    assert_eq!(groups_of(&agg, false, true), one);
+}
+
+/// Throughput on ~4 M synthetic rows per scenario: `cargo test --release -p
+/// moosedb-tests agg_throughput -- --ignored --nocapture`. `AGG_BENCH_ROWS`
+/// scales the row count (default 4 000 000), `AGG_BENCH_THREADS` ("1,4,8")
+/// the thread counts, `AGG_BENCH_ONLY` ("B") the scenarios by label prefix.
 #[test]
 #[ignore]
 fn agg_throughput() {
-    let dir = tempfile::tempdir().unwrap();
-    let t = open_new(&dir.path().join("t"));
-    let (series, per_series) = (1000i64, 10_000i64);
-    let t0 = std::time::Instant::now();
-    for chunk in 0..10 {
-        let mut b = t.begin_batch().unwrap();
-        for s in 0..series {
-            for k in chunk * per_series / 10..(chunk + 1) * per_series / 10 {
-                b.write(vec![
-                    Value::Timestamp(base() + k * 10 * MICROS_PER_SEC),
-                    Value::Bytes(format!("h{s}").into_bytes()),
-                    Value::Int((k * 7 + s) % 1000),
-                    Value::Bytes(format!("name{}", (k / 50 + s) % 20).into_bytes()),
-                    Value::Float64(k as f64),
-                ])
-                .unwrap();
-            }
+    let rows: i64 = std::env::var("AGG_BENCH_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(4_000_000);
+    let threads_list: Vec<usize> = std::env::var("AGG_BENCH_THREADS")
+        .ok()
+        .map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+        .unwrap_or_else(|| vec![1, 4, 8]);
+    let fns = || vec![FuncSpec::CountStar, FuncSpec::Sum(2), FuncSpec::Min(2), FuncSpec::Max(2)];
+    // (label, series, distinct names (0 = file-like names, ~rows/2), keys)
+    let scenarios: Vec<(&str, i64, i64, Vec<KeySpec>)> = vec![
+        ("A varchar high-card", 1000, rows / 2, vec![KeySpec::Column(3)]),
+        ("B 70k small series", 70_000, 20, vec![KeySpec::Series]),
+        ("C few groups (20)", 1000, 20, vec![KeySpec::Column(3)]),
+        ("D series (1000)", 1000, 20, vec![KeySpec::Series]),
+        ("E series + name(20)", 1000, 20, vec![KeySpec::Series, KeySpec::Column(3)]),
+    ];
+    let only = std::env::var("AGG_BENCH_ONLY").unwrap_or_default();
+    for (label, series, names, keys) in scenarios {
+        if !label.starts_with(&only) {
+            continue;
         }
-        b.commit(false).unwrap();
-        t.flush().unwrap();
-    }
-    println!("loaded {} rows in {:?}", series * per_series, t0.elapsed());
-    let rows = (series * per_series) as f64;
-    for (label, keys) in
-        [("Series", vec![KeySpec::Series]), ("Column(name)", vec![KeySpec::Column(3)]), ("none", vec![])]
-    {
-        for threads in [1, 4] {
+        let dir = tempfile::tempdir().unwrap();
+        let t = open_new(&dir.path().join("t"));
+        let per_series = rows / series;
+        let total = per_series * series;
+        let t0 = std::time::Instant::now();
+        let step = 1_000_000 / series.max(1) + 1;
+        let mut k0 = 0;
+        while k0 < per_series {
+            let k1 = (k0 + step).min(per_series);
+            let mut b = t.begin_batch().unwrap();
+            for s in 0..series {
+                for k in k0..k1 {
+                    let n = s * per_series + k;
+                    // multiplicative hash: names repeat ~2x in the high-cardinality scenario
+                    let id = (n.wrapping_mul(0x9E37_79B9_7F4A_7C15u64 as i64) as u64 >> 20) as i64 % names;
+                    b.write(vec![
+                        Value::Timestamp(base() + k * 10 * MICROS_PER_SEC),
+                        Value::Bytes(format!("h{s}").into_bytes()),
+                        Value::Int((k * 7 + s) % 1000),
+                        Value::Bytes(format!("/var/lib/data/file{id}.log").into_bytes()),
+                        Value::Float64(k as f64),
+                    ])
+                    .unwrap();
+                }
+            }
+            b.commit(false).unwrap();
+            t.flush().unwrap();
+            k0 = k1;
+        }
+        println!("== {label}: loaded {total} rows in {:?}", t0.elapsed());
+        for &threads in &threads_list {
             let mut agg = t.agg_open(i64::MIN, i64::MAX, None).unwrap();
-            let s = AggSpec {
-                keys: keys.clone(),
-                funcs: vec![FuncSpec::CountStar, FuncSpec::Sum(2), FuncSpec::Min(2), FuncSpec::Max(2)],
-                filters: vec![],
-                max_memory: 1 << 30,
-                threads,
-            };
-            let mut best = f64::MAX;
-            let mut first = 0.0;
+            let s = AggSpec { keys: keys.clone(), funcs: fns(), max_memory: 4 << 30, threads, ..AggSpec::default() };
+            let mut times = Vec::new();
             for _ in 0..3 {
                 let t1 = std::time::Instant::now();
                 agg.run(&s, None).unwrap();
-                let e = t1.elapsed().as_secs_f64();
-                if first == 0.0 {
-                    first = e;
-                }
-                best = best.min(e);
+                times.push(t1.elapsed().as_secs_f64());
             }
-            println!("key {label:>13} threads {threads}: 1st run {:.3} s ({:.1} M rows/s), best {:.3} s ({:.1} M rows/s), {} groups", first, rows / first / 1e6, best, rows / best / 1e6, agg.result().groups);
+            let best = times.iter().copied().fold(f64::MAX, f64::min);
+            println!(
+                "{label:>22} threads {threads}: 1st {:.3} s, best {:.3} s = {:.1} M rows/s, {} groups",
+                times[0],
+                best,
+                total as f64 / best / 1e6,
+                agg.result().groups
+            );
+        }
+        if label.starts_with('A') {
+            let target = b"/var/lib/data/file0.log".to_vec();
+            for &threads in &threads_list {
+                let funcs = vec![FuncSpec::CountStar];
+                // dictionary phase + mask (what a handler without exact filters does)
+                let mut best_mask = f64::MAX;
+                let mut best_exact = f64::MAX;
+                let mut best_top = f64::MAX;
+                let (mut n_mask, mut n_exact) = (0, 0);
+                for _ in 0..3 {
+                    let mut agg = t.agg_open(i64::MIN, i64::MAX, None).unwrap();
+                    let t1 = std::time::Instant::now();
+                    let dict = AggSpec { keys: vec![KeySpec::Column(3)], max_memory: 4 << 30, threads, ..AggSpec::default() };
+                    agg.run(&dict, None).unwrap();
+                    let KeyCol::Bytes { nulls, starts, lens, data } = agg.result().keys[0].clone() else { panic!() };
+                    let mask: Vec<bool> = (0..nulls.len())
+                        .map(|i| !nulls[i] && data[starts[i] as usize..starts[i] as usize + lens[i] as usize] == target[..])
+                        .collect();
+                    let sp = AggSpec { funcs: funcs.clone(), filters: vec![ColFilter { col: 3, mask }], max_memory: 4 << 30, threads, ..AggSpec::default() };
+                    agg.run(&sp, None).unwrap();
+                    best_mask = best_mask.min(t1.elapsed().as_secs_f64());
+                    n_mask = agg.result().funcs[0].count[0];
+                    let mut agg = t.agg_open(i64::MIN, i64::MAX, None).unwrap();
+                    let t1 = std::time::Instant::now();
+                    let sp = AggSpec {
+                        funcs: funcs.clone(),
+                        value_filters: vec![ValueFilter { col: 3, bytes: vec![target.clone()], ..Default::default() }],
+                        max_memory: 4 << 30,
+                        threads,
+                        ..AggSpec::default()
+                    };
+                    agg.run(&sp, None).unwrap();
+                    best_exact = best_exact.min(t1.elapsed().as_secs_f64());
+                    n_exact = agg.result().funcs[0].count[0];
+                    let t1 = std::time::Instant::now();
+                    let sp = AggSpec {
+                        keys: vec![KeySpec::Column(3)],
+                        funcs: funcs.clone(),
+                        top: Some(TopN { func: 0, desc: true, limit: 20 }),
+                        max_memory: 4 << 30,
+                        threads,
+                        ..AggSpec::default()
+                    };
+                    agg.run(&sp, None).unwrap();
+                    best_top = best_top.min(t1.elapsed().as_secs_f64());
+                }
+                assert_eq!(n_mask, n_exact);
+                println!(
+                    "{label:>22} threads {threads}: filter file=x: dictionary+mask {best_mask:.3} s, exact {best_exact:.3} s ({n_exact} rows); top-20 by COUNT {best_top:.3} s"
+                );
+            }
+        }
+        // the dictionary phase of the key column (single Column key, no function)
+        if let Some(KeySpec::Column(c)) = keys.first().filter(|_| keys.len() == 1) {
+            for &threads in &threads_list {
+                let mut agg = t.agg_open(i64::MIN, i64::MAX, None).unwrap();
+                let s = AggSpec { keys: vec![KeySpec::Column(*c)], max_memory: 4 << 30, threads, ..AggSpec::default() };
+                let mut best = f64::MAX;
+                for _ in 0..3 {
+                    let t1 = std::time::Instant::now();
+                    agg.run(&s, None).unwrap();
+                    best = best.min(t1.elapsed().as_secs_f64());
+                }
+                println!("{label:>22} dictionary threads {threads}: best {best:.3} s, {} values", agg.result().groups);
+            }
         }
     }
 }

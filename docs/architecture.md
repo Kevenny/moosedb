@@ -718,10 +718,51 @@ essas colunas, constantes e `COUNT(*)`/`COUNT(col)`/`SUM`/`AVG` de inteiro (meno
 `MIN`/`MAX` de inteiro ou do eixo de tempo; WHERE = conjunção de igualdades/IN
 de TAG e limites do eixo (`capture_delete_cond`, o mesmo reconhecimento exato do
 DELETE direto; constantes string contra o eixo `DATETIME` valem quando o
-comparador é datetime). HAVING, ORDER BY (chave ou agregado, ASC/DESC), LIMIT e
-OFFSET entram. Fora: DISTINCT, ROLLUP, window, WITH TIES, SQL_CALC_FOUND_ROWS,
-subconsulta/derivada/view/CTE/UNION, rotinas, expressões, predicado em coluna
-comum, eixo `TIMESTAMP`.
+comparador é datetime). Os demais conjuntos do WHERE entram se cada um referencia
+**uma única coluna comum** (VARCHAR/CHAR de qualquer collation ou INT/BIGINT,
+inclusive `BIGINT UNSIGNED`; nunca TAG nem o eixo) só com constantes: `=`, `<=>`,
+`<>`, `<`, `<=`, `>`, `>=`, `BETWEEN`, `IN`, `NOT IN`, `LIKE`/`NOT LIKE`,
+`IS [NOT] NULL`, e `OR`/`NOT`/`AND` aninhados desses sobre a MESMA coluna (os
+conjuntos de uma coluna formam o predicado dela). HAVING, ORDER BY (chave ou
+agregado, ASC/DESC), LIMIT e OFFSET entram. Fora: DISTINCT, ROLLUP, window, WITH
+TIES, SQL_CALC_FOUND_ROWS, subconsulta/derivada/view/CTE/UNION, rotinas,
+expressões, `OR` entre colunas diferentes, conjunto com duas colunas, função da
+coluna (`UPPER(op)='X'`), função não constante/não determinística, `Item_param`
+não ligado, comparação string x número (o servidor converte e avisa linha a
+linha), predicado em TAG que não seja `=`/`IN`, eixo `TIMESTAMP`.
+
+**Predicado em coluna comum** (`init_scan`, `build_mask`): para cada coluna
+filtrada `c` a engine roda a fase de dicionário no MESMO snapshot já aberto com a
+faixa de tempo e as séries do WHERE (`Column(c)` como única chave, sem funções
+nem filtros), de modo que o dicionário só tem os valores relevantes. Cada valor
+distinto (NULL inclusive) é gravado no próprio `Field` de `c` do `record[0]` da
+tabela (restaurado ao fim) e o `Item` do predicado do **próprio servidor** é
+avaliado (`val_int`, NULL = falso, como no WHERE); o resultado vira a máscara
+(`TFAggFilter`) da execução final. É isso que garante a exatidão, já que o
+servidor não reavalia o WHERE sobre os grupos: collation, PAD SPACE, `LIKE`,
+lógica de NULL e conversões são as do servidor, não uma reimplementação. A
+máscara entra no orçamento `moosedb_agg_max_memory` (o dicionário, dentro do
+core). Custo: uma avaliação de `Item` por valor DISTINTO (colunas com milhões de
+valores distintos pagam isso; `=`/`IN` byte-exatos nem passam por aqui, ver atalhos abaixo). Limites do core (16 chaves, 64 funções, 16 filtros) e `moosedb_agg_max_memory` esgotado antes de uma execução: recusa no planejamento / erro de orçamento. O `parallel_sort` do pós-processamento não checa KILL (≈1 s por milhão de grupos string). Medição do
+tempo (status cumulativos `Moosedb_gbh_dict_us`, `_agg_us`, `_dict_values`,
+`_eval_us`, `_post_us` = pós-processamento em C++).
+
+**Atalhos para o core.** (1) *Conjunto de valores*: um filtro cujo predicado é
+exatamente `col = const` / `col IN (consts)` (sem NOT/OR/NULL na lista) vai ao core
+como `TF_AGG_FILTER_VALUES`, sem fase de dicionário, quando a comparação é
+byte a byte: inteiro com constantes inteiras (constante fora do range da coluna
+é descartada; `BIGINT UNSIGNED` vai como padrão de bits) ou VARCHAR com collation
+binária NO PAD (`utf8mb4_nopad_bin`; `utf8mb4_bin` é PAD SPACE e NÃO serve), cuja
+collation de comparação seja a da coluna e cujas constantes estejam no charset da
+coluna. Qualquer outro caso fica no dicionário + máscara. (2) *Top-N*:
+uma chave não-TAG, `ORDER BY` de um único agregado (COUNT/SUM/MIN/MAX, não AVG)
+com `LIMIT`, sem HAVING, chave inteira (não `BIGINT UNSIGNED`) ou string
+binária NO PAD; o desempate do core (chave crescente) é o do handler
+(`cmp_raw`), então os K grupos são os mesmos. Chave TAG nunca usa (o core
+desempata por id de série, o handler pelo valor). Status `Moosedb_gbh_exact_filters`
+e `Moosedb_gbh_topn`. O pós-processamento ordena em paralelo
+(`moosedb_agg_threads`) e o merge por collation ordena pares (hash, grupo).
+Testes: `gbh_shortcuts`.
 
 **Execução** (`init_scan`): mapeia `all_fields` para os campos da tmp table,
 resolve as séries do WHERE, abre a agregação (`moosedb_agg_open`, reconferindo
@@ -760,7 +801,7 @@ Pontos de atenção (já medidos ou assumidos):
 Diferenças visíveis de metadata (não do dado): as flags `BINARY`/`NUM`/
 `NO_DEFAULT_VALUE` dos campos do resultado vêm do campo da tmp table em vez do
 item; `NOT_NULL`/`UNSIGNED` são iguais. Testes: `gbh_scope`, `gbh_basic`,
-`gbh_collation`, `gbh_scale`.
+`gbh_collation`, `gbh_scale`, `gbh_where`.
 
 Comportamento do servidor (11.4.13) medido com um handler de teste que devolvia
 linhas fixas fora de ordem; o que a implementação de verdade precisa respeitar:
@@ -821,27 +862,80 @@ scan não ordenado: só o commitado; o lote privado do statement é invisível).
 
 - **Chaves**: `Series` (um estado por série, laço apertado na janela) e
   `Column(i)` (Int64/Timestamp/Bool como inteiro, Varchar/Decimal como bytes;
-  NULL é valor próprio). Imagem da chave em bytes num `std::HashMap` (SipHash:
-  o valor vem do cliente; o `FastMap` é só para ids internos), com cache da
-  última chave e do "mesmo valor da linha anterior".
+  NULL é valor próprio). Imagem da chave em bytes numa tabela própria
+  (arena de chaves + índice de endereçamento aberto com `u32`), hash
+  SipHash-1-3 com chave aleatória por execução (`RandomState`: o valor vem do
+  cliente; o `FastMap` é só para ids internos), hash guardado por grupo (merge
+  e crescimento nunca rehasheiam). Linhas consecutivas com a mesma chave
+  reaproveitam a imagem, e as imagens distintas de um trecho são resolvidas em
+  lotes de 256 (`Groups::warm` toca slots/hashes/chaves em laços independentes
+  para sobrepor cache misses). Grupos sem nenhuma linha aceita (filtros) não
+  aparecem no resultado (exceto o grupo único da agregação sem chave).
 - **Funções**: `CountStar`, `Count(i)`, `Sum(i)` (Int64, acumulador `i128` com
-  `checked_add`; estouro = erro `Full`), `Min/Max(i)` (Int64/Timestamp).
-- **Filtros** por máscara de dicionário: uma execução com a única chave
+  `checked_add`; estouro = erro `Full`), `Min/Max(i)` (Int64/Timestamp). Estado
+  de 24 bytes por (grupo, função). `FuncCol` só preenche `sum_*` para `Sum` e
+  `val` para `Min/Max`.
+- **Filtros**: (1) máscara de dicionário: uma execução com a única chave
   `Column(c)`, sem funções nem filtros, grava o dicionário de `c` (valores na
   ordem do resultado); filtros seguintes passam `mask[i]` por posição do
   dicionário (vários = AND; máscara de tamanho errado ou sem dicionário =
-  `InvalidArg`).
-- **Paralelismo**: `std::thread::scope`; unidades de ~256 entradas de chunk e
-  de 64 Ki linhas da MemTable via `AtomicUsize`; um mapa parcial por worker,
-  merge sequencial; resultado idêntico para qualquer nº de threads. O callback
-  de cancelamento só roda na thread chamadora (~10 ms); workers leem um
-  `AtomicBool`. Pânico em worker é repropagado na thread chamadora (vira
-  `TF_ERR_INTERNAL` na FFI). Cancelado = `Error::Cancelled`/`TF_ERR_CANCELLED`.
+  `InvalidArg`). (2) **Valores exatos** (`TFAggFilter.mode = TF_AGG_FILTER_VALUES`,
+  `ValueFilter`): conjunto de inteiros ou de strings comparadas byte a byte,
+  aplicado direto na agregação, sem fase de dicionário; NULL nunca é aceito;
+  conjunto vazio rejeita tudo; com um só valor compara sem hash. O handler só
+  pode usar quando a comparação SQL é exata (inteiros ou collation binária /
+  NO PAD).
+- **Top-N** (`TopN`, `TFAggSpec.top_*`): com uma única chave, devolve só os K
+  melhores grupos por uma função (COUNT, SUM, MIN, MAX; ASC/DESC), melhor
+  primeiro. NULL (grupo sem valores) é o menor valor; empate resolvido SEMPRE
+  pela chave crescente (id da série, inteiro com sinal, ou bytes sem sinal
+  lexicográfico, prefixo menor primeiro; chave NULL primeiro). Seleção por
+  partição (`select_nth_unstable`) e depois global; `limit = 0` devolve nenhum
+  grupo. Só vale quando essa ordem é a que o SQL pede (chave inteira ou bytes
+  em collation binária NO PAD).
+- **Paralelismo**: `std::thread::scope`; unidades de ~32 Ki linhas (entradas de
+  chunk inteiras, no máximo 1024) e de 64 Ki linhas da MemTable via
+  `AtomicUsize`; uma tabela de grupos por worker. Com mais de um worker o
+  merge é **por partição de hash** (4 partições por thread, potência de 2, até
+  256): cada worker agrupa seus grupos por partição ao terminar, as partições
+  são reivindicadas pelos workers, cada uma é fundida (hash guardado, tabela
+  pré-dimensionada) e já vira colunas de resultado (ou candidatos do top-N) na
+  mesma thread; os pedaços são concatenados na thread chamadora. Menos de
+  `DEFAULT_MIN_PARALLEL_ROWS` (128 Ki) linhas estimadas ou menos de 8192
+  grupos: sem threads de fundo / merge na thread chamadora
+  (`Agg::set_min_parallel_rows` muda o piso; o resultado não depende dele).
+  Resultado idêntico para qualquer nº de threads. O callback de cancelamento
+  só roda na thread chamadora (~10 ms); workers leem um `AtomicBool`. Pânico em
+  worker é repropagado na thread chamadora (vira `TF_ERR_INTERNAL` na FFI).
+  Cancelado = `Error::Cancelled`/`TF_ERR_CANCELLED`.
 - **Memória**: um orçamento atômico compartilhado (chave + estados + overhead
-  por grupo em cada mapa parcial, conjuntos dos filtros, resultado, dicionário);
+  por grupo em cada tabela, cobrado em lotes de até 32 KiB por worker para não
+  disputar o contador; conjuntos dos filtros, resultado, dicionário);
   estourar = `Error::Full("aggregation exceeds moosedb_agg_max_memory ...")`.
+  As tabelas dos workers ficam vivas durante o merge, então uma execução
+  paralela com muitos grupos chega a ~2x a memória dos grupos vistos pelos
+  workers; a concatenação final cobra uma cópia a mais do resultado.
   Cada worker decodifica uma janela por vez, então a decodificação simultânea
   é limitada pelo nº de threads.
+- **Cache de blocos** (`cache.rs`): o LRU de blocos/colunas/séries é dividido em
+  16 shards (chave de uma série = mesmo shard) sob um orçamento global
+  (`total` atômico): cada shard expulsa primeiro seus próprios mais antigos
+  (LRU amostrado) e só depois os dos outros, um lock por vez; `used_bytes`
+  é ≤ `moosedb_chunk_cache_size` em repouso (a soma é feita antes do trim, então
+  com N inserções concorrentes pode passar transitoriamente em até N entradas;
+  o trim começa por um shard rotativo). `touched_before` é lock-free. Antes
+  a agregação de 70 mil séries piorava com mais threads por causa do mutex
+  único.
+- **Orçamento subestimado (limite conhecido)**: `GROUP_OVERHEAD` (80 B) não
+  cobre a folga de capacidade dos `Vec` (até 2x na arena e nos vetores), o
+  `grow()` do índice (slots velho + novo ao mesmo tempo, 4 B por slot) nem o
+  `presize` das partições (reserva pelo teto soma-dos-workers, mesmo com
+  muitos duplicados; não é cobrado). Somado ao ~2x das tabelas dos workers
+  durante o merge, o pico real pode passar de `moosedb_agg_max_memory` por uma
+  fração; dimensione o limite com folga.
+- **Dicionário de varchar**: os blocos de varchar são `ENC_PLAIN` (sem
+  dicionário nem RLE por bloco), então não há como agregar por códigos; o custo
+  da fase de dicionário é o da própria agregação por chave `Column`.
 
 ## Limitações conhecidas
 

@@ -355,15 +355,25 @@ CREATE TABLE segura (ts DATETIME(6) NOT NULL, v DOUBLE, INDEX(ts))
   ENGINE=MooseDB ENCRYPTION='YES' ENCRYPTION_KEY_ID=1;
 ```
 
-Chunks e WAL são cifrados com AES-256-CTR. Rotacionar a chave no key
-management é transparente: dados novos usam a versão mais recente e os
-antigos continuam legíveis.
+Chunks e WAL são cifrados com AES-256-GCM, que também **autentica**: bit
+alterado, bloco trocado de lugar ou de arquivo e entrada de WAL movida são
+detectados na leitura (o dado adulterado nunca é devolvido; a consulta falha
+com erro de corrupção, e a abertura da tabela com erro de decriptação).
+Rotacionar a chave no key management é transparente: dados novos usam a versão
+mais recente e os antigos continuam legíveis.
 
-A criptografia protege a **confidencialidade**, não a integridade: quem pode
-escrever no datadir consegue adulterar dados cifrados sem ser detectado. Se a
-chave configurada não decifra a tabela, ela não abre (`Got error 192 ... from
-MooseDB`, erro de decriptação) — nada é descartado; corrija a configuração
-de chaves e reabra.
+Tabelas criadas por versões anteriores usavam AES-256-CTR, que cifra mas não
+autentica. Elas continuam abrindo (o log avisa "encrypted without
+authentication"); `OPTIMIZE TABLE` reescreve os chunks antigos já autenticados
+e o WAL antigo some no próximo flush. Depois da migração, um binário anterior
+não abre mais a tabela (recusa a versão do formato).
+
+A autenticação não cobre apagar ou truncar arquivos, restaurar uma cópia antiga
+válida nem alterar o `MANIFEST`; proteja o datadir com permissões do sistema
+de arquivos. Se a chave configurada não decifra a tabela, ela não abre
+(`Got error 192 ... from MooseDB`, erro de decriptação) — nada é descartado;
+corrija a configuração de chaves e reabra. Adulteração e chave errada não se
+distinguem.
 
 ## Backup
 

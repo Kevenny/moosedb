@@ -40,14 +40,12 @@ use std::path::Path;
 
 use crate::bytes::{put_u16, put_u32, put_u64, ByteReader};
 use crate::error::{corrupt, Error, Result};
+use crate::format::{MANIFEST_PLAIN as VERSION_PLAIN, MANIFEST_TOMB as VERSION, MANIFEST_V1};
 use crate::fsutil::write_atomic;
 use crate::tomb::{decode_range, decode_rows, encode_range, encode_rows, RangeTomb, RowsTomb};
 
 pub(crate) const MANIFEST_FILE: &str = "MANIFEST";
 const MAGIC: &[u8; 4] = b"TFLM";
-const VERSION: u16 = 3;
-/// Version written while the table has never had a tombstone.
-const VERSION_PLAIN: u16 = 2;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Manifest {
@@ -135,7 +133,7 @@ impl Manifest {
             return Err(corrupt("MANIFEST bad magic"));
         }
         let version = r.u16()?;
-        if version != VERSION && version != VERSION_PLAIN && version != 1 {
+        if version != VERSION && version != VERSION_PLAIN && version != MANIFEST_V1 {
             return Err(corrupt(format!("MANIFEST version {version} not supported")));
         }
         r.u16()?;

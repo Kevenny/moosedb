@@ -85,6 +85,10 @@ ts DATETIME NOT NULL, host VARCHAR(8) NOT NULL COMMENT 'TAG',
 u3 VARCHAR(8) CHARACTER SET utf8mb3 COLLATE utf8mb3_nopad_bin,
 vb VARBINARY(8),
 ch CHAR(6) CHARACTER SET utf8mb4 COLLATE utf8mb4_nopad_bin,
+pb VARCHAR(8) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin,
+pl VARCHAR(8) CHARACTER SET latin1 COLLATE latin1_bin,
+pc VARCHAR(8) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci,
+pu VARCHAR(8) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci,
 bytes INT NOT NULL,
 INDEX(ts)
 ) ENGINE=MooseDB;
@@ -92,6 +96,10 @@ INSERT INTO g SELECT '2024-03-01' + INTERVAL seq SECOND, CONCAT('h', seq MOD 3),
 ELT(seq MOD 4 + 1, 'a', 'a ', 'b', CONVERT(0xC3A9 USING utf8mb3)),
 ELT(seq MOD 4 + 1, 'a', 'a ', 'b', 0xFF),
 ELT(seq MOD 4 + 1, 'a', 'a ', 'b', 'ab'),
+ELT(seq MOD 4 + 1, 'a', 'a ', 'a   ', 'b'),
+ELT(seq MOD 4 + 1, 'a', 'a ', 'a   ', 'b'),
+ELT(seq MOD 4 + 1, 'a', 'a ', 'a   ', 'b'),
+ELT(seq MOD 4 + 1, 'a', 'a ', 'a   ', 'b'),
 seq MOD 10
 FROM seq_0_to_2999;
 CREATE TABLE mirror.g LIKE test.g;
@@ -140,6 +148,42 @@ INSERT INTO mirror.g SELECT * FROM test.g;
 # CHAR NO PAD column with strict sql_mode and PAD_CHAR_TO_FULL_LENGTH
 # SELECT host, COUNT(*) c FROM g WHERE ch = 'a' GROUP BY host ORDER BY host
 # same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=0 core top-N=0
+# binary PAD SPACE collations (utf8mb4_bin, latin1_bin): exact value set with pad_space; _ci stays on the dictionary
+# SELECT host, COUNT(*) c FROM g WHERE pb = 'a' GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=1 core top-N=0
+# binary PAD SPACE collations (utf8mb4_bin, latin1_bin): exact value set with pad_space; _ci stays on the dictionary
+# SELECT host, COUNT(*) c FROM g WHERE pb = 'a   ' GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=1 core top-N=0
+# binary PAD SPACE collations (utf8mb4_bin, latin1_bin): exact value set with pad_space; _ci stays on the dictionary
+# SELECT host, COUNT(*) c FROM g WHERE pb IN ('a ', 'zz', 'b   ') GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=1 core top-N=0
+# binary PAD SPACE collations (utf8mb4_bin, latin1_bin): exact value set with pad_space; _ci stays on the dictionary
+# SELECT host, COUNT(*) c FROM g WHERE pl = 'a' GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=1 core top-N=0
+# binary PAD SPACE collations (utf8mb4_bin, latin1_bin): exact value set with pad_space; _ci stays on the dictionary
+# SELECT host, COUNT(*) c FROM g WHERE pl IN ('a  ', 'b') GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=1 core top-N=0
+# binary PAD SPACE collations (utf8mb4_bin, latin1_bin): exact value set with pad_space; _ci stays on the dictionary
+# SELECT host, COUNT(*) c FROM g WHERE pb = 'a' AND pl = 'a ' GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=2 core top-N=0
+# binary PAD SPACE collations (utf8mb4_bin, latin1_bin): exact value set with pad_space; _ci stays on the dictionary
+# SELECT host, COUNT(*) c FROM g WHERE pc = 'A' GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=0 core top-N=0
+# binary PAD SPACE collations (utf8mb4_bin, latin1_bin): exact value set with pad_space; _ci stays on the dictionary
+# SELECT host, COUNT(*) c FROM g WHERE pu = 'a ' GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=0 core top-N=0
+# binary PAD SPACE collations (utf8mb4_bin, latin1_bin): exact value set with pad_space; _ci stays on the dictionary
+# SELECT host, COUNT(*) c FROM g WHERE pb = 'a' COLLATE utf8mb4_bin GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine did not run it
 # shortcuts taken: exact filters=0 core top-N=0
 # DECIMAL / TIME constant against an integer column: refused (per-row conversion)
 # SELECT host, COUNT(*) c FROM g WHERE bytes = 5.0 GROUP BY host ORDER BY host

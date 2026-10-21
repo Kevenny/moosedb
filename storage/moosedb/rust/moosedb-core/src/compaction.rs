@@ -189,13 +189,16 @@ impl Table {
                 // (rewriting always uses the latest), so old versions can be retired.
                 let rekey = rekey_below
                     .is_some_and(|v| group.iter().any(|c| c.cipher.as_ref().is_some_and(|k| k.key_version < v)));
+                // OPTIMIZE also upgrades chunks of the unauthenticated CTR format
+                // (format v2 with the ENCRYPTED flag) to authenticated ones.
+                let legacy = force && group.iter().any(|c| c.cipher.as_ref().is_some_and(|k| !k.is_authenticated()));
                 // Rows a DELETE hid are only removed by rewriting: when a quarter of
                 // a chunk is dead (or at OPTIMIZE), not for a handful of rows.
                 let dirty = group.iter().any(|c| {
                     let d = tombs.dead_rows(c.id);
                     d > 0 && (force || d.saturating_mul(4) >= c.header.row_count || many_tombs)
                 });
-                group.len() >= trigger || (force && group.len() > 1) || recode || rekey || dirty
+                group.len() >= trigger || (force && group.len() > 1) || recode || rekey || legacy || dirty
             })
             .map(|(_, g)| g)
             .collect()

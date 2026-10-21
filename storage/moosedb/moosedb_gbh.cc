@@ -164,6 +164,7 @@ struct gfilter
   std::vector<Item *> conds;       /* ANDed                                  */
   /* `col = const` / `col IN (consts)` compared byte for byte: the core can filter by the values themselves */
   bool exact= false;
+  bool pad= false;                 /* exact: PAD SPACE binary collation (trailing 0x20 ignored) */
   std::vector<Item *> consts;
 };
 
@@ -629,9 +630,20 @@ void exact_shape(const gplan *p, gfilter *g)
   }
   if (g->is_str)
   {
-    if (g->field->real_type() != MYSQL_TYPE_VARCHAR || !cs_exact(g->field->charset()) ||
-        (th && th->cmp_type() != STRING_RESULT) || ccs != g->field->charset())
+    CHARSET_INFO *fcs= g->field->charset();
+    if (g->field->real_type() != MYSQL_TYPE_VARCHAR || (th && th->cmp_type() != STRING_RESULT) ||
+        ccs != fcs)
       return;
+    if (!cs_exact(fcs))
+    {
+      /* binary PAD SPACE (utf8mb4_bin, latin1_bin...): equal after trimming trailing 0x20, in charsets where 0x20 is a whole character */
+      const char *n= fcs->cs_name.str;
+      if (!(fcs->state & MY_CS_BINSORT) || (fcs->state & MY_CS_NOPAD) || fcs->mbminlen != 1 || !n ||
+          !(strcmp(n, "utf8mb4") == 0 || strcmp(n, "utf8mb3") == 0 || strcmp(n, "latin1") == 0 ||
+            strcmp(n, "ascii") == 0))
+        return;
+      g->pad= true;
+    }
   }
   else if (th && th->cmp_type() != INT_RESULT)
     return;
@@ -792,7 +804,15 @@ const char *analyze(THD *thd, Query *q, gplan *p)
     compares signed), AVG, HAVING, or a second ORDER BY term.
   */
   if (!p->has_having && p->limit != HA_POS_ERROR && p->limit > 0 && !p->has_series &&
-      !p->need_merge && p->keys.size() == 1 && p->order.size() == 1 &&
+      !p->need_merge && p->keys.size() == 1 &&
+      (p->order.size() == 1 ||
+       /* ORDER BY aggregate, the key ASC: the SQL order is total and the second term is exactly the core's
+          tiebreak (signed integer, unsigned bytes with the shorter prefix first, NULL first). For a binary
+          NO PAD collation of a one-byte-unit charset (utf8mb4/utf8mb3/latin1/ascii: code point order ==
+          byte order) strnncollsp == memcmp-then-length. */
+       (p->order.size() == 2 && p->order[1].is_key && !p->order[1].desc &&
+        p->order[1].idx == 0 &&
+        (!p->keys[0].is_str || (p->keys[0].cs && p->keys[0].cs->mbminlen == 1)))) &&
       !p->order[0].is_key && p->order[0].idx >= 0 &&
       (size_t) p->order[0].idx < p->aggs.size() &&
       p->aggs[p->order[0].idx].k != aggk::AVG &&
@@ -1241,6 +1261,7 @@ int moosedb_gbh::compute()
         t.value_count= s.lens.size();
         t.value_data= (const uint8_t *) s.data.data();
         t.value_data_len= s.data.size();
+        t.pad_space= gf.pad ? 1 : 0;
       }
     }
     else

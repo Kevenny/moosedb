@@ -54,12 +54,12 @@ call mtr.add_suppression("MooseDB");
 INSERT INTO s VALUES ('2026-01-02', 'SECRET-HOST-NAME', 'CONFIDENTIAL-after');
 # restart: --file-key-management-filename=MYSQL_TEST_DIR/suite/moosedb/std_data/keys_wrong.txt
 SELECT COUNT(*) FROM s;
-ERROR HY000: Got error 192 'encryption: test.s/chunk_20260101T000000_20260102T000000_000001.tfl: series count mismatch (corrupt file or wrong encryption key)' from MooseDB
+ERROR HY000: Got error 192 'encryption: test.s/chunk_20260101T000000_20260102T000000_000001.tfl: series index failed authentication (corrupt file or wrong encryption key)' from MooseDB
 SHOW WARNINGS;
 Level	Code	Message
-Error	1296	Got error 192 'encryption: test.s/chunk_20260101T000000_20260102T000000_000001.tfl: series count mismatch (corrupt file or wrong encryption key)' from MooseDB
+Error	1296	Got error 192 'encryption: test.s/chunk_20260101T000000_20260102T000000_000001.tfl: series index failed authentication (corrupt file or wrong encryption key)' from MooseDB
 INSERT INTO s VALUES ('2026-01-03', 'SECRET-HOST-NAME', 'CONFIDENTIAL-wrong-key');
-ERROR HY000: Got error 192 'encryption: test.s/chunk_20260101T000000_20260102T000000_000001.tfl: series count mismatch (corrupt file or wrong encryption key)' from MooseDB
+ERROR HY000: Got error 192 'encryption: test.s/chunk_20260101T000000_20260102T000000_000001.tfl: series index failed authentication (corrupt file or wrong encryption key)' from MooseDB
 # The files were not touched: with the right key again, all data is back
 # restart
 SELECT COUNT(*), MAX(note) FROM s;

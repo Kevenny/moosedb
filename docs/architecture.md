@@ -23,12 +23,13 @@ mysqld ──► ha_moosedb.so
 | `tomb`, `delete` | tombstones (exclusão lógica por faixa ou por linhas), `DELETE` atômico e durável, replay |
 | `fsutil` | `write_atomic`, `sync_dir`, fsync que marca falha (poison) |
 | `memtable` | buffer em segmentos imutáveis (snapshot O(1)) |
-| `chunk`, `chunk_writer`, `chunk_reader`, `block` | formato `.tfl` v2, blocos por coluna |
+| `chunk`, `chunk_writer`, `chunk_reader`, `block` | formato `.tfl` v2/v3, blocos por coluna |
 | `compression/` | delta-of-delta, delta, Simple8b, Gorilla, RLE, LZ4/ZSTD |
 | `scan` | snapshots, scan em streaming, k-way merge ordenado |
 | `compaction` | merge de chunks por intervalo, recodificação fria |
 | `maintenance` | registro de tabelas abertas + pool de threads de fundo |
-| `crypto` | AES-256-CTR, provedor de chaves |
+| `crypto` | AES-256-GCM autenticado (AES-CTR legado só para leitura), provedor de chaves |
+| `format` | números de versão de todos os formatos em disco |
 | `cache` | LRU de blocos decodificados e de descritores de arquivo |
 | `inspect` | diagnóstico para o INFORMATION_SCHEMA |
 
@@ -51,16 +52,18 @@ Cada tabela é um diretório `<datadir>/<schema>/<tabela>/`:
 | `MANIFEST` | lista de chunks vivos + checkpoint do WAL (`wal_seq`) + início do replay (`replay_seq`) (v2; v3 quando há ou houve `DELETE`: + `born` por chunk, `tseq` e os tombstones; CRC32, troca atômica) |
 | `OPTIONS` | TABLE OPTIONS normalizadas (texto), lidas pelo INFORMATION_SCHEMA |
 | `wal_NNNNNN.tfl.wal` | segmentos do WAL |
-| `chunk_<início>_<fim>_<id>.tfl` | chunk selado (formato v2, `chunk.rs`) |
+| `chunk_<início>_<fim>_<id>.tfl` | chunk selado (formato v2 ou v3 cifrado, `chunk.rs`) |
 | `*.tfl.corrupt` | chunk em quarentena (CRC inválido na recuperação) |
 
-### Formato do chunk (v2)
+### Formato do chunk (v2 e v3)
 
 Header de 64 bytes (texto claro) → header de criptografia de 32 bytes (se
 cifrado) → blocos de coluna → índice de séries → Bloom filter → footer de 24
 bytes. Cada **bloco de coluna** tem codificação por tipo, codec (LZ4/ZSTD,
 aplicado só se reduzir o tamanho) e CRC próprio; o arquivo inteiro tem um CRC
-sobre os bytes armazenados (o `CHECK TABLE` funciona sem a chave).
+sobre os bytes armazenados (o `CHECK TABLE` funciona sem a chave). No v3
+(cifrado) cada bloco e a seção índice+Bloom são selados com AES-256-GCM e
+seguidos de uma tag de 16 bytes (ver §Criptografia).
 
 | Tipo | Codificação |
 |---|---|
@@ -210,9 +213,42 @@ Se uma thread entra em panic segurando o estado da tabela, toda operação
 (leitura inclusive) falha na hora com "table must be reopened" — nunca
 devolve estado possivelmente inconsistente; reabrir resolve.
 
+### Fuzzing dos decodificadores de disco
+
+`storage/moosedb/rust/fuzz/` (cargo-fuzz, **fora** do workspace: exige nightly e
+não afeta o build do plugin nem o clippy). O core expõe, só com a feature
+`fuzz` (`#[doc(hidden)] pub mod fuzz_api`), um ponto de entrada por parser:
+
+| Alvo | Cobre |
+|---|---|
+| `column_block` | corpo de bloco por tipo (delta, delta-of-delta, Gorilla, RLE, simple8b, plain; `decode`, `decode_compact`, `decode_compact_prefix`) |
+| `block_envelope` | envelope do bloco (`unpack`, CRC) + wrapper LZ4/ZSTD (`decompress`) |
+| `codec_stream` | cada codec isolado (simple8b, delta, dod, Gorilla 32/64, RLE, varint) |
+| `chunk_file` | arquivo `.tfl` inteiro (CRC do header reparado): header, índice de séries, bloom, `decode_series`, `fetch_row`, `read_block` |
+| `small_records` | entrada de série, valor/linha, bloom, tombstones, cabeçalho de cifra |
+| `manifest` | `MANIFEST` v1/v2/v3 (com e sem CRC reparado) |
+| `wal_segment` | segmento WAL (CRC das entradas reparado), replay em todos os modos |
+| `wal_payload` | corpo de entrada WAL (DELETE_RANGE/DELETE_ROWS/linha) |
+
+Rodar (imagem descartável com nightly + cargo-fuzz; target e corpus em volumes):
+
+```bash
+docker build -t moosedb-fuzz-img storage/moosedb/rust/fuzz
+R='docker run --rm -v "$PWD:/work" -v moosedb-target-fuzz:/fuzz-target -e CARGO_TARGET_DIR=/fuzz-target -w /work/storage/moosedb/rust/fuzz moosedb-fuzz-img'
+eval $R cargo +nightly fuzz build
+eval $R cargo run --release --bin gen_seeds /fuzz-target/corpus      # corpus inicial (arquivos reais)
+eval $R /fuzz-target/x86_64-unknown-linux-gnu/release/chunk_file /fuzz-target/corpus/chunk_file \
+        -max_total_time=600 -timeout=10 -rss_limit_mb=2048
+```
+
+Critério: entrada arbitrária devolve `Err` — nunca panic, travamento
+(`-timeout`) ou alocação acima do teto (`-rss_limit_mb`). Todo crash achado
+vira teste de regressão em `moosedb-tests`. O harness limita `n` (linhas) a 1 M
+por execução; o teto real (512 MiB materializados por decode) está acima disso.
+
 ### Coleta do WAL
 
-Segmentos não reutilizados na abertura (keystream CTR único), mas também não
+Segmentos não reutilizados na abertura (nonce GCM único por IV de arquivo), mas também não
 acumulam: a abertura de uma tabela com MemTable vazia grava o checkpoint e
 apaga os segmentos antigos; FLUSH/OPTIMIZE com MemTable vazia e o commit de
 um lote com spill coletam entradas mortas (respeitando lotes abertos).
@@ -453,26 +489,122 @@ só se as entradas ainda estiverem vivas.
 
 ## Criptografia
 
-`ENCRYPTION='YES' ENCRYPTION_KEY_ID=n` cifra chunks e WAL com AES-256-CTR. As
-chaves vêm do plugin de key management do servidor (`file_key_management`,
-`aws_key_management`, …) através de um callback; cada arquivo guarda id e
-versão da chave e um IV aleatório, então a rotação de chaves funciona
-(arquivos antigos seguem legíveis; novos usam a versão mais recente). A chave
-precisa ter 256 bits. Ficam em claro: os headers (contagens, intervalo de
-tempo, ids), o MANIFEST e o OPTIONS.
+`ENCRYPTION='YES' ENCRYPTION_KEY_ID=n` cifra chunks e WAL com **AES-256-GCM**
+(autenticado). As chaves vêm do plugin de key management do servidor
+(`file_key_management`, `aws_key_management`, …) através de um callback; cada
+arquivo guarda id e versão da chave e um IV aleatório de 128 bits, então a
+rotação de chaves funciona (arquivos antigos seguem legíveis; novos usam a
+versão mais recente). A chave precisa ter 256 bits. Ficam em claro: os headers
+(contagens, intervalo de tempo, ids), o MANIFEST e o OPTIONS.
 
-**Modelo de ameaça: só confidencialidade.** AES-CTR não tem MAC e os CRC32
-não são autenticação — quem escreve no datadir consegue alterar bits do texto
-claro sem a chave (testado). Integridade autenticada (AEAD) exigiria formato
-v3. Salvaguardas atuais:
+**Desenho** (`crypto.rs`). Cada *unidade* é selada separadamente e portanto lida
+e verificada separadamente: um bloco de coluna do chunk, a seção
+índice+Bloom do chunk, uma entrada do WAL. Unidade armazenada = texto cifrado +
+tag de 16 bytes.
 
-* abertura **fail-closed**: falha de decriptação do índice (chave errada ou
-  índice corrompido sob cifra) recusa a abertura sem quarentena e sem
-  reescrever o MANIFEST; para descartar um chunk de fato corrompido, o
-  operador o renomeia para `.tfl.corrupt`;
-* tabela cifrada não aceita chunk em claro, e vice-versa;
+| | Chunk v3 | WAL v3 |
+|---|---|---|
+| nonce (128 bits) | IV do arquivo com a posição da unidade no arquivo (u64 BE, relativa ao início dos dados) XOR nos 8 bytes baixos | idem, posição = início da entrada |
+| AAD | os 64 bytes do header do chunk (versão, flags, `chunk_id`, intervalo, contagens, `wal_seq`, fingerprint) + tipo da unidade (`0` bloco; `1` índice, com `bloom_offset`) | os 40 bytes do header do segmento (versão, flags, chave, IV) + número do segmento |
+| `len`/`BlockRef.len` | `BlockRef.len` não conta a tag; `offset` conta | `len` da entrada = payload + 16 |
+
+Nonce único: o IV é aleatório por arquivo (128 bits) e a posição é única dentro
+do arquivo (blocos e índice nunca se sobrepõem; entradas do WAL nunca são
+reescritas — segmento novo a cada abertura, falha de escrita invalida o
+segmento). Como o header entra no AAD e o `chunk_id`/número do segmento também,
+trocar blocos entre arquivos, reordenar blocos, mover entradas para outra
+posição/segmento, editar o índice (que nomeia os blocos) ou o header falha a
+verificação **antes** de qualquer decodificação.
+
+**Resultado de uma falha**: bloco → `Error::Corrupt` (o `read_block` nunca
+devolve dado); índice do chunk e entrada do WAL → `Error::Crypto`
+(*fail-closed*: chave errada e adulteração não se distinguem, então não há
+quarentena nem reescrita do MANIFEST). Dano visível sem a chave (CRC do header
+ou do footer) segue o caminho de antes: quarentena do chunk.
+
+**Compatibilidade**: chunk v2 e WAL v2 *com* a flag ENCRYPTED são o formato
+antigo AES-256-CTR sem MAC; continuam legíveis (um aviso vai ao log na
+abertura do chunk) mas **sem autenticação**. Toda escrita nova é v3.
+`OPTIMIZE TABLE` reescreve chunks antigos como v3 (mesmo com um só chunk no
+intervalo); segmentos de WAL antigos somem no próximo flush. Chunks e WAL em
+claro continuam v2 e legíveis por binários antigos; um binário antigo diante
+de arquivo v3 recusa explicitamente ("version 3 not supported").
+
+**Limites do modelo de ameaça**: a autenticação é por unidade, não por tabela:
+a detecção de troca, reordenação e truncamento vale **dentro de uma
+unidade/arquivo** (blocos de um chunk, entradas de um segmento WAL). Quem
+escreve no datadir ainda consegue (a) apagar um chunk ou um segmento WAL
+inteiro, ou cortar o fim do último segmento (tratado como torn tail; o CRC é
+recalculável sem a chave), (b) substituir um arquivo por uma cópia antiga
+válida do mesmo `chunk_id`/segmento (rollback), (c) copiar um chunk GCM de
+outra tabela com a mesma chave (o AAD não amarra a tabela), (d) alterar o MANIFEST
+(CRC32, em claro) — por exemplo trocar a lista de chunks vivos ou os
+tombstones. O `CHECK TABLE` continua sem chave e só confere CRC32. Salvaguardas:
+
+* abertura **fail-closed**: falha de decriptação/autenticação do índice
+  recusa a abertura sem quarentena e sem reescrever o MANIFEST; para descartar
+  um chunk de fato corrompido, o operador o renomeia para `.tfl.corrupt`;
+* tabela cifrada não aceita chunk nem segmento WAL (com entradas) em claro, e vice-versa — o replay compara a flag do segmento com a configuração da tabela antes de ler;
 * sem chave disponível, criação, abertura e flush falham — não há fallback
   para texto claro.
+
+## Formato em disco v1.0
+
+Todos os números de versão estão em `moosedb-core/src/format.rs`. Regras
+comuns a todos os arquivos:
+
+1. **Escrita**: emite a *menor* versão que expressa o conteúdo. Uma tabela
+   sem criptografia e sem `DELETE` continua gravando exatamente os formatos
+   v0.x (chunk v2, WAL v2, MANIFEST v2); binários antigos seguem abrindo-a.
+2. **Leitura**: cada leitor aceita só as versões da tabela abaixo. Qualquer
+   outra (ou flag/combinação impossível, como chunk v3 sem `ENCRYPTED`) vira
+   `Error::Corrupt("... version N not supported")` — recusa explícita, sem
+   leitura parcial nem reinterpretação.
+3. **Binário antigo, arquivo novo**: chunk v3, WAL v3 e MANIFEST v3 são
+   recusados pela mensagem acima (já valia para o MANIFEST v3 dos tombstones).
+4. **Binário novo, arquivo antigo**: lê tudo que um binário v0.x gravou. Os
+   arquivos CTR antigos são lidos sem autenticação (aviso no log do chunk);
+   a migração é preguiçosa e não precisa de passo de upgrade: o WAL antigo é
+   consumido no flush, chunks antigos são reescritos por `OPTIMIZE TABLE`
+   (ou por qualquer compactação que os junte).
+5. **Rebaixar** uma tabela cifrada para um binário v0.x não é possível (os
+   arquivos v3 são recusados); exporte os dados (`INSERT ... SELECT`).
+6. Uma versão nova de formato exige: constante em `format.rs`, leitor que
+   recusa as desconhecidas, **fixture binária nova** em
+   `moosedb-tests/fixtures/` e entrada nesta tabela. As fixtures antigas nunca
+   são regeradas.
+
+| Arquivo | Magic | Versão | Conteúdo | Lido por |
+|---|---|---|---|---|
+| `chunk_*.tfl` | `TFLW` … `TFLE` | **2** | em claro; ou, com a flag `ENCRYPTED`, AES-256-CTR sem tags (legado, só leitura) | v0.x e v1.0 |
+| | | **3** | sempre `ENCRYPTED`: blocos e índice+Bloom selados com AES-256-GCM + tag de 16 B | v1.0 |
+| `wal_*.tfl.wal` | `TFWL` | **1** | linhas puras, tudo confirmado (só leitura) | v0.x e v1.0 |
+| | | **2** | entradas `ROW`/`COMMIT`/`ROW_COMMIT`/`DELETE_*`; em claro ou, com `ENCRYPTED`, AES-256-CTR (legado) | v0.x e v1.0 |
+| | | **3** | idem v2, sempre `ENCRYPTED`, entradas seladas com AES-256-GCM (`len` inclui a tag) | v1.0 |
+| `MANIFEST` | `TFLM` | **1** | sem `replay_seq` (só leitura) | v0.x e v1.0 |
+| | | **2** | `wal_seq`, `replay_seq`, `next_chunk_id`, chunks vivos, CRC32 | v0.x e v1.0 |
+| | | **3** | + `born` por chunk, `tseq`, tombstones; gravado a partir do primeiro `DELETE` | v0.x com DELETE e v1.0 |
+| `OPTIONS` | — | sem versão | `chave=valor` em texto; chaves desconhecidas são ignoradas | todos |
+| `*.tmp`, `*.tfl.corrupt` | — | — | temporário de escrita atômica (apagado na abertura) / chunk em quarentena | — |
+
+O MANIFEST **não** é cifrado nem autenticado (CRC32). O header de criptografia
+(32 B: `key_id`, `key_version`, IV, reservado, CRC32) é igual em chunk e WAL,
+v2 e v3; é a *versão do contêiner* que decide se há tags.
+
+**Testes de compatibilidade** (`moosedb-tests/src/compat_tests.rs`, fixtures
+em `moosedb-tests/fixtures/`, cada uma um diretório de tabela pequeno):
+
+| Fixture | Gerada por | Cobre |
+|---|---|---|
+| `plain_v2` | código v0.x (HEAD `b37d555`) | chunk em claro v2, WAL v2, MANIFEST v2 |
+| `ctr_v2` | idem | chunk v2 e WAL v2 AES-256-CTR (chave 7, versão 1); migração por `OPTIMIZE` |
+| `wal_v1` | idem, WAL reescrito no layout v1 | WAL v1 |
+| `deleted_v3` | idem | MANIFEST v3 com tombstone |
+| `aead_v3` | v1.0 | chunk v3 e WAL v3 (trava o formato novo) |
+
+Cada teste copia a fixture, abre com o código atual e exige as mesmas linhas e
+`CHECK TABLE` limpo. Os geradores são testes `#[ignore]`
+(`gen_fixture_legacy`, `gen_fixture_aead`); só se rodam de propósito.
 
 ## Mapeamento de tipos
 
@@ -523,6 +655,7 @@ v3. Salvaguardas atuais:
 | 29 | Índice só no timestamp | Índices compostos não-UNIQUE `(tag_1..tag_k [, tempo])`, até 8 por tabela. TAG do índice: `COMMENT 'TAG'`, `NOT NULL`, inteira (`TINYINT`..`BIGINT`) ou `CHAR`/`VARCHAR` inteira (sem prefixo), sem repetição, sem `DESC`; qualquer subconjunto/ordem das TAGs (não precisa ser prefixo da ordem do schema); o tempo, se presente, é a **última** parte. O índice só no tempo continua obrigatório. `index_flags`: parte de tempo = `NEXT\|PREV\|ORDER\|RANGE`; parte TAG = `NEXT\|PREV`, e `+ORDER` só para `all_parts=0` (pergunta do `MIN/MAX(col)`); **nenhuma** parte TAG anuncia `RANGE`. Detalhes em §Leitura (índices compostos) | Zabbix lê `WHERE itemid=X AND clock BETWEEN …`, `MAX(clock) … itemid=X`, e faz self-join em `(itemid, clock)`; sem índice cada linha do join varria a série inteira (4,1 s vs 0,7 ms no InnoDB). A engine não tem estrutura de índice: a leitura é "quais séries casam as TAGs da chave" (cache de TAG, O(1)) + faixa de tempo (poda por busca binária), servida pelo k-way merge que já existia. Por isso a ordem que o servidor pode assumir é só a que isso dá de graça (ver §Leitura), e **não** se anuncia ordem nem faixa entre valores de TAG. |
 | 30 | Índices só não-UNIQUE ("linhas não são únicas por tag+tempo") | **Uma** `PRIMARY KEY`/`UNIQUE (todas as TAGs em qualquer ordem, tempo[, 1-2 colunas INT NOT NULL])`, com unicidade verificada de verdade (`ER_DUP_ENTRY`, `INSERT IGNORE`, errkey = a chave). Sem TAGs: só `UNIQUE(tempo)`. TAG de texto na chave exige collation binária NO PAD (ou inteira); `REPLACE`/`ODKU` sobre chave existente → `ER_ILLEGAL_HA` (sem UPDATE; depois de um `DELETE` da chave inserem normalmente); `unique_checks=0` pula a checagem. Detalhes em §Chave única | O Zabbix 7.0 declara `PRIMARY KEY (itemid,clock,ns)`; antes só rodava com a PK removida. Subconjunto de TAGs foi recusado: unicidade sobre parte da identidade da série exigiria checar várias séries a cada INSERT. Collation `_ci`/PAD SPACE foi recusada porque duas séries (bytes diferentes) seriam a mesma chave. O índice de tempo isolado deixa de ser obrigatório quando existe a chave única (ela contém o tempo). |
 | 31 | Engine append-only: sem `DELETE` (a retenção por chunk era a única remoção) | `DELETE` suportado por **tombstones** duráveis (faixa de tempo × séries, ou linhas exatas), com a atomicidade e a visibilidade do `INSERT` e remoção física na compactação. MANIFEST v3 (`born` por chunk, `tseq`, tombstones) só depois do primeiro `DELETE`; entradas WAL 4 e 5. `UPDATE` segue recusado. `DELETE` com `WHERE` roda concorrente com `INSERT`. Detalhes em §DELETE | O housekeeper e `history.clear` do Zabbix apagam por item/intervalo. Reescrever chunks a cada `DELETE` custaria O(chunk) por statement (5.000 por dia); o tombstone custa O(1) e o espaço volta na compactação. |
+| 32 | AES-256-CTR sem MAC (§14 da spec) | AES-256-**GCM** (crate `aes-gcm` 0.10 da RustCrypto, mesma família de `aes`/`ctr`); arquivos CTR antigos continuam legíveis, sem autenticação | CTR não detecta adulteração (o CRC32 é linear e recomputável por quem escreve no datadir). GCM é um AEAD pronto, com AAD; CTR+HMAC exigiria duas crates novas (`hmac`+`sha2`) e composição manual. Formato novo: chunk v3 / WAL v3 (§Formato em disco v1.0). Resolve a limitação "criptografia sem integridade autenticada". |
 
 ## DELETE (tombstones)
 
@@ -752,11 +885,11 @@ exatamente `col = const` / `col IN (consts)` (sem NOT/OR/NULL na lista) vai ao c
 como `TF_AGG_FILTER_VALUES`, sem fase de dicionário, quando a comparação é
 byte a byte: inteiro com constantes inteiras (constante fora do range da coluna
 é descartada; `BIGINT UNSIGNED` vai como padrão de bits) ou VARCHAR com collation
-binária NO PAD (`utf8mb4_nopad_bin`; `utf8mb4_bin` é PAD SPACE e NÃO serve), cuja
+binária NO PAD (`utf8mb4_nopad_bin`) ou binária PAD SPACE (`utf8mb4_bin`, `latin1_bin`; só em utf8mb4/utf8mb3/latin1/ascii, com `pad_space=1`: espaços finais 0x20 ignorados dos dois lados), cuja
 collation de comparação seja a da coluna e cujas constantes estejam no charset da
 coluna. Qualquer outro caso fica no dicionário + máscara. (2) *Top-N*:
 uma chave não-TAG, `ORDER BY` de um único agregado (COUNT/SUM/MIN/MAX, não AVG)
-com `LIMIT`, sem HAVING, chave inteira (não `BIGINT UNSIGNED`) ou string
+com `LIMIT` (ou `ORDER BY agregado, a própria chave ASC`: ordem SQL total, 2º termo = desempate do core), sem HAVING, chave inteira (não `BIGINT UNSIGNED`) ou string
 binária NO PAD; o desempate do core (chave crescente) é o do handler
 (`cmp_raw`), então os K grupos são os mesmos. Chave TAG nunca usa (o core
 desempata por id de série, o handler pelo valor). Status `Moosedb_gbh_exact_filters`
@@ -962,8 +1095,24 @@ scan não ordenado: só o commitado; o lote privado do statement é invisível).
   durante a espera por uma série saem com as linhas anteriores do statement já
   mantidas (#24), ao contrário do InnoDB; quem re-executa recebe `ER_DUP_ENTRY` nessas
   linhas. Recomendação: `INSERT IGNORE` no retry, ou statements de uma série / ordem
-  de séries consistente. O estado de unicidade (~70 B/série, em `Inner`) não entra no
-  `moosedb_batch_memory_budget`. O desempate por `ns` em varredura ordenada de tabela
+  de séries consistente. O estado de unicidade (em `Inner`) tem teto próprio por
+  tabela: `settings::unique_state_bytes`, padrão ¼ de `moosedb_batch_memory_budget`
+  (256 MiB), sem sysvar própria. Custo medido: ~146 B de RSS por série (era ~224 antes
+  de encaixotar o `Top::Many`; cobrança de 150 B/série + 32 B por extra além do
+  primeiro; conjunto de extras no mesmo `ts` limitado a 1024, acima vira
+  "desconhecido" e cada linha naquele instante faz lookup). Ao estourar, o quarto mais
+  frio das séries (menor `max_ts`) é descartado e o maior `max_ts` descartado vira um
+  piso (`evicted`): série sem entrada só é aceita sem lookup acima do piso, e entradas
+  recriadas abaixo dele herdam o piso como limite e nascem incompletas — a unicidade
+  continua exata (testado com modelo, restart e WAL), só a checagem de linhas
+  antigas/recentes das séries descartadas fica mais lenta (lookup nos chunks). Com
+  orçamento menor que o conjunto quente, o piso sobe até "agora" e toda linha vira
+  lookup (correto, lento). Memória do `SeriesIndex` (não limitável: é o catálogo de
+  séries): ~270 B/série com TAG de 20 bytes (`TableStats::series_bytes`, estimativa;
+  `unique_bytes` mostra o estado de unicidade); `moosedb_series_list` já é um
+  snapshot compartilhado (O(1), sem cópia), a cópia ordenada `Table::series()` custa
+  ~96 B/série e não é usada pela FFI. Ainda não exposto no INFORMATION_SCHEMA
+  (precisa de campo FFI + handler). O desempate por `ns` em varredura ordenada de tabela
   inteira com PK coleta e ordena o grupo de cada instante (custo extra por linha;
   não medido isoladamente). `Table::write_shared` usa um prazo fixo de 50 s
   (o handler não o usa: respeita `moosedb_unique_lock_wait_timeout`).
@@ -1004,7 +1153,7 @@ scan não ordenado: só o commitado; o lote privado do statement é invisível).
 * 1 MiB ≤ `MEMTABLE_SIZE` ≤ 96 MiB (garante blocos de flush < 256 MiB); tabelas antigas
   com valor maior abrem com o valor limitado.
 * O plugin se declara `EXPERIMENTAL`: requer `plugin_maturity=experimental`.
-* Criptografia sem integridade autenticada (ver §Criptografia).
+* Autenticação da criptografia é por unidade (bloco/entrada), não da tabela: apagar ou truncar arquivos, restaurar cópia antiga válida e alterar o MANIFEST não são detectados (ver §Criptografia).
 * **`mariadb-backup` não copia tabelas MooseDB**: ele pula subdiretórios do
   banco (`extra/mariabackup/backup_copy.cc:379`) e só copia extensões fixas
   (`backup_copy.cc:926-943`, `common_engine.cc:352-361`). Os hooks

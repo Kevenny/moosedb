@@ -13,10 +13,11 @@ use crate::block;
 use crate::bytes::{put_i64, put_u32, put_u64};
 use crate::chunk::{
     chunk_file_name, chunk_flags, encode_series_entry, series_offsets, BlockRef, ChunkFile, ChunkHeader, ChunkMeta,
-    SeriesEntry, FOOTER_MAGIC, HEADER_LEN, VERSION,
+    SeriesEntry, FOOTER_MAGIC, HEADER_LEN,
 };
 use crate::compression::Codec;
-use crate::crypto::CipherParams;
+use crate::crypto::{CipherParams, TAG_LEN};
+use crate::format::{CHUNK_AEAD, CHUNK_PLAIN};
 use crate::error::{invalid, Result};
 use crate::index::bloom::Bloom;
 use crate::schema::{Row, Schema, Value};
@@ -72,7 +73,8 @@ pub(crate) struct ChunkBuilder<'a> {
     codec: Codec,
     cipher: Option<CipherParams>,
     data_start: u64,
-    /// Data section bytes (plaintext until `finish`).
+    /// Data section bytes (plaintext until `finish`; with a cipher, each
+    /// block is followed by `TAG_LEN` zero bytes that `finish` fills in).
     data: Vec<u8>,
     entries: Vec<SeriesEntry>,
     raw_bytes: u64,
@@ -108,6 +110,9 @@ impl<'a> ChunkBuilder<'a> {
                 len: u32::try_from(b.bytes.len()).map_err(|_| invalid("column block exceeds 4GiB"))?,
             });
             self.data.extend_from_slice(&b.bytes);
+            if self.cipher.is_some() {
+                self.data.extend_from_slice(&[0; TAG_LEN]);
+            }
             self.raw_bytes += b.plain_len as u64;
         }
         self.entries.push(SeriesEntry {
@@ -150,7 +155,7 @@ impl<'a> ChunkBuilder<'a> {
         bloom.encode(&mut buf);
 
         let header = ChunkHeader {
-            version: VERSION,
+            version: if self.cipher.is_some() { CHUNK_AEAD } else { CHUNK_PLAIN },
             flags: chunk_flags(self.codec, self.cipher.is_some()),
             ts_min,
             ts_max,
@@ -161,10 +166,21 @@ impl<'a> ChunkBuilder<'a> {
             wal_seq,
             schema_fingerprint: self.schema.fingerprint(),
         };
-        buf[..HEADER_LEN].copy_from_slice(&header.encode());
-        if let Some(c) = &self.cipher {
+        let header_bytes = header.encode();
+        buf[..HEADER_LEN].copy_from_slice(&header_bytes);
+        // Authenticated encryption: every block and the index+bloom section are
+        // sealed separately; the tags are bound to the header just written.
+        let cipher = self.cipher.map(|c| c.authenticated(header_bytes.to_vec()));
+        if let Some(c) = &cipher {
             buf[HEADER_LEN..start].copy_from_slice(&c.encode());
-            c.apply(&mut buf[start..], 0);
+            for b in self.entries.iter().flat_map(|e| &e.blocks) {
+                let (from, to) = (b.offset as usize, b.offset as usize + b.len as usize);
+                let tag = c.seal(&mut buf[from..to], b.offset - self.data_start, &[crate::chunk::UNIT_BLOCK])?;
+                buf[to..to + TAG_LEN].copy_from_slice(&tag);
+            }
+            let ctx = crate::chunk::index_ctx(bloom_offset);
+            let tag = c.seal(&mut buf[index_offset as usize..], index_offset - self.data_start, &ctx)?;
+            buf.extend_from_slice(&tag);
         }
         put_u64(&mut buf, index_offset);
         put_u64(&mut buf, bloom_offset);
@@ -200,7 +216,7 @@ impl<'a> ChunkBuilder<'a> {
             series_offsets: series_offsets(&self.entries),
             series: self.entries,
             bloom,
-            cipher: self.cipher,
+            cipher,
             by_id: Default::default(),
             // Callers that publish the chunk set the real value (`Table`).
             born: u64::MAX,

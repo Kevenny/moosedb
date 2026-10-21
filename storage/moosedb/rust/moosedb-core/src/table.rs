@@ -131,6 +131,10 @@ pub struct TableStats {
     pub chunk_count: u32,
     pub memtable_rows: u64,
     pub series_count: u64,
+    /// Estimated heap bytes of the series index (tag values, keys, maps).
+    pub series_bytes: u64,
+    /// Bytes charged to the UNIQUE-key state (bounded, see `unique.rs`).
+    pub unique_bytes: u64,
 }
 
 pub(crate) struct Inner {
@@ -605,7 +609,7 @@ impl Table {
         let limits = wal::ReplayLimits::standard();
         let manifest_tseq = manifest.tseq;
         let replayed =
-            wal::replay_events(&dir, &replay, manifest.wal_seq, true, &limits, &too_big, |seq, event| match event {
+            wal::replay_events(&dir, &replay, manifest.wal_seq, true, Some(config.opts.encryption_key_id.is_some()), &limits, &too_big, |seq, event| match event {
                 wal::ReplayEvent::Row(payload) => {
                     let row = decode_row(&mut ByteReader::new(payload))?;
                     schema.validate_row(&row).map_err(|e| {
@@ -1118,6 +1122,8 @@ impl Table {
             chunk_count: inner.chunks.len() as u32,
             memtable_rows: inner.memtable.len() as u64,
             series_count: inner.series.len() as u64,
+            series_bytes: inner.series.bytes() as u64,
+            unique_bytes: inner.uniq.bytes() as u64,
             ..TableStats::default()
         };
         for c in &inner.chunks {

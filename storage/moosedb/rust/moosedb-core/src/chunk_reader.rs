@@ -9,11 +9,11 @@ use crate::block;
 use crate::bytes::ByteReader;
 use crate::cache::{self, BlockPayload, DecodedSeries};
 use crate::chunk::{
-    decode_series_entry, series_offsets, BlockRef, ChunkFile, ChunkHeader, ChunkMeta, ENC_HEADER_LEN, FOOTER_LEN,
+    decode_series_entry, index_ctx, UNIT_BLOCK, series_offsets, BlockRef, ChunkFile, ChunkHeader, ChunkMeta, ENC_HEADER_LEN, FOOTER_LEN,
     FOOTER_MAGIC, HEADER_LEN,
 };
 use crate::compression::{MAX_BLOCK_RAW, MAX_SERIES_ROWS};
-use crate::crypto::CipherParams;
+use crate::crypto::{CipherParams, TAG_LEN};
 use crate::error::{corrupt, Error, Result};
 use crate::index::bloom::Bloom;
 use crate::schema::{ColumnType, Row, Schema};
@@ -52,7 +52,8 @@ pub(crate) fn read_meta(path: &Path, id: u64) -> Result<ChunkMeta> {
         crate::crypto::ensure_available()?;
         let mut eb = [0u8; ENC_HEADER_LEN];
         f.read_exact(&mut eb)?;
-        Some(CipherParams::decode(&eb)?)
+        let c = CipherParams::decode(&eb)?;
+        Some(if header.is_authenticated() { c.authenticated(hb.to_vec()) } else { c })
     } else {
         None
     };
@@ -73,12 +74,6 @@ pub(crate) fn read_meta(path: &Path, id: u64) -> Result<ChunkMeta> {
     let mut meta_bytes = vec![0u8; (footer_start - footer.index_offset) as usize];
     f.seek(SeekFrom::Start(footer.index_offset))?;
     f.read_exact(&mut meta_bytes)?;
-    if let Some(c) = &cipher {
-        c.apply(&mut meta_bytes, footer.index_offset - data_start);
-    }
-    let split = (footer.bloom_offset - footer.index_offset) as usize;
-    let (index_bytes, bloom_bytes) = meta_bytes.split_at(split);
-
     let encrypted = cipher.is_some();
     // Index/bloom bytes are only meaningful after decryption: under a wrong
     // key they are garbage, which looks like corruption but is not provable
@@ -91,6 +86,32 @@ pub(crate) fn read_meta(path: &Path, id: u64) -> Result<ChunkMeta> {
             corrupt(msg)
         }
     };
+    if let Some(c) = &cipher {
+        if c.is_authenticated() {
+            let ctx = index_ctx(footer.bloom_offset);
+            let pos = footer.index_offset - data_start;
+            let Some(n) = meta_bytes.len().checked_sub(TAG_LEN) else { return Err(bad_index("unreadable series index")) };
+            let (body, tag) = meta_bytes.split_at_mut(n);
+            if !c.open(body, tag, pos, &ctx) {
+                return Err(bad_index("series index failed authentication"));
+            }
+            meta_bytes.truncate(n);
+        } else {
+            c.apply_ctr(&mut meta_bytes, footer.index_offset - data_start);
+        }
+        if !c.is_authenticated() {
+            crate::log::warn(&format!(
+                "{} is encrypted without authentication (legacy format); OPTIMIZE TABLE rewrites it authenticated",
+                path.display()
+            ));
+        }
+    }
+    let split = (footer.bloom_offset - footer.index_offset) as usize;
+    if split > meta_bytes.len() {
+        return Err(bad_index("unreadable series index"));
+    }
+    let (index_bytes, bloom_bytes) = meta_bytes.split_at(split);
+
     let mut r = ByteReader::new(index_bytes);
     let raw_bytes = r.u64().map_err(|_| bad_index("unreadable series index"))?;
     let (bucket_lo, bucket_hi) = match (r.i64(), r.i64()) {
@@ -113,7 +134,7 @@ pub(crate) fn read_meta(path: &Path, id: u64) -> Result<ChunkMeta> {
         }
         total_rows += u64::from(e.row_count);
         for b in &e.blocks {
-            let end = b.offset.checked_add(u64::from(b.len));
+            let end = b.offset.checked_add(u64::from(b.len)).and_then(|e| e.checked_add(header.block_overhead() as u64));
             if b.offset < data_start
                 || end.map_or(true, |end| end > footer.index_offset)
                 || b.len as usize > block::HEADER_LEN + MAX_BLOCK_RAW
@@ -169,10 +190,25 @@ pub(crate) fn read_block(meta: &ChunkMeta, b: BlockRef) -> Result<Arc<BlockPaylo
     if b.len as usize > block::HEADER_LEN + MAX_BLOCK_RAW {
         return Err(corrupt(format!("block of {} bytes is too large", b.len)));
     }
-    let mut bytes = vec![0u8; b.len as usize];
+    let len = b.len as usize;
+    let mut bytes = vec![0u8; len + meta.header.block_overhead()];
     cache::read_at(&file, &mut bytes, b.offset)?;
     if let Some(c) = &meta.cipher {
-        c.apply(&mut bytes, b.offset - meta.header.data_start());
+        let pos = b.offset - meta.header.data_start();
+        if c.is_authenticated() {
+            // Verified before anything is decoded; a failure is never data.
+            let (body, tag) = bytes.split_at_mut(len);
+            if !c.open(body, tag, pos, &[UNIT_BLOCK]) {
+                return Err(corrupt(format!(
+                    "{} at offset {}: block failed authentication (altered, moved or wrong key)",
+                    meta.path().display(),
+                    b.offset
+                )));
+            }
+            bytes.truncate(len);
+        } else {
+            c.apply_ctr(&mut bytes, pos);
+        }
     }
     let payload = Arc::new(
         block::unpack(&bytes).map_err(|e| corrupt(format!("{} at offset {}: {e}", meta.path().display(), b.offset)))?,

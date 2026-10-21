@@ -25,7 +25,11 @@ pub mod compression;
 pub mod crypto;
 pub mod delete;
 pub mod error;
+#[cfg(feature = "fuzz")]
+#[doc(hidden)]
+pub mod fuzz_api;
 mod fasthash;
+mod format;
 mod fsutil;
 pub mod index;
 pub mod inspect;
@@ -33,6 +37,8 @@ mod log;
 pub mod maintenance;
 mod manifest;
 mod memtable;
+#[cfg(test)]
+mod memprobe;
 pub mod options;
 mod rowbatch;
 pub mod scan;

@@ -108,9 +108,9 @@ INSERT INTO mirror.g SELECT * FROM test.g;
 --source suite/moosedb/include/gbh_sc.inc
 
 --echo ##########################################################
---echo # Not byte-exact: dictionary + mask (exact filters=0)
+--echo # Dictionary + mask (exact filters=0), except kp (binary PAD SPACE: exact with pad_space)
 --echo ##########################################################
---let $label= PAD SPACE binary collation: 'a' = 'a ' (utf8mb4_bin is not byte-exact)
+--let $label= PAD SPACE binary collation (utf8mb4_bin): trailing spaces ignored, exact value set with pad_space
 --let $q= SELECT host, COUNT(*) c FROM g WHERE kp = 'a' GROUP BY host ORDER BY host
 --source suite/moosedb/include/gbh_sc.inc
 --let $q= SELECT host, COUNT(*) c FROM g WHERE kp IN ('a ', 'b') GROUP BY host ORDER BY host
@@ -206,6 +206,31 @@ SET SESSION moosedb_group_by_pushdown = ON;
 --source suite/moosedb/include/gbh_sc.inc
 --let $label= two keys
 --let $q= SELECT i, ty, SUM(bytes) s FROM g GROUP BY i, ty ORDER BY s DESC, i, ty LIMIT 3
+--source suite/moosedb/include/gbh_sc.inc
+
+--echo ##########################################################
+--echo # Top-N with ORDER BY aggregate, key ASC (total SQL order, ties at the boundary)
+--echo ##########################################################
+--let $label= integer key (NULL group among the ties), aggregate DESC / ASC
+--let $q= SELECT i, COUNT(*) c FROM g WHERE ts < '2024-03-01 00:10:00' GROUP BY i ORDER BY c DESC, i LIMIT 4
+--source suite/moosedb/include/gbh_sc.inc
+--let $q= SELECT i, COUNT(*) c FROM g WHERE ts < '2024-03-01 00:10:00' GROUP BY i ORDER BY c, i LIMIT 4
+--source suite/moosedb/include/gbh_sc.inc
+--let $q= SELECT i, COUNT(*) c FROM g WHERE i IS NOT NULL AND i < 10 GROUP BY i ORDER BY c, i LIMIT 5 OFFSET 1
+--source suite/moosedb/include/gbh_sc.inc
+--let $q= SELECT i, SUM(bytes) s, COUNT(*) c FROM g WHERE i < 12 GROUP BY i ORDER BY c DESC, i LIMIT 3
+--source suite/moosedb/include/gbh_sc.inc
+--let $label= NO PAD string key (NULL key, ties)
+--let $q= SELECT kb, COUNT(*) c FROM g WHERE ts < '2024-03-01 00:20:00' GROUP BY kb ORDER BY c DESC, kb LIMIT 3
+--source suite/moosedb/include/gbh_sc.inc
+--let $q= SELECT kb, MIN(ts) t FROM g GROUP BY kb ORDER BY t, kb LIMIT 4
+--source suite/moosedb/include/gbh_sc.inc
+--let $label= key DESC in the second term, BIGINT UNSIGNED key, PAD SPACE string key: no core top-N
+--let $q= SELECT i, COUNT(*) c FROM g WHERE i < 10 GROUP BY i ORDER BY c, i DESC LIMIT 4
+--source suite/moosedb/include/gbh_sc.inc
+--let $q= SELECT bu, COUNT(*) c FROM g WHERE ts < '2024-03-01 00:10:00' GROUP BY bu ORDER BY c DESC, bu LIMIT 3
+--source suite/moosedb/include/gbh_sc.inc
+--let $q= SELECT COUNT(*) c FROM g GROUP BY kp ORDER BY c DESC, kp LIMIT 3
 --source suite/moosedb/include/gbh_sc.inc
 
 DROP DATABASE mirror;

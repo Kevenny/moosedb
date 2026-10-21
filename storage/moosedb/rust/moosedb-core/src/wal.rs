@@ -8,8 +8,11 @@
 //! entry   := crc32:u32 len:u32 payload[len]     crc32 covers len || payload (as stored)
 //! ```
 //!
-//! The payload is encrypted with AES-256-CTR (keystream offset = file offset)
-//! when the table is encrypted. Appends are buffered; durability is reached
+//! When the table is encrypted the payload is sealed with AES-256-GCM (segment
+//! version 3): `len` counts the payload plus its 16-byte tag, the nonce comes
+//! from the entry's file offset and the AAD is the segment header and number,
+//! so an entry cannot be altered, moved or replayed in another segment. (Version
+//! 2 encrypted segments, AES-256-CTR with no tag, are still readable.) Appends are buffered; durability is reached
 //! by `sync`, which the handler calls at statement end.
 //!
 //! Payload by segment version:
@@ -43,8 +46,9 @@ use std::path::{Path, PathBuf};
 use crate::bytes::{put_i64, put_u32, put_u64, ByteReader};
 use crate::codec::{decode_row, encode_row};
 use crate::tomb::{decode_rows, encode_rows, RowsTomb};
-use crate::crypto::{CipherParams, PARAMS_LEN};
-use crate::error::{corrupt, Error, Result};
+use crate::crypto::{CipherParams, PARAMS_LEN, TAG_LEN};
+use crate::format::{WAL_AEAD, WAL_PLAIN, WAL_V1};
+use crate::error::{corrupt, invalid, Error, Result};
 use crate::fsutil::{self, sync_dir};
 use crate::log::warn;
 use crate::schema::Value;
@@ -52,8 +56,6 @@ use crate::schema::Value;
 const WAL_PREFIX: &str = "wal_";
 const WAL_SUFFIX: &str = ".tfl.wal";
 const MAGIC: &[u8; 4] = b"TFWL";
-/// Version written by new segments; version 1 is still readable.
-const VERSION: u16 = 2;
 const K_ROW: u8 = 1;
 const K_COMMIT: u8 = 2;
 const K_ROW_COMMIT: u8 = 3;
@@ -279,6 +281,37 @@ pub(crate) fn list_segments(dir: &Path) -> Result<Vec<u64>> {
     Ok(seqs)
 }
 
+/// What the tags of segment `seq` are bound to: its header (version, flags,
+/// key id/version, IV) and its number.
+fn bind(header: &[u8], seq: u64) -> Vec<u8> {
+    let mut b = header.to_vec();
+    b.extend_from_slice(&seq.to_le_bytes());
+    b
+}
+
+/// Cipher of a segment whose header is `header` (BASE_HEADER + PARAMS_LEN bytes).
+fn segment_cipher(header: &[u8], version: u16, seq: u64) -> Result<CipherParams> {
+    let c = CipherParams::decode(header.get(BASE_HEADER..).ok_or_else(|| corrupt("WAL header truncated"))?)?;
+    Ok(if version == WAL_AEAD { c.authenticated(bind(header, seq)) } else { c })
+}
+
+/// Decrypts the stored `body` of the entry at `pos` in place, verifying its
+/// tag when the segment is authenticated. A failed check is `Crypto`: a wrong
+/// key and an altered entry cannot be told apart (fail closed, no truncation).
+fn unseal(c: &CipherParams, body: &mut Vec<u8>, pos: u64) -> Result<()> {
+    if !c.is_authenticated() {
+        c.apply_ctr(body, pos + ENTRY_HEADER as u64);
+        return Ok(());
+    }
+    let n = body.len().checked_sub(TAG_LEN).ok_or_else(|| corrupt("WAL entry shorter than its tag"))?;
+    let (data, tag) = body.split_at_mut(n);
+    if !c.open(data, tag, pos, &[]) {
+        return Err(Error::Crypto(format!("WAL entry at offset {pos} failed authentication (altered or wrong key)")));
+    }
+    body.truncate(n);
+    Ok(())
+}
+
 pub(crate) struct Wal {
     seq: u64,
     out: BufWriter<File>,
@@ -300,15 +333,17 @@ impl Wal {
     /// Creates a brand-new, empty segment (header fsynced). Fails if it exists.
     pub(crate) fn create(dir: &Path, seq: u64, encryption_key: Option<u32>) -> Result<Wal> {
         let cipher = encryption_key.map(CipherParams::for_new_file).transpose()?;
+        let version = if cipher.is_some() { WAL_AEAD } else { WAL_PLAIN };
         let path = segment_path(dir, seq);
         let mut file = OpenOptions::new().write(true).create_new(true).open(&path)?;
         let mut header = Vec::with_capacity(BASE_HEADER + PARAMS_LEN);
         header.extend_from_slice(MAGIC);
-        header.extend_from_slice(&VERSION.to_le_bytes());
+        header.extend_from_slice(&version.to_le_bytes());
         header.extend_from_slice(&(if cipher.is_some() { FLAG_ENCRYPTED } else { 0 }).to_le_bytes());
         if let Some(c) = &cipher {
             header.extend_from_slice(&c.encode());
         }
+        let cipher = cipher.map(|c| c.authenticated(bind(&header, seq)));
         let written = file.write_all(&header).map_err(Error::from).and_then(|()| fsutil::sync_all(&file));
         if let Err(e) = written {
             // A segment with a partial header is useless; do not leave it behind.
@@ -339,20 +374,22 @@ impl Wal {
 
     pub(crate) fn append(&mut self, payload: &[u8]) -> Result<()> {
         self.check_usable()?;
-        let len = u32::try_from(payload.len())
+        u32::try_from(payload.len())
             .ok()
             .filter(|&l| (l as usize) <= max_entry())
             .ok_or_else(|| crate::error::invalid("WAL entry too large"))?;
-        let len_bytes = len.to_le_bytes();
         let mut stored;
         let body = match &self.cipher {
             Some(c) => {
-                stored = payload.to_vec();
-                c.apply(&mut stored, self.offset + ENTRY_HEADER as u64);
+                stored = Vec::with_capacity(payload.len() + TAG_LEN);
+                stored.extend_from_slice(payload);
+                let tag = c.seal(&mut stored, self.offset, &[])?;
+                stored.extend_from_slice(&tag);
                 &stored[..]
             }
             None => payload,
         };
+        let len_bytes = (body.len() as u32).to_le_bytes();
         let mut h = crc32fast::Hasher::new();
         h.update(&len_bytes);
         h.update(body);
@@ -478,8 +515,14 @@ pub(crate) fn replay_at(
     r.take(4)?;
     let version = r.u16()?;
     let flags = r.u16()?;
-    if version != VERSION && version != 1 {
-        return Err(corrupt(format!("{}: WAL version {version} not supported", path.display())));
+    if version != WAL_AEAD && version != WAL_PLAIN && version != WAL_V1 {
+        return Err(corrupt(format!(
+            "{}: WAL version {version} not supported (this binary reads {WAL_V1} to {WAL_AEAD})",
+            path.display()
+        )));
+    }
+    if version == WAL_AEAD && flags & FLAG_ENCRYPTED == 0 {
+        return Err(corrupt(format!("{}: WAL version 3 without the ENCRYPTED flag", path.display())));
     }
     let mut header_len = BASE_HEADER as u64;
     let cipher = if flags & FLAG_ENCRYPTED != 0 {
@@ -495,7 +538,7 @@ pub(crate) fn replay_at(
         if file_len == max_header {
             return Ok(never_used(0));
         }
-        Some(CipherParams::decode(r.take(PARAMS_LEN)?)?)
+        Some(segment_cipher(&prefix[..header_len as usize], version, seq)?)
     } else {
         None
     };
@@ -511,7 +554,7 @@ pub(crate) fn replay_at(
         input.read_exact(&mut head)?;
         let crc = u32::from_le_bytes([head[0], head[1], head[2], head[3]]);
         let len = u32::from_le_bytes([head[4], head[5], head[6], head[7]]) as usize;
-        if len > MAX_ENTRY || len as u64 > file_len - pos - ENTRY_HEADER as u64 {
+        if len > MAX_ENTRY + TAG_LEN || len as u64 > file_len - pos - ENTRY_HEADER as u64 {
             break;
         }
         body.clear();
@@ -530,7 +573,7 @@ pub(crate) fn replay_at(
             Some(c) => {
                 plain.clear();
                 plain.extend_from_slice(&body);
-                c.apply(&mut plain, pos + ENTRY_HEADER as u64);
+                unseal(c, &mut plain, pos)?;
                 &plain[..]
             }
             None => &body[..],
@@ -654,7 +697,10 @@ impl RowReader<'_> {
             let version = u16::from_le_bytes([head[4], head[5]]);
             let flags = u16::from_le_bytes([head[6], head[7]]);
             let cipher = if flags & FLAG_ENCRYPTED != 0 {
-                Some(CipherParams::decode(head.get(BASE_HEADER..).ok_or_else(changed)?)?)
+                if head.len() < BASE_HEADER + PARAMS_LEN {
+                    return Err(changed());
+                }
+                Some(segment_cipher(&head, version, seq)?)
             } else {
                 None
             };
@@ -667,7 +713,7 @@ impl RowReader<'_> {
         f.read_exact(&mut head).map_err(|_| changed())?;
         let crc = u32::from_le_bytes([head[0], head[1], head[2], head[3]]);
         let len = u32::from_le_bytes([head[4], head[5], head[6], head[7]]) as usize;
-        if len > MAX_ENTRY {
+        if len > MAX_ENTRY + TAG_LEN {
             return Err(changed());
         }
         self.body.clear();
@@ -679,7 +725,7 @@ impl RowReader<'_> {
             return Err(changed());
         }
         if let Some(c) = cipher {
-            c.apply(&mut self.body, pos + ENTRY_HEADER as u64);
+            unseal(c, &mut self.body, pos)?;
         }
         let version = *version;
         let payload = &self.body[..];
@@ -705,6 +751,27 @@ fn segment_has_no_entries(dir: &Path, seq: u64) -> Result<bool> {
     }
     let flags = u16::from_le_bytes([prefix[6], prefix[7]]);
     Ok(if flags & FLAG_ENCRYPTED != 0 { len <= max_header } else { len <= BASE_HEADER as u64 })
+}
+
+/// Fails if segment `seq` has entries and its ENCRYPTED flag differs from the
+/// table's configuration (a plaintext segment forged into an encrypted table
+/// would otherwise be applied without the key). Same error as for chunks.
+fn check_segment_encryption(dir: &Path, seq: u64, table_encrypted: bool) -> Result<()> {
+    let mut prefix = Vec::with_capacity(BASE_HEADER);
+    Read::by_ref(&mut File::open(segment_path(dir, seq))?).take(BASE_HEADER as u64).read_to_end(&mut prefix)?;
+    if prefix.len() < BASE_HEADER || &prefix[..4] != MAGIC {
+        return Ok(()); // never used, or replay_at rejects the header
+    }
+    let seg_encrypted = u16::from_le_bytes([prefix[6], prefix[7]]) & FLAG_ENCRYPTED != 0;
+    if seg_encrypted == table_encrypted || segment_has_no_entries(dir, seq)? {
+        return Ok(());
+    }
+    Err(invalid(format!(
+        "{} is {} but the table is configured {}",
+        segment_path(dir, seq).display(),
+        if seg_encrypted { "encrypted" } else { "not encrypted" },
+        if table_encrypted { "with encryption" } else { "without encryption" },
+    )))
 }
 
 /// Where the row starts inside a ROW payload (kind byte + batch id).
@@ -735,16 +802,18 @@ fn row_offset(version: u16) -> usize {
 /// for any row, the whole batch is withheld (all or nothing) and reported in
 /// `Replayed::rejected` (keeping only its counters). Buffered bytes stay
 /// within `limits`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn replay_committed(
     dir: &Path,
     segs: &[u64],
     flushed_seq: u64,
     recover: bool,
+    encrypted: Option<bool>,
     limits: &ReplayLimits,
     reject: &dyn Fn(&[u8]) -> bool,
     mut on_row: impl FnMut(u64, &[u8]) -> Result<()>,
 ) -> Result<Replayed> {
-    replay_events(dir, segs, flushed_seq, recover, limits, reject, |seq, ev| match ev {
+    replay_events(dir, segs, flushed_seq, recover, encrypted, limits, reject, |seq, ev| match ev {
         ReplayEvent::Row(p) => on_row(seq, p),
         ReplayEvent::Delete(_) => Ok(()),
     })
@@ -752,15 +821,23 @@ pub(crate) fn replay_committed(
 
 /// [`replay_committed`] that also reports the DELETE entries after `flushed_seq`,
 /// in log order among the committed rows.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn replay_events(
     dir: &Path,
     segs: &[u64],
     flushed_seq: u64,
     recover: bool,
+    encrypted: Option<bool>,
     limits: &ReplayLimits,
     reject: &dyn Fn(&[u8]) -> bool,
     mut on_event: impl FnMut(u64, ReplayEvent<'_>) -> Result<()>,
 ) -> Result<Replayed> {
+    // `None` only when the table's configuration is unknown (diagnostics, fuzzing).
+    if let Some(enc) = encrypted {
+        for &seq in segs {
+            check_segment_encryption(dir, seq, enc)?;
+        }
+    }
     let too_much = |what: &str, seq: u64, used: usize, limit: usize| {
         corrupt(format!(
             "WAL segment {seq}: {what} ({used}) exceeds the replay limit of {limit}; \
@@ -1074,7 +1151,7 @@ mod tests {
 
     fn committed(dir: &Path, segs: &[u64], flushed: u64) -> (Vec<(u64, Vec<u8>)>, u64) {
         let mut got = Vec::new();
-        let out = replay_committed(dir, segs, flushed, true, &ReplayLimits::standard(), &|_| false, |seq, p| {
+        let out = replay_committed(dir, segs, flushed, true, None, &ReplayLimits::standard(), &|_| false, |seq, p| {
             got.push((seq, p.to_vec()));
             Ok(())
         })
@@ -1166,7 +1243,7 @@ mod tests {
         w.append(&row_commit_entry(&r(9))).unwrap();
         w.sync(true).unwrap();
         drop(w);
-        let err = replay_committed(dir.path(), &[1, 2], 0, true, &ReplayLimits::standard(), &|_| false, |_, _| Ok(()))
+        let err = replay_committed(dir.path(), &[1, 2], 0, true, None, &ReplayLimits::standard(), &|_| false, |_, _| Ok(()))
             .err()
             .unwrap();
         assert!(matches!(err, Error::Corrupt(_)), "a tail followed by real entries is corruption");
@@ -1179,7 +1256,7 @@ mod tests {
         w.append(&commit_entry(9)).unwrap();
         w.sync(true).unwrap();
         drop(w);
-        let err = replay_committed(dir.path(), &[1], 0, true, &ReplayLimits::standard(), &|_| false, |_, _| Ok(()))
+        let err = replay_committed(dir.path(), &[1], 0, true, None, &ReplayLimits::standard(), &|_| false, |_, _| Ok(()))
             .err()
             .unwrap();
         assert!(matches!(err, Error::Corrupt(_)));
@@ -1227,7 +1304,7 @@ mod tests {
 
     fn replay_with(dir: &Path, segs: &[u64], l: &ReplayLimits) -> Result<(Vec<Vec<u8>>, Replayed)> {
         let mut got = Vec::new();
-        let r = replay_committed(dir, segs, 0, true, l, &|_| false, |_, p| {
+        let r = replay_committed(dir, segs, 0, true, None, l, &|_| false, |_, p| {
             got.push(p.to_vec());
             Ok(())
         })?;
@@ -1254,7 +1331,7 @@ mod tests {
         // Batch 1 alone has 300 rows, far over the limit of 4: it never commits, so it is never remembered.
         let l = limits(4, 16);
         let mut got = Vec::new();
-        let out = replay_committed(dir.path(), &[1, 2], 1, true, &l, &|_| false, |s, p| {
+        let out = replay_committed(dir.path(), &[1, 2], 1, true, None, &l, &|_| false, |s, p| {
             got.push((s, p.to_vec()));
             Ok(())
         })
@@ -1365,7 +1442,7 @@ mod tests {
         w.sync(true).unwrap();
         drop(w);
         let mut applied = 0;
-        let out = replay_committed(dir.path(), &[1], 0, true, &limits(10, 16), &|p| p.len() > 3000, |_, _| {
+        let out = replay_committed(dir.path(), &[1], 0, true, None, &limits(10, 16), &|p| p.len() > 3000, |_, _| {
             applied += 1;
             Ok(())
         })

@@ -14,6 +14,7 @@ pub struct Settings {
     chunk_cache_bytes: AtomicU64,
     max_open_chunks: AtomicU32,
     batch_memory_budget_bytes: AtomicU64,
+    unique_state_bytes: AtomicU64,
 }
 
 static SETTINGS: Settings = Settings {
@@ -23,6 +24,7 @@ static SETTINGS: Settings = Settings {
     chunk_cache_bytes: AtomicU64::new(128 << 20),
     max_open_chunks: AtomicU32::new(100),
     batch_memory_budget_bytes: AtomicU64::new(DEFAULT_BATCH_MEMORY_BUDGET),
+    unique_state_bytes: AtomicU64::new(0),
 };
 
 pub fn get() -> &'static Settings {
@@ -82,6 +84,19 @@ impl Settings {
     }
     pub fn set_batch_memory_budget_bytes(&self, v: u64) {
         self.batch_memory_budget_bytes.store(v, Relaxed);
+    }
+
+    /// Bytes of UNIQUE-key state (an accelerator, see `unique.rs`) one table
+    /// may keep; past it the coldest series are dropped. 0 (the default) = a
+    /// quarter of the batch memory budget. Not a system variable.
+    pub fn unique_state_bytes(&self) -> u64 {
+        match self.unique_state_bytes.load(Relaxed) {
+            0 => self.batch_memory_budget_bytes() / 4,
+            v => v,
+        }
+    }
+    pub fn set_unique_state_bytes(&self, v: u64) {
+        self.unique_state_bytes.store(v, Relaxed);
     }
 }
 

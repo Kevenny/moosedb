@@ -156,7 +156,7 @@ pub fn inspect(dir: &Path, now: i64) -> Result<TableInfo> {
     }
     let mut pending = 0u64;
     let segs: Vec<u64> = wal::list_segments(dir)?.into_iter().filter(|&s| s >= manifest.replay_seq).collect();
-    wal::replay_committed(dir, &segs, manifest.wal_seq, false, &wal::ReplayLimits::standard(), &|_| false, |_, _| {
+    wal::replay_committed(dir, &segs, manifest.wal_seq, false, options.as_ref().map(|o| o.encryption_key_id.is_some()), &wal::ReplayLimits::standard(), &|_| false, |_, _| {
         pending += 1;
         Ok(())
     })?;

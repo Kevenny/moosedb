@@ -600,3 +600,44 @@ fn a_spilling_statement_and_a_concurrent_one_keep_every_row_in_its_series() {
     assert!(is_dup(insert_one(&t, r("new", 1000, 1))));
     assert!(is_dup(insert_one(&t, r("new", 399, 1))));
 }
+
+#[test]
+fn a_tiny_state_budget_keeps_uniqueness_exact_also_after_restarts() {
+    // The state is an accelerator: with room for ~13 series, 120 series still
+    // get exactly the right answers (a smaller budget only makes lookups slower).
+    moosedb_core::settings::get().set_unique_state_bytes(2_000);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t");
+    let items: Vec<String> = (0..120).map(|i| format!("item{i}")).collect();
+    let check = |t: &Arc<Table>| {
+        for (i, it) in items.iter().enumerate() {
+            for (c, ns) in [(10, 1), (20, 1), (20, 2), (30 + i as i64, 1)] {
+                assert!(is_dup(insert_one(t, r(it, c, ns))), "{it} {c} {ns} must be a duplicate");
+            }
+            insert_one(t, r(it, 15, 7)).unwrap_or_else(|e| panic!("{it}@15 ns7 is new: {e:?}")); // older than the highest
+            assert!(is_dup(insert_one(t, r(it, 15, 7))));
+            insert_one(t, r(it, 30 + i as i64, 2)).unwrap(); // at the highest, other ns
+        }
+    };
+    {
+        let t = open_new(&path, false);
+        for (i, it) in items.iter().enumerate() {
+            for (c, ns) in [(10, 1), (20, 1), (20, 2), (30 + i as i64, 1)] {
+                insert_one(&t, r(it, c, ns)).unwrap();
+            }
+        }
+        check(&t);
+        t.flush().unwrap();
+        for (i, it) in items.iter().enumerate().take(20) {
+            assert!(is_dup(insert_one(&t, r(it, 30 + i as i64, 2))));
+        }
+    }
+    let t = reopen(&path);
+    for it in items.iter().take(30) {
+        assert!(is_dup(insert_one(&t, r(it, 15, 7))));
+        insert_one(&t, r(it, 16, 7)).unwrap();
+    }
+    assert_eq!(t.stats().unwrap().row_count, 120 * 6 + 30);
+    assert!(t.stats().unwrap().unique_bytes <= 2_000 + 150, "the state stays within its budget");
+    moosedb_core::settings::get().set_unique_state_bytes(0);
+}

@@ -1,0 +1,4 @@
+# saídas das medições, dados sintéticos (gerados por scripts/gen_data.py) e cópia local do plugin
+results/
+data/
+plugin/

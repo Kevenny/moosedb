@@ -1233,3 +1233,6 @@ mod unique_tests;
 
 #[cfg(test)]
 mod delete_tests;
+
+#[cfg(test)]
+mod agg_tests;

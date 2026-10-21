@@ -132,6 +132,11 @@ impl MemSnapshot {
         self.segments.iter().flat_map(|s| s.rows.iter()).enumerate().map(|(i, r)| (i as u64, r))
     }
 
+    /// The rows of each segment, in arrival order.
+    pub(crate) fn segment_rows(&self) -> impl Iterator<Item = &[MemRow]> {
+        self.segments.iter().map(|s| s.rows.as_slice())
+    }
+
     /// Number of rows in the snapshot, in O(segments).
     pub(crate) fn row_total(&self) -> usize {
         self.segments.iter().map(|s| s.rows.len()).sum()

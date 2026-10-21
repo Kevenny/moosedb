@@ -444,7 +444,7 @@ snapshot atômico do volume ou `mariadb-dump --lock-all-tables`.
 Na restauração, copie os diretórios de volta com o mesmo
 `file_key_management`; o WAL é reaplicado na abertura.
 
-## Variáveis globais
+## Variáveis
 
 | Variável | Padrão | Efeito |
 |---|---|---|
@@ -458,6 +458,9 @@ Na restauração, copie os diretórios de volta com o mesmo
 | `moosedb_batch_memory_budget` | 1 GiB | memória total de statements em andamento; acima disso, os grandes fazem spill antecipado |
 | `moosedb_max_open_chunks` | 100 | descritores de chunk mantidos abertos |
 | `moosedb_unique_lock_wait_timeout` | 50 | segundos que um INSERT espera outro statement que escreve a mesma série (tabelas com PK/UNIQUE); 0 = falha na hora |
+| `moosedb_group_by_pushdown` | `OFF` | (sessão) `ON` = a engine calcula o GROUP BY de TAG/VARCHAR/INT com COUNT/SUM/AVG/MIN/MAX (ver architecture.md); o resultado não muda |
+| `moosedb_agg_max_memory` | 1 GiB | (sessão) memória máxima dos grupos de um GROUP BY empurrado (mín. 16 MiB) |
+| `moosedb_agg_threads` | min(4, CPUs) | threads de um GROUP BY empurrado (1 a 64) |
 
 ## Replicação
 

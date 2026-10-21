@@ -7,7 +7,7 @@
 --source suite/moosedb/include/have_moosedb.inc
 
 
---echo # ---- Scope: all variables are global-only ----
+--echo # ---- Scope: global-only, except the GROUP BY pushdown session variables ----
 --error ER_GLOBAL_VARIABLE
 SET SESSION moosedb_wal_sync_mode = 'write';
 --error ER_GLOBAL_VARIABLE
@@ -90,6 +90,38 @@ SET GLOBAL moosedb_max_open_chunks = DEFAULT, moosedb_compaction_trigger_chunks 
 SELECT @@GLOBAL.moosedb_max_open_chunks, @@GLOBAL.moosedb_compaction_trigger_chunks,
        @@GLOBAL.moosedb_memtable_flush_threshold, @@GLOBAL.moosedb_bloom_filter_false_positive_rate,
        @@GLOBAL.moosedb_retention_check_interval;
+
+--echo # ---- GROUP BY pushdown variables ----
+SELECT @@GLOBAL.moosedb_group_by_pushdown, @@SESSION.moosedb_group_by_pushdown;
+SET SESSION moosedb_group_by_pushdown = ON;
+SELECT @@SESSION.moosedb_group_by_pushdown;
+SET SESSION moosedb_group_by_pushdown = DEFAULT;
+SELECT @@SESSION.moosedb_group_by_pushdown;
+--error ER_WRONG_VALUE_FOR_VAR
+SET SESSION moosedb_group_by_pushdown = 'maybe';
+SELECT @@GLOBAL.moosedb_gbh_debug, @@SESSION.moosedb_gbh_debug;
+SELECT @@SESSION.moosedb_agg_max_memory = 1073741824 AS default_1gib;
+SET SESSION moosedb_agg_max_memory = 1;
+SELECT @@SESSION.moosedb_agg_max_memory;
+SET SESSION moosedb_agg_max_memory = 18446744073709551615;
+SELECT @@SESSION.moosedb_agg_max_memory;
+SET SESSION moosedb_agg_max_memory = 2147483648;
+SELECT @@SESSION.moosedb_agg_max_memory;
+SET SESSION moosedb_agg_max_memory = DEFAULT;
+SELECT @@SESSION.moosedb_agg_max_memory = 1073741824 AS back_to_default;
+--error ER_INCORRECT_GLOBAL_LOCAL_VAR
+SELECT @@SESSION.moosedb_agg_threads;
+--error ER_GLOBAL_VARIABLE
+SET SESSION moosedb_agg_threads = 2;
+SELECT @@GLOBAL.moosedb_agg_threads BETWEEN 1 AND 4 AS default_in_1_4;
+SET GLOBAL moosedb_agg_threads = 0;
+SELECT @@GLOBAL.moosedb_agg_threads;
+SET GLOBAL moosedb_agg_threads = 1000;
+SELECT @@GLOBAL.moosedb_agg_threads;
+SET GLOBAL moosedb_agg_threads = 3;
+SELECT @@GLOBAL.moosedb_agg_threads;
+SET GLOBAL moosedb_agg_threads = DEFAULT;
+SELECT @@GLOBAL.moosedb_agg_threads BETWEEN 1 AND 4 AS default_in_1_4;
 
 --echo # ---- Variables listed in the server's catalogue ----
 SELECT VARIABLE_NAME, VARIABLE_SCOPE, VARIABLE_TYPE, READ_ONLY, NUMERIC_MIN_VALUE, NUMERIC_MAX_VALUE

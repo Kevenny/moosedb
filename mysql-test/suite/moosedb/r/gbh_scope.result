@@ -1,0 +1,885 @@
+CREATE TABLE g (
+ts     DATETIME NOT NULL,
+host   VARCHAR(16) NOT NULL COMMENT 'TAG',
+region VARCHAR(8) COMMENT 'TAG',
+code   VARCHAR(8),
+n      INT,
+big    BIGINT,
+d      DECIMAL(10,2),
+f      DOUBLE,
+INDEX(ts)
+) ENGINE=MooseDB;
+INSERT INTO g SELECT '2024-01-01' + INTERVAL seq * 10 MINUTE,
+CONCAT('h', seq MOD 5),
+IF(seq MOD 7 = 0, NULL, CONCAT('r', seq MOD 3)),
+CONCAT('c', seq MOD 4),
+IF(seq MOD 11 = 0, NULL, seq MOD 50),
+seq * 1000000007, seq / 4, seq / 3
+FROM seq_0_to_399;
+CREATE TABLE gi LIKE g;
+ALTER TABLE gi ENGINE=InnoDB;
+INSERT INTO gi SELECT * FROM g;
+FLUSH TABLES g;
+##### Switches: pushdown OFF and debug OFF -> no verdict at all
+SELECT host, COUNT(*) c FROM g GROUP BY host ORDER BY host;
+host	c
+h0	80
+h1	80
+h2	80
+h3	80
+h4	80
+SET SESSION moosedb_group_by_pushdown = ON;
+SELECT host, COUNT(*) c FROM g GROUP BY host ORDER BY host;
+host	c
+h0	80
+h1	80
+h2	80
+h3	80
+h4	80
+##### Debug ON, pushdown OFF: the analysis still reports
+SET SESSION moosedb_group_by_pushdown = OFF;
+SET SESSION moosedb_gbh_debug = ON;
+SELECT host, COUNT(*) c FROM g GROUP BY host ORDER BY host;
+host	c
+h0	80
+h1	80
+h2	80
+h3	80
+h4	80
+Warnings:
+Note	1105	gbh: accepted
+SET SESSION moosedb_group_by_pushdown = ON;
+##########################################################
+# Accepted
+##########################################################
+# TAG, COUNT(*)
+SELECT host, COUNT(*) c FROM g GROUP BY host ORDER BY host
+SELECT host, COUNT(*) c FROM g GROUP BY host ORDER BY host;
+host	c
+h0	80
+h1	80
+h2	80
+h3	80
+h4	80
+Warnings:
+Note	1105	gbh: accepted
+# same as InnoDB
+result_rows	vs_innodb
+5	SAME
+# two TAGs, every supported aggregate
+SELECT host, region, COUNT(*) c, COUNT(n) cn, SUM(n) sn, AVG(n) an, MIN(n) mn, MAX(n) xn, MIN(ts) t0, MAX(ts) t1, SUM(big) sb, MIN(big) mb FROM g GROUP BY host, region ORDER BY host, region
+SELECT host, region, COUNT(*) c, COUNT(n) cn, SUM(n) sn, AVG(n) an, MIN(n) mn, MAX(n) xn, MIN(ts) t0, MAX(ts) t1, SUM(big) sb, MIN(big) mb FROM g GROUP BY host, region ORDER BY host, region;
+host	region	c	cn	sn	an	mn	xn	t0	t1	sb	mb
+h0	NULL	12	10	225	22.5000	0	45	2024-01-01 00:00:00	2024-01-03 16:10:00	2310000016170	0
+h0	r0	23	21	540	25.7143	0	45	2024-01-01 02:30:00	2024-01-03 17:00:00	4635000032445	15000000105
+h0	r1	22	20	450	22.5000	0	45	2024-01-01 01:40:00	2024-01-03 13:40:00	4225000029575	10000000070
+h0	r2	23	21	445	21.1905	0	45	2024-01-01 00:50:00	2024-01-03 17:50:00	4630000032410	5000000035
+h1	NULL	11	10	225	22.5000	1	46	2024-01-01 03:30:00	2024-01-03 13:50:00	2156000015092	21000000147
+h1	r0	23	21	451	21.4762	1	46	2024-01-01 01:00:00	2024-01-03 18:00:00	4713000032991	6000000042
+h1	r1	24	22	497	22.5909	1	46	2024-01-01 00:10:00	2024-01-03 17:10:00	4704000032928	1000000007
+h1	r2	22	19	479	25.2105	1	46	2024-01-01 01:50:00	2024-01-03 16:20:00	4307000030149	11000000077
+h2	NULL	12	11	267	24.2727	2	47	2024-01-01 01:10:00	2024-01-03 17:20:00	2394000016758	7000000049
+h2	r0	22	20	460	23.0000	2	42	2024-01-01 02:00:00	2024-01-03 16:30:00	4389000030723	12000000084
+h2	r1	23	20	535	26.7500	2	47	2024-01-01 03:40:00	2024-01-03 18:10:00	4796000033572	22000000154
+h2	r2	23	22	489	22.2273	2	47	2024-01-01 00:20:00	2024-01-03 14:50:00	4381000030667	2000000014
+h3	NULL	11	10	275	27.5000	3	48	2024-01-01 04:40:00	2024-01-03 15:00:00	2233000015631	28000000196
+h3	r0	23	20	520	26.0000	3	48	2024-01-01 00:30:00	2024-01-03 17:30:00	4464000031248	3000000021
+h3	r1	22	20	480	24.0000	3	48	2024-01-01 02:10:00	2024-01-03 16:40:00	4471000031297	13000000091
+h3	r2	24	23	579	25.1739	3	48	2024-01-01 01:20:00	2024-01-03 18:20:00	4872000034104	8000000056
+h4	NULL	12	11	324	29.4545	9	49	2024-01-01 02:20:00	2024-01-03 18:30:00	2478000017346	14000000098
+h4	r0	23	21	479	22.8095	4	49	2024-01-01 01:30:00	2024-01-03 16:00:00	4542000031794	9000000063
+h4	r1	23	22	628	28.5455	4	49	2024-01-01 00:40:00	2024-01-03 17:40:00	4547000031829	4000000028
+h4	r2	22	19	526	27.6842	4	49	2024-01-01 04:50:00	2024-01-03 16:50:00	4553000031871	29000000203
+Warnings:
+Note	1105	gbh: accepted
+# same as InnoDB
+result_rows	vs_innodb
+20	SAME
+# VARCHAR and INT group columns, LIMIT
+SELECT code, n, COUNT(*) c FROM g GROUP BY code, n ORDER BY code, n LIMIT 7
+SELECT code, n, COUNT(*) c FROM g GROUP BY code, n ORDER BY code, n LIMIT 7;
+code	n	c
+c0	NULL	10
+c0	0	3
+c0	2	3
+c0	4	4
+c0	6	4
+c0	8	3
+c0	10	4
+Warnings:
+Note	1105	gbh: accepted
+# same as InnoDB
+result_rows	vs_innodb
+7	SAME
+# WHERE: conjunction of time range, IN, =, BETWEEN, LIKE, IS NOT NULL, comparisons
+SELECT host, COUNT(*) c, SUM(n) s FROM g WHERE ts >= '2024-01-02 00:00:00' AND ts < '2024-01-03 00:00:00' AND host IN ('h1','h2','h3') AND region = 'r1' AND n BETWEEN 3 AND 40 AND code LIKE 'c%' AND big IS NOT NULL AND d > 1.5 AND f <> 2 GROUP BY host ORDER BY host
+SELECT host, COUNT(*) c, SUM(n) s FROM g WHERE ts >= '2024-01-02 00:00:00' AND ts < '2024-01-03 00:00:00' AND host IN ('h1','h2','h3') AND region = 'r1' AND n BETWEEN 3 AND 40 AND code LIKE 'c%' AND big IS NOT NULL AND d > 1.5 AND f <> 2 GROUP BY host ORDER BY host;
+host	c	s
+h1	6	111
+h2	5	100
+h3	6	123
+Warnings:
+Note	1105	gbh: refused: WHERE: only TAG equality/IN and time bounds
+# same as InnoDB
+result_rows	vs_innodb
+3	SAME
+# WHERE: IS NULL and <=>
+SELECT host, COUNT(*) c FROM g WHERE region IS NULL AND n <=> 5 GROUP BY host ORDER BY host
+SELECT host, COUNT(*) c FROM g WHERE region IS NULL AND n <=> 5 GROUP BY host ORDER BY host;
+host	c
+h0	1
+Warnings:
+Note	1105	gbh: refused: WHERE: only TAG equality/IN and time bounds
+# same as InnoDB
+result_rows	vs_innodb
+1	SAME
+# WHERE: constant on the left
+SELECT host, COUNT(*) c FROM g WHERE 3 < n GROUP BY host ORDER BY host
+SELECT host, COUNT(*) c FROM g WHERE 3 < n GROUP BY host ORDER BY host;
+host	c
+h0	65
+h1	64
+h2	66
+h3	66
+h4	73
+Warnings:
+Note	1105	gbh: refused: WHERE: only TAG equality/IN and time bounds
+# same as InnoDB
+result_rows	vs_innodb
+5	SAME
+# HAVING (done by the server), ORDER BY an aggregate
+SELECT host, COUNT(*) c, SUM(n) s FROM g GROUP BY host HAVING c > 70 AND SUM(n) > 100 ORDER BY s DESC, host
+SELECT host, COUNT(*) c, SUM(n) s FROM g GROUP BY host HAVING c > 70 AND SUM(n) > 100 ORDER BY s DESC, host;
+host	c	s
+h4	80	1957
+h3	80	1854
+h2	80	1751
+h0	80	1660
+h1	80	1652
+Warnings:
+Note	1105	gbh: accepted
+# same as InnoDB
+result_rows	vs_innodb
+5	SAME
+# ORDER BY aggregate DESC with LIMIT and OFFSET
+SELECT host, COUNT(*) c FROM g GROUP BY host ORDER BY c DESC, host LIMIT 2 OFFSET 1
+SELECT host, COUNT(*) c FROM g GROUP BY host ORDER BY c DESC, host LIMIT 2 OFFSET 1;
+host	c
+h1	80
+h2	80
+Warnings:
+Note	1105	gbh: accepted
+# same as InnoDB
+result_rows	vs_innodb
+2	SAME
+# ORDER BY an aggregate that is not selected (hidden item)
+SELECT host, COUNT(*) c FROM g GROUP BY host ORDER BY SUM(n), host
+SELECT host, COUNT(*) c FROM g GROUP BY host ORDER BY SUM(n), host;
+host	c
+h1	80
+h0	80
+h2	80
+h3	80
+h4	80
+Warnings:
+Note	1105	gbh: accepted
+# same as InnoDB
+result_rows	vs_innodb
+5	SAME
+# GROUP BY columns that are not selected
+SELECT COUNT(*) c FROM g GROUP BY host, region ORDER BY c, host, region
+SELECT COUNT(*) c FROM g GROUP BY host, region ORDER BY c, host, region;
+c
+11
+11
+12
+12
+12
+22
+22
+22
+22
+22
+23
+23
+23
+23
+23
+23
+23
+23
+24
+24
+Warnings:
+Note	1105	gbh: accepted
+# same as InnoDB
+result_rows	vs_innodb
+20	SAME
+# constants in the select list
+SELECT 7 k, 'x' s, host, COUNT(*) c FROM g GROUP BY host ORDER BY host
+SELECT 7 k, 'x' s, host, COUNT(*) c FROM g GROUP BY host ORDER BY host;
+k	s	host	c
+7	x	h0	80
+7	x	h1	80
+7	x	h2	80
+7	x	h3	80
+7	x	h4	80
+Warnings:
+Note	1105	gbh: accepted
+# same as InnoDB
+result_rows	vs_innodb
+5	SAME
+# table and column aliases, ORDER BY the group column DESC
+SELECT x.host AS hh, COUNT(*) AS c FROM g AS x GROUP BY hh ORDER BY hh DESC
+SELECT x.host AS hh, COUNT(*) AS c FROM g AS x GROUP BY hh ORDER BY hh DESC;
+hh	c
+h4	80
+h3	80
+h2	80
+h1	80
+h0	80
+Warnings:
+Note	1105	gbh: accepted
+# same as InnoDB
+result_rows	vs_innodb
+5	SAME
+# GROUP BY position
+SELECT host, COUNT(*) c FROM g GROUP BY 1 ORDER BY 1
+SELECT host, COUNT(*) c FROM g GROUP BY 1 ORDER BY 1;
+host	c
+h0	80
+h1	80
+h2	80
+h3	80
+h4	80
+Warnings:
+Note	1105	gbh: accepted
+# same as InnoDB
+result_rows	vs_innodb
+5	SAME
+# ORDER BY NULL
+SELECT host, COUNT(*) c FROM g GROUP BY host ORDER BY NULL
+SELECT host, COUNT(*) c FROM g GROUP BY host ORDER BY NULL;
+host	c
+h0	80
+h1	80
+h2	80
+h3	80
+h4	80
+Warnings:
+Note	1105	gbh: accepted
+# same as InnoDB
+result_rows	vs_innodb
+5	SAME
+# NOT LIKE (the optimizer keeps a negated LIKE, still a column predicate)
+SELECT host, COUNT(*) c FROM g WHERE code NOT LIKE 'c1%' GROUP BY host ORDER BY host
+SELECT host, COUNT(*) c FROM g WHERE code NOT LIKE 'c1%' GROUP BY host ORDER BY host;
+host	c
+h0	60
+h1	60
+h2	60
+h3	60
+h4	60
+Warnings:
+Note	1105	gbh: refused: WHERE: only TAG equality/IN and time bounds
+# same as InnoDB
+result_rows	vs_innodb
+5	SAME
+# EXPLAIN reaches the hook too
+EXPLAIN SELECT host, COUNT(*) c FROM g GROUP BY host;
+id	select_type	table	type	possible_keys	key	key_len	ref	rows	Extra
+1	SIMPLE	NULL	NULL	NULL	NULL	NULL	NULL	NULL	Storage engine handles GROUP BY
+Warnings:
+Note	1105	gbh: accepted
+# Prepared statement: analysed again at every EXECUTE, parameters bound
+PREPARE p FROM 'SELECT host, COUNT(*) c FROM g WHERE ts >= ? AND n > ? GROUP BY host ORDER BY host';
+SET @a= '2024-01-03 00:00:00', @b= 10;
+EXECUTE p USING @a, @b;
+host	c
+h0	14
+h1	16
+h2	17
+h3	18
+h4	17
+Warnings:
+Note	1105	gbh: refused: WHERE: only TAG equality/IN and time bounds
+SET @a= '2024-01-04 00:00:00', @b= 40;
+EXECUTE p USING @a, @b;
+host	c
+Warnings:
+Note	1105	gbh: refused: WHERE: only TAG equality/IN and time bounds
+DEALLOCATE PREPARE p;
+##########################################################
+# Refused: what the statement is part of
+##########################################################
+# no GROUP BY
+SELECT COUNT(*) c, SUM(n) s FROM g WHERE n > 5
+SELECT COUNT(*) c, SUM(n) s FROM g WHERE n > 5;
+c	s
+320	8768
+Warnings:
+Note	1105	gbh: refused: no GROUP BY
+# same as InnoDB
+result_rows	vs_innodb
+1	SAME
+# plain SELECT
+SELECT host FROM g WHERE n > 45 ORDER BY ts LIMIT 5
+SELECT host FROM g WHERE n > 45 ORDER BY ts LIMIT 5;
+host
+h1
+h2
+h3
+h4
+h1
+Warnings:
+Note	1105	gbh: refused: no GROUP BY
+# same as InnoDB
+result_rows	vs_innodb
+5	SAME
+# UNION (each part is refused)
+SELECT host, COUNT(*) c FROM g GROUP BY host UNION ALL SELECT region, COUNT(*) FROM g GROUP BY region ORDER BY 1, 2
+SELECT host, COUNT(*) c FROM g GROUP BY host UNION ALL SELECT region, COUNT(*) FROM g GROUP BY region ORDER BY 1, 2;
+host	c
+NULL	58
+h0	80
+h1	80
+h2	80
+h3	80
+h4	80
+r0	114
+r1	114
+r2	114
+Warnings:
+Note	1105	gbh: refused: UNION/INTERSECT/EXCEPT
+Note	1105	gbh: refused: UNION/INTERSECT/EXCEPT
+# same as InnoDB
+result_rows	vs_innodb
+9	SAME
+# derived table
+SELECT * FROM (SELECT host, COUNT(*) c FROM g GROUP BY host) d ORDER BY host
+SELECT * FROM (SELECT host, COUNT(*) c FROM g GROUP BY host) d ORDER BY host;
+host	c
+h0	80
+h1	80
+h2	80
+h3	80
+h4	80
+Warnings:
+Note	1105	gbh: refused: derived table, view or CTE
+# same as InnoDB
+result_rows	vs_innodb
+5	SAME
+# CTE
+WITH w AS (SELECT host, COUNT(*) c FROM g GROUP BY host) SELECT * FROM w ORDER BY host
+WITH w AS (SELECT host, COUNT(*) c FROM g GROUP BY host) SELECT * FROM w ORDER BY host;
+host	c
+h0	80
+h1	80
+h2	80
+h3	80
+h4	80
+Warnings:
+Note	1105	gbh: refused: derived table, view or CTE
+# same as InnoDB
+result_rows	vs_innodb
+5	SAME
+# subquery (and the outer query)
+SELECT host FROM g WHERE n IN (SELECT COUNT(*) FROM g t2 GROUP BY t2.host) GROUP BY host ORDER BY host
+SELECT host FROM g WHERE n IN (SELECT COUNT(*) FROM g t2 GROUP BY t2.host) GROUP BY host ORDER BY host;
+host
+Warnings:
+Note	1105	gbh: refused: subquery
+# same as InnoDB
+result_rows	vs_innodb
+0	SAME
+# derived table inside a scalar subquery
+SELECT (SELECT SUM(c) FROM (SELECT COUNT(*) c FROM g t3 GROUP BY t3.region) z) s, host FROM g GROUP BY host ORDER BY host
+SELECT (SELECT SUM(c) FROM (SELECT COUNT(*) c FROM g t3 GROUP BY t3.region) z) s, host FROM g GROUP BY host ORDER BY host;
+s	host
+400	h0
+400	h1
+400	h2
+400	h3
+400	h4
+Warnings:
+Note	1105	gbh: refused: derived table, view or CTE
+Note	1105	gbh: refused: select list: expression
+# same as InnoDB
+result_rows	vs_innodb
+5	SAME
+# two tables
+SELECT t1.host, COUNT(*) c FROM g t1 JOIN g t2 ON t2.n = t1.n AND t2.host = t1.host GROUP BY t1.host ORDER BY t1.host
+SELECT t1.host, COUNT(*) c FROM g t1 JOIN g t2 ON t2.n = t1.n AND t2.host = t1.host GROUP BY t1.host ORDER BY t1.host;
+host	c
+h0	520
+h1	520
+h2	535
+h3	535
+h4	535
+Warnings:
+Note	1105	gbh: refused: more than one table
+# same as InnoDB
+result_rows	vs_innodb
+5	SAME
+CREATE VIEW gv AS SELECT * FROM g;
+CREATE VIEW gvi AS SELECT * FROM gi;
+CREATE VIEW gvg AS SELECT host, COUNT(*) c FROM g GROUP BY host;
+CREATE VIEW gvgi AS SELECT host, COUNT(*) c FROM gi GROUP BY host;
+# merged view: the hook is not called at all (no verdict)
+SELECT host, COUNT(*) c FROM gv GROUP BY host ORDER BY host;
+host	c
+h0	80
+h1	80
+h2	80
+h3	80
+h4	80
+SELECT host, COUNT(*) c FROM gvi GROUP BY host ORDER BY host;
+host	c
+h0	80
+h1	80
+h2	80
+h3	80
+h4	80
+# view with a GROUP BY inside
+SELECT * FROM gvg ORDER BY host;
+host	c
+h0	80
+h1	80
+h2	80
+h3	80
+h4	80
+Warnings:
+Note	1105	gbh: refused: derived table, view or CTE
+SELECT * FROM gvgi ORDER BY host;
+host	c
+h0	80
+h1	80
+h2	80
+h3	80
+h4	80
+DROP VIEW gv, gvi, gvg, gvgi;
+# statements that are not a top-level SELECT
+CREATE TABLE cs AS SELECT host, COUNT(*) c FROM g GROUP BY host;
+Warnings:
+Note	1105	gbh: refused: not a top-level SELECT
+INSERT INTO cs SELECT code, COUNT(*) FROM g GROUP BY code;
+Warnings:
+Note	1105	gbh: refused: not a top-level SELECT
+SELECT COUNT(*) FROM cs;
+COUNT(*)
+9
+DROP TABLE cs;
+CREATE TABLE cs2 (host VARCHAR(16), c BIGINT) ENGINE=InnoDB;
+INSERT INTO cs2 SELECT host, COUNT(*) FROM g GROUP BY host;
+Warnings:
+Note	1105	gbh: refused: not a top-level SELECT
+SELECT COUNT(*) FROM cs2;
+COUNT(*)
+5
+DROP TABLE cs2;
+# inside a stored procedure, a function and a trigger
+CREATE PROCEDURE pr() BEGIN SELECT host, COUNT(*) c FROM g GROUP BY host ORDER BY host; END|
+CREATE FUNCTION fn() RETURNS BIGINT DETERMINISTIC BEGIN DECLARE r BIGINT; SELECT SUM(c) INTO r FROM (SELECT COUNT(*) c FROM g GROUP BY host) z; RETURN r; END|
+CALL pr();
+host	c
+h0	80
+h1	80
+h2	80
+h3	80
+h4	80
+Warnings:
+Note	1105	gbh: refused: inside a stored routine or trigger
+SELECT fn();
+fn()
+400
+DROP PROCEDURE pr;
+DROP FUNCTION fn;
+##########################################################
+# Refused: clauses
+##########################################################
+# DISTINCT
+SELECT DISTINCT COUNT(*) c FROM g GROUP BY host ORDER BY c
+SELECT DISTINCT COUNT(*) c FROM g GROUP BY host ORDER BY c;
+c
+80
+Warnings:
+Note	1105	gbh: refused: DISTINCT
+# same as InnoDB
+result_rows	vs_innodb
+1	SAME
+# ROLLUP (CREATE ... SELECT cannot hold its NULL row, so compared directly)
+SELECT host, COUNT(*) c FROM g GROUP BY host WITH ROLLUP;
+host	c
+h0	80
+h1	80
+h2	80
+h3	80
+h4	80
+NULL	400
+Warnings:
+Note	1105	gbh: refused: ROLLUP
+SELECT host, COUNT(*) c FROM gi GROUP BY host WITH ROLLUP;
+host	c
+h0	80
+h1	80
+h2	80
+h3	80
+h4	80
+NULL	400
+# window function
+SELECT host, COUNT(*) c, COUNT(*) OVER () w FROM g GROUP BY host ORDER BY host
+SELECT host, COUNT(*) c, COUNT(*) OVER () w FROM g GROUP BY host ORDER BY host;
+host	c	w
+h0	80	5
+h1	80	5
+h2	80	5
+h3	80	5
+h4	80	5
+Warnings:
+Note	1105	gbh: refused: window function
+# same as InnoDB
+result_rows	vs_innodb
+5	SAME
+# WITH TIES
+SELECT host, COUNT(*) c FROM g GROUP BY host ORDER BY host FETCH FIRST 1 ROWS WITH TIES
+SELECT host, COUNT(*) c FROM g GROUP BY host ORDER BY host FETCH FIRST 1 ROWS WITH TIES;
+host	c
+h0	80
+Warnings:
+Note	1105	gbh: refused: WITH TIES
+# same as InnoDB
+result_rows	vs_innodb
+1	SAME
+SELECT SQL_CALC_FOUND_ROWS host, COUNT(*) c FROM g GROUP BY host ORDER BY host LIMIT 2;
+host	c
+h0	80
+h1	80
+Warnings:
+Note	1105	gbh: refused: SQL_CALC_FOUND_ROWS
+SELECT FOUND_ROWS();
+FOUND_ROWS()
+5
+##########################################################
+# Refused: select list, GROUP BY, aggregates
+##########################################################
+# expression over an aggregate
+SELECT host, SUM(n) / 2 q FROM g GROUP BY host ORDER BY host
+SELECT host, SUM(n) / 2 q FROM g GROUP BY host ORDER BY host;
+host	q
+h0	830.0000
+h1	826.0000
+h2	875.5000
+h3	927.0000
+h4	978.5000
+Warnings:
+Note	1105	gbh: refused: select list: expression
+# same as InnoDB
+result_rows	vs_innodb
+5	SAME
+# GROUP BY expression
+SELECT UPPER(host) u, COUNT(*) c FROM g GROUP BY UPPER(host) ORDER BY u
+SELECT UPPER(host) u, COUNT(*) c FROM g GROUP BY UPPER(host) ORDER BY u;
+u	c
+H0	80
+H1	80
+H2	80
+H3	80
+H4	80
+Warnings:
+Note	1105	gbh: refused: GROUP BY: not a column
+# same as InnoDB
+result_rows	vs_innodb
+5	SAME
+# GROUP BY arithmetic
+SELECT n DIV 10 b, COUNT(*) c FROM g GROUP BY n DIV 10 ORDER BY b
+SELECT n DIV 10 b, COUNT(*) c FROM g GROUP BY n DIV 10 ORDER BY b;
+b	c
+NULL	37
+0	73
+1	73
+2	73
+3	72
+4	72
+Warnings:
+Note	1105	gbh: refused: GROUP BY: not a column
+# same as InnoDB
+result_rows	vs_innodb
+6	SAME
+# GROUP BY the time column
+SELECT ts, COUNT(*) c FROM g WHERE n = 7 GROUP BY ts ORDER BY ts
+SELECT ts, COUNT(*) c FROM g WHERE n = 7 GROUP BY ts ORDER BY ts;
+ts	c
+2024-01-01 01:10:00	1
+2024-01-01 09:30:00	1
+2024-01-01 17:50:00	1
+2024-01-02 02:10:00	1
+2024-01-02 10:30:00	1
+2024-01-02 18:50:00	1
+2024-01-03 03:10:00	1
+2024-01-03 11:30:00	1
+Warnings:
+Note	1105	gbh: refused: GROUP BY: unsupported column type
+# same as InnoDB
+result_rows	vs_innodb
+8	SAME
+# GROUP BY a DECIMAL column
+SELECT d, COUNT(*) c FROM g WHERE n = 7 GROUP BY d ORDER BY d
+SELECT d, COUNT(*) c FROM g WHERE n = 7 GROUP BY d ORDER BY d;
+d	c
+1.75	1
+14.25	1
+26.75	1
+39.25	1
+51.75	1
+64.25	1
+76.75	1
+89.25	1
+Warnings:
+Note	1105	gbh: refused: GROUP BY: unsupported column type
+# same as InnoDB
+result_rows	vs_innodb
+8	SAME
+# SUM of a DECIMAL
+SELECT host, SUM(d) s FROM g GROUP BY host ORDER BY host
+SELECT host, SUM(d) s FROM g GROUP BY host ORDER BY host;
+host	s
+h0	3950.00
+h1	3970.00
+h2	3990.00
+h3	4010.00
+h4	4030.00
+Warnings:
+Note	1105	gbh: refused: aggregate: unsupported argument type
+# same as InnoDB
+result_rows	vs_innodb
+5	SAME
+# MAX of a DOUBLE
+SELECT host, MAX(f) s FROM g GROUP BY host ORDER BY host
+SELECT host, MAX(f) s FROM g GROUP BY host ORDER BY host;
+host	s
+h0	131.666666666
+h1	132
+h2	132.333333333
+h3	132.666666666
+h4	133
+Warnings:
+Note	1105	gbh: refused: aggregate: unsupported argument type
+# same as InnoDB
+result_rows	vs_innodb
+5	SAME
+# MAX of a string
+SELECT host, MAX(code) s FROM g GROUP BY host ORDER BY host
+SELECT host, MAX(code) s FROM g GROUP BY host ORDER BY host;
+host	s
+h0	c3
+h1	c3
+h2	c3
+h3	c3
+h4	c3
+Warnings:
+Note	1105	gbh: refused: aggregate: unsupported argument type
+# same as InnoDB
+result_rows	vs_innodb
+5	SAME
+# MIN of a DECIMAL
+SELECT host, MIN(d) s FROM g GROUP BY host ORDER BY host
+SELECT host, MIN(d) s FROM g GROUP BY host ORDER BY host;
+host	s
+h0	0.00
+h1	0.25
+h2	0.50
+h3	0.75
+h4	1.00
+Warnings:
+Note	1105	gbh: refused: aggregate: unsupported argument type
+# same as InnoDB
+result_rows	vs_innodb
+5	SAME
+# COUNT(DISTINCT)
+SELECT host, COUNT(DISTINCT n) s FROM g GROUP BY host ORDER BY host
+SELECT host, COUNT(DISTINCT n) s FROM g GROUP BY host ORDER BY host;
+host	s
+h0	10
+h1	10
+h2	10
+h3	10
+h4	10
+Warnings:
+Note	1105	gbh: refused: aggregate: unsupported function
+# same as InnoDB
+result_rows	vs_innodb
+5	SAME
+# aggregate over an expression
+SELECT host, SUM(n + 1) s FROM g GROUP BY host ORDER BY host
+SELECT host, SUM(n + 1) s FROM g GROUP BY host ORDER BY host;
+host	s
+h0	1732
+h1	1724
+h2	1824
+h3	1927
+h4	2030
+Warnings:
+Note	1105	gbh: refused: aggregate: unsupported argument type
+# same as InnoDB
+result_rows	vs_innodb
+5	SAME
+# GROUP_CONCAT
+SELECT host, GROUP_CONCAT(code ORDER BY code) s FROM g WHERE n < 3 GROUP BY host ORDER BY host
+SELECT host, GROUP_CONCAT(code ORDER BY code) s FROM g WHERE n < 3 GROUP BY host ORDER BY host;
+host	s
+h0	c0,c0,c0,c2,c2,c2,c2
+h1	c1,c1,c1,c1,c3,c3,c3,c3
+h2	c0,c0,c0,c2,c2,c2,c2
+Warnings:
+Note	1105	gbh: refused: aggregate: unsupported function
+# same as InnoDB
+result_rows	vs_innodb
+3	SAME
+# STD
+SELECT host, STD(n) s FROM g GROUP BY host ORDER BY host
+SELECT host, STD(n) s FROM g GROUP BY host ORDER BY host;
+host	s
+h0	14.5429
+h1	14.5429
+h2	14.3044
+h3	14.0963
+h4	14.1660
+Warnings:
+Note	1105	gbh: refused: aggregate: unsupported function
+# same as InnoDB
+result_rows	vs_innodb
+5	SAME
+# ORDER BY an expression over an aggregate
+SELECT host, COUNT(*) c FROM g GROUP BY host ORDER BY COUNT(*) + 1, host
+SELECT host, COUNT(*) c FROM g GROUP BY host ORDER BY COUNT(*) + 1, host;
+host	c
+h0	80
+h1	80
+h2	80
+h3	80
+h4	80
+Warnings:
+Note	1105	gbh: refused: select list: expression
+# same as InnoDB
+result_rows	vs_innodb
+5	SAME
+##########################################################
+# Refused: WHERE
+##########################################################
+# OR
+SELECT host, COUNT(*) c FROM g WHERE n = 3 OR host = 'h1' GROUP BY host ORDER BY host
+SELECT host, COUNT(*) c FROM g WHERE n = 3 OR host = 'h1' GROUP BY host ORDER BY host;
+host	c
+h1	80
+h3	7
+Warnings:
+Note	1105	gbh: refused: WHERE: OR/XOR
+# same as InnoDB
+result_rows	vs_innodb
+2	SAME
+# expression on the column
+SELECT host, COUNT(*) c FROM g WHERE n + 1 > 5 GROUP BY host ORDER BY host
+SELECT host, COUNT(*) c FROM g WHERE n + 1 > 5 GROUP BY host ORDER BY host;
+host	c
+h0	65
+h1	64
+h2	66
+h3	66
+h4	66
+Warnings:
+Note	1105	gbh: refused: WHERE: unsupported predicate
+# same as InnoDB
+result_rows	vs_innodb
+5	SAME
+# column against column
+SELECT host, COUNT(*) c FROM g WHERE n > big GROUP BY host ORDER BY host
+SELECT host, COUNT(*) c FROM g WHERE n > big GROUP BY host ORDER BY host;
+host	c
+Warnings:
+Note	1105	gbh: refused: WHERE: unsupported predicate
+# same as InnoDB
+result_rows	vs_innodb
+0	SAME
+# REGEXP
+SELECT host, COUNT(*) c FROM g WHERE code REGEXP '^c[12]' GROUP BY host ORDER BY host
+SELECT host, COUNT(*) c FROM g WHERE code REGEXP '^c[12]' GROUP BY host ORDER BY host;
+host	c
+h0	40
+h1	40
+h2	40
+h3	40
+h4	40
+Warnings:
+Note	1105	gbh: refused: WHERE: unsupported predicate
+# same as InnoDB
+result_rows	vs_innodb
+5	SAME
+# subquery in WHERE
+SELECT host, COUNT(*) c FROM g WHERE n > (SELECT AVG(n) FROM g t2) GROUP BY host ORDER BY host
+SELECT host, COUNT(*) c FROM g WHERE n > (SELECT AVG(n) FROM g t2) GROUP BY host ORDER BY host;
+host	c
+h0	37
+h1	35
+h2	35
+h3	36
+h4	38
+Warnings:
+Note	1105	gbh: refused: subquery
+Note	1105	gbh: refused: WHERE: unsupported predicate
+# same as InnoDB
+result_rows	vs_innodb
+5	SAME
+# two columns equal
+SELECT host, COUNT(*) c FROM g WHERE host = region GROUP BY host ORDER BY host
+SELECT host, COUNT(*) c FROM g WHERE host = region GROUP BY host ORDER BY host;
+host	c
+Warnings:
+Note	1105	gbh: refused: WHERE: unsupported predicate
+# same as InnoDB
+result_rows	vs_innodb
+0	SAME
+##########################################################
+# Not affected: other engines never reach the hook
+##########################################################
+SELECT host, COUNT(*) c FROM gi GROUP BY host ORDER BY host;
+host	c
+h0	80
+h1	80
+h2	80
+h3	80
+h4	80
+##########################################################
+# Pushdown OFF with debug ON still gives the same answers
+##########################################################
+SET SESSION moosedb_group_by_pushdown = OFF;
+# OFF, accepted shape
+SELECT host, region, COUNT(*) c, SUM(n) s, MIN(ts) t0 FROM g WHERE ts >= '2024-01-02 00:00:00' GROUP BY host, region ORDER BY host, region
+SELECT host, region, COUNT(*) c, SUM(n) s, MIN(ts) t0 FROM g WHERE ts >= '2024-01-02 00:00:00' GROUP BY host, region ORDER BY host, region;
+host	region	c	s	t0
+h0	NULL	7	125	2024-01-02 05:10:00
+h0	r0	15	320	2024-01-02 01:00:00
+h0	r1	14	295	2024-01-02 00:10:00
+h0	r2	15	305	2024-01-02 01:50:00
+h1	NULL	7	131	2024-01-02 02:50:00
+h1	r0	15	279	2024-01-02 02:00:00
+h1	r1	15	324	2024-01-02 01:10:00
+h1	r2	14	307	2024-01-02 00:20:00
+h2	NULL	8	206	2024-01-02 00:30:00
+h2	r0	14	336	2024-01-02 03:00:00
+h2	r1	15	331	2024-01-02 02:10:00
+h2	r2	14	271	2024-01-02 01:20:00
+h3	NULL	7	153	2024-01-02 04:00:00
+h3	r0	14	311	2024-01-02 01:30:00
+h3	r1	15	372	2024-01-02 00:40:00
+h3	r2	15	415	2024-01-02 02:20:00
+h4	NULL	8	208	2024-01-02 01:40:00
+h4	r0	15	341	2024-01-02 00:00:00
+h4	r1	14	412	2024-01-02 04:10:00
+h4	r2	15	387	2024-01-02 00:50:00
+Warnings:
+Note	1105	gbh: accepted
+# same as InnoDB
+result_rows	vs_innodb
+20	SAME
+SET SESSION moosedb_gbh_debug = OFF;
+DROP TABLE g, gi;

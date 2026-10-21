@@ -1,4 +1,4 @@
-# ---- Scope: all variables are global-only ----
+# ---- Scope: global-only, except the GROUP BY pushdown session variables ----
 SET SESSION moosedb_wal_sync_mode = 'write';
 ERROR HY000: Variable 'moosedb_wal_sync_mode' is a GLOBAL variable and should be set with SET GLOBAL
 SET moosedb_max_open_chunks = 5;
@@ -156,15 +156,86 @@ SELECT @@GLOBAL.moosedb_max_open_chunks, @@GLOBAL.moosedb_compaction_trigger_chu
 @@GLOBAL.moosedb_retention_check_interval;
 @@GLOBAL.moosedb_max_open_chunks	@@GLOBAL.moosedb_compaction_trigger_chunks	@@GLOBAL.moosedb_memtable_flush_threshold	@@GLOBAL.moosedb_bloom_filter_false_positive_rate	@@GLOBAL.moosedb_retention_check_interval
 100	10	67108864	0.010000	3600
+# ---- GROUP BY pushdown variables ----
+SELECT @@GLOBAL.moosedb_group_by_pushdown, @@SESSION.moosedb_group_by_pushdown;
+@@GLOBAL.moosedb_group_by_pushdown	@@SESSION.moosedb_group_by_pushdown
+0	0
+SET SESSION moosedb_group_by_pushdown = ON;
+SELECT @@SESSION.moosedb_group_by_pushdown;
+@@SESSION.moosedb_group_by_pushdown
+1
+SET SESSION moosedb_group_by_pushdown = DEFAULT;
+SELECT @@SESSION.moosedb_group_by_pushdown;
+@@SESSION.moosedb_group_by_pushdown
+0
+SET SESSION moosedb_group_by_pushdown = 'maybe';
+ERROR 42000: Variable 'moosedb_group_by_pushdown' can't be set to the value of 'maybe'
+SELECT @@GLOBAL.moosedb_gbh_debug, @@SESSION.moosedb_gbh_debug;
+@@GLOBAL.moosedb_gbh_debug	@@SESSION.moosedb_gbh_debug
+0	0
+SELECT @@SESSION.moosedb_agg_max_memory = 1073741824 AS default_1gib;
+default_1gib
+1
+SET SESSION moosedb_agg_max_memory = 1;
+Warnings:
+Warning	1292	Truncated incorrect moosedb_agg_max_memory value: '1'
+SELECT @@SESSION.moosedb_agg_max_memory;
+@@SESSION.moosedb_agg_max_memory
+16777216
+SET SESSION moosedb_agg_max_memory = 18446744073709551615;
+Warnings:
+Warning	1292	Truncated incorrect moosedb_agg_max_memory value: '18446744073709551615'
+SELECT @@SESSION.moosedb_agg_max_memory;
+@@SESSION.moosedb_agg_max_memory
+1099511627776
+SET SESSION moosedb_agg_max_memory = 2147483648;
+SELECT @@SESSION.moosedb_agg_max_memory;
+@@SESSION.moosedb_agg_max_memory
+2147483648
+SET SESSION moosedb_agg_max_memory = DEFAULT;
+SELECT @@SESSION.moosedb_agg_max_memory = 1073741824 AS back_to_default;
+back_to_default
+1
+SELECT @@SESSION.moosedb_agg_threads;
+ERROR HY000: Variable 'moosedb_agg_threads' is a GLOBAL variable
+SET SESSION moosedb_agg_threads = 2;
+ERROR HY000: Variable 'moosedb_agg_threads' is a GLOBAL variable and should be set with SET GLOBAL
+SELECT @@GLOBAL.moosedb_agg_threads BETWEEN 1 AND 4 AS default_in_1_4;
+default_in_1_4
+1
+SET GLOBAL moosedb_agg_threads = 0;
+Warnings:
+Warning	1292	Truncated incorrect moosedb_agg_threads value: '0'
+SELECT @@GLOBAL.moosedb_agg_threads;
+@@GLOBAL.moosedb_agg_threads
+1
+SET GLOBAL moosedb_agg_threads = 1000;
+Warnings:
+Warning	1292	Truncated incorrect moosedb_agg_threads value: '1000'
+SELECT @@GLOBAL.moosedb_agg_threads;
+@@GLOBAL.moosedb_agg_threads
+64
+SET GLOBAL moosedb_agg_threads = 3;
+SELECT @@GLOBAL.moosedb_agg_threads;
+@@GLOBAL.moosedb_agg_threads
+3
+SET GLOBAL moosedb_agg_threads = DEFAULT;
+SELECT @@GLOBAL.moosedb_agg_threads BETWEEN 1 AND 4 AS default_in_1_4;
+default_in_1_4
+1
 # ---- Variables listed in the server's catalogue ----
 SELECT VARIABLE_NAME, VARIABLE_SCOPE, VARIABLE_TYPE, READ_ONLY, NUMERIC_MIN_VALUE, NUMERIC_MAX_VALUE
 FROM information_schema.SYSTEM_VARIABLES WHERE VARIABLE_NAME LIKE 'MOOSEDB%' ORDER BY VARIABLE_NAME;
 VARIABLE_NAME	VARIABLE_SCOPE	VARIABLE_TYPE	READ_ONLY	NUMERIC_MIN_VALUE	NUMERIC_MAX_VALUE
+MOOSEDB_AGG_MAX_MEMORY	SESSION	BIGINT UNSIGNED	NO	16777216	1099511627776
+MOOSEDB_AGG_THREADS	GLOBAL	INT UNSIGNED	NO	1	64
 MOOSEDB_BATCH_MEMORY_BUDGET	GLOBAL	BIGINT UNSIGNED	NO	16777216	1099511627776
 MOOSEDB_BLOOM_FILTER_FALSE_POSITIVE_RATE	GLOBAL	DOUBLE	NO	0.000001	0.5
 MOOSEDB_CHUNK_CACHE_SIZE	GLOBAL	BIGINT UNSIGNED	NO	0	18446744073709551615
 MOOSEDB_COMPACTION_THREADS	GLOBAL	INT UNSIGNED	YES	1	64
 MOOSEDB_COMPACTION_TRIGGER_CHUNKS	GLOBAL	INT UNSIGNED	NO	2	10000
+MOOSEDB_GBH_DEBUG	SESSION	BOOLEAN	NO	NULL	NULL
+MOOSEDB_GROUP_BY_PUSHDOWN	SESSION	BOOLEAN	NO	NULL	NULL
 MOOSEDB_MAX_OPEN_CHUNKS	GLOBAL	INT UNSIGNED	NO	1	1000000
 MOOSEDB_MEMTABLE_FLUSH_THRESHOLD	GLOBAL	BIGINT UNSIGNED	NO	1048576	100663296
 MOOSEDB_RETENTION_CHECK_INTERVAL	GLOBAL	INT UNSIGNED	NO	0	4294967295

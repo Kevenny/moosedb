@@ -700,6 +700,149 @@ linhas, autocommit, em ordem de clock; MooseDB sem PK com `INDEX(clock)` +
 `INDEX(itemid,clock)` contra a PK `(itemid,clock,ns)`): 0,75 s contra 0,81 s em média
 de 6 execuções (+8 %, de −8 % a +20 % entre execuções; o InnoDB leva ~21 s).
 
+## Agregação pela engine (group_by_handler)
+
+`hton->create_group_by` aponta para `moosedb_create_group_by`
+(`moosedb_gbh.cc`). Com `moosedb_group_by_pushdown=OFF` (padrão) devolve
+`nullptr` e nada muda. Com `ON`, `analyze()` decide se a consulta está no escopo
+e monta o plano; se estiver, o handler `moosedb_gbh` assume o GROUP BY (zera
+`group_by` e `order_by`), senão devolve `nullptr` e a consulta segue o caminho
+normal. Com `moosedb_gbh_debug=ON` o veredito sai como nota (`gbh: accepted` /
+`gbh: refused: <motivo>`). Contador global `Moosedb_gbh_queries` = consultas
+executadas pelo handler.
+
+**Escopo aceito**: SELECT de nível superior, uma tabela MooseDB, GROUP BY de
+colunas TAG (string ou inteira), VARCHAR ou INT comuns; select list só com
+essas colunas, constantes e `COUNT(*)`/`COUNT(col)`/`SUM`/`AVG` de inteiro (menos
+`BIGINT UNSIGNED`, que não cabe nos agregados de 64 bits com sinal do core) e
+`MIN`/`MAX` de inteiro ou do eixo de tempo; WHERE = conjunção de igualdades/IN
+de TAG e limites do eixo (`capture_delete_cond`, o mesmo reconhecimento exato do
+DELETE direto; constantes string contra o eixo `DATETIME` valem quando o
+comparador é datetime). HAVING, ORDER BY (chave ou agregado, ASC/DESC), LIMIT e
+OFFSET entram. Fora: DISTINCT, ROLLUP, window, WITH TIES, SQL_CALC_FOUND_ROWS,
+subconsulta/derivada/view/CTE/UNION, rotinas, expressões, predicado em coluna
+comum, eixo `TIMESTAMP`.
+
+**Execução** (`init_scan`): mapeia `all_fields` para os campos da tmp table,
+resolve as séries do WHERE, abre a agregação (`moosedb_agg_open`, reconferindo
+`moosedb_series_version` até 64 vezes) e roda com `moosedb_agg_threads` threads
+e `moosedb_agg_max_memory` (o mesmo orçamento vale para a parte em C++, que
+fica sozinha com os grupos depois do `agg_close`). Chave TAG = uma chave de
+série; os valores vêm de `moosedb_series_list`. Grupos cujas chaves são iguais
+pela collation (séries com o mesmo valor, `a`/`A` em `_ci`) são fundidos com
+`hash_sort` + `strnncollsp`; o valor mostrado é o menor pelos bytes
+(determinístico: o servidor mostra o primeiro que viu). A ordenação é a do
+ORDER BY (NULL primeiro no ASC, strings por `strnncollsp`, AVG depois da
+divisão com `my_decimal`), desempate pelos bytes da chave; sem HAVING e com
+LIMIT usa `partial_sort` (top-N). `next_row` grava COUNT direto, SUM como
+DECIMAL a partir do `i128`, AVG por `my_decimal_div(prec_increment)`, MIN/MAX
+do eixo via `micros_to_time`. KILL/`max_statement_time` chegam pelo callback
+`thd_killed`; estouro de orçamento vira o erro `MooseDB: full: aggregation
+exceeds moosedb_agg_max_memory ...`. `end_scan` grava `thd->limit_found_rows`
+(o servidor não o faz no caminho do gbh).
+
+Pontos de atenção (já medidos ou assumidos):
+- `max_sort_length`: o servidor pode agrupar/ordenar strings truncadas por
+  `max_sort_length` (blobs/strings muito longas na ordenação); o handler compara
+  a string inteira com `strnncollsp`. Para as chaves aceitas (TAG e VARCHAR até
+  255 caracteres) a diferença só aparece com valores acima de `max_sort_length`
+  (1024 bytes por padrão), que o escopo praticamente não admite.
+- A lista de séries (`moosedb_series_list`) usada para obter os valores de TAG
+  dos grupos é compartilhada e materializa todas as séries da tabela; ela não
+  entra no orçamento `moosedb_agg_max_memory` e não pode ser restringida aos
+  grupos do resultado.
+- A reconferência de `moosedb_series_version` só acontece quando há filtro de
+  séries (WHERE em TAG); sem filtro, séries novas durante a abertura são vistas
+  inteiras ou não, nunca parcialmente.
+- Nenhuma exceção C++ sai do handler: falta de memória vira `HA_ERR_OUT_OF_MEM`
+  (ou o caminho normal, no planejamento).
+
+Diferenças visíveis de metadata (não do dado): as flags `BINARY`/`NUM`/
+`NO_DEFAULT_VALUE` dos campos do resultado vêm do campo da tmp table em vez do
+item; `NOT_NULL`/`UNSIGNED` são iguais. Testes: `gbh_scope`, `gbh_basic`,
+`gbh_collation`, `gbh_scale`.
+
+Comportamento do servidor (11.4.13) medido com um handler de teste que devolvia
+linhas fixas fora de ordem; o que a implementação de verdade precisa respeitar:
+
+- **O servidor nunca ordena por cima do handler.** `Query::order_by` é o
+  ORDER BY, ou a própria lista do GROUP BY quando não há ORDER BY (e também com
+  `ORDER BY NULL`, que só se distingue pelo item NULL auxiliar no início de
+  `all_fields`). Mesmo deixando `order_by` preenchido, o servidor não ordena (e
+  com LIMIT devolve linhas erradas): o handler deve sempre zerar `group_by` **e**
+  `order_by` e entregar as linhas já ordenadas (ORDER BY, top-N, LIMIT/OFFSET
+  são aplicados pelo servidor sobre a ordem emitida: o handler faz o top-N).
+  Quando ORDER BY coincide com GROUP BY, as duas listas são o mesmo `ORDER*`
+  (a direção DESC vem nele).
+- **HAVING é avaliado pelo servidor** sobre a tmp table, incluindo os agregados
+  auxiliares (`n_aux` itens ocultos no início de `all_fields`: colunas de GROUP
+  BY fora do SELECT, agregados de HAVING/ORDER BY, NULL de `ORDER BY NULL`).
+  Todos os campos da tmp table precisam ser preenchidos.
+- **Mapeamento `all_fields` -> `table->field`**: constantes não ocupam campo;
+  agregados e colunas ocupam um campo cada, em ordem; campos de agregados
+  auxiliares não têm nome. Expressões (`SUM(x)/2`) são calculadas pelo
+  servidor, mas `COUNT(*)+1` (sem tabela em `used_tables`) ganha um campo
+  que o handler não deve usar. `Item_sum::result_field` é a ponte segura; a
+  tmp table só existe depois de `create_group_by` (o handler recebe `table`
+  antes de `init_scan`).
+- **`FOUND_ROWS()` fica desatualizado** (`do_select` retorna antes de gravar
+  `limit_found_rows`), com ou sem `SQL_CALC_FOUND_ROWS`. Consultas com
+  `SQL_CALC_FOUND_ROWS` são recusadas; para `FOUND_ROWS()` simples o handler
+  precisa gravar `thd->limit_found_rows`.
+- `create_group_by` é chamado **também em EXPLAIN** (duas vezes no formato
+  tabular, uma no JSON), sem `init_scan`/`end_scan`: não pode abrir snapshot nem
+  reservar recurso no construtor. É recriado a cada `EXECUTE` de PREPARE, com
+  os `Item_param` já ligados (`CONST_ITEM`, `const_item()`), e o objeto é
+  apagado pelo servidor com `delete` (`~Pushdown_query`): criar com
+  `std::make_unique<...>().release()`.
+- É chamado para qualquer SELECT não constante na tabela, **sem GROUP BY**
+  (`group_by == NULL`), em subconsulta, derivada/CTE/view com GROUP BY, partes de
+  UNION, ROLLUP, window e dentro de rotinas — o reconhecedor recusa tudo isso.
+  `SELECT DISTINCT col` chega como GROUP BY sem `distinct`. View mesclada e
+  JOIN com outra engine não chamam o hook; `COUNT(*)` puro e tabela de ≤1 linha
+  (const table) também não. `GROUP BY` sobre constante some (`distinct=1`,
+  `group_by=NULL`).
+- **WHERE**: nunca traz `Item_equal` (já substituído por `=` simples, com
+  constantes propagadas e conjuntos reordenados; `NOT (v>3)` vira `v<=3`).
+  Constantes de tempo chegam como `Item_string`/`Item_param` (varchar/longblob),
+  mas o comparador é `datetime`: o valor tem de ser obtido por `get_date()`,
+  nunca por `val_str()`. `BETWEEN` e expressões constantes chegam como
+  `Item_cache` já tipados.
+
+### Motor de agregação (`moosedb-core/src/agg.rs`, FFI `moosedb_agg_*`)
+
+Usado por `moosedb_gbh.cc` (ver acima).
+`Table::agg_open(lo, hi, séries)` segura **um** `Snapshot` (mesmo corte de um
+scan não ordenado: só o commitado; o lote privado do statement é invisível).
+`Agg::run(spec, cancel)` faz hash aggregation e deixa um resultado colunar
+(`moosedb_agg_result(start, max)`, ordem não especificada). Deletes passam por
+`scan::visible_stretches`/`Visible` (a mesma lógica de `plan`/`split_by_holes`/
+`load_window` do scan em stream; não há segunda cópia).
+
+- **Chaves**: `Series` (um estado por série, laço apertado na janela) e
+  `Column(i)` (Int64/Timestamp/Bool como inteiro, Varchar/Decimal como bytes;
+  NULL é valor próprio). Imagem da chave em bytes num `std::HashMap` (SipHash:
+  o valor vem do cliente; o `FastMap` é só para ids internos), com cache da
+  última chave e do "mesmo valor da linha anterior".
+- **Funções**: `CountStar`, `Count(i)`, `Sum(i)` (Int64, acumulador `i128` com
+  `checked_add`; estouro = erro `Full`), `Min/Max(i)` (Int64/Timestamp).
+- **Filtros** por máscara de dicionário: uma execução com a única chave
+  `Column(c)`, sem funções nem filtros, grava o dicionário de `c` (valores na
+  ordem do resultado); filtros seguintes passam `mask[i]` por posição do
+  dicionário (vários = AND; máscara de tamanho errado ou sem dicionário =
+  `InvalidArg`).
+- **Paralelismo**: `std::thread::scope`; unidades de ~256 entradas de chunk e
+  de 64 Ki linhas da MemTable via `AtomicUsize`; um mapa parcial por worker,
+  merge sequencial; resultado idêntico para qualquer nº de threads. O callback
+  de cancelamento só roda na thread chamadora (~10 ms); workers leem um
+  `AtomicBool`. Pânico em worker é repropagado na thread chamadora (vira
+  `TF_ERR_INTERNAL` na FFI). Cancelado = `Error::Cancelled`/`TF_ERR_CANCELLED`.
+- **Memória**: um orçamento atômico compartilhado (chave + estados + overhead
+  por grupo em cada mapa parcial, conjuntos dos filtros, resultado, dicionário);
+  estourar = `Error::Full("aggregation exceeds moosedb_agg_max_memory ...")`.
+  Cada worker decodifica uma janela por vez, então a decodificação simultânea
+  é limitada pelo nº de threads.
+
 ## Limitações conhecidas
 
 * A manutenção de background só alcança tabelas **abertas** (no table cache).

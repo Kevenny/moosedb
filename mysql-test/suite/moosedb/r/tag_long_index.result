@@ -1,0 +1,50 @@
+SET NAMES utf8mb4;
+CREATE TABLE l64 (ts DATETIME NOT NULL, process VARCHAR(64) CHARACTER SET utf8mb4 NOT NULL COMMENT 'TAG', v INT,
+INDEX(ts), INDEX(process, ts)) ENGINE=MooseDB;
+CREATE TABLE l255 (ts DATETIME NOT NULL, process VARCHAR(255) CHARACTER SET utf8mb4 NOT NULL COMMENT 'TAG', v INT,
+INDEX(ts), INDEX(process, ts)) ENGINE=MooseDB;
+CREATE TABLE l300 (ts DATETIME NOT NULL, process VARCHAR(300) CHARACTER SET latin1 NOT NULL COMMENT 'TAG', v INT,
+INDEX(ts), INDEX(process, ts)) ENGINE=MooseDB;
+CREATE TABLE l63 (ts DATETIME NOT NULL, process VARCHAR(63) CHARACTER SET utf8mb4 NOT NULL COMMENT 'TAG', v INT,
+INDEX(ts), INDEX(process, ts)) ENGINE=MooseDB;
+SHOW CREATE TABLE l64;
+Table	Create Table
+l64	CREATE TABLE `l64` (
+  `ts` datetime NOT NULL,
+  `process` varchar(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci NOT NULL COMMENT 'TAG',
+  `v` int(11) DEFAULT NULL,
+  KEY `ts` (`ts`),
+  KEY `process` (`process`,`ts`)
+) ENGINE=MooseDB DEFAULT CHARSET=latin1 COLLATE=latin1_swedish_ci
+# a real prefix is still refused
+CREATE TABLE lp (ts DATETIME NOT NULL, process VARCHAR(64) CHARACTER SET utf8mb4 NOT NULL COMMENT 'TAG', v INT,
+INDEX(ts), INDEX(process(8), ts)) ENGINE=MooseDB;
+ERROR HY000: MooseDB: index 'process' is not supported: column 'process': index prefixes are not supported. MooseDB indexes the timestamp column alone, or TAG columns optionally followed by the timestamp (INDEX (itemid, clock))
+SHOW WARNINGS;
+Level	Code	Message
+Error	1478	MooseDB: index 'process' is not supported: column 'process': index prefixes are not supported. MooseDB indexes the timestamp column alone, or TAG columns optionally followed by the timestamp (INDEX (itemid, clock))
+Warning	1030	Got error 140 "Wrong create options" from storage engine MooseDB
+INSERT INTO l64 SELECT '2024-01-01' + INTERVAL seq SECOND, CONCAT('proc-', seq MOD 5, REPEAT('é', 40)), seq FROM seq_0_to_99;
+INSERT INTO l255 SELECT '2024-01-01' + INTERVAL seq SECOND, CONCAT('proc-', seq MOD 5, REPEAT('é', 200)), seq FROM seq_0_to_99;
+INSERT INTO l300 SELECT '2024-01-01' + INTERVAL seq SECOND, CONCAT('proc-', seq MOD 5, REPEAT('x', 280)), seq FROM seq_0_to_99;
+INSERT INTO l63 SELECT '2024-01-01' + INTERVAL seq SECOND, CONCAT('proc-', seq MOD 5), seq FROM seq_0_to_99;
+FLUSH TABLES;
+SELECT COUNT(*), SUM(v) FROM l64 WHERE process = CONCAT('proc-2', REPEAT('é', 40));
+COUNT(*)	SUM(v)
+20	990
+SELECT COUNT(*), SUM(v) FROM l255 WHERE process = CONCAT('proc-3', REPEAT('é', 200)) AND ts < '2024-01-01 00:00:50';
+COUNT(*)	SUM(v)
+10	255
+SELECT COUNT(*), SUM(v) FROM l300 WHERE process = CONCAT('proc-4', REPEAT('x', 280));
+COUNT(*)	SUM(v)
+20	1030
+SELECT COUNT(*), SUM(v) FROM l63 WHERE process = 'proc-1';
+COUNT(*)	SUM(v)
+20	970
+EXPLAIN SELECT COUNT(*) FROM l64 WHERE process = CONCAT('proc-2', REPEAT('é', 40));
+id	select_type	table	type	possible_keys	key	key_len	ref	rows	Extra
+1	SIMPLE	l64	ref	process	process	258	const	20	Using where
+SELECT COUNT(*) AS groups_l64 FROM (SELECT process FROM l64 GROUP BY process) x;
+groups_l64
+5
+DROP TABLE l64, l255, l300, l63;

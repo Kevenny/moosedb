@@ -128,7 +128,7 @@ impl ResolvedFilter {
         self.series.as_ref().map_or(true, |s| s.contains(&id))
     }
 
-    fn chunk_wanted(&self, c: &ChunkMeta) -> bool {
+    pub(crate) fn chunk_wanted(&self, c: &ChunkMeta) -> bool {
         if !c.overlaps(self.ts_min, self.ts_max) {
             return false;
         }
@@ -202,11 +202,8 @@ struct StreamState {
     next_series: usize,
     cur: Option<ChunkCursor>,
     mem_next: u64,
-    /// Timestamp intervals of the entry being visited still to be read, last
-    /// first (only when tombstones cut the wanted range).
-    todo: Vec<(i64, i64)>,
-    todo_holes: Vec<(u32, u32)>,
-    todo_entry: (usize, usize),
+    /// The entry being visited, window by window (see [`Visible`]).
+    todo: Option<Visible>,
 }
 
 impl StreamState {
@@ -216,11 +213,73 @@ impl StreamState {
             next_series: 0,
             cur: None,
             mem_next: 0,
-            todo: Vec::new(),
-            todo_holes: Vec::new(),
-            todo_entry: (0, 0),
+            todo: None,
         }
     }
+}
+
+/// What of one chunk entry is visible in a wanted timestamp range: the range
+/// minus the range tombstones (one interval each), and within each interval
+/// the rows the row tombstones leave. The single place that applies deletes to
+/// chunk reads; scans and aggregations both go through it.
+/// A decoded window and its live stretches.
+pub(crate) type Loaded = (Window, Vec<(usize, usize)>);
+
+pub(crate) struct Visible {
+    chunk: usize,
+    entry: usize,
+    /// Intervals still to be read, last first.
+    ivs: Vec<(i64, i64)>,
+    /// The single interval of an entry with no tombstones around: no allocation.
+    first: Option<(i64, i64)>,
+    holes: Vec<(u32, u32)>,
+}
+
+impl Visible {
+    pub(crate) fn plan(snap: &Snapshot, chunk: usize, entry: usize, lo: i64, hi: i64) -> Visible {
+        if snap.tombs.is_empty() {
+            return Visible { chunk, entry, ivs: Vec::new(), first: (lo <= hi).then_some((lo, hi)), holes: Vec::new() };
+        }
+        let meta = &snap.chunks[chunk];
+        let p = snap.tombs.plan(meta, entry, meta.series[entry].series_id, lo, hi);
+        let mut ivs = p.ivs;
+        ivs.reverse();
+        Visible { chunk, entry, ivs, first: None, holes: p.holes }
+    }
+
+    /// The next decoded window and its live stretches `[a, b)` (ascending,
+    /// never empty), or `None` when the entry is done.
+    pub(crate) fn next(&mut self, snap: &Snapshot, want: &[bool]) -> Result<Option<Loaded>> {
+        while let Some(iv) = self.first.take().or_else(|| self.ivs.pop()) {
+            let meta = &snap.chunks[self.chunk];
+            if let Some(win) = load_window(&snap.schema, meta, self.entry, iv, want, false)? {
+                let stretches = split_by_holes(win.lo, win.hi, &self.holes);
+                if !stretches.is_empty() {
+                    return Ok(Some((win, stretches)));
+                }
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// Calls `f(window, a, b)` for every live stretch (rows `[a, b)` of the
+/// window) of entry `entry` of chunk `chunk` with timestamp in `[lo, hi]`.
+pub(crate) fn visible_stretches(
+    snap: &Snapshot,
+    chunk: usize,
+    entry: usize,
+    (lo, hi): (i64, i64),
+    want: &[bool],
+    mut f: impl FnMut(&Window, usize, usize) -> Result<()>,
+) -> Result<()> {
+    let mut v = Visible::plan(snap, chunk, entry, lo, hi);
+    while let Some((win, stretches)) = v.next(snap, want)? {
+        for (a, b) in stretches {
+            f(&win, a, b)?;
+        }
+    }
+    Ok(())
 }
 
 // ─── merge mode ─────────────────────────────────────────────────────────────
@@ -496,16 +555,17 @@ impl Scan {
                 }
                 continue;
             }
-            // Intervals of an entry that tombstones cut up, one window each.
-            if let Some((a, b)) = st.todo.pop() {
-                let (ci, si) = st.todo_entry;
-                let meta = &snap.chunks[ci];
-                if let Some(win) = load_window(&snap.schema, meta, si, (a, b), &plan.want, false)? {
-                    let mut stretches = split_by_holes(win.lo, win.hi, &st.todo_holes);
-                    stretches.reverse();
-                    if let Some((x, y)) = stretches.pop() {
-                        st.cur = Some(ChunkCursor { chunk: ci, series: si, next: x, end: y, rest: stretches, win });
+            // Windows of the entry being visited (several when tombstones cut its range).
+            if let Some(v) = &mut st.todo {
+                match v.next(snap, &plan.want)? {
+                    Some((win, mut stretches)) => {
+                        stretches.reverse();
+                        if let Some((x, y)) = stretches.pop() {
+                            let (chunk, series) = (v.chunk, v.entry);
+                            st.cur = Some(ChunkCursor { chunk, series, next: x, end: y, rest: stretches, win });
+                        }
                     }
+                    None => st.todo = None,
                 }
                 continue;
             }
@@ -522,26 +582,7 @@ impl Scan {
                 let idx = st.next_series;
                 st.next_series += 1;
                 if entry.ts_min <= f.ts_max && entry.ts_max >= f.ts_min && f.series_matches(entry.series_id) {
-                    if snap.tombs.is_empty() {
-                        if let Some(win) =
-                            load_window(&snap.schema, meta, idx, (f.ts_min, f.ts_max), &plan.want, false)?
-                        {
-                            st.cur = Some(ChunkCursor {
-                                chunk: st.next_chunk,
-                                series: idx,
-                                next: win.lo,
-                                end: win.hi,
-                                rest: Vec::new(),
-                                win,
-                            });
-                        }
-                    } else {
-                        let p = snap.tombs.plan(meta, idx, entry.series_id, f.ts_min, f.ts_max);
-                        st.todo = p.ivs;
-                        st.todo.reverse();
-                        st.todo_holes = p.holes;
-                        st.todo_entry = (st.next_chunk, idx);
-                    }
+                    st.todo = Some(Visible::plan(snap, st.next_chunk, idx, f.ts_min, f.ts_max));
                 }
                 continue;
             }

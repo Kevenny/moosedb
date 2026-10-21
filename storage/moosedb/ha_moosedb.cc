@@ -11,6 +11,7 @@
 #define MYSQL_SERVER 1
 
 #include "ha_moosedb.h"
+#include "moosedb_gbh.h"
 
 #include <algorithm>
 #include <atomic>
@@ -23,6 +24,7 @@
 #include <filesystem>
 #include <iterator>
 #include <system_error>
+#include <thread>
 
 #include "my_global.h"
 #include "sql_class.h"
@@ -442,7 +444,64 @@ static MYSQL_SYSVAR_UINT(unique_lock_wait_timeout, srv_unique_lock_wait_timeout,
   "lock wait timeout (0 = fail at once)",
   NULL, NULL, 50, 0, 86400, 0);
 
+/*
+  Aggregation done by the engine (group_by_handler, moosedb_gbh.cc), only for
+  queries it recognises (moosedb_gbh_debug shows the verdict); others run the
+  normal way. With the pushdown OFF none of these has any effect.
+*/
+static MYSQL_THDVAR_BOOL(group_by_pushdown, PLUGIN_VAR_RQCMDARG,
+  "Let the engine compute GROUP BY aggregates of queries on MooseDB tables "
+  "(COUNT/SUM/AVG/MIN/MAX); queries it cannot handle run the normal way",
+  NULL, NULL, 0);
+
+static MYSQL_THDVAR_BOOL(gbh_debug, PLUGIN_VAR_RQCMDARG,
+  "Report, as a note per query, whether the GROUP BY pushdown recognises it "
+  "(\"gbh: accepted\" or \"gbh: refused: <reason>\"); for tests",
+  NULL, NULL, 0);
+
+static MYSQL_THDVAR_ULONGLONG(agg_max_memory, PLUGIN_VAR_RQCMDARG,
+  "Bytes one pushed-down GROUP BY may use for its groups; above it the "
+  "statement fails with an error",
+  NULL, NULL, 1ULL << 30, 16ULL << 20, 1ULL << 40, 0);
+
+static uint default_agg_threads()
+{
+  return std::clamp<uint>(std::thread::hardware_concurrency(), 1, 4);
+}
+
+static uint srv_agg_threads= 1;
+static MYSQL_SYSVAR_UINT(agg_threads, srv_agg_threads, PLUGIN_VAR_RQCMDARG,
+  "Threads one pushed-down GROUP BY uses to scan chunks (default: the number "
+  "of CPUs, at most 4)",
+  NULL, NULL, default_agg_threads(), 1, 64, 0);
+
+bool moosedb_group_by_pushdown_enabled(THD *thd)
+{
+  return thd && THDVAR(thd, group_by_pushdown);
+}
+
+bool moosedb_gbh_debug_enabled(THD *thd)
+{
+  return thd && THDVAR(thd, gbh_debug);
+}
+
+
+/* Queries whose GROUP BY the engine computed itself (group_by_handler). */
+static ulonglong srv_gbh_queries= 0;
+void moosedb_gbh_count()
+{
+  __atomic_fetch_add(&srv_gbh_queries, 1, __ATOMIC_RELAXED);
+}
+
+static SHOW_VAR moosedb_status_variables[]= {
+  {"gbh_queries", (char *) &srv_gbh_queries, SHOW_LONGLONG},
+  {NullS, NullS, SHOW_LONG}
+};
 static struct st_mysql_sys_var *moosedb_system_variables[]= {
+  MYSQL_SYSVAR(group_by_pushdown),
+  MYSQL_SYSVAR(gbh_debug),
+  MYSQL_SYSVAR(agg_max_memory),
+  MYSQL_SYSVAR(agg_threads),
   MYSQL_SYSVAR(wal_sync_mode),
   MYSQL_SYSVAR(memtable_flush_threshold),
   MYSQL_SYSVAR(compaction_trigger_chunks),
@@ -969,6 +1028,67 @@ bool ha_moosedb::moosedb_is_timestamp_column(const Field *field) const
   const tf_layout &l= share_->layout;
   return l.ts_column < l.columns.size() &&
          l.columns[l.ts_column].field_index == field->field_index;
+}
+
+bool ha_moosedb::moosedb_column_conv(const Field *field, tf_conv *out) const
+{
+  if (!share_ || !field || !out)
+    return false;
+  for (const tf_column &c : share_->layout.columns)
+    if (c.field_index == field->field_index)
+    {
+      *out= c.conv;
+      return true;
+    }
+  return false;
+}
+
+bool ha_moosedb::moosedb_gbh_where(Item *where,
+                                   std::vector<tf_tag_predicate> *preds,
+                                   longlong *lo, longlong *hi)
+{
+  if (!where || !preds || !lo || !hi)
+    return false;
+  capture_str_time_= true;
+  const bool ok= capture_delete_cond(where, preds, lo, hi);
+  capture_str_time_= false;
+  return ok;
+}
+
+bool ha_moosedb::moosedb_gbh_series(const std::vector<tf_tag_predicate> &preds,
+                                    std::vector<uint64_t> *out)
+{
+  if (!out)
+    return false;
+  std::vector<const tf_tag_predicate *> ptrs;
+  for (const tf_tag_predicate &p : preds)
+    ptrs.push_back(&p);
+  return resolve_series(ptrs, out);
+}
+
+std::string ha_moosedb::moosedb_gbh_error() const
+{
+  return share_ ? client_error(share_->path, share_->display)
+                : client_error("", "");
+}
+
+void moosedb_micros_to_time(longlong us, MYSQL_TIME *lt)
+{
+  if (lt)
+    micros_to_time(us, lt);
+}
+
+ulonglong moosedb_agg_max_memory_of(THD *thd)
+{
+  return thd ? THDVAR(thd, agg_max_memory) : (1ULL << 30);
+}
+
+uint moosedb_agg_threads_value() { return srv_agg_threads; }
+
+ha_moosedb *moosedb_handler_of(handler *file)
+{
+  return (file && file->ht == moosedb_hton) ? static_cast<ha_moosedb *>(file)
+                                            : nullptr;
 }
 
 MooseDB_share *ha_moosedb::get_share()
@@ -2630,7 +2750,24 @@ bool ha_moosedb::capture_delete_cond(Item *item,
   const tf_column &tc= l.columns[l.ts_column];
 
   /* Time bound: column OP constant, constant on either side. */
-  auto time_bound= [&](Item *fld, Item *cst, Item_func::Functype op) -> bool {
+  /* The comparison itself is DATETIME (the constant may be a string): GROUP BY pushdown only. */
+  auto time_cmp= [&](Item_func *f) -> bool {
+    if (!capture_str_time_)
+      return false;
+    switch (f->functype()) {
+    case Item_func::LT_FUNC: case Item_func::LE_FUNC: case Item_func::GT_FUNC:
+    case Item_func::GE_FUNC: case Item_func::EQ_FUNC:
+      return static_cast<Item_bool_func2 *>(f)->compare_type_handler()->cmp_type() == TIME_RESULT;
+    case Item_func::BETWEEN:
+      /* (datetime, string, string) compares as datetime */
+      return f->argument_count() == 3 && f->arguments()[0]->cmp_type() == TIME_RESULT &&
+             f->arguments()[1]->cmp_type() == STRING_RESULT &&
+             f->arguments()[2]->cmp_type() == STRING_RESULT;
+    default:
+      return false;
+    }
+  };
+  auto time_bound= [&](Item *fld, Item *cst, Item_func::Functype op, bool cmp_time) -> bool {
     const Item_field *f= field_of(fld, table);
     if (!f || f->field->field_index != tc.field_index || !cst->const_item() ||
         cst->is_expensive())
@@ -2652,8 +2789,8 @@ bool ha_moosedb::capture_delete_cond(Item *item,
     {
       THD *thd= ha_thd();
       MYSQL_TIME lt;
-      if (!thd || cst->cmp_type() != TIME_RESULT ||
-          cst->get_date(thd, &lt, date_mode_t(0)) || cst->null_value ||
+      if (!thd || (cst->cmp_type() != TIME_RESULT && !cmp_time) ||
+          cst->get_date(thd, &lt, Datetime::Options_cmp(thd)) /* the comparator's own flags and rounding */ || cst->null_value ||
           lt.month == 0 || lt.day == 0 || lt.neg ||
           (lt.time_type != MYSQL_TIMESTAMP_DATETIME && lt.time_type != MYSQL_TIMESTAMP_DATE))
         return false;
@@ -2705,8 +2842,9 @@ bool ha_moosedb::capture_delete_cond(Item *item,
       if (preds->size() > before)
         return true;
     }
-    return time_bound(a[0], a[1], fn->functype()) ||
-           time_bound(a[1], a[0], flip(fn->functype()));
+    const bool ct= time_cmp(fn);
+    return time_bound(a[0], a[1], fn->functype(), ct) ||
+           time_bound(a[1], a[0], flip(fn->functype()), ct);
   }
   case Item_func::IN_FUNC:
   {
@@ -2737,8 +2875,9 @@ bool ha_moosedb::capture_delete_cond(Item *item,
       return false;
     Item **a= fn->arguments();
     longlong l0= *lo, h0= *hi;
-    if (time_bound(a[0], a[1], Item_func::GE_FUNC) &&
-        time_bound(a[0], a[2], Item_func::LE_FUNC))
+    const bool ct= time_cmp(fn);
+    if (time_bound(a[0], a[1], Item_func::GE_FUNC, ct) &&
+        time_bound(a[0], a[2], Item_func::LE_FUNC, ct))
       return true;
     *lo= l0;
     *hi= h0;
@@ -5150,6 +5289,7 @@ static int moosedb_init_func(void *p)
   moosedb_hton->prepare_for_backup= moosedb_prepare_for_backup;
   moosedb_hton->end_backup= moosedb_end_backup;
   moosedb_hton->flush_logs= moosedb_flush_logs;
+  moosedb_hton->create_group_by= moosedb_create_group_by;
   push_globals();
   if (moosedb_set_key_callback(moosedb_key_callback) != TF_OK)
   {
@@ -5189,7 +5329,7 @@ maria_declare_plugin(moosedb)
   moosedb_init_func,                    /* Plugin Init   */
   moosedb_deinit_func,                  /* Plugin Deinit */
   0x0002,                                /* version 0.2   */
-  NULL,                                  /* status vars   */
+  moosedb_status_variables,             /* status vars   */
   moosedb_system_variables,             /* system vars   */
   "0.2.0",                               /* string version */
   MariaDB_PLUGIN_MATURITY_EXPERIMENTAL   /* maturity      */

@@ -1,0 +1,63 @@
+#
+# GROUP BY done by the engine, string keys under several collations: groups
+# whose keys compare equal under the collation (different series with the
+# same TAG value; 'a', 'A', 'á' and 'a ' under a _ci / PAD SPACE collation)
+# must be merged exactly as the server does, and ordered like the server
+# orders them. Differential: pushdown OFF / ON / InnoDB (include/gbh_diff.inc).
+#
+--source include/not_embedded.inc
+--source include/have_innodb.inc
+--source include/have_sequence.inc
+--source suite/moosedb/include/have_moosedb.inc
+SET NAMES utf8mb4;
+
+--let $refused= 0
+--let $sorted= 0
+--let $show= 0
+--let $pre=
+
+CREATE DATABASE mirror;
+
+--let $cs= utf8mb4
+--let $coll= utf8mb4_general_ci
+--let $exact= 0
+--source suite/moosedb/include/gbh_coll_run.inc
+
+--let $coll= uca1400_ai_ci
+--source suite/moosedb/include/gbh_coll_run.inc
+
+--let $coll= utf8mb4_bin
+--let $exact= 1
+--source suite/moosedb/include/gbh_coll_run.inc
+
+--let $coll= utf8mb4_nopad_bin
+--source suite/moosedb/include/gbh_coll_run.inc
+
+--let $cs= latin1
+--let $coll= latin1_swedish_ci
+--let $exact= 0
+--source suite/moosedb/include/gbh_coll_run.inc
+
+--echo ##########################################################
+--echo # The key shown for a merged group is the smallest by raw bytes
+--echo # (the server shows whichever spelling it met first), so it is
+--echo # checked on the engine alone
+--echo ##########################################################
+--let $cs= utf8mb4
+--let $coll= utf8mb4_general_ci
+--let $exact= 0
+CREATE TABLE t (
+  ts DATETIME NOT NULL,
+  tg VARCHAR(16) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci NOT NULL COMMENT 'TAG',
+  v INT,
+  INDEX(ts)
+) ENGINE=MooseDB;
+INSERT INTO t VALUES ('2024-01-01 00:00:01', 'a', 1), ('2024-01-01 00:00:02', 'A', 2),
+  ('2024-01-01 00:00:03', 'b', 3), ('2024-01-01 00:00:04', 'a ', 4), ('2024-01-01 00:00:05', 'B', 5),
+  ('2024-01-01 00:00:06', 'á', 6);
+SET SESSION moosedb_group_by_pushdown = ON;
+SELECT tg, COUNT(*) c, SUM(v) s FROM t GROUP BY tg ORDER BY tg;
+SET SESSION moosedb_group_by_pushdown = DEFAULT;
+DROP TABLE t;
+
+DROP DATABASE mirror;

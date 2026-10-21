@@ -1,0 +1,84 @@
+CREATE TABLE s (
+ts   DATETIME NOT NULL,
+host VARCHAR(16) NOT NULL COMMENT 'TAG',
+file VARCHAR(32),
+n    INT,
+INDEX(ts)
+) ENGINE=MooseDB CHUNK_INTERVAL='1 DAY';
+# 2 million rows, 700001 distinct files
+INSERT INTO s SELECT '2024-01-01' + INTERVAL seq SECOND, CONCAT('host', seq MOD 100),
+CONCAT('/var/f', seq MOD 700001), seq MOD 1000
+FROM seq_0_to_1999999;
+FLUSH TABLES s;
+SELECT COUNT(*) FROM s;
+COUNT(*)
+2000000
+##### the same answer with the engine and without it
+SET SESSION moosedb_group_by_pushdown = OFF;
+SELECT file, COUNT(*), SUM(n) INTO @f_off, @c_off, @s_off FROM s GROUP BY file ORDER BY COUNT(*) DESC, file LIMIT 1;
+SELECT host, COUNT(*), SUM(n) INTO @h_off, @hc_off, @hs_off FROM s GROUP BY host ORDER BY SUM(n) DESC, host LIMIT 1;
+SET SESSION moosedb_group_by_pushdown = ON;
+SELECT file, COUNT(*), SUM(n) INTO @f_on, @c_on, @s_on FROM s GROUP BY file ORDER BY COUNT(*) DESC, file LIMIT 1;
+SELECT host, COUNT(*), SUM(n) INTO @h_on, @hc_on, @hs_on FROM s GROUP BY host ORDER BY SUM(n) DESC, host LIMIT 1;
+SELECT @f_off = @f_on AND @c_off = @c_on AND @s_off = @s_on AS file_same,
+@h_off = @h_on AND @hc_off = @hc_on AND @hs_off = @hs_on AS host_same;
+file_same	host_same
+1	1
+SELECT @f_on, @c_on, @s_on, @h_on, @hc_on, @hs_on;
+@f_on	@c_on	@s_on	@h_on	@hc_on	@hs_on
+/var/f0	3	3	host99	20000	10980000
+##### one thread and eight threads
+SET GLOBAL moosedb_agg_threads = 1;
+SELECT file, COUNT(*), SUM(n) INTO @f_1, @c_1, @s_1 FROM s GROUP BY file ORDER BY COUNT(*) DESC, file LIMIT 1;
+SET GLOBAL moosedb_agg_threads = 8;
+SELECT file, COUNT(*), SUM(n) INTO @f_8, @c_8, @s_8 FROM s GROUP BY file ORDER BY COUNT(*) DESC, file LIMIT 1;
+SET GLOBAL moosedb_agg_threads = DEFAULT;
+SELECT @f_1 = @f_8 AND @c_1 = @c_8 AND @s_1 = @s_8 AND @f_1 = @f_on AS threads_same;
+threads_same
+1
+##### the memory budget: 700001 groups do not fit 16 MiB
+SET SESSION moosedb_agg_max_memory = 16777216;
+SELECT @@SESSION.moosedb_agg_max_memory;
+@@SESSION.moosedb_agg_max_memory
+16777216
+SELECT file, COUNT(*) c FROM s GROUP BY file ORDER BY file LIMIT 3;
+ERROR HY000: MooseDB: full: aggregation exceeds moosedb_agg_max_memory (N bytes); narrow the query or raise the limit
+# a few groups still fit
+SELECT host, COUNT(*) c FROM s GROUP BY host ORDER BY host LIMIT 3;
+host	c
+host0	20000
+host1	20000
+host10	20000
+# and the session is fine afterwards
+SELECT COUNT(*) FROM s WHERE host = 'host7';
+COUNT(*)
+20000
+SET SESSION moosedb_agg_max_memory = DEFAULT;
+SELECT file, COUNT(*) c FROM s GROUP BY file ORDER BY file LIMIT 3;
+file	c
+/var/f0	3
+/var/f1	3
+/var/f10	3
+##### max_statement_time stops the aggregation
+SET SESSION max_statement_time = 0.001;
+SELECT file, COUNT(*) c FROM s GROUP BY file ORDER BY c DESC, file LIMIT 3;
+ERROR 70100: Query execution was interrupted (max_statement_time exceeded)
+SET SESSION max_statement_time = DEFAULT;
+SELECT host, COUNT(*) c FROM s GROUP BY host ORDER BY host LIMIT 2;
+host	c
+host0	20000
+host1	20000
+##### KILL QUERY during the aggregation
+connect  con2,localhost,root,,test;
+SET SESSION moosedb_group_by_pushdown = ON;
+SET SESSION moosedb_agg_max_memory = 4294967296;
+SELECT file, COUNT(*) c, SUM(n) s FROM s GROUP BY file ORDER BY c DESC, file LIMIT 5;
+connection default;
+connection con2;
+# the connection is still usable
+SELECT COUNT(*) FROM s WHERE host = 'host9';
+COUNT(*)
+20000
+connection default;
+disconnect con2;
+DROP TABLE s;

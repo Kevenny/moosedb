@@ -1,0 +1,1 @@
+SELECT concat(toString(count()), ' partes ', toString(round(sum(bytes_on_disk) / 1048576)), ' MiB em disco; ', toString(round(sum(data_uncompressed_bytes) / 1048576)), ' MiB sem compressao') FROM system.parts WHERE database = 'fileacc' AND table = 'evento' AND active

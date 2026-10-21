@@ -29,6 +29,8 @@ pub enum Error {
     Busy(String),
     /// Waiting for that series would close a cycle of waiting statements.
     Deadlock(String),
+    /// The caller asked to stop a long operation (aggregation).
+    Cancelled(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -47,6 +49,7 @@ impl fmt::Display for Error {
             Error::Duplicate(m) => write!(f, "duplicate key: {m}"),
             Error::Busy(m) => write!(f, "busy: {m}"),
             Error::Deadlock(m) => write!(f, "deadlock: {m}"),
+            Error::Cancelled(m) => write!(f, "cancelled: {m}"),
         }
     }
 }

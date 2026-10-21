@@ -2,13 +2,17 @@ SELECT ENGINE, SUPPORT, TRANSACTIONS, XA, SAVEPOINTS
 FROM information_schema.ENGINES WHERE ENGINE = 'MooseDB';
 ENGINE	SUPPORT	TRANSACTIONS	XA	SAVEPOINTS
 MooseDB	YES	NO	NO	NO
-SHOW VARIABLES LIKE 'moosedb%';
+# moosedb_agg_threads defaults to the CPU count (at most 4): not listed
+SHOW VARIABLES WHERE Variable_name LIKE 'moosedb%' AND Variable_name <> 'moosedb_agg_threads';
 Variable_name	Value
+moosedb_agg_max_memory	1073741824
 moosedb_batch_memory_budget	1073741824
 moosedb_bloom_filter_false_positive_rate	0.010000
 moosedb_chunk_cache_size	134217728
 moosedb_compaction_threads	2
 moosedb_compaction_trigger_chunks	10
+moosedb_gbh_debug	OFF
+moosedb_group_by_pushdown	OFF
 moosedb_max_open_chunks	100
 moosedb_memtable_flush_threshold	67108864
 moosedb_retention_check_interval	3600

@@ -1062,6 +1062,21 @@ impl Table {
     /// as NULL. The timestamp is decoded internally whenever the range or the
     /// order needs it, even if not projected.
     pub fn scan_projected(&self, filter: &ScanFilter, sorted: bool, columns: Option<&[bool]>) -> Result<Scan> {
+        let (snap, resolved) = self.resolved_snapshot(filter)?;
+        let tie = self.config.unique.as_ref().map_or(&[][..], |u| u.extra_columns());
+        Scan::new(snap, resolved, sorted, columns, tie)
+    }
+
+    /// Opens an aggregation (see `agg`) over one snapshot of the table, with
+    /// the same visibility as an unordered scan: `lo <= ts <= hi`, optionally
+    /// only the given series (`None` = all).
+    pub fn agg_open(&self, lo: i64, hi: i64, series: Option<Vec<u64>>) -> Result<crate::agg::Agg> {
+        let filter = ScanFilter { ts_min: lo, ts_max: hi, tags: Vec::new(), series };
+        let (snap, resolved) = self.resolved_snapshot(&filter)?;
+        Ok(crate::agg::Agg::new(snap, resolved))
+    }
+
+    fn resolved_snapshot(&self, filter: &ScanFilter) -> Result<(Arc<Snapshot>, ResolvedFilter)> {
         // Both views under ONE acquisition of the mutex: a commit between two
         // acquisitions could show the rows of a statement's series X but not
         // of its new series Y (a partly visible statement).
@@ -1070,9 +1085,7 @@ impl Table {
             let all = (!filter.tags.is_empty()).then(|| guard.series.snapshot());
             (self.snapshot_locked(&mut guard), all)
         };
-        let resolved = self.resolve(filter, all)?;
-        let tie = self.config.unique.as_ref().map_or(&[][..], |u| u.extra_columns());
-        Scan::new(snap, resolved, sorted, columns, tie)
+        Ok((snap, self.resolve(filter, all)?))
     }
 
     /// Re-reads the row at `pos` from the current contents.

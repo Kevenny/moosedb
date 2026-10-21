@@ -63,7 +63,7 @@ ELSE()
     VERBATIM)
 ENDIF()
 
-MYSQL_ADD_PLUGIN(moosedb ha_moosedb.cc
+MYSQL_ADD_PLUGIN(moosedb ha_moosedb.cc moosedb_gbh.cc
   STORAGE_ENGINE MODULE_ONLY
   LINK_LIBRARIES ${MOOSEDB_RUST_LIB} pthread dl m)
 

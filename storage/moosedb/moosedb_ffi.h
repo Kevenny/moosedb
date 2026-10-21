@@ -13,6 +13,29 @@
 // Size in bytes of a row position (`handler::ref_length`).
 #define TF_POSITION_LEN 16
 
+// Group key kinds of `TFAggKey::kind`.
+#define TF_AGG_KEY_SERIES 0
+
+#define TF_AGG_KEY_COLUMN 1
+
+// Function codes of `TFAggFunc::op`.
+#define TF_AGG_COUNT_STAR 0
+
+#define TF_AGG_COUNT 1
+
+#define TF_AGG_SUM 2
+
+#define TF_AGG_MIN 3
+
+#define TF_AGG_MAX 4
+
+// Result key column kinds (`TFAggKeyBatch::kind`).
+#define TF_AGG_KEYCOL_SERIES 0
+
+#define TF_AGG_KEYCOL_INT 1
+
+#define TF_AGG_KEYCOL_BYTES 2
+
 typedef enum {
   TF_OK = 0,
   TF_ERR_IO = 1,
@@ -37,6 +60,8 @@ typedef enum {
   TF_ERR_BUSY = 12,
   // Waiting for that series would close a cycle of waiting statements.
   TF_ERR_DEADLOCK = 13,
+  // The caller cancelled a long operation (aggregation).
+  TF_ERR_CANCELLED = 14,
 } TFStatus;
 
 // Column type codes used in `TFTableConfig::column_types` and `TFValue::kind`.
@@ -50,6 +75,9 @@ typedef enum {
   TF_COL_TAG = 6,
   TF_COL_DECIMAL = 7,
 } TFColumnType;
+
+// Opaque aggregation handle: one snapshot, used by one thread at a time.
+typedef struct MooseDBAgg MooseDBAgg;
 
 // Opaque statement batch (see `moosedb_batch_begin`). Used by one thread.
 typedef struct MooseDBBatch MooseDBBatch;
@@ -201,6 +229,85 @@ typedef struct {
   // `row_count * TF_POSITION_LEN` bytes: the position of each row.
   const uint8_t *positions;
 } TFBatch;
+
+// One group-by key: the series (`col` ignored) or a column.
+typedef struct {
+  // `TF_AGG_KEY_SERIES` or `TF_AGG_KEY_COLUMN`.
+  uint8_t kind;
+  uint32_t col;
+} TFAggKey;
+
+// One aggregate function (`col` ignored for `TF_AGG_COUNT_STAR`).
+typedef struct {
+  // `TF_AGG_COUNT_STAR` .. `TF_AGG_MAX`.
+  uint8_t op;
+  uint32_t col;
+} TFAggFunc;
+
+// Dictionary mask of a column: `mask[i] != 0` accepts the i-th value of the
+// dictionary that an earlier run with the single key `{COLUMN, col}`, no
+// functions and no filters left in the result (result order).
+typedef struct {
+  uint32_t col;
+  const uint8_t *mask;
+  uint64_t mask_len;
+} TFAggFilter;
+
+typedef struct {
+  const TFAggKey *keys;
+  uint32_t key_count;
+  const TFAggFunc *funcs;
+  uint32_t func_count;
+  const TFAggFilter *filters;
+  uint32_t filter_count;
+  // Budget in bytes for keys, states and result.
+  uint64_t max_memory;
+  // Worker threads (1 = the calling thread only).
+  uint32_t threads;
+} TFAggSpec;
+
+// Polled about every 10 ms on the calling thread; a non-zero return cancels
+// the run (`TF_ERR_CANCELLED`).
+typedef int32_t (*TFAggCancel)(void *ctx);
+
+// A key column of the result, one entry per group. `nulls` (NULL for the
+// series) holds 1 for a NULL value. `values` holds `uint64_t` series ids
+// (`TF_AGG_KEYCOL_SERIES`) or `int64_t` values (`TF_AGG_KEYCOL_INT`);
+// `starts`/`lens`/`data` describe byte strings (`TF_AGG_KEYCOL_BYTES`):
+// `starts[i] + lens[i] <= data_len`.
+typedef struct {
+  uint8_t kind;
+  const uint8_t *nulls;
+  const void *values;
+  const uint64_t *starts;
+  const uint32_t *lens;
+  const uint8_t *data;
+  uint64_t data_len;
+} TFAggKeyBatch;
+
+// A function column of the result, one entry per group. `count` is the number
+// of rows (COUNT(*)), of non-NULL values (COUNT) or of values aggregated by
+// SUM/MIN/MAX (0 = the SQL result is NULL). SUM: the signed 128-bit value
+// `(sum_hi << 64) | sum_lo`. MIN/MAX: `val`. Pointers the op does not use are NULL.
+typedef struct {
+  uint8_t op;
+  const uint64_t *count;
+  const uint64_t *sum_lo;
+  const int64_t *sum_hi;
+  const int64_t *val;
+} TFAggFuncBatch;
+
+// Groups `[start, start + row_count)` of the last result. Owned by the
+// handle; valid until the next call on it.
+typedef struct {
+  uint64_t row_count;
+  // Groups in the whole result.
+  uint64_t total_groups;
+  uint32_t key_count;
+  uint32_t func_count;
+  const TFAggKeyBatch *keys;
+  const TFAggFuncBatch *funcs;
+} TFAggBatch;
 
 // Table-level diagnostics (INFORMATION_SCHEMA.MOOSEDB_TABLES). Strings are
 // owned by the `MooseDBInfo` handle.
@@ -595,6 +702,44 @@ TFStatus moosedb_snapshot_fetch(MooseDBSnapshot *snapshot, const uint8_t *pos, T
 // # Safety
 // `snapshot` must come from `moosedb_scan_snapshot` and not be used afterwards.
 TFStatus moosedb_snapshot_close(MooseDBSnapshot *snapshot);
+
+// Opens an aggregation over a snapshot of the table, with the visibility of
+// an unordered scan: rows with `ts_start_us <= ts <= ts_end_us`, only in the
+// given series (`series_count < 0` = all series).
+//
+// # Safety
+// `series_ids` must hold `series_count` elements when `series_count > 0`;
+// `out_agg` writable.
+TFStatus moosedb_agg_open(MooseDBTable *table,
+                          int64_t ts_start_us,
+                          int64_t ts_end_us,
+                          const uint64_t *series_ids,
+                          int64_t series_count,
+                          MooseDBAgg **out_agg);
+
+// Runs the aggregation described by `spec`; the result is read with
+// `moosedb_agg_result` (it replaces the previous one; a failed run leaves
+// none). `cancel` may be NULL. Errors: `TF_ERR_INVALID_ARG` (bad column or
+// type, missing dictionary, mask of the wrong length), `TF_ERR_FULL` (memory
+// budget, SUM overflow), `TF_ERR_CANCELLED`, `TF_ERR_INTERNAL` (a panic in a
+// worker thread).
+//
+// # Safety
+// `agg` valid; `spec` and the arrays it points to valid for the call;
+// `cancel(ctx)` must be callable from this thread.
+TFStatus moosedb_agg_run(MooseDBAgg *agg, const TFAggSpec *spec, TFAggCancel cancel, void *ctx);
+
+// Groups `[start, start + max_groups)` of the last result, in columns (an
+// empty batch when `start` is past the end). Order is unspecified but stable
+// until the next run. Valid until the next call on the handle.
+//
+// # Safety
+// `agg` valid; `out` writable.
+TFStatus moosedb_agg_result(MooseDBAgg *agg, uint64_t start, uint64_t max_groups, TFAggBatch *out);
+
+// # Safety
+// `agg` must come from `moosedb_agg_open` and not be used afterwards. NULL is ignored.
+TFStatus moosedb_agg_close(MooseDBAgg *agg);
 
 // Version of the table's set of series: it changes whenever a series is added
 // or the table is truncated, so equal values mean the same series. Lock-free

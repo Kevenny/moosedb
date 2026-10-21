@@ -560,20 +560,21 @@ INSERT INTO tr VALUES (1, 101, 3, 1);
 SELECT clock, value FROM tr ORDER BY clock;
 --echo # retention: the key of an expired row can be inserted again
 TRUNCATE TABLE tr;
-INSERT INTO tr VALUES (1, UNIX_TIMESTAMP() - 200 * 86400, 1, 1), (1, UNIX_TIMESTAMP() - 100 * 86400, 1, 1), (1, UNIX_TIMESTAMP() - 3600, 1, 1);
+SET @now= UNIX_TIMESTAMP();
+INSERT INTO tr VALUES (1, @now - 200 * 86400, 1, 1), (1, @now - 100 * 86400, 1, 1), (1, @now - 3600, 1, 1);
 FLUSH TABLES tr;
 --replace_regex /-[0-9]{9,10}-1/-<clock>-1/
 --error ER_DUP_ENTRY
-INSERT INTO tr VALUES (1, UNIX_TIMESTAMP() - 200 * 86400, 2, 1);
+INSERT INTO tr VALUES (1, @now - 200 * 86400, 2, 1);
 CALL moosedb_apply_retention('test.tr');
 SELECT COUNT(*) AS rows_left FROM tr;
-INSERT INTO tr VALUES (1, UNIX_TIMESTAMP() - 200 * 86400, 2, 1);
+INSERT INTO tr VALUES (1, @now - 200 * 86400, 2, 1);
 --replace_regex /-[0-9]{9,10}-1/-<clock>-1/
 --error ER_DUP_ENTRY
-INSERT INTO tr VALUES (1, UNIX_TIMESTAMP() - 200 * 86400, 3, 1);
+INSERT INTO tr VALUES (1, @now - 200 * 86400, 3, 1);
 --replace_regex /-[0-9]{9,10}-1/-<clock>-1/
 --error ER_DUP_ENTRY
-INSERT INTO tr VALUES (1, UNIX_TIMESTAMP() - 3600, 3, 1);
+INSERT INTO tr VALUES (1, @now - 3600, 3, 1);
 DROP TABLE tr;
 
 --echo ##################################################################

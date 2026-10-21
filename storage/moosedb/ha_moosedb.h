@@ -293,9 +293,26 @@ public:
   uint max_supported_keys() const override { return 8; }
   uint max_supported_key_parts() const override { return 16; }
   uint max_supported_key_length() const override { return 3072; }
+  /* The default (255) turns a VARCHAR TAG of more than 255 bytes (utf8mb4 VARCHAR(64)) into a prefix key. */
+  uint max_supported_key_part_length() const override { return 3072; }
 
   /* ── MooseDB specific ────────────────────────────────────────────── */
   bool moosedb_is_timestamp_column(const Field *field) const;
+  /* Storage class of a column; false for a column the engine does not store. */
+  bool moosedb_column_conv(const Field *field, tf_conv *out) const;
+  /* GROUP BY pushdown support (moosedb_gbh.cc). */
+  /* Absorbs a WHERE made only of exact TAG equalities/IN and time bounds. */
+  bool moosedb_gbh_where(Item *where, std::vector<tf_tag_predicate> *preds,
+                         longlong *lo, longlong *hi);
+  /* Series (sorted ids) satisfying every predicate; false = not resolvable. */
+  bool moosedb_gbh_series(const std::vector<tf_tag_predicate> &preds,
+                          std::vector<uint64_t> *out);
+  MooseDBTable *moosedb_table_handle() const
+  { return share_ ? share_->table.get() : nullptr; }
+  const tf_layout *moosedb_layout() const
+  { return share_ ? &share_->layout : nullptr; }
+  /* The pending Rust error of this thread, with host paths removed. */
+  std::string moosedb_gbh_error() const;
   int moosedb_force_flush();
   int moosedb_compact_chunks(longlong from_us, longlong to_us);
 
@@ -372,6 +389,7 @@ private:
   std::vector<tf_tag_predicate> ddel_cap_preds_;
   longlong ddel_cap_lo_= LONGLONG_MIN, ddel_cap_hi_= LONGLONG_MAX;
   uint64_t del_rows_= 0;      /* delete_row() calls of the open DELETE */
+  bool capture_str_time_= false;  /* capture_delete_cond: a string constant is a DATETIME one when the comparison is */
   bool in_bulk_insert_= false;
   uint dup_key_= MAX_KEY;     /* key of the last HA_ERR_FOUND_DUPP_KEY (info ERRKEY) */
   query_id_t bulk_query_id_= 0;  /* statement that called start_bulk_insert */
@@ -441,3 +459,9 @@ private:
   bool pushed_filter_= false;           /* some predicate restricts rows  */
   std::vector<uint64_t> pushed_ids_;    /* series matching all predicates */
 };
+
+/* Helpers the group_by_handler (moosedb_gbh.cc) shares with the handler. */
+void moosedb_micros_to_time(longlong us, MYSQL_TIME *lt);
+ulonglong moosedb_agg_max_memory_of(THD *thd);
+uint moosedb_agg_threads_value();
+void moosedb_gbh_count();

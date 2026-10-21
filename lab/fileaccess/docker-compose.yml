@@ -70,7 +70,39 @@ services:
       timeout: 5s
       retries: 60
 
+  columnstore:
+    # Mesmo MariaDB 11.4.13 + ColumnStore 25.10 do repositório oficial (columnstore/Dockerfile).
+    build: ./columnstore
+    image: fileacc-columnstore
+    container_name: fileacc-columnstore
+    cpus: 8
+    mem_limit: 10g
+    shm_size: 2g                 # BRM do ColumnStore vive em memória compartilhada
+    stop_grace_period: 120s      # o entrypoint para os daemons e salva o BRM; 10 s padrão => SIGKILL antes do save
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_bin
+      - --innodb-buffer-pool-size=256M
+      - --max-connections=50
+    environment:
+      MARIADB_ROOT_PASSWORD: ${ROOT_PASSWORD:-fileacc}
+    volumes:
+      - fileacc-cs-mariadb:/var/lib/mysql
+      - fileacc-cs-data:/var/lib/columnstore
+      - ./sql:/lab/sql:ro
+      - ./cs:/lab/cs:ro
+      - fileacc-data:/lab/data:ro
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+
 volumes:
+  fileacc-cs-mariadb:
+    name: fileacc-cs-mariadb
+  fileacc-cs-data:
+    name: fileacc-cs-data
   fileacc-mariadb:
     name: fileacc-mariadb
   fileacc-clickhouse:

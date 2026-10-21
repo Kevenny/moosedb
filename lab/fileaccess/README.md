@@ -286,3 +286,34 @@ O `ANALYZE` instrumenta cada linha e infla os tempos de varredura (~1,5x) em rel
 
 Plugin compilado do HEAD `5c771db` (árvore limpa naquele momento) pelo fluxo da skill `moosedb-build`, MariaDB
 11.4.13, ClickHouse 26.9.23.15. As tabelas acima desta seção são do HEAD; a seção "Agregação na engine" é do working tree com group-by handler (não commitado).
+
+## MooseDB x ColumnStore (20 M linhas, 2026-10-21)
+
+ColumnStore 25.10.6 sobre o mesmo MariaDB 11.4.13, em contêiner próprio (`columnstore/`, serviço `columnstore`,
+`ENGINES=cs` no `bench.sh`, esquema `cs/schema.sql` sem índices) com 8 CPUs e 10 GiB. O PrimProc dimensiona a memória
+pela RAM do host, então o cache de blocos foi fixado em ~4 GiB e `TotalUmMemory` em 3 GiB. As consultas são as mesmas de
+`sql/`. Cada engine rodou com só o seu contêiner no ar. Os md5 das 9 consultas são **idênticos nas 5 engines**.
+Melhor de 5 quentes (s); entre parênteses, a 1ª execução (COLD=1). MooseDB ON = `GBH=1 AGG_THREADS=4`.
+Plugin `plugin/ha_moosedb.so` de 2026-10-20. Resultados em `results/{cs_load,cs_q,cmp_mariadb,cmp_moose_off,cmp_ch}_20m.txt`.
+
+| Consulta | InnoDB | MooseDB OFF | MooseDB ON | MooseDB-h OFF | MooseDB-h ON | ColumnStore | ClickHouse |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| q01 | 2,99 (8,51) | 3,24 (4,11) | 0,038 (0,603) | 1,91 (2,08) | 0,0024 (0,152) | 0,192 (0,242) | 0,015 (0,034) |
+| q02 | 0,486 (0,509) | 0,683 (1,44) | 0,073 (0,364) | 0,431 (0,828) | 0,014 (0,279) | 0,133 (0,240) | 0,025 (0,047) |
+| q03 | 0,290 (0,290) | 0,383 (0,456) | 0,042 (0,077) | 0,217 (0,308) | 0,0052 (0,064) | 0,112 (0,130) | 0,010 (0,018) |
+| q04 | 14,40 (14,68) | 16,86 (18,13) | 0,378 (0,501) | 14,43 (14,66) | 0,297 (0,467) | 0,554 (0,669) | 0,063 (0,098) |
+| q05 | 1,51 (13,34) | 2,20 (4,19) | 1,15 (2,95) | 3,03 (3,19) | 1,22 (2,17) | 8,85 (9,36) | 0,098 (0,183) |
+| q05b | 2,20 (2,17) | 3,30 (3,58) | 0,236 (0,246) | 1,62 (1,71) | 0,184 (0,203) | 0,687 (0,791) | 0,031 (0,033) |
+| q06 | 0,0130 (0,0144) | 0,0048 (0,0052) | 0,0046 (0,0054) | 0,0039 (0,0050) | 0,00066 (0,00087) | 0,958 (0,999) | 0,003 (0,004) |
+| q07 | 0,0137 (0,0150) | 0,0057 (0,0058) | 0,0054 (0,0060) | 0,0047 (0,0047) | 0,0048 (0,0054) | 0,976 (1,02) | 0,003 (0,004) |
+| q07b | 0,0017 (0,0020) | 0,0012 (0,0021) | 0,0010 (0,0012) | 0,00088 (0,0010) | 0,00085 (0,0009) | 0,104 (0,111) | 0,003 (0,003) |
+
+Carga do ColumnStore (LOAD DATA, que vira cpimport): 109 s (183 mil linhas/s), 1.065 MiB em disco. MooseDB, da rodada
+anterior: 136 s + 48 s de compactação e 778 MiB com host+process como TAG; 58 s + 22 s e 555 MiB com só host.
+
+Leitura: com a agregação na engine, a MooseDB fica à frente do ColumnStore nas 9 consultas. Nas agregações de janela
+(q01 a q04, q05b) a vantagem vai de 1,5x a 5x com host+process (2x a 80x com só host). Nas consultas por host (q06, q07)
+o ColumnStore paga ~1 s de piso por consulta e varre a janela sem índice, enquanto a MooseDB lê uma série (~200x).
+q05 (`file =` em 7 dias) é a pior do ColumnStore (8,8 s): VARCHAR(512) vai para o dicionário e o filtro varre os tokens.
+Sem a agregação na engine, a MooseDB perde para o ColumnStore de 3x a 30x nas agregações largas (q01, q04). O ClickHouse
+continua à frente de ambos em tudo, exceto nas consultas por série.

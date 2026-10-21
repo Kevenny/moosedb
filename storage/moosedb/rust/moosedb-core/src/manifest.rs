@@ -13,24 +13,39 @@
 //! v2: magic "TFLM" | version:u16 | reserved:u16 | wal_seq:u64 | next_chunk_id:u64
 //!     | replay_seq:u64 | chunk_count:u32 | chunk_id:u64 * chunk_count | crc32:u32
 //! v1: same without `replay_seq` (read as `wal_seq + 1`)
+//! v3: v2 header, then
+//!     tseq:u64                                   highest tombstone sequence ever assigned
+//!     chunk_count:u32 | (chunk_id:u64 born:u64) * chunk_count
+//!     range_count:u32 | range tombstone * range_count     (see `tomb::encode_range`)
+//!     rows_count:u32  | row tombstone * rows_count        (see `tomb::encode_rows`)
+//!     crc32:u32
 //! ```
+//!
+//! A table that never had a `DELETE` keeps writing v2 byte for byte (an older
+//! binary still opens it); the first tombstone makes the MANIFEST v3, which an
+//! older binary refuses ("version 3 not supported") instead of showing rows
+//! that were deleted.
 //!
 //! `wal_seq` is the flush point: every batch whose COMMIT lies in a segment
 //! `<= wal_seq` is already in `chunks`. `replay_seq` is where replay starts:
 //! it trails `wal_seq + 1` while a batch that logged rows before the flush
 //! is still open, because its rows precede the flush point but its COMMIT
-//! will follow it.
+//! will follow it. `tseq` plays the same role for deletes: a `DELETE` entry of
+//! the WAL with `seq <= tseq` is already reflected in the tombstones listed
+//! here (or was applied physically), so replay only re-applies it to the rows
+//! it brings back into the MemTable.
 
 use std::fs;
 use std::path::Path;
 
 use crate::bytes::{put_u16, put_u32, put_u64, ByteReader};
 use crate::error::{corrupt, Error, Result};
+use crate::format::{MANIFEST_PLAIN as VERSION_PLAIN, MANIFEST_TOMB as VERSION, MANIFEST_V1};
 use crate::fsutil::write_atomic;
+use crate::tomb::{decode_range, decode_rows, encode_range, encode_rows, RangeTomb, RowsTomb};
 
 pub(crate) const MANIFEST_FILE: &str = "MANIFEST";
 const MAGIC: &[u8; 4] = b"TFLM";
-const VERSION: u16 = 2;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Manifest {
@@ -42,24 +57,63 @@ pub(crate) struct Manifest {
     pub next_chunk_id: u64,
     /// Live chunk ids, ascending.
     pub chunks: Vec<u64>,
+    /// `born` of each chunk of `chunks`, same order (see `tomb`).
+    pub born: Vec<u64>,
+    /// Highest tombstone sequence number ever assigned (0 = never any).
+    pub tseq: u64,
+    pub ranges: Vec<RangeTomb>,
+    pub rows: Vec<RowsTomb>,
 }
 
 impl Manifest {
     pub(crate) fn empty() -> Manifest {
-        Manifest { wal_seq: 0, replay_seq: 1, next_chunk_id: 1, chunks: Vec::new() }
+        Manifest {
+            wal_seq: 0,
+            replay_seq: 1,
+            next_chunk_id: 1,
+            chunks: Vec::new(),
+            born: Vec::new(),
+            tseq: 0,
+            ranges: Vec::new(),
+            rows: Vec::new(),
+        }
+    }
+
+    /// `born` of chunk `id` (0 for a chunk the MANIFEST predates tombstones for).
+    #[cfg(test)]
+    pub(crate) fn born_of(&self, id: u64) -> u64 {
+        self.chunks.iter().position(|&c| c == id).and_then(|i| self.born.get(i)).copied().unwrap_or(0)
     }
 
     fn encode(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(40 + self.chunks.len() * 8);
+        let plain = self.tseq == 0 && self.ranges.is_empty() && self.rows.is_empty();
+        let mut buf = Vec::with_capacity(48 + self.chunks.len() * 16);
         buf.extend_from_slice(MAGIC);
-        put_u16(&mut buf, VERSION);
+        put_u16(&mut buf, if plain { VERSION_PLAIN } else { VERSION });
         put_u16(&mut buf, 0);
         put_u64(&mut buf, self.wal_seq);
         put_u64(&mut buf, self.next_chunk_id);
         put_u64(&mut buf, self.replay_seq);
-        put_u32(&mut buf, self.chunks.len() as u32);
-        for id in &self.chunks {
-            put_u64(&mut buf, *id);
+        if plain {
+            put_u32(&mut buf, self.chunks.len() as u32);
+            for id in &self.chunks {
+                put_u64(&mut buf, *id);
+            }
+        } else {
+            put_u64(&mut buf, self.tseq);
+            put_u32(&mut buf, self.chunks.len() as u32);
+            for (i, id) in self.chunks.iter().enumerate() {
+                put_u64(&mut buf, *id);
+                put_u64(&mut buf, self.born.get(i).copied().unwrap_or(0));
+            }
+            put_u32(&mut buf, self.ranges.len() as u32);
+            for t in &self.ranges {
+                encode_range(&mut buf, t);
+            }
+            put_u32(&mut buf, self.rows.len() as u32);
+            for t in &self.rows {
+                encode_rows(&mut buf, t);
+            }
         }
         let crc = crc32fast::hash(&buf);
         put_u32(&mut buf, crc);
@@ -79,7 +133,7 @@ impl Manifest {
             return Err(corrupt("MANIFEST bad magic"));
         }
         let version = r.u16()?;
-        if version != VERSION && version != 1 {
+        if version != VERSION && version != VERSION_PLAIN && version != MANIFEST_V1 {
             return Err(corrupt(format!("MANIFEST version {version} not supported")));
         }
         r.u16()?;
@@ -87,12 +141,50 @@ impl Manifest {
         let next_chunk_id = r.u64()?;
         let after_flush = wal_seq.saturating_add(1);
         let replay_seq = if version >= 2 { r.u64()?.min(after_flush) } else { after_flush };
+        if version < VERSION {
+            let n = r.u32()? as usize;
+            if n.checked_mul(8) != Some(r.remaining()) {
+                return Err(corrupt("MANIFEST chunk list length mismatch"));
+            }
+            let chunks = (0..n).map(|_| r.u64()).collect::<Result<Vec<_>>>()?;
+            let born = vec![0; chunks.len()];
+            return Ok(Manifest { wal_seq, replay_seq, next_chunk_id, chunks, born, ..Manifest::empty() });
+        }
+        let tseq = r.u64()?;
         let n = r.u32()? as usize;
-        if n.checked_mul(8) != Some(r.remaining()) {
+        if n.checked_mul(16).map_or(true, |b| b > r.remaining()) {
             return Err(corrupt("MANIFEST chunk list length mismatch"));
         }
-        let chunks = (0..n).map(|_| r.u64()).collect::<Result<Vec<_>>>()?;
-        Ok(Manifest { wal_seq, replay_seq, next_chunk_id, chunks })
+        let mut chunks = Vec::with_capacity(n);
+        let mut born = Vec::with_capacity(n);
+        for _ in 0..n {
+            chunks.push(r.u64()?);
+            born.push(r.u64()?);
+        }
+        let nr = r.u32()? as usize;
+        // Each tombstone takes far more than a byte: the count cannot exceed what is left.
+        if nr > r.remaining() {
+            return Err(corrupt("MANIFEST tombstone count longer than its data"));
+        }
+        let mut ranges = Vec::with_capacity(nr.min(1 << 16));
+        for _ in 0..nr {
+            ranges.push(decode_range(&mut r)?);
+        }
+        let nw = r.u32()? as usize;
+        if nw > r.remaining() {
+            return Err(corrupt("MANIFEST row tombstone count longer than its data"));
+        }
+        let mut rows = Vec::with_capacity(nw.min(1 << 16));
+        for _ in 0..nw {
+            rows.push(decode_rows(&mut r)?);
+        }
+        if r.remaining() != 0 {
+            return Err(corrupt("MANIFEST has trailing bytes"));
+        }
+        if ranges.iter().any(|t| t.seq > tseq) || rows.iter().any(|t| t.seq > tseq) {
+            return Err(corrupt("MANIFEST tombstone newer than its highest sequence"));
+        }
+        Ok(Manifest { wal_seq, replay_seq, next_chunk_id, chunks, born, tseq, ranges, rows })
     }
 
     pub(crate) fn load(dir: &Path) -> Result<Manifest> {
@@ -113,13 +205,62 @@ impl Manifest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tomb::Sel;
 
     #[test]
     fn roundtrip() {
         let dir = tempfile::tempdir().unwrap();
-        let m = Manifest { wal_seq: 9, replay_seq: 7, next_chunk_id: 12, chunks: vec![3, 7, 11] };
+        let m = Manifest {
+            wal_seq: 9,
+            replay_seq: 7,
+            next_chunk_id: 12,
+            chunks: vec![3, 7, 11],
+            born: vec![0, 0, 0],
+            ..Manifest::empty()
+        };
         m.store(dir.path()).unwrap();
         assert_eq!(Manifest::load(dir.path()).unwrap(), m);
+    }
+
+    #[test]
+    fn a_table_without_deletes_still_writes_the_v2_layout() {
+        let m = Manifest { chunks: vec![4], born: vec![0], ..Manifest::empty() };
+        let bytes = m.encode();
+        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 2);
+        // 4 magic + 4 flags + 3*8 header + 4 count + 8 id + 4 crc
+        assert_eq!(bytes.len(), 4 + 4 + 24 + 4 + 8 + 4);
+    }
+
+    #[test]
+    fn v3_roundtrips_tombstones_and_borns() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = Manifest {
+            wal_seq: 9,
+            replay_seq: 9,
+            next_chunk_id: 20,
+            chunks: vec![3, 7],
+            born: vec![2, 5],
+            tseq: 6,
+            ranges: vec![RangeTomb { seq: 6, lo: 1, hi: 99, sel: Sel::from_ids(vec![4, 2]), hits: vec![(3, 10)] }],
+            rows: vec![RowsTomb { seq: 4, chunk: 7, entry: 3, runs: vec![(0, 2), (8, 1)] }],
+        };
+        m.store(dir.path()).unwrap();
+        let back = Manifest::load(dir.path()).unwrap();
+        assert_eq!(back, m);
+        assert_eq!(back.born_of(7), 5);
+        assert_eq!(back.born_of(99), 0);
+        let bytes = m.encode();
+        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 3);
+        // a tombstone newer than tseq, or a forged count, is corruption
+        let bad = Manifest { tseq: 3, ..m.clone() };
+        assert!(matches!(Manifest::decode(&bad.encode()), Err(Error::Corrupt(_))));
+        let mut forged = bytes.clone();
+        let at = 4 + 4 + 24 + 8; // chunk_count
+        forged[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        let crc = crc32fast::hash(&forged[..forged.len() - 4]);
+        let n = forged.len();
+        forged[n - 4..].copy_from_slice(&crc.to_le_bytes());
+        assert!(matches!(Manifest::decode(&forged), Err(Error::Corrupt(_))));
     }
 
     #[test]
@@ -135,7 +276,10 @@ mod tests {
         let crc = crc32fast::hash(&buf);
         put_u32(&mut buf, crc);
         let m = Manifest::decode(&buf).unwrap();
-        assert_eq!(m, Manifest { wal_seq: 5, replay_seq: 6, next_chunk_id: 9, chunks: vec![4] });
+        assert_eq!(
+            m,
+            Manifest { wal_seq: 5, replay_seq: 6, next_chunk_id: 9, chunks: vec![4], born: vec![0], ..Manifest::empty() }
+        );
     }
 
     #[test]

@@ -1,0 +1,6 @@
+chunk_interval=1 DAY
+retention_period=FOREVER
+compression=ZSTD
+compression_level=3
+hot_threshold=7 DAYS
+memtable_size=67108864

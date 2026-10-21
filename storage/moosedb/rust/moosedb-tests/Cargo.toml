@@ -13,3 +13,4 @@ moosedb-core.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+crc32fast.workspace = true

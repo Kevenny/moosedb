@@ -1,0 +1,33 @@
+#
+# mariadb-backup does not copy MooseDB tables but exits 0. While a BACKUP STAGE
+# is active and a MooseDB table exists, FLUSH ENGINE LOGS (which mariadb-backup
+# runs in BLOCK_COMMIT and treats as fatal) must fail; otherwise it must work.
+#
+--source suite/moosedb/include/have_moosedb.inc
+
+--echo # No MooseDB table: the backup flush works
+BACKUP STAGE START;
+BACKUP STAGE BLOCK_COMMIT;
+FLUSH NO_WRITE_TO_BINLOG ENGINE LOGS;
+BACKUP STAGE END;
+
+CREATE TABLE bt (ts DATETIME NOT NULL, v INT, INDEX(ts)) ENGINE=MooseDB;
+INSERT INTO bt VALUES ('2026-01-01', 1);
+
+--echo # Outside a backup, FLUSH ENGINE LOGS (logrotate) still works
+FLUSH NO_WRITE_TO_BINLOG ENGINE LOGS;
+
+--echo # During a backup it fails, from another connection too
+BACKUP STAGE START;
+BACKUP STAGE BLOCK_COMMIT;
+connect (con2,localhost,root,,test);
+--error ER_UNKNOWN_ERROR
+FLUSH NO_WRITE_TO_BINLOG ENGINE LOGS;
+disconnect con2;
+connection default;
+BACKUP STAGE END;
+
+--echo # After the backup it works again; data intact
+FLUSH NO_WRITE_TO_BINLOG ENGINE LOGS;
+SELECT v FROM bt;
+DROP TABLE bt;

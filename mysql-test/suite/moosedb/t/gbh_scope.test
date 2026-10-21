@@ -1,0 +1,312 @@
+#
+# GROUP BY pushdown: which queries the engine takes over (moosedb_gbh_debug
+# prints the verdict as a note). With moosedb_group_by_pushdown ON an accepted
+# query is computed by the engine, a refused one runs the normal way; either
+# way every answer must stay identical to the InnoDB mirror's.
+#
+--source include/not_embedded.inc
+--source include/have_innodb.inc
+--source include/have_sequence.inc
+--source suite/moosedb/include/have_moosedb.inc
+
+CREATE TABLE g (
+  ts     DATETIME NOT NULL,
+  host   VARCHAR(16) NOT NULL COMMENT 'TAG',
+  region VARCHAR(8) COMMENT 'TAG',
+  code   VARCHAR(8),
+  n      INT,
+  big    BIGINT,
+  d      DECIMAL(10,2),
+  f      DOUBLE,
+  INDEX(ts)
+) ENGINE=MooseDB;
+INSERT INTO g SELECT '2024-01-01' + INTERVAL seq * 10 MINUTE,
+                     CONCAT('h', seq MOD 5),
+                     IF(seq MOD 7 = 0, NULL, CONCAT('r', seq MOD 3)),
+                     CONCAT('c', seq MOD 4),
+                     IF(seq MOD 11 = 0, NULL, seq MOD 50),
+                     seq * 1000000007, seq / 4, seq / 3
+  FROM seq_0_to_399;
+CREATE TABLE gi LIKE g;
+ALTER TABLE gi ENGINE=InnoDB;
+INSERT INTO gi SELECT * FROM g;
+FLUSH TABLES g;
+
+--let $mt= g
+--let $it= gi
+
+--echo ##### Switches: pushdown OFF and debug OFF -> no verdict at all
+SELECT host, COUNT(*) c FROM g GROUP BY host ORDER BY host;
+SET SESSION moosedb_group_by_pushdown = ON;
+SELECT host, COUNT(*) c FROM g GROUP BY host ORDER BY host;
+
+--echo ##### Debug ON, pushdown OFF: the analysis still reports
+SET SESSION moosedb_group_by_pushdown = OFF;
+SET SESSION moosedb_gbh_debug = ON;
+SELECT host, COUNT(*) c FROM g GROUP BY host ORDER BY host;
+
+SET SESSION moosedb_group_by_pushdown = ON;
+
+--echo ##########################################################
+--echo # Accepted
+--echo ##########################################################
+--let $q= SELECT host, COUNT(*) c FROM {T} GROUP BY host ORDER BY host
+--let $label= TAG, COUNT(*)
+--source suite/moosedb/include/gbh_case.inc
+
+--let $q= SELECT host, region, COUNT(*) c, COUNT(n) cn, SUM(n) sn, AVG(n) an, MIN(n) mn, MAX(n) xn, MIN(ts) t0, MAX(ts) t1, SUM(big) sb, MIN(big) mb FROM {T} GROUP BY host, region ORDER BY host, region
+--let $label= two TAGs, every supported aggregate
+--source suite/moosedb/include/gbh_case.inc
+
+--let $q= SELECT code, n, COUNT(*) c FROM {T} GROUP BY code, n ORDER BY code, n LIMIT 7
+--let $label= VARCHAR and INT group columns, LIMIT
+--source suite/moosedb/include/gbh_case.inc
+
+--let $q= SELECT host, COUNT(*) c, SUM(n) s FROM {T} WHERE ts >= '2024-01-02 00:00:00' AND ts < '2024-01-03 00:00:00' AND host IN ('h1','h2','h3') AND region = 'r1' AND n BETWEEN 3 AND 40 AND code LIKE 'c%' AND big IS NOT NULL AND d > 1.5 AND f <> 2 GROUP BY host ORDER BY host
+--let $label= WHERE: conjunction of time range, IN, =, BETWEEN, LIKE, IS NOT NULL, comparisons
+--source suite/moosedb/include/gbh_case.inc
+
+--let $q= SELECT host, COUNT(*) c FROM {T} WHERE region IS NULL AND n <=> 5 GROUP BY host ORDER BY host
+--let $label= WHERE: IS NULL and <=>
+--source suite/moosedb/include/gbh_case.inc
+
+--let $q= SELECT host, COUNT(*) c FROM {T} WHERE 3 < n GROUP BY host ORDER BY host
+--let $label= WHERE: constant on the left
+--source suite/moosedb/include/gbh_case.inc
+
+--let $q= SELECT host, COUNT(*) c, SUM(n) s FROM {T} GROUP BY host HAVING c > 70 AND SUM(n) > 100 ORDER BY s DESC, host
+--let $label= HAVING (done by the server), ORDER BY an aggregate
+--source suite/moosedb/include/gbh_case.inc
+
+--let $q= SELECT host, COUNT(*) c FROM {T} GROUP BY host ORDER BY c DESC, host LIMIT 2 OFFSET 1
+--let $label= ORDER BY aggregate DESC with LIMIT and OFFSET
+--source suite/moosedb/include/gbh_case.inc
+
+--let $q= SELECT host, COUNT(*) c FROM {T} GROUP BY host ORDER BY SUM(n), host
+--let $label= ORDER BY an aggregate that is not selected (hidden item)
+--source suite/moosedb/include/gbh_case.inc
+
+--let $q= SELECT COUNT(*) c FROM {T} GROUP BY host, region ORDER BY c, host, region
+--let $label= GROUP BY columns that are not selected
+--source suite/moosedb/include/gbh_case.inc
+
+--let $q= SELECT 7 k, 'x' s, host, COUNT(*) c FROM {T} GROUP BY host ORDER BY host
+--let $label= constants in the select list
+--source suite/moosedb/include/gbh_case.inc
+
+--let $q= SELECT x.host AS hh, COUNT(*) AS c FROM {T} AS x GROUP BY hh ORDER BY hh DESC
+--let $label= table and column aliases, ORDER BY the group column DESC
+--source suite/moosedb/include/gbh_case.inc
+
+--let $q= SELECT host, COUNT(*) c FROM {T} GROUP BY 1 ORDER BY 1
+--let $label= GROUP BY position
+--source suite/moosedb/include/gbh_case.inc
+
+--let $q= SELECT host, COUNT(*) c FROM {T} GROUP BY host ORDER BY NULL
+--let $label= ORDER BY NULL
+--source suite/moosedb/include/gbh_case.inc
+
+--let $q= SELECT host, COUNT(*) c FROM {T} WHERE code NOT LIKE 'c1%' GROUP BY host ORDER BY host
+--let $label= NOT LIKE (the optimizer keeps a negated LIKE, still a column predicate)
+--source suite/moosedb/include/gbh_case.inc
+--echo # EXPLAIN reaches the hook too
+EXPLAIN SELECT host, COUNT(*) c FROM g GROUP BY host;
+
+--echo # Prepared statement: analysed again at every EXECUTE, parameters bound
+PREPARE p FROM 'SELECT host, COUNT(*) c FROM g WHERE ts >= ? AND n > ? GROUP BY host ORDER BY host';
+SET @a= '2024-01-03 00:00:00', @b= 10;
+EXECUTE p USING @a, @b;
+SET @a= '2024-01-04 00:00:00', @b= 40;
+EXECUTE p USING @a, @b;
+DEALLOCATE PREPARE p;
+
+--echo ##########################################################
+--echo # Refused: what the statement is part of
+--echo ##########################################################
+--let $q= SELECT COUNT(*) c, SUM(n) s FROM {T} WHERE n > 5
+--let $label= no GROUP BY
+--source suite/moosedb/include/gbh_case.inc
+
+--let $q= SELECT host FROM {T} WHERE n > 45 ORDER BY ts LIMIT 5
+--let $label= plain SELECT
+--source suite/moosedb/include/gbh_case.inc
+
+--let $q= SELECT host, COUNT(*) c FROM {T} GROUP BY host UNION ALL SELECT region, COUNT(*) FROM {T} GROUP BY region ORDER BY 1, 2
+--let $label= UNION (each part is refused)
+--source suite/moosedb/include/gbh_case.inc
+
+--let $q= SELECT * FROM (SELECT host, COUNT(*) c FROM {T} GROUP BY host) d ORDER BY host
+--let $label= derived table
+--source suite/moosedb/include/gbh_case.inc
+
+--let $q= WITH w AS (SELECT host, COUNT(*) c FROM {T} GROUP BY host) SELECT * FROM w ORDER BY host
+--let $label= CTE
+--source suite/moosedb/include/gbh_case.inc
+
+--let $q= SELECT host FROM {T} WHERE n IN (SELECT COUNT(*) FROM {T} t2 GROUP BY t2.host) GROUP BY host ORDER BY host
+--let $label= subquery (and the outer query)
+--source suite/moosedb/include/gbh_case.inc
+
+--let $q= SELECT (SELECT SUM(c) FROM (SELECT COUNT(*) c FROM {T} t3 GROUP BY t3.region) z) s, host FROM {T} GROUP BY host ORDER BY host
+--let $label= derived table inside a scalar subquery
+--source suite/moosedb/include/gbh_case.inc
+
+--let $q= SELECT t1.host, COUNT(*) c FROM {T} t1 JOIN {T} t2 ON t2.n = t1.n AND t2.host = t1.host GROUP BY t1.host ORDER BY t1.host
+--let $label= two tables
+--source suite/moosedb/include/gbh_case.inc
+
+CREATE VIEW gv AS SELECT * FROM g;
+CREATE VIEW gvi AS SELECT * FROM gi;
+CREATE VIEW gvg AS SELECT host, COUNT(*) c FROM g GROUP BY host;
+CREATE VIEW gvgi AS SELECT host, COUNT(*) c FROM gi GROUP BY host;
+--echo # merged view: the hook is not called at all (no verdict)
+SELECT host, COUNT(*) c FROM gv GROUP BY host ORDER BY host;
+SELECT host, COUNT(*) c FROM gvi GROUP BY host ORDER BY host;
+--echo # view with a GROUP BY inside
+SELECT * FROM gvg ORDER BY host;
+SELECT * FROM gvgi ORDER BY host;
+DROP VIEW gv, gvi, gvg, gvgi;
+
+--echo # statements that are not a top-level SELECT
+CREATE TABLE cs AS SELECT host, COUNT(*) c FROM g GROUP BY host;
+INSERT INTO cs SELECT code, COUNT(*) FROM g GROUP BY code;
+SELECT COUNT(*) FROM cs;
+DROP TABLE cs;
+CREATE TABLE cs2 (host VARCHAR(16), c BIGINT) ENGINE=InnoDB;
+INSERT INTO cs2 SELECT host, COUNT(*) FROM g GROUP BY host;
+SELECT COUNT(*) FROM cs2;
+DROP TABLE cs2;
+
+--echo # inside a stored procedure, a function and a trigger
+DELIMITER |;
+CREATE PROCEDURE pr() BEGIN SELECT host, COUNT(*) c FROM g GROUP BY host ORDER BY host; END|
+CREATE FUNCTION fn() RETURNS BIGINT DETERMINISTIC BEGIN DECLARE r BIGINT; SELECT SUM(c) INTO r FROM (SELECT COUNT(*) c FROM g GROUP BY host) z; RETURN r; END|
+DELIMITER ;|
+CALL pr();
+SELECT fn();
+DROP PROCEDURE pr;
+DROP FUNCTION fn;
+
+--echo ##########################################################
+--echo # Refused: clauses
+--echo ##########################################################
+--let $q= SELECT DISTINCT COUNT(*) c FROM {T} GROUP BY host ORDER BY c
+--let $label= DISTINCT
+--source suite/moosedb/include/gbh_case.inc
+--echo # ROLLUP (CREATE ... SELECT cannot hold its NULL row, so compared directly)
+SELECT host, COUNT(*) c FROM g GROUP BY host WITH ROLLUP;
+SELECT host, COUNT(*) c FROM gi GROUP BY host WITH ROLLUP;
+
+
+--let $q= SELECT host, COUNT(*) c, COUNT(*) OVER () w FROM {T} GROUP BY host ORDER BY host
+--let $label= window function
+--source suite/moosedb/include/gbh_case.inc
+
+--let $q= SELECT host, COUNT(*) c FROM {T} GROUP BY host ORDER BY host FETCH FIRST 1 ROWS WITH TIES
+--let $label= WITH TIES
+--source suite/moosedb/include/gbh_case.inc
+
+SELECT SQL_CALC_FOUND_ROWS host, COUNT(*) c FROM g GROUP BY host ORDER BY host LIMIT 2;
+SELECT FOUND_ROWS();
+
+--echo ##########################################################
+--echo # Refused: select list, GROUP BY, aggregates
+--echo ##########################################################
+--let $q= SELECT host, SUM(n) / 2 q FROM {T} GROUP BY host ORDER BY host
+--let $label= expression over an aggregate
+--source suite/moosedb/include/gbh_case.inc
+
+--let $q= SELECT UPPER(host) u, COUNT(*) c FROM {T} GROUP BY UPPER(host) ORDER BY u
+--let $label= GROUP BY expression
+--source suite/moosedb/include/gbh_case.inc
+
+--let $q= SELECT n DIV 10 b, COUNT(*) c FROM {T} GROUP BY n DIV 10 ORDER BY b
+--let $label= GROUP BY arithmetic
+--source suite/moosedb/include/gbh_case.inc
+
+--let $q= SELECT ts, COUNT(*) c FROM {T} WHERE n = 7 GROUP BY ts ORDER BY ts
+--let $label= GROUP BY the time column
+--source suite/moosedb/include/gbh_case.inc
+
+--let $q= SELECT d, COUNT(*) c FROM {T} WHERE n = 7 GROUP BY d ORDER BY d
+--let $label= GROUP BY a DECIMAL column
+--source suite/moosedb/include/gbh_case.inc
+
+--let $q= SELECT host, SUM(d) s FROM {T} GROUP BY host ORDER BY host
+--let $label= SUM of a DECIMAL
+--source suite/moosedb/include/gbh_case.inc
+
+--let $q= SELECT host, MAX(f) s FROM {T} GROUP BY host ORDER BY host
+--let $label= MAX of a DOUBLE
+--source suite/moosedb/include/gbh_case.inc
+
+--let $q= SELECT host, MAX(code) s FROM {T} GROUP BY host ORDER BY host
+--let $label= MAX of a string
+--source suite/moosedb/include/gbh_case.inc
+
+--let $q= SELECT host, MIN(d) s FROM {T} GROUP BY host ORDER BY host
+--let $label= MIN of a DECIMAL
+--source suite/moosedb/include/gbh_case.inc
+
+--let $q= SELECT host, COUNT(DISTINCT n) s FROM {T} GROUP BY host ORDER BY host
+--let $label= COUNT(DISTINCT)
+--source suite/moosedb/include/gbh_case.inc
+
+--let $q= SELECT host, SUM(n + 1) s FROM {T} GROUP BY host ORDER BY host
+--let $label= aggregate over an expression
+--source suite/moosedb/include/gbh_case.inc
+
+--let $q= SELECT host, GROUP_CONCAT(code ORDER BY code) s FROM {T} WHERE n < 3 GROUP BY host ORDER BY host
+--let $label= GROUP_CONCAT
+--source suite/moosedb/include/gbh_case.inc
+
+--let $q= SELECT host, STD(n) s FROM {T} GROUP BY host ORDER BY host
+--let $label= STD
+--source suite/moosedb/include/gbh_case.inc
+
+--let $q= SELECT host, COUNT(*) c FROM {T} GROUP BY host ORDER BY COUNT(*) + 1, host
+--let $label= ORDER BY an expression over an aggregate
+--source suite/moosedb/include/gbh_case.inc
+
+--echo ##########################################################
+--echo # Refused: WHERE
+--echo ##########################################################
+--let $q= SELECT host, COUNT(*) c FROM {T} WHERE n = 3 OR host = 'h1' GROUP BY host ORDER BY host
+--let $label= OR
+--source suite/moosedb/include/gbh_case.inc
+
+--let $q= SELECT host, COUNT(*) c FROM {T} WHERE n + 1 > 5 GROUP BY host ORDER BY host
+--let $label= expression on the column
+--source suite/moosedb/include/gbh_case.inc
+
+--let $q= SELECT host, COUNT(*) c FROM {T} WHERE n > big GROUP BY host ORDER BY host
+--let $label= column against column
+--source suite/moosedb/include/gbh_case.inc
+
+--let $q= SELECT host, COUNT(*) c FROM {T} WHERE code REGEXP '^c[12]' GROUP BY host ORDER BY host
+--let $label= REGEXP
+--source suite/moosedb/include/gbh_case.inc
+
+--let $q= SELECT host, COUNT(*) c FROM {T} WHERE n > (SELECT AVG(n) FROM {T} t2) GROUP BY host ORDER BY host
+--let $label= subquery in WHERE
+--source suite/moosedb/include/gbh_case.inc
+
+--let $q= SELECT host, COUNT(*) c FROM {T} WHERE host = region GROUP BY host ORDER BY host
+--let $label= two columns equal
+--source suite/moosedb/include/gbh_case.inc
+
+--echo ##########################################################
+--echo # Not affected: other engines never reach the hook
+--echo ##########################################################
+SELECT host, COUNT(*) c FROM gi GROUP BY host ORDER BY host;
+
+--echo ##########################################################
+--echo # Pushdown OFF with debug ON still gives the same answers
+--echo ##########################################################
+SET SESSION moosedb_group_by_pushdown = OFF;
+--let $q= SELECT host, region, COUNT(*) c, SUM(n) s, MIN(ts) t0 FROM {T} WHERE ts >= '2024-01-02 00:00:00' GROUP BY host, region ORDER BY host, region
+--let $label= OFF, accepted shape
+--source suite/moosedb/include/gbh_case.inc
+
+SET SESSION moosedb_gbh_debug = OFF;
+DROP TABLE g, gi;

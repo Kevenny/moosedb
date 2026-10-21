@@ -23,6 +23,9 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 use std::sync::Arc;
 
+use moosedb_core::agg::{Agg, AggSpec, ColFilter, FuncSpec, KeyCol, KeySpec, TopN, ValueFilter};
+use moosedb_core::delete::RangeDelete;
+use moosedb_core::DeleteBatch;
 use moosedb_core::compression::Codec;
 use moosedb_core::inspect::{ChunkStatus, TableInfo};
 use moosedb_core::{
@@ -62,6 +65,8 @@ pub enum TFStatus {
     TF_ERR_BUSY = 12,
     /// Waiting for that series would close a cycle of waiting statements.
     TF_ERR_DEADLOCK = 13,
+    /// The caller cancelled a long operation (aggregation).
+    TF_ERR_CANCELLED = 14,
 }
 
 /// Column type codes used in `TFTableConfig::column_types` and `TFValue::kind`.
@@ -351,6 +356,7 @@ fn status_of(e: &Error) -> TFStatus {
         Error::Duplicate(_) => TFStatus::TF_ERR_DUPLICATE,
         Error::Busy(_) => TFStatus::TF_ERR_BUSY,
         Error::Deadlock(_) => TFStatus::TF_ERR_DEADLOCK,
+        Error::Cancelled(_) => TFStatus::TF_ERR_CANCELLED,
     }
 }
 
@@ -876,6 +882,161 @@ pub unsafe extern "C" fn moosedb_truncate(table: *mut MooseDBTable) -> TFStatus 
     guard(|| table_ref(table)?.table.truncate())
 }
 
+
+// ─── deletes ─────────────────────────────────────────────────────────────────
+
+/// Opaque set of rows a `DELETE` removes one by one (see `moosedb_delete_begin`).
+pub struct MooseDBDelete {
+    del: Option<DeleteBatch>,
+}
+
+/// Deletes every row of the given series (`series_count < 0` = all series) with
+/// `ts_start_us <= ts <= ts_end_us`, as one atomic, logged step. With
+/// `max_rows >= 0` nothing is deleted when more rows match: `*out_exceeds` is
+/// set and `*out_rows` holds the number that match. Otherwise `*out_rows` is
+/// the number deleted. `durable` fsyncs the log before returning.
+///
+/// # Safety
+/// `series_ids` must hold `series_count` ids when `series_count > 0`; the out
+/// pointers must be writable.
+#[no_mangle]
+pub unsafe extern "C" fn moosedb_delete_range(
+    table: *mut MooseDBTable,
+    series_ids: *const u64,
+    series_count: i64,
+    ts_start_us: i64,
+    ts_end_us: i64,
+    max_rows: i64,
+    durable: bool,
+    out_rows: *mut u64,
+    out_exceeds: *mut bool,
+) -> TFStatus {
+    guard(|| {
+        let rows = handle_mut(out_rows, "out_rows")?;
+        let exceeds = handle_mut(out_exceeds, "out_exceeds")?;
+        *rows = 0;
+        *exceeds = false;
+        let t = table_ref(table)?;
+        let ids = if series_count >= 0 {
+            // SAFETY: caller contract.
+            Some(unsafe { slice(series_ids, series_count as usize, "series_ids") }?)
+        } else {
+            None
+        };
+        let max = (max_rows >= 0).then_some(max_rows as u64);
+        match t.table.delete_range(ids, ts_start_us, ts_end_us, max, durable)? {
+            RangeDelete::Deleted(n) => *rows = n,
+            RangeDelete::Exceeds(n) => {
+                *rows = n;
+                *exceeds = true;
+            }
+        }
+        Ok(())
+    })
+}
+
+/// How many rows `moosedb_delete_range` with the same arguments would delete now.
+///
+/// # Safety
+/// As `moosedb_delete_range`.
+#[no_mangle]
+pub unsafe extern "C" fn moosedb_count_range(
+    table: *mut MooseDBTable,
+    series_ids: *const u64,
+    series_count: i64,
+    ts_start_us: i64,
+    ts_end_us: i64,
+    out_rows: *mut u64,
+) -> TFStatus {
+    guard(|| {
+        let rows = handle_mut(out_rows, "out_rows")?;
+        *rows = 0;
+        let t = table_ref(table)?;
+        let ids = if series_count >= 0 {
+            // SAFETY: caller contract.
+            Some(unsafe { slice(series_ids, series_count as usize, "series_ids") }?)
+        } else {
+            None
+        };
+        *rows = t.table.count_range(ids, ts_start_us, ts_end_us)?;
+        Ok(())
+    })
+}
+
+/// Starts collecting the rows of one `DELETE` statement. They are matched by
+/// content and deleted by `moosedb_delete_commit` (also in pieces if the
+/// statement is huge). The handle ends in commit or abort.
+///
+/// # Safety
+/// `table` must be a valid handle; `out_delete` writable.
+#[no_mangle]
+pub unsafe extern "C" fn moosedb_delete_begin(
+    table: *mut MooseDBTable,
+    durable: bool,
+    out_delete: *mut *mut MooseDBDelete,
+) -> TFStatus {
+    guard(|| {
+        let out = handle_mut(out_delete, "out_delete")?;
+        *out = ptr::null_mut();
+        let t = table_ref(table)?;
+        *out = Box::into_raw(Box::new(MooseDBDelete { del: Some(t.table.begin_delete(durable)) }));
+        Ok(())
+    })
+}
+
+/// Adds one row (same value convention as `moosedb_write_row`) to delete.
+///
+/// # Safety
+/// `del` must be a live handle; `row` as in `moosedb_write_row`.
+#[no_mangle]
+pub unsafe extern "C" fn moosedb_delete_add(del: *mut MooseDBDelete, row: *const TFRow) -> TFStatus {
+    guard(|| {
+        let d = handle_mut(del, "delete")?;
+        let b = d.del.as_mut().ok_or_else(|| invalid("the delete is already finished"))?;
+        // SAFETY: caller contract.
+        let row = unsafe { row_from_c(b.schema(), row) }?;
+        b.add(row)
+    })
+}
+
+/// Deletes the collected rows and releases the handle (also on error).
+/// `*out_rows` receives the number of rows deleted.
+///
+/// # Safety
+/// `del` must come from `moosedb_delete_begin` and not be used afterwards.
+#[no_mangle]
+pub unsafe extern "C" fn moosedb_delete_commit(del: *mut MooseDBDelete, out_rows: *mut u64) -> TFStatus {
+    guard(|| {
+        if del.is_null() {
+            return Err(invalid("delete is NULL"));
+        }
+        // SAFETY: ownership is transferred back from C, exactly once.
+        let mut d = unsafe { Box::from_raw(del) };
+        let b = d.del.take().ok_or_else(|| invalid("the delete is already finished"))?;
+        let n = b.commit()?;
+        // SAFETY: caller contract (NULL allowed).
+        if let Some(p) = unsafe { out_rows.as_mut() } {
+            *p = n;
+        }
+        Ok(())
+    })
+}
+
+/// Discards the collected rows and releases the handle. NULL is ignored.
+///
+/// # Safety
+/// `del` must come from `moosedb_delete_begin` and not be used afterwards.
+#[no_mangle]
+pub unsafe extern "C" fn moosedb_delete_abort(del: *mut MooseDBDelete) -> TFStatus {
+    guard(|| {
+        if !del.is_null() {
+            // SAFETY: ownership is transferred back from C, exactly once.
+            drop(unsafe { Box::from_raw(del) });
+        }
+        Ok(())
+    })
+}
+
 // ─── scans ───────────────────────────────────────────────────────────────────
 
 fn open_scan(
@@ -1323,6 +1484,429 @@ pub unsafe extern "C" fn moosedb_snapshot_fetch(
 pub unsafe extern "C" fn moosedb_snapshot_close(snapshot: *mut MooseDBSnapshot) -> TFStatus {
     guard(|| {
         release(snapshot);
+        Ok(())
+    })
+}
+
+// ─── aggregation ─────────────────────────────────────────────────────────────
+
+/// Group key kinds of `TFAggKey::kind`.
+pub const TF_AGG_KEY_SERIES: u8 = 0;
+pub const TF_AGG_KEY_COLUMN: u8 = 1;
+/// Function codes of `TFAggFunc::op`.
+pub const TF_AGG_COUNT_STAR: u8 = 0;
+pub const TF_AGG_COUNT: u8 = 1;
+pub const TF_AGG_SUM: u8 = 2;
+pub const TF_AGG_MIN: u8 = 3;
+pub const TF_AGG_MAX: u8 = 4;
+/// Result key column kinds (`TFAggKeyBatch::kind`).
+pub const TF_AGG_KEYCOL_SERIES: u8 = 0;
+pub const TF_AGG_KEYCOL_INT: u8 = 1;
+pub const TF_AGG_KEYCOL_BYTES: u8 = 2;
+
+/// One group-by key: the series (`col` ignored) or a column.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TFAggKey {
+    /// `TF_AGG_KEY_SERIES` or `TF_AGG_KEY_COLUMN`.
+    pub kind: u8,
+    pub col: u32,
+}
+
+/// One aggregate function (`col` ignored for `TF_AGG_COUNT_STAR`).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TFAggFunc {
+    /// `TF_AGG_COUNT_STAR` .. `TF_AGG_MAX`.
+    pub op: u8,
+    pub col: u32,
+}
+
+/// `TFAggFilter::mode`: dictionary mask (the zero value, the original behaviour).
+pub const TF_AGG_FILTER_MASK: u8 = 0;
+/// `TFAggFilter::mode`: exact set of accepted values.
+pub const TF_AGG_FILTER_VALUES: u8 = 1;
+/// `TFAggSpec::top_mode`: no top-N (the zero value).
+pub const TF_AGG_TOP_NONE: u8 = 0;
+/// `TFAggSpec::top_mode`: the `top_limit` smallest groups by `funcs[top_func]`.
+pub const TF_AGG_TOP_ASC: u8 = 1;
+/// `TFAggSpec::top_mode`: the `top_limit` largest groups by `funcs[top_func]`.
+pub const TF_AGG_TOP_DESC: u8 = 2;
+
+/// A filter on a column, ANDed with the others.
+///
+/// * `mode == TF_AGG_FILTER_MASK` (0): dictionary mask. `mask[i] != 0` accepts
+///   the i-th value of the dictionary that an earlier run with the single key
+///   `{COLUMN, col}`, no functions and no filters left in the result (result
+///   order). The fields after `mask_len` are ignored.
+/// * `mode == TF_AGG_FILTER_VALUES` (1): a row is kept iff its value in `col`
+///   is one of the listed values, compared **byte for byte** (a NULL value is
+///   never kept; an empty list keeps nothing; duplicates are harmless). No
+///   dictionary run is needed. For INT64/TIMESTAMP/BOOL columns the values are
+///   `int_values[0..int_count]` (`bool` as 0/1) and `value_count` must be 0;
+///   for VARCHAR/DECIMAL columns value `i` is
+///   `value_data[value_starts[i] .. value_starts[i] + value_lens[i]]`
+///   (`value_starts[i] + value_lens[i] <= value_data_len`) and `int_count`
+///   must be 0. `mask` is ignored. **The caller may use this only when the SQL
+///   comparison it replaces is exactly a byte comparison** (integers, or a
+///   binary / NO PAD collation); with any other collation (case or accent
+///   insensitive, PAD SPACE) it would give wrong answers.
+///
+/// A zero-initialized tail (every field after `mask_len` zero) is a plain
+/// dictionary mask.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TFAggFilter {
+    pub col: u32,
+    pub mask: *const u8,
+    pub mask_len: u64,
+    /// `TF_AGG_FILTER_MASK` or `TF_AGG_FILTER_VALUES`.
+    pub mode: u8,
+    pub int_values: *const i64,
+    pub int_count: u64,
+    pub value_starts: *const u64,
+    pub value_lens: *const u32,
+    pub value_count: u64,
+    pub value_data: *const u8,
+    pub value_data_len: u64,
+    /// `TF_AGG_FILTER_VALUES` only; non-zero = PAD SPACE comparison: trailing
+    /// 0x20 bytes are ignored on both sides (the listed values and the row's
+    /// value), as a binary PAD SPACE collation (`utf8mb4_bin`, `latin1_bin`,
+    /// ...) of a charset whose space is the single byte 0x20 and never a
+    /// continuation byte (utf8mb4, utf8mb3, latin1, ascii; NOT ucs2, utf16,
+    /// utf32) compares. Other whitespace (tab...) is not trimmed. NULL is
+    /// still never accepted. Zero = exact bytes (NO PAD).
+    pub pad_space: u8,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TFAggSpec {
+    pub keys: *const TFAggKey,
+    pub key_count: u32,
+    pub funcs: *const TFAggFunc,
+    pub func_count: u32,
+    pub filters: *const TFAggFilter,
+    pub filter_count: u32,
+    /// Budget in bytes for keys, states and result.
+    pub max_memory: u64,
+    /// Worker threads (1 = the calling thread only).
+    pub threads: u32,
+    /// Top-N: `TF_AGG_TOP_NONE` (0, every group is returned, in no particular
+    /// order), `TF_AGG_TOP_ASC` or `TF_AGG_TOP_DESC`. Needs exactly one key
+    /// (`TF_ERR_INVALID_ARG` otherwise). Only the `top_limit` best groups by
+    /// `funcs[top_func]` are returned, best first (`total_groups` of the
+    /// result is that count). The order is the SQL order of the function
+    /// value (`COUNT` as a number; `SUM`/`MIN`/`MAX` as numbers with "no
+    /// value" = NULL, the smallest, so first when ascending); groups with the
+    /// same value come in ascending order of the key: series id, integer
+    /// value, or bytes compared as unsigned (a shorter prefix first); a NULL
+    /// key first. **The caller may use this only when that order is the one
+    /// the query asks for**: integer keys, or byte keys under a binary /
+    /// NO PAD collation, and ties that the SQL leaves unspecified anyway.
+    /// `top_limit == 0` returns no group.
+    pub top_mode: u8,
+    pub top_func: u32,
+    pub top_limit: u64,
+}
+
+/// Polled about every 10 ms on the calling thread; a non-zero return cancels
+/// the run (`TF_ERR_CANCELLED`).
+pub type TFAggCancel = Option<unsafe extern "C" fn(ctx: *mut c_void) -> i32>;
+
+/// A key column of the result, one entry per group. `nulls` (NULL for the
+/// series) holds 1 for a NULL value. `values` holds `uint64_t` series ids
+/// (`TF_AGG_KEYCOL_SERIES`) or `int64_t` values (`TF_AGG_KEYCOL_INT`);
+/// `starts`/`lens`/`data` describe byte strings (`TF_AGG_KEYCOL_BYTES`):
+/// `starts[i] + lens[i] <= data_len`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TFAggKeyBatch {
+    pub kind: u8,
+    pub nulls: *const u8,
+    pub values: *const c_void,
+    pub starts: *const u64,
+    pub lens: *const u32,
+    pub data: *const u8,
+    pub data_len: u64,
+}
+
+/// A function column of the result, one entry per group. `count` is the number
+/// of rows (COUNT(*)), of non-NULL values (COUNT) or of values aggregated by
+/// SUM/MIN/MAX (0 = the SQL result is NULL). SUM: the signed 128-bit value
+/// `(sum_hi << 64) | sum_lo`. MIN/MAX: `val`. Pointers the op does not use are NULL.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TFAggFuncBatch {
+    pub op: u8,
+    pub count: *const u64,
+    pub sum_lo: *const u64,
+    pub sum_hi: *const i64,
+    pub val: *const i64,
+}
+
+/// Groups `[start, start + row_count)` of the last result. Owned by the
+/// handle; valid until the next call on it.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TFAggBatch {
+    pub row_count: u64,
+    /// Groups in the whole result.
+    pub total_groups: u64,
+    pub key_count: u32,
+    pub func_count: u32,
+    pub keys: *const TFAggKeyBatch,
+    pub funcs: *const TFAggFuncBatch,
+}
+
+/// Opaque aggregation handle: one snapshot, used by one thread at a time.
+pub struct MooseDBAgg {
+    agg: Agg,
+    ops: Vec<u8>,
+    keys_out: Vec<TFAggKeyBatch>,
+    funcs_out: Vec<TFAggFuncBatch>,
+}
+
+/// Opens an aggregation over a snapshot of the table, with the visibility of
+/// an unordered scan: rows with `ts_start_us <= ts <= ts_end_us`, only in the
+/// given series (`series_count < 0` = all series).
+///
+/// # Safety
+/// `series_ids` must hold `series_count` elements when `series_count > 0`;
+/// `out_agg` writable.
+#[no_mangle]
+pub unsafe extern "C" fn moosedb_agg_open(
+    table: *mut MooseDBTable,
+    ts_start_us: i64,
+    ts_end_us: i64,
+    series_ids: *const u64,
+    series_count: i64,
+    out_agg: *mut *mut MooseDBAgg,
+) -> TFStatus {
+    guard(|| {
+        let out = handle_mut(out_agg, "out_agg")?;
+        *out = ptr::null_mut();
+        let t = table_ref(table)?;
+        // SAFETY: caller contract.
+        let filter = unsafe { series_filter(ts_start_us, ts_end_us, series_ids, series_count) }?;
+        let agg = t.table.agg_open(ts_start_us, ts_end_us, filter.series)?;
+        *out = Box::into_raw(Box::new(MooseDBAgg { agg, ops: Vec::new(), keys_out: Vec::new(), funcs_out: Vec::new() }));
+        Ok(())
+    })
+}
+
+/// Runs the aggregation described by `spec`; the result is read with
+/// `moosedb_agg_result` (it replaces the previous one; a failed run leaves
+/// none). `cancel` may be NULL. Errors: `TF_ERR_INVALID_ARG` (bad column or
+/// type, missing dictionary, mask of the wrong length), `TF_ERR_FULL` (memory
+/// budget, SUM overflow), `TF_ERR_CANCELLED`, `TF_ERR_INTERNAL` (a panic in a
+/// worker thread).
+///
+/// # Safety
+/// `agg` valid; `spec` and the arrays it points to valid for the call;
+/// `cancel(ctx)` must be callable from this thread.
+#[no_mangle]
+pub unsafe extern "C" fn moosedb_agg_run(
+    agg: *mut MooseDBAgg,
+    spec: *const TFAggSpec,
+    cancel: TFAggCancel,
+    ctx: *mut c_void,
+) -> TFStatus {
+    guard(|| {
+        let a = handle_mut(agg, "agg")?;
+        let s = handle_ref(spec, "spec")?;
+        a.ops.clear();
+        a.keys_out.clear();
+        a.funcs_out.clear();
+        // SAFETY: caller contract for every array.
+        let (keys, funcs, filters) = unsafe {
+            (
+                slice(s.keys, s.key_count as usize, "spec.keys")?,
+                slice(s.funcs, s.func_count as usize, "spec.funcs")?,
+                slice(s.filters, s.filter_count as usize, "spec.filters")?,
+            )
+        };
+        let keys = keys
+            .iter()
+            .map(|k| match k.kind {
+                TF_AGG_KEY_SERIES => Ok(KeySpec::Series),
+                TF_AGG_KEY_COLUMN => Ok(KeySpec::Column(k.col as usize)),
+                other => Err(invalid(&format!("unknown key kind {other}"))),
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        let ops: Vec<u8> = funcs.iter().map(|f| f.op).collect();
+        let funcs = funcs
+            .iter()
+            .map(|f| {
+                let c = f.col as usize;
+                match f.op {
+                    TF_AGG_COUNT_STAR => Ok(FuncSpec::CountStar),
+                    TF_AGG_COUNT => Ok(FuncSpec::Count(c)),
+                    TF_AGG_SUM => Ok(FuncSpec::Sum(c)),
+                    TF_AGG_MIN => Ok(FuncSpec::Min(c)),
+                    TF_AGG_MAX => Ok(FuncSpec::Max(c)),
+                    other => Err(invalid(&format!("unknown function {other}"))),
+                }
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        let mut fs = Vec::new();
+        let mut vfs = Vec::new();
+        for f in filters {
+            match f.mode {
+                TF_AGG_FILTER_MASK => {
+                    let n = usize::try_from(f.mask_len).map_err(|_| invalid("filter mask too long"))?;
+                    // SAFETY: caller contract.
+                    let mask = unsafe { slice(f.mask, n, "filter.mask") }?;
+                    fs.push(ColFilter { col: f.col as usize, mask: mask.iter().map(|&m| m != 0).collect() });
+                }
+                TF_AGG_FILTER_VALUES => {
+                    let to_n = |v: u64, what: &str| usize::try_from(v).map_err(|_| invalid(&format!("{what} too long")));
+                    let (ni, nv, nd) = (
+                        to_n(f.int_count, "int_count")?,
+                        to_n(f.value_count, "value_count")?,
+                        to_n(f.value_data_len, "value_data_len")?,
+                    );
+                    // SAFETY: caller contract for every array.
+                    let (ints, starts, lens, data) = unsafe {
+                        (
+                            slice(f.int_values, ni, "filter.int_values")?,
+                            slice(f.value_starts, nv, "filter.value_starts")?,
+                            slice(f.value_lens, nv, "filter.value_lens")?,
+                            slice(f.value_data, nd, "filter.value_data")?,
+                        )
+                    };
+                    let mut bytes = Vec::with_capacity(nv);
+                    for (&st, &len) in starts.iter().zip(lens) {
+                        let range = usize::try_from(st).ok().and_then(|st| st.checked_add(len as usize).map(|e| (st, e)));
+                        let (st, end) = range
+                            .filter(|&(_, e)| e <= data.len())
+                            .ok_or_else(|| invalid("filter value out of range"))?;
+                        bytes.push(data[st..end].to_vec());
+                    }
+                    vfs.push(ValueFilter { col: f.col as usize, ints: ints.to_vec(), bytes, pad_space: f.pad_space != 0 });
+                }
+                other => return Err(invalid(&format!("unknown filter mode {other}"))),
+            }
+        }
+        let top = match s.top_mode {
+            TF_AGG_TOP_NONE => None,
+            m @ (TF_AGG_TOP_ASC | TF_AGG_TOP_DESC) => Some(TopN {
+                func: s.top_func as usize,
+                desc: m == TF_AGG_TOP_DESC,
+                limit: usize::try_from(s.top_limit).unwrap_or(usize::MAX),
+            }),
+            other => return Err(invalid(&format!("unknown top mode {other}"))),
+        };
+        let spec = AggSpec {
+            keys,
+            funcs,
+            filters: fs,
+            value_filters: vfs,
+            top,
+            max_memory: usize::try_from(s.max_memory).unwrap_or(usize::MAX),
+            threads: s.threads as usize,
+        };
+        let mut poll = cancel.map(|cb| {
+            move || {
+                // SAFETY: the caller guarantees `cb(ctx)` is callable on this thread.
+                unsafe { cb(ctx) != 0 }
+            }
+        });
+        let poll: Option<&mut dyn FnMut() -> bool> = poll.as_mut().map(|p| p as &mut dyn FnMut() -> bool);
+        a.agg.run(&spec, poll)?;
+        a.ops = ops;
+        Ok(())
+    })
+}
+
+/// Groups `[start, start + max_groups)` of the last result, in columns (an
+/// empty batch when `start` is past the end). Order is unspecified but stable
+/// until the next run, except for a run with a top-N, whose groups come best
+/// first. Valid until the next call on the handle.
+///
+/// # Safety
+/// `agg` valid; `out` writable.
+#[no_mangle]
+pub unsafe extern "C" fn moosedb_agg_result(
+    agg: *mut MooseDBAgg,
+    start: u64,
+    max_groups: u64,
+    out: *mut TFAggBatch,
+) -> TFStatus {
+    guard(|| {
+        let a = handle_mut(agg, "agg")?;
+        let out = handle_mut(out, "out")?;
+        *out = TFAggBatch {
+            row_count: 0,
+            total_groups: 0,
+            key_count: 0,
+            func_count: 0,
+            keys: ptr::null(),
+            funcs: ptr::null(),
+        };
+        let r = a.agg.result();
+        let total = r.groups;
+        let from = usize::try_from(start).unwrap_or(usize::MAX).min(total);
+        let to = from.saturating_add(usize::try_from(max_groups).unwrap_or(usize::MAX)).min(total);
+        a.keys_out.clear();
+        a.funcs_out.clear();
+        for k in &r.keys {
+            a.keys_out.push(match k {
+                KeyCol::Series(v) => TFAggKeyBatch {
+                    kind: TF_AGG_KEYCOL_SERIES,
+                    nulls: ptr::null(),
+                    values: ptr_or_null(&v[from..to]).cast(),
+                    starts: ptr::null(),
+                    lens: ptr::null(),
+                    data: ptr::null(),
+                    data_len: 0,
+                },
+                KeyCol::Int { nulls, vals } => TFAggKeyBatch {
+                    kind: TF_AGG_KEYCOL_INT,
+                    nulls: ptr_or_null(&nulls[from..to]).cast(),
+                    values: ptr_or_null(&vals[from..to]).cast(),
+                    starts: ptr::null(),
+                    lens: ptr::null(),
+                    data: ptr::null(),
+                    data_len: 0,
+                },
+                KeyCol::Bytes { nulls, starts, lens, data } => TFAggKeyBatch {
+                    kind: TF_AGG_KEYCOL_BYTES,
+                    nulls: ptr_or_null(&nulls[from..to]).cast(),
+                    values: ptr::null(),
+                    starts: ptr_or_null(&starts[from..to]),
+                    lens: ptr_or_null(&lens[from..to]),
+                    data: ptr_or_null(data),
+                    data_len: data.len() as u64,
+                },
+            });
+        }
+        for (f, &op) in r.funcs.iter().zip(&a.ops) {
+            let (sum, val) = (op == TF_AGG_SUM, op == TF_AGG_MIN || op == TF_AGG_MAX);
+            a.funcs_out.push(TFAggFuncBatch {
+                op,
+                count: ptr_or_null(&f.count[from..to]),
+                sum_lo: if sum { ptr_or_null(&f.sum_lo[from..to]) } else { ptr::null() },
+                sum_hi: if sum { ptr_or_null(&f.sum_hi[from..to]) } else { ptr::null() },
+                val: if val { ptr_or_null(&f.val[from..to]) } else { ptr::null() },
+            });
+        }
+        out.row_count = (to - from) as u64;
+        out.total_groups = total as u64;
+        out.key_count = a.keys_out.len() as u32;
+        out.func_count = a.funcs_out.len() as u32;
+        out.keys = ptr_or_null(&a.keys_out);
+        out.funcs = ptr_or_null(&a.funcs_out);
+        Ok(())
+    })
+}
+
+/// # Safety
+/// `agg` must come from `moosedb_agg_open` and not be used afterwards. NULL is ignored.
+#[no_mangle]
+pub unsafe extern "C" fn moosedb_agg_close(agg: *mut MooseDBAgg) -> TFStatus {
+    guard(|| {
+        release(agg);
         Ok(())
     })
 }

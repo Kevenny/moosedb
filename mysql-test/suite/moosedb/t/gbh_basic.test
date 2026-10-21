@@ -1,0 +1,499 @@
+#
+# GROUP BY done by the engine (moosedb_group_by_pushdown): differential test.
+# Every case runs three times -- pushdown OFF, pushdown ON, and on an InnoDB
+# copy of the table -- and the three complete outputs (rows, warnings, column
+# metadata) must be identical (include/gbh_diff.inc). The query counter
+# Moosedb_gbh_queries proves that the ON run really was done by the engine.
+#
+--source include/not_embedded.inc
+--source include/have_innodb.inc
+--source include/have_sequence.inc
+--source suite/moosedb/include/have_moosedb.inc
+
+--let $refused= 0
+--let $sorted= 0
+--let $show= 0
+--let $pre=
+
+CREATE TABLE g (
+  ts      DATETIME NOT NULL,
+  host    VARCHAR(16) NOT NULL COMMENT 'TAG',
+  iface   INT NOT NULL COMMENT 'TAG',
+  proc    VARCHAR(24) COMMENT 'TAG',
+  file    VARCHAR(32),
+  code    INT,
+  bytes   BIGINT,
+  latency INT,
+  INDEX(ts)
+) ENGINE=MooseDB CHUNK_INTERVAL='1 DAY';
+
+--echo # 20000 rows in chunks, 10000 more left in the MemTable
+INSERT INTO g SELECT '2024-03-01' + INTERVAL seq * 20 SECOND,
+                     CONCAT('h', seq MOD 23), seq MOD 4,
+                     IF(seq MOD 13 = 0, NULL, CONCAT('p', seq MOD 17)),
+                     CONCAT('/f/', seq MOD 41),
+                     IF(seq MOD 9 = 0, NULL, seq MOD 7),
+                     (seq * 7919) MOD 100000 + 5000000000,
+                     IF(seq MOD 5 = 0, NULL, (seq * 31) MOD 997)
+  FROM seq_0_to_19999;
+FLUSH TABLES g;
+INSERT INTO g SELECT '2024-03-01' + INTERVAL seq * 20 SECOND,
+                     CONCAT('h', seq MOD 23), seq MOD 4,
+                     IF(seq MOD 13 = 0, NULL, CONCAT('p', seq MOD 17)),
+                     CONCAT('/f/', seq MOD 41),
+                     IF(seq MOD 9 = 0, NULL, seq MOD 7),
+                     (seq * 7919) MOD 100000 + 5000000000,
+                     IF(seq MOD 5 = 0, NULL, (seq * 31) MOD 997)
+  FROM seq_20000_to_29999;
+
+CREATE DATABASE mirror;
+CREATE TABLE mirror.g LIKE test.g;
+ALTER TABLE mirror.g ENGINE=InnoDB;
+INSERT INTO mirror.g SELECT * FROM test.g;
+SELECT (SELECT COUNT(*) FROM test.g) = (SELECT COUNT(*) FROM mirror.g) AS same_rows;
+
+--echo ##########################################################
+--echo # Monitoring queries
+--echo ##########################################################
+--let $label= top 10 hosts by SUM(bytes) in an interval
+--let $q= SELECT host, SUM(bytes) s FROM g WHERE ts >= '2024-03-02 00:00:00' AND ts < '2024-03-04 00:00:00' GROUP BY host ORDER BY s DESC, host LIMIT 10
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= top processes of a host: COUNT, AVG, MAX
+--let $q= SELECT proc, COUNT(*) c, AVG(latency) a, MAX(latency) m FROM g WHERE host = 'h3' GROUP BY proc ORDER BY c DESC, proc LIMIT 5
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= top files by COUNT (plain VARCHAR key)
+--let $q= SELECT file, COUNT(*) c FROM g GROUP BY file ORDER BY c DESC, file LIMIT 10
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= integer TAG key
+--let $q= SELECT iface, COUNT(*) c, SUM(bytes) s, MIN(bytes) mn, MAX(bytes) mx FROM g GROUP BY iface ORDER BY iface
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= integer plain column key (NULL group included)
+--let $q= SELECT code, COUNT(*) c, SUM(latency) s FROM g GROUP BY code ORDER BY code
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= host, process (two TAGs, NULL process group)
+--let $q= SELECT host, proc, COUNT(*) c FROM g GROUP BY host, proc ORDER BY host, proc LIMIT 20 OFFSET 7
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= TAG and plain column together
+--let $q= SELECT host, code, COUNT(*) c, SUM(bytes) s FROM g WHERE host IN ('h1','h2','h7') GROUP BY host, code ORDER BY host, code
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= no ORDER BY: the implicit GROUP BY order
+--let $q= SELECT host, COUNT(*) c FROM g GROUP BY host
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= ORDER BY NULL (any order)
+--let $sorted= 1
+--let $q= SELECT host, COUNT(*) c FROM g GROUP BY host ORDER BY NULL
+--source suite/moosedb/include/gbh_diff.inc
+
+--echo ##########################################################
+--echo # NULLs, empty results, implicit group
+--echo ##########################################################
+--let $label= one row with NULL key parts and NULL argument
+--let $q= SELECT host, proc, code, COUNT(*) c, COUNT(latency) cl, SUM(latency) sl, AVG(latency) al, MIN(latency) mnl, MAX(latency) mxl FROM g WHERE ts = '2024-03-01 00:00:00' GROUP BY host, proc, code
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= COUNT(col) vs COUNT(*) and aggregates of mostly NULL arguments
+--let $q= SELECT host, COUNT(*) c, COUNT(latency) cl, SUM(latency) sl, MIN(latency) mnl, MAX(latency) mxl, COUNT(code) cc FROM g GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= no row matches: no group
+--let $q= SELECT proc, COUNT(*) c, SUM(bytes) s FROM g WHERE host = 'nobody' GROUP BY proc
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= time range with no data
+--let $q= SELECT host, COUNT(*) c FROM g WHERE ts >= '2030-01-01' GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= implicit single group over no rows (no GROUP BY: not the engine)
+--let $refused= 1
+--let $q= SELECT COUNT(*) c, SUM(bytes) s, MIN(bytes) m, AVG(latency) a FROM g WHERE host = 'nobody'
+--source suite/moosedb/include/gbh_diff.inc
+
+--echo ##########################################################
+--echo # Predicates: TAG equality / IN, time bounds
+--echo ##########################################################
+--let $label= TAG IN, integer TAG equality, time range with BETWEEN
+--let $q= SELECT host, COUNT(*) c FROM g WHERE host IN ('h1','h4','h22') AND iface = 2 AND ts BETWEEN '2024-03-01 06:00:00' AND '2024-03-03 12:30:00' GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= TAG IN with an integer list, open time bounds
+--let $q= SELECT iface, COUNT(*) c FROM g WHERE iface IN (1,3) AND ts > '2024-03-01 00:00:20' AND ts <= '2024-03-05' GROUP BY iface ORDER BY iface
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= constant on the left of the time comparison
+--let $q= SELECT host, COUNT(*) c FROM g WHERE '2024-03-02 00:00:00' <= ts AND ts < '2024-03-02 01:00:00' GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= a plain column predicate: evaluated by the engine through the column dictionary (gbh_where covers it in depth)
+--let $q= SELECT host, COUNT(*) c FROM g WHERE file = '/f/3' GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+
+--echo ##########################################################
+--echo # SUM / AVG / MIN / MAX
+--echo ##########################################################
+CREATE TABLE b (
+  d  DATETIME NOT NULL,
+  k  VARCHAR(8) NOT NULL COMMENT 'TAG',
+  v  BIGINT,
+  u  INT UNSIGNED,
+  w  BIGINT UNSIGNED,
+  s  SMALLINT,
+  INDEX(d)
+) ENGINE=MooseDB;
+INSERT INTO b (d, k, v, u, w, s) VALUES
+  ('2024-05-01 00:00:01', 'a', 4611686018427387904, 4294967295, 18446744073709551615, -32768),
+  ('2024-05-01 00:00:02', 'a', 4611686018427387904, 4294967295, 9223372036854775808, 32767),
+  ('2024-05-01 00:00:03', 'a', 4611686018427387904, 4294967295, 1, 0),
+  ('2024-05-01 00:00:04', 'a', 4611686018427387904, 4294967295, 2, 1),
+  ('2024-05-01 00:00:05', 'b', -9223372036854775807, 1, 0, -1),
+  ('2024-05-01 00:00:06', 'b', -9223372036854775807, 2, 0, -2),
+  ('2024-05-01 00:00:07', 'b', 9223372036854775807, 3, 0, NULL),
+  ('2024-05-01 00:00:08', 'c', NULL, NULL, NULL, NULL),
+  ('2024-05-01 00:00:09', 'c', NULL, NULL, NULL, NULL),
+  ('2024-05-01 00:00:10', 'd', 9223372036854775807, 4294967295, 0, 5),
+  ('2024-05-01 00:00:11', 'd', 9223372036854775807, 4294967295, 0, 6);
+CREATE TABLE mirror.b LIKE test.b;
+ALTER TABLE mirror.b ENGINE=InnoDB;
+INSERT INTO mirror.b SELECT * FROM test.b;
+
+--let $label= SUM past 2^63 and below -2^63, MIN, MAX, COUNT of BIGINT
+--let $q= SELECT k, COUNT(*) c, COUNT(v) cv, SUM(v) sv, AVG(v) av, MIN(v) mnv, MAX(v) mxv FROM b GROUP BY k ORDER BY k
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= SUM / AVG / MIN / MAX of INT UNSIGNED and SMALLINT
+--let $q= SELECT k, SUM(u) su, AVG(u) au, MIN(u) mnu, MAX(u) mxu, SUM(s) ss, AVG(s) aas, MIN(s) mns, MAX(s) mxs FROM b GROUP BY k ORDER BY k
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= BIGINT UNSIGNED aggregates do not fit the core: refused, same answer
+--let $refused= 1
+--let $q= SELECT k, SUM(w) sw, MIN(w) mnw, MAX(w) mxw FROM b GROUP BY k ORDER BY k
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= MIN / MAX of the time axis
+--let $q= SELECT k, MIN(d) first_d, MAX(d) last_d FROM b GROUP BY k ORDER BY k
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= AVG with div_precision_increment 0
+--let $pre= SET SESSION div_precision_increment = 0;
+--let $q= SELECT host, AVG(latency) a, AVG(bytes) b FROM g GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= AVG with div_precision_increment 4
+--let $pre= SET SESSION div_precision_increment = 4;
+--let $q= SELECT host, AVG(latency) a, AVG(bytes) b FROM g GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= AVG with div_precision_increment 30
+--let $pre= SET SESSION div_precision_increment = 30;
+--let $q= SELECT host, AVG(latency) a, AVG(bytes) b FROM g GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= AVG of BIGINT near 2^63 with div_precision_increment 30
+--let $pre= SET SESSION div_precision_increment = 30;
+--let $q= SELECT k, AVG(v) av FROM b GROUP BY k ORDER BY k
+--source suite/moosedb/include/gbh_diff.inc
+
+--echo ##########################################################
+--echo # HAVING, ORDER BY, LIMIT / OFFSET
+--echo ##########################################################
+--let $label= HAVING on the aggregate and on a hidden aggregate
+--let $q= SELECT host, COUNT(*) c FROM g GROUP BY host HAVING c > 1300 AND SUM(bytes) > 0 ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= HAVING on the key moves to the WHERE as a TAG range: not captured, refused
+--let $refused= 1
+--let $q= SELECT host, COUNT(*) c FROM g GROUP BY host HAVING host > 'h2' ORDER BY c, host
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= HAVING with LIMIT and OFFSET (top-N must not cut before HAVING)
+--let $q= SELECT host, SUM(bytes) s FROM g GROUP BY host HAVING s > 0 AND COUNT(*) > 1300 ORDER BY s DESC LIMIT 3 OFFSET 1
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= ORDER BY aggregate ASC
+--let $q= SELECT host, COUNT(*) c FROM g GROUP BY host ORDER BY c, host
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= ORDER BY aggregate DESC, key DESC
+--let $q= SELECT host, COUNT(*) c FROM g GROUP BY host ORDER BY c DESC, host DESC
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= ORDER BY key DESC with LIMIT
+--let $q= SELECT host, COUNT(*) c FROM g GROUP BY host ORDER BY host DESC LIMIT 4
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= ORDER BY AVG DESC (after the division)
+--let $q= SELECT host, AVG(latency) a FROM g GROUP BY host ORDER BY a DESC, host LIMIT 6
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= ORDER BY MIN / MAX of the time axis, NULL aggregates first
+--let $q= SELECT host, MIN(ts) t0, MAX(ts) t1, MAX(latency) m FROM g GROUP BY host ORDER BY t1 DESC, t0, host LIMIT 5
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= ORDER BY an aggregate that is not selected
+--let $q= SELECT host FROM g GROUP BY host ORDER BY SUM(bytes) DESC, host LIMIT 5
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= ORDER BY SUM with NULL sums
+--let $q= SELECT code, SUM(latency) s FROM g WHERE ts < '2024-03-01 00:01:00' GROUP BY code ORDER BY s, code
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= LIMIT 0 (the server answers it without the hook)
+--let $refused= 1
+--let $q= SELECT host, COUNT(*) c FROM g GROUP BY host ORDER BY host LIMIT 0
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= LIMIT beyond the number of groups, OFFSET beyond too
+--let $q= SELECT host, COUNT(*) c FROM g GROUP BY host ORDER BY host LIMIT 100 OFFSET 20
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= LIMIT without ORDER BY (implicit order)
+--let $q= SELECT host, COUNT(*) c FROM g GROUP BY host LIMIT 3 OFFSET 2
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= FOUND_ROWS() after a pushed-down LIMIT
+--let $q= SELECT host, COUNT(*) c FROM g GROUP BY host ORDER BY host LIMIT 3; SELECT FOUND_ROWS();
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= FOUND_ROWS() with HAVING and OFFSET
+--let $q= SELECT host, COUNT(*) c FROM g GROUP BY host HAVING c > 1300 ORDER BY host LIMIT 4 OFFSET 1; SELECT FOUND_ROWS();
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= SQL_CALC_FOUND_ROWS is refused (the server leaves FOUND_ROWS stale)
+--let $refused= 1
+--let $q= SELECT SQL_CALC_FOUND_ROWS host, COUNT(*) c FROM g GROUP BY host ORDER BY host LIMIT 3; SELECT FOUND_ROWS();
+--source suite/moosedb/include/gbh_diff.inc
+
+--echo ##########################################################
+--echo # PREPARE / EXECUTE, EXPLAIN
+--echo ##########################################################
+--let $label= the plan is rebuilt at each EXECUTE with the new parameters
+--let $pre= PREPARE p FROM 'SELECT host, COUNT(*) c, MAX(bytes) m FROM g WHERE ts >= ? AND ts < ? AND host IN (?, ?) GROUP BY host ORDER BY host'; SET @a = '2024-03-02', @b = '2024-03-03', @c = 'h1', @d = 'h5';
+--let $q= EXECUTE p USING @a, @b, @c, @d; SET @a = '2024-03-04', @b = '2024-03-06', @c = 'h9', @d = 'h5'; EXECUTE p USING @a, @b, @c, @d;
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= a session variable changed between EXECUTEs
+--let $pre= PREPARE p FROM 'SELECT iface, COUNT(*) c FROM g GROUP BY iface ORDER BY iface'; SET SESSION moosedb_group_by_pushdown = 0; EXECUTE p; SET SESSION moosedb_group_by_pushdown = 1;
+--let $q= EXECUTE p;
+--source suite/moosedb/include/gbh_diff.inc
+
+SET SESSION moosedb_group_by_pushdown = 1;
+--echo # EXPLAIN shows the engine handles the GROUP BY (and opens nothing)
+EXPLAIN SELECT host, COUNT(*) c FROM g GROUP BY host;
+EXPLAIN FORMAT=JSON SELECT host, COUNT(*) c FROM g WHERE host = 'h1' GROUP BY host;
+EXPLAIN SELECT host, COUNT(*) c FROM g WHERE file = '/f/1' GROUP BY host;
+SET SESSION moosedb_group_by_pushdown = 0;
+EXPLAIN SELECT host, COUNT(*) c FROM g GROUP BY host;
+SET SESSION moosedb_group_by_pushdown = DEFAULT;
+
+--echo ##########################################################
+--echo # DELETE (tombstones), MemTable and chunks together
+--echo ##########################################################
+DELETE FROM test.g WHERE host = 'h5' AND ts < '2024-03-03';
+DELETE FROM mirror.g WHERE host = 'h5' AND ts < '2024-03-03';
+DELETE FROM test.g WHERE ts >= '2024-03-06 12:00:00' AND iface = 1;
+DELETE FROM mirror.g WHERE ts >= '2024-03-06 12:00:00' AND iface = 1;
+SELECT (SELECT COUNT(*) FROM test.g) = (SELECT COUNT(*) FROM mirror.g) AS same_rows_after_delete;
+
+--let $label= after DELETE: counts and sums per host
+--let $q= SELECT host, COUNT(*) c, SUM(bytes) s, MIN(ts) t0, MAX(ts) t1 FROM g GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= after DELETE: integer TAG
+--let $q= SELECT iface, COUNT(*) c, MAX(latency) m FROM g GROUP BY iface ORDER BY iface
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= after DELETE: a host that lost rows, by time range
+--let $q= SELECT iface, COUNT(*) c FROM g WHERE host = 'h5' AND ts < '2024-03-04' GROUP BY iface ORDER BY iface
+--source suite/moosedb/include/gbh_diff.inc
+
+OPTIMIZE TABLE test.g;
+--let $label= after OPTIMIZE (compacted chunks)
+--let $q= SELECT host, COUNT(*) c, SUM(bytes) s FROM g GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+
+--echo ##########################################################
+--echo # One thread and many threads give the same answer
+--echo ##########################################################
+SET GLOBAL moosedb_agg_threads = 1;
+--let $label= threads = 1
+--let $q= SELECT host, proc, COUNT(*) c, SUM(bytes) s, AVG(latency) a FROM g GROUP BY host, proc ORDER BY host, proc
+--source suite/moosedb/include/gbh_diff.inc
+SET GLOBAL moosedb_agg_threads = 8;
+--let $label= threads = 8
+--let $q= SELECT host, proc, COUNT(*) c, SUM(bytes) s, AVG(latency) a FROM g GROUP BY host, proc ORDER BY host, proc
+--source suite/moosedb/include/gbh_diff.inc
+SET GLOBAL moosedb_agg_threads = DEFAULT;
+
+--echo ##########################################################
+--echo # Refused shapes keep their answer
+--echo ##########################################################
+--let $refused= 1
+--let $label= expression over an aggregate
+--let $q= SELECT host, SUM(bytes) / 2 q FROM g GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $refused= 1
+--let $label= COUNT(DISTINCT)
+--let $q= SELECT host, COUNT(DISTINCT code) c FROM g GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $refused= 1
+--let $label= GROUP BY the time column
+--let $q= SELECT ts, COUNT(*) c FROM g WHERE ts < '2024-03-01 00:01:00' GROUP BY ts ORDER BY ts
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $refused= 1
+--let $label= derived table
+--let $q= SELECT * FROM (SELECT host, COUNT(*) c FROM g GROUP BY host) d ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $refused= 1
+--let $label= ROLLUP
+--let $q= SELECT host, COUNT(*) c FROM g WHERE host < 'h2' GROUP BY host WITH ROLLUP
+--source suite/moosedb/include/gbh_diff.inc
+
+--echo ##########################################################
+--echo # Review fixes
+--echo ##########################################################
+--let $label= COUNT of a TAG column is refused (the core cannot), same answer
+--let $refused= 1
+--let $q= SELECT host, COUNT(host) c FROM g GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= COUNT of an integer TAG is refused too
+--let $refused= 1
+--let $q= SELECT iface, COUNT(iface) c FROM g GROUP BY iface ORDER BY iface
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= COUNT of a plain column is done by the engine
+--let $q= SELECT host, COUNT(file) cf, COUNT(code) cc FROM g GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= COUNT(constant that is NULL) counts nothing: refused, same answer
+--let $refused= 1
+--let $q= SELECT host, COUNT(NULLIF(1,1)) a, COUNT(CAST(NULL AS SIGNED)) b, COUNT(IF(1,NULL,2)) c FROM g GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= COUNT(non-NULL constant) is COUNT(*)
+--let $q= SELECT host, COUNT(1) a, COUNT(7) b FROM g GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= the same key twice in the select list
+--let $q= SELECT host, host h2, COUNT(*) c FROM g GROUP BY host ORDER BY host LIMIT 4
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= aggregate before the key
+--let $q= SELECT COUNT(*) c, host FROM g GROUP BY host ORDER BY host LIMIT 4
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= keys only in ORDER BY and HAVING
+--let $q= SELECT COUNT(*) c FROM g GROUP BY host, iface HAVING iface = 2 AND SUM(bytes) > 0 ORDER BY host DESC, iface LIMIT 5
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= GROUP BY a BIGINT UNSIGNED column with the high bit set (unsigned order)
+--let $q= SELECT w, COUNT(*) c, SUM(s) ss FROM b GROUP BY w ORDER BY w DESC
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= GROUP BY a BIGINT UNSIGNED column, ASC
+--let $q= SELECT w, COUNT(*) c FROM b GROUP BY w ORDER BY w
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= LOCK TABLES ... READ around the aggregate
+--let $pre= LOCK TABLES g READ;
+--let $q= SELECT host, COUNT(*) c FROM g GROUP BY host ORDER BY host LIMIT 3; UNLOCK TABLES;
+--source suite/moosedb/include/gbh_diff.inc
+
+CREATE TABLE tsx (
+  ts TIMESTAMP NOT NULL,
+  k  VARCHAR(8) NOT NULL COMMENT 'TAG',
+  n  INT,
+  INDEX(ts)
+) ENGINE=MooseDB;
+INSERT INTO tsx VALUES ('2024-02-01 00:00:01', 'a', 1), ('2024-02-01 00:00:02', 'a', 2), ('2024-02-01 00:00:03', 'b', 3);
+CREATE TABLE mirror.tsx LIKE test.tsx;
+ALTER TABLE mirror.tsx ENGINE=InnoDB;
+INSERT INTO mirror.tsx SELECT * FROM test.tsx;
+--let $label= a TIMESTAMP axis with a time bound is refused (not captured), same answer
+--let $refused= 1
+--let $q= SELECT k, COUNT(*) c, SUM(n) s FROM tsx WHERE ts >= '2024-02-01 00:00:02' GROUP BY k ORDER BY k
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= a TIMESTAMP axis without a time bound is fine
+--let $q= SELECT k, COUNT(*) c, SUM(n) s FROM tsx GROUP BY k ORDER BY k
+--source suite/moosedb/include/gbh_diff.inc
+
+--echo # Fractions beyond 6 digits in a time bound: the engine uses the server's
+--echo # own conversion (flags and rounding of the comparison)
+CREATE TABLE fr (
+  ts DATETIME(6) NOT NULL,
+  k  VARCHAR(8) NOT NULL COMMENT 'TAG',
+  n  INT,
+  INDEX(ts)
+) ENGINE=MooseDB;
+INSERT INTO fr VALUES
+  ('2024-01-01 00:00:20.999998', 'a', 1), ('2024-01-01 00:00:20.999999', 'a', 2),
+  ('2024-01-01 00:00:21.000000', 'b', 4), ('2024-01-01 00:00:21.000001', 'b', 8),
+  ('2024-01-01 00:00:21.000002', 'c', 16);
+CREATE TABLE mirror.fr LIKE test.fr;
+ALTER TABLE mirror.fr ENGINE=InnoDB;
+INSERT INTO mirror.fr SELECT * FROM test.fr;
+--let $c= '2024-01-01 00:00:20.9999995'
+--let $label= fraction < (string)
+--let $q= SELECT k, COUNT(*) c, SUM(n) s FROM fr WHERE ts < $c GROUP BY k ORDER BY k
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= fraction <= (string)
+--let $q= SELECT k, COUNT(*) c, SUM(n) s FROM fr WHERE ts <= $c GROUP BY k ORDER BY k
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= fraction > (string)
+--let $q= SELECT k, COUNT(*) c, SUM(n) s FROM fr WHERE ts > $c GROUP BY k ORDER BY k
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= fraction >= (string)
+--let $q= SELECT k, COUNT(*) c, SUM(n) s FROM fr WHERE ts >= $c GROUP BY k ORDER BY k
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= fraction BETWEEN (string)
+--let $q= SELECT k, COUNT(*) c, SUM(n) s FROM fr WHERE ts BETWEEN $c AND '2024-01-01 00:00:21.0000015' GROUP BY k ORDER BY k
+--source suite/moosedb/include/gbh_diff.inc
+--let $c= 20240101000020.9999995
+--let $label= fraction < (number)
+--let $q= SELECT k, COUNT(*) c, SUM(n) s FROM fr WHERE ts < $c GROUP BY k ORDER BY k
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= fraction <= (number)
+--let $q= SELECT k, COUNT(*) c, SUM(n) s FROM fr WHERE ts <= $c GROUP BY k ORDER BY k
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= fraction > (number)
+--let $q= SELECT k, COUNT(*) c, SUM(n) s FROM fr WHERE ts > $c GROUP BY k ORDER BY k
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= fraction >= (number)
+--let $q= SELECT k, COUNT(*) c, SUM(n) s FROM fr WHERE ts >= $c GROUP BY k ORDER BY k
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= fraction BETWEEN (number)
+--let $q= SELECT k, COUNT(*) c, SUM(n) s FROM fr WHERE ts BETWEEN $c AND 20240101000021.0000015 GROUP BY k ORDER BY k
+--source suite/moosedb/include/gbh_diff.inc
+
+--echo # The direct DELETE converts the bound the same way
+DELETE FROM test.fr WHERE ts <= '2024-01-01 00:00:20.9999995';
+DELETE FROM mirror.fr WHERE ts <= '2024-01-01 00:00:20.9999995';
+--let $label= rows left after the DELETE with a fractional bound
+--let $q= SELECT k, COUNT(*) c, SUM(n) s FROM fr GROUP BY k ORDER BY k
+--source suite/moosedb/include/gbh_diff.inc
+
+--echo ##########################################################
+--echo # Session counters
+--echo ##########################################################
+SET SESSION moosedb_group_by_pushdown = ON;
+--let $c0= `SELECT VARIABLE_VALUE FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME = 'MOOSEDB_GBH_QUERIES'`
+SELECT COUNT(*) FROM (SELECT host FROM g GROUP BY host) x;
+--let $c1= `SELECT VARIABLE_VALUE FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME = 'MOOSEDB_GBH_QUERIES'`
+--echo # a derived table is not taken over: counter moved by
+--let $dc= `SELECT $c1 - $c0`
+--echo # counter moved by $dc
+SET SESSION moosedb_group_by_pushdown = DEFAULT;
+
+DROP DATABASE mirror;
+DROP TABLE g, b, tsx, fr;

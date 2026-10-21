@@ -659,18 +659,17 @@ impl Batch {
         if inner.epoch != self.epoch {
             return Err(stale());
         }
-        let mut manifest = inner.manifest.clone();
-        manifest.chunks.extend(self.staged.iter().map(|m| m.id));
-        manifest.chunks.sort_unstable();
         // The files now belong to this MANIFEST swap. If it fails we cannot
         // know whether it reached the disk (the table is poisoned), so they
         // are neither listed in memory nor deleted: recovery decides.
+        // The rows count as inserted now: a delete that ran while the statement
+        // was open does not apply to them (`publish` stamps the chunks born now).
         let staged = std::mem::take(&mut self.staged);
         self.finished = true;
-        inner.commit_manifest(&table.config.dir, manifest)?;
         let mut chunks = inner.chunks.clone();
         chunks.extend(staged);
-        inner.replace_chunks(chunks);
+        let tombs = (*inner.tombs).clone();
+        inner.publish(&table.config.dir, chunks, tombs, |_| {})?;
         self.release_claims_locked(inner);
         // The rows this batch logged before spilling are dead weight in the
         // WAL: collect them now, unless another batch still needs those

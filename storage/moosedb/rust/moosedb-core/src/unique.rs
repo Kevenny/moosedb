@@ -13,7 +13,9 @@
 //!   this statement staged, plus the rows the statement itself buffered.
 //!   `max_ts` is only an upper bound (retention and aborted statements never
 //!   lower it), so state that is lost or stale can make a check slower, never
-//!   wrong. It is rebuilt at open from the series entries of the chunks
+//!   wrong. The state is **bounded** (see [`UniqueState`]): past a byte budget
+//!   the coldest series are dropped and a floor (`evicted`) remembers how far
+//!   their bounds reached, so an absent series is only trusted above it. It is rebuilt at open from the series entries of the chunks
 //!   (`max_ts`, `complete = false`) and the replayed WAL rows.
 //! * **series claims.** A statement's rows are invisible to other sessions
 //!   until it commits, so two statements could both see "no such key" and both
@@ -94,7 +96,25 @@ impl UniqueSpec {
 enum Top {
     Empty,
     One(Extras),
-    Many(HashSet<Extras>),
+    /// Boxed so a series with one extras tuple (the common case) stays small.
+    #[allow(clippy::box_collection)] // the box keeps `Top` at 24 bytes
+    Many(Box<HashSet<Extras>>),
+}
+
+/// Most extras tuples kept for the top timestamp of one series; more and the
+/// top becomes unknown (rows at that instant are answered by a lookup).
+const MANY_MAX: usize = 1024;
+/// Bytes charged per series entry: the map bucket is ~50 B; 146 B/series of RSS
+/// were measured at 2M series with the slack of a power-of-two growth.
+const ENTRY_BYTES: usize = 150;
+/// Bytes charged per element of a `Top::Many` set.
+const MANY_ELEM_BYTES: usize = 32;
+
+fn top_cost(t: &Top) -> usize {
+    match t {
+        Top::Many(s) => s.capacity() * MANY_ELEM_BYTES,
+        _ => 0,
+    }
 }
 
 impl Top {
@@ -114,7 +134,7 @@ impl Top {
                 let mut s = HashSet::new();
                 s.insert(*x);
                 s.insert(e);
-                *self = Top::Many(s);
+                *self = Top::Many(Box::new(s));
             }
             Top::Many(s) => {
                 s.insert(e);
@@ -155,9 +175,23 @@ pub(crate) enum Claim {
 }
 
 /// Unique-key state of a table, guarded by the table mutex.
+///
+/// Bounded: `series` plus the `Top::Many` sets are charged `ENTRY_BYTES` per
+/// series and `MANY_ELEM_BYTES` per element against `settings::unique_state_bytes`
+/// (per table). Past it the coldest quarter of the series (lowest `max_ts`) is
+/// dropped and `evicted` records the highest bound dropped. Safe because a
+/// missing entry then means "bound at most `evicted`": [`UniqueState::plan`]
+/// answers `Lookup` at or below it, and entries re-created below it take it as
+/// their bound and start incomplete. State is only an accelerator.
 #[derive(Debug, Default)]
 pub(crate) struct UniqueState {
     series: FastMap<u64, SeriesTop>,
+    /// Charged bytes of the `Top::Many` sets in `series`.
+    many_bytes: usize,
+    /// Highest `max_ts` among the entries dropped to stay in budget.
+    evicted: Option<i64>,
+    /// Byte budget; 0 = the process setting.
+    cap: usize,
     /// series id -> id of the statement (batch) that holds it
     claims: FastMap<u64, u64>,
     /// batch id -> batch id it waits for
@@ -165,24 +199,101 @@ pub(crate) struct UniqueState {
 }
 
 impl UniqueState {
+    /// A DELETE may have removed the rows the extras of any series were
+    /// recorded from: forget them all (the bounds stay valid).
+    pub(crate) fn invalidate_all(&mut self) {
+        for st in self.series.values_mut() {
+            st.complete = false;
+            st.top = Top::Empty;
+        }
+        self.many_bytes = 0;
+    }
+
     pub(crate) fn clear(&mut self) {
-        self.series.clear();
+        self.many_bytes = 0;
+        self.evicted = None;
+        self.series = FastMap::default();
         self.claims.clear();
         self.waiting.clear();
+    }
+
+    fn budget(&self) -> usize {
+        if self.cap > 0 {
+            self.cap
+        } else {
+            usize::try_from(crate::settings::get().unique_state_bytes()).unwrap_or(usize::MAX)
+        }
+    }
+
+    /// Bytes charged for the state (what the budget limits).
+    pub(crate) fn bytes(&self) -> usize {
+        self.series.len().saturating_mul(ENTRY_BYTES).saturating_add(self.many_bytes)
+    }
+
+    /// Sets the entry of `sid`, dropping the coldest series first if a new
+    /// one would not fit.
+    fn put(&mut self, sid: u64, new: SeriesTop) {
+        if !self.series.contains_key(&sid) {
+            self.make_room();
+        }
+        self.many_bytes += top_cost(&new.top);
+        if let Some(old) = self.series.insert(sid, new) {
+            self.many_bytes = self.many_bytes.saturating_sub(top_cost(&old.top));
+        }
+    }
+
+    fn make_room(&mut self) {
+        let budget = self.budget();
+        while !self.series.is_empty() && self.bytes().saturating_add(ENTRY_BYTES) > budget {
+            let mut ts: Vec<i64> = self.series.values().map(|s| s.max_ts).collect();
+            let k = ts.len() / 4;
+            let (_, cut, _) = ts.select_nth_unstable(k);
+            let cut = *cut;
+            drop(ts);
+            self.evicted = Some(self.evicted.map_or(cut, |e| e.max(cut)));
+            let mut freed = 0usize;
+            self.series.retain(|_, s| {
+                let keep = s.max_ts > cut;
+                if !keep {
+                    freed += top_cost(&s.top);
+                }
+                keep
+            });
+            self.many_bytes = self.many_bytes.saturating_sub(freed);
+            // Do not keep the memory of the dropped entries.
+            if self.series.len() * 2 < self.series.capacity() {
+                self.series.shrink_to_fit();
+            }
+        }
+    }
+
+    /// Entry for a series that has none and now has a row at `ts`: exact above
+    /// the eviction floor, otherwise only the floor is known.
+    fn fresh(&self, ts: i64, e: Option<Extras>) -> SeriesTop {
+        match (self.evicted, e) {
+            (Some(f), _) if ts <= f => SeriesTop { max_ts: f, complete: false, top: Top::Empty },
+            (_, Some(e)) => SeriesTop { max_ts: ts, complete: true, top: Top::One(e) },
+            (_, None) => SeriesTop { max_ts: ts, complete: false, top: Top::Empty },
+        }
     }
 
     /// A chunk holds rows of `sid` up to `ts_max` (their extras are unknown).
     pub(crate) fn note_chunk(&mut self, sid: u64, ts_max: i64) {
         match self.series.get_mut(&sid) {
             None => {
-                self.series.insert(sid, SeriesTop { max_ts: ts_max, complete: false, top: Top::Empty });
+                let f = self.evicted.map_or(ts_max, |f| f.max(ts_max));
+                self.put(sid, SeriesTop { max_ts: f, complete: false, top: Top::Empty });
             }
             Some(st) if ts_max > st.max_ts => {
+                let old = top_cost(&st.top);
                 *st = SeriesTop { max_ts: ts_max, complete: false, top: Top::Empty };
+                self.many_bytes = self.many_bytes.saturating_sub(old);
             }
             Some(st) if ts_max == st.max_ts => {
+                let old = top_cost(&st.top);
                 st.complete = false;
                 st.top = Top::Empty;
+                self.many_bytes = self.many_bytes.saturating_sub(old);
             }
             Some(_) => {}
         }
@@ -201,32 +312,39 @@ impl UniqueState {
     /// Records an accepted row. `existing` = every extras tuple already stored
     /// at `ts` (only used to make a state complete that was not).
     pub(crate) fn accept(&mut self, sid: u64, ts: i64, e: Extras, existing: Option<&[Extras]>) {
-        match self.series.get_mut(&sid) {
-            None => {
-                self.series.insert(sid, SeriesTop { max_ts: ts, complete: true, top: Top::One(e) });
-            }
-            Some(st) if ts > st.max_ts => {
-                *st = SeriesTop { max_ts: ts, complete: true, top: Top::One(e) };
-            }
-            Some(st) if ts == st.max_ts => {
-                if st.complete {
-                    st.top.insert(e);
-                } else if let Some(all) = existing {
-                    let mut top = Top::Empty;
-                    for x in all {
-                        top.insert(*x);
-                    }
-                    top.insert(e);
-                    st.top = top;
-                    st.complete = true;
+        let Some(st) = self.series.get_mut(&sid) else {
+            let fresh = self.fresh(ts, Some(e));
+            self.put(sid, fresh);
+            return;
+        };
+        let old = top_cost(&st.top);
+        if ts > st.max_ts {
+            *st = SeriesTop { max_ts: ts, complete: true, top: Top::One(e) };
+        } else if ts == st.max_ts {
+            if st.complete {
+                st.top.insert(e);
+            } else if let Some(all) = existing {
+                let mut top = Top::Empty;
+                for x in all {
+                    top.insert(*x);
                 }
+                top.insert(e);
+                st.top = top;
+                st.complete = true;
             }
-            Some(_) => {}
+            if matches!(&st.top, Top::Many(s) if s.len() > MANY_MAX) {
+                st.complete = false;
+                st.top = Top::Empty;
+            }
         }
+        let new = top_cost(&st.top);
+        self.many_bytes = (self.many_bytes + new).saturating_sub(old);
     }
 
     pub(crate) fn plan(&self, sid: u64, ts: i64, e: &Extras) -> Plan {
-        let Some(st) = self.series.get(&sid) else { return Plan::Accept };
+        let Some(st) = self.series.get(&sid) else {
+            return if self.evicted.is_some_and(|f| ts <= f) { Plan::Lookup } else { Plan::Accept };
+        };
         if ts > st.max_ts {
             return Plan::Accept;
         }
@@ -240,8 +358,10 @@ impl UniqueState {
     /// unknown: forget the extras (the bound stays valid).
     pub(crate) fn invalidate(&mut self, sid: u64) {
         if let Some(st) = self.series.get_mut(&sid) {
+            let old = top_cost(&st.top);
             st.complete = false;
             st.top = Top::Empty;
+            self.many_bytes = self.many_bytes.saturating_sub(old);
         }
     }
 
@@ -332,8 +452,16 @@ pub(crate) fn existing_extras(
             if e.series_id != sid || e.ts_min > ts || e.ts_max < ts {
                 continue;
             }
+            // Rows a DELETE hid are not there any more.
+            if snap.tombs.range_hides(sid, meta.born, ts) {
+                continue;
+            }
             let Some(win) = load_window(schema, meta, si, (ts, ts), &want, false)? else { continue };
+            let holes = snap.tombs.holes(meta.id, si);
             for i in win.lo..win.hi {
+                if crate::tomb::in_runs(holes, i) {
+                    continue;
+                }
                 let mut x = [0i64; MAX_EXTRAS];
                 let mut usable = true;
                 for (slot, &c) in x.iter_mut().zip(spec.extra_columns()) {
@@ -448,5 +576,109 @@ mod tests {
         }
         assert_eq!(s.plan(1, 7, &[999, 0]), Plan::Duplicate);
         assert_eq!(s.plan(1, 7, &[1000, 0]), Plan::Accept);
+    }
+
+    /// Ground truth for the bounded state: whatever it evicts, `Duplicate` and
+    /// `Accept` must always agree with the set of keys really stored.
+    fn run_model(cap: usize, seed: u64, rebuild_every: usize) {
+        use std::collections::BTreeSet;
+        let mut rng = seed;
+        let mut next = move |n: u64| {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (rng >> 33) % n
+        };
+        let fresh = || UniqueState { cap, ..UniqueState::default() };
+        let mut s = fresh();
+        let mut truth: BTreeSet<(u64, i64, i64)> = BTreeSet::new();
+        for step in 0..20_000usize {
+            if rebuild_every > 0 && step % rebuild_every == 0 {
+                // restart: the state is rebuilt from what is stored (bounds only)
+                s = fresh();
+                let mut top: std::collections::BTreeMap<u64, i64> = Default::default();
+                for &(sid, ts, _) in &truth {
+                    let m = top.entry(sid).or_insert(ts);
+                    *m = (*m).max(ts);
+                }
+                for (sid, ts) in top {
+                    s.note_chunk(sid, ts);
+                }
+            }
+            let (sid, ts, x) = (next(60), next(25) as i64, next(3) as i64);
+            let plan = s.plan(sid, ts, &[x, 0]);
+            let stored = truth.contains(&(sid, ts, x));
+            match plan {
+                Plan::Duplicate => assert!(stored, "false positive at step {step}"),
+                Plan::Accept => assert!(!stored, "false negative at step {step}"),
+                Plan::Lookup => {}
+            }
+            if stored {
+                continue;
+            }
+            let existing: Vec<Extras> =
+                truth.range((sid, ts, i64::MIN)..=(sid, ts, i64::MAX)).map(|&(_, _, e)| [e, 0]).collect();
+            s.accept(sid, ts, [x, 0], (plan == Plan::Lookup).then_some(&existing[..]));
+            truth.insert((sid, ts, x));
+            assert!(s.bytes() <= cap.max(ENTRY_BYTES) + MANY_ELEM_BYTES * 64, "over budget: {}", s.bytes());
+        }
+    }
+
+    #[test]
+    fn evicting_state_never_changes_the_answer() {
+        for (cap, rebuild) in [(5 * ENTRY_BYTES, 0), (12 * ENTRY_BYTES, 0), (12 * ENTRY_BYTES, 777), (1_000 * ENTRY_BYTES, 0)] {
+            for seed in 1..6 {
+                run_model(cap, seed, rebuild);
+            }
+        }
+    }
+
+    #[test]
+    fn eviction_keeps_a_floor_for_absent_series() {
+        let mut s = UniqueState { cap: 4 * ENTRY_BYTES, ..UniqueState::default() };
+        for sid in 0..4u64 {
+            s.accept(sid, 10 + sid as i64, [1, 0], None);
+        }
+        s.accept(9, 100, [1, 0], None); // does not fit: the coldest are dropped
+        assert!(s.series.len() < 5);
+        assert_eq!(s.plan(0, 10, &[1, 0]), Plan::Lookup, "dropped series at or below the floor: look it up");
+        assert_eq!(s.plan(77, 5, &[1, 0]), Plan::Lookup, "a never-seen series cannot be told from a dropped one");
+        assert_eq!(s.plan(77, 1_000, &[1, 0]), Plan::Accept, "above every dropped bound");
+        s.clear();
+        assert_eq!(s.plan(77, 5, &[1, 0]), Plan::Accept, "TRUNCATE forgets the floor");
+    }
+
+    #[test]
+    fn a_huge_top_becomes_unknown_instead_of_growing() {
+        let mut s = UniqueState::default();
+        for i in 0..(MANY_MAX as i64 + 10) {
+            s.accept(1, 7, [i, 0], None);
+        }
+        assert!(!s.is_complete(1));
+        assert_eq!(s.plan(1, 7, &[3, 0]), Plan::Lookup);
+        assert_eq!(s.plan(1, 8, &[3, 0]), Plan::Accept);
+        assert_eq!(s.bytes(), ENTRY_BYTES);
+    }
+
+    /// `cargo test -p moosedb-core --release -- --ignored --nocapture unique_state_memory`
+    #[test]
+    #[ignore = "memory measurement (millions of series)"]
+    fn unique_state_memory_per_series() {
+        let n: u64 = 2_000_000;
+        let before = crate::memprobe::rss_bytes();
+        let mut s = UniqueState::default();
+        for sid in 0..n {
+            s.accept(sid, 1_000 + sid as i64, [sid as i64, 0], None);
+        }
+        let per = (crate::memprobe::rss_bytes() - before) as f64 / n as f64;
+        eprintln!("unique state: {per:.1} B/series ({n} series, accounted {} B)", s.bytes());
+        // 8 extras at one timestamp of 50k series
+        let before = crate::memprobe::rss_bytes();
+        let mut t = UniqueState::default();
+        for sid in 0..50_000u64 {
+            for x in 0..8 {
+                t.accept(sid, 7, [x, 0], None);
+            }
+        }
+        let per = (crate::memprobe::rss_bytes() - before) as f64 / 50_000.0;
+        eprintln!("unique state, 8 extras at one ts: {per:.1} B/series (accounted {} B)", t.bytes());
     }
 }

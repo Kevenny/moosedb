@@ -1,0 +1,81 @@
+[package]
+name = "moosedb-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Fora do workspace principal: nao afeta o build do plugin nem o clippy.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+moosedb-core = { path = "../moosedb-core", features = ["fuzz"] }
+
+[[bin]]
+name = "gen_seeds"
+path = "src/bin/gen_seeds.rs"
+test = false
+doc = false
+
+[profile.release]
+debug = 1
+panic = "unwind"
+
+[[bin]]
+name = "column_block"
+path = "fuzz_targets/column_block.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "block_envelope"
+path = "fuzz_targets/block_envelope.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "codec_stream"
+path = "fuzz_targets/codec_stream.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "chunk_file"
+path = "fuzz_targets/chunk_file.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "small_records"
+path = "fuzz_targets/small_records.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "manifest"
+path = "fuzz_targets/manifest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wal_segment"
+path = "fuzz_targets/wal_segment.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wal_payload"
+path = "fuzz_targets/wal_payload.rs"
+test = false
+doc = false
+bench = false

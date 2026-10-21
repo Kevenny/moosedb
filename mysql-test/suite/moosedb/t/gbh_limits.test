@@ -1,0 +1,236 @@
+#
+# GROUP BY done by the engine: limits and edge cases of the WHERE shortcuts.
+#  - the core's own limits (16 keys, 64 functions, 16 filters): refused, not an error
+#  - the parallel sort of the post-processing (> 65536 groups, no LIMIT) with 1 and 8 threads
+#  - exact value sets: other charsets, VARBINARY, strict mode, PAD_CHAR_TO_FULL_LENGTH
+#  - moosedb_agg_max_memory exhausted in the dictionary phase; KILL / max_statement_time
+#
+--source include/not_embedded.inc
+--source include/have_innodb.inc
+--source include/have_sequence.inc
+--source suite/moosedb/include/have_moosedb.inc
+
+--let $refused= 0
+--let $sorted= 0
+--let $show= 0
+--let $pre=
+CREATE DATABASE mirror;
+
+--echo ##########################################################
+--echo # Core limits: 16 filters / 16 keys / 64 functions
+--echo ##########################################################
+CREATE TABLE g (
+  ts DATETIME NOT NULL, host VARCHAR(8) NOT NULL COMMENT 'TAG',
+  c1 INT, c2 INT, c3 INT, c4 INT, c5 INT, c6 INT, c7 INT, c8 INT, c9 INT,
+  c10 INT, c11 INT, c12 INT, c13 INT, c14 INT, c15 INT, c16 INT, c17 INT,
+  INDEX(ts)
+) ENGINE=MooseDB;
+INSERT INTO g SELECT '2024-03-01' + INTERVAL seq SECOND, CONCAT('h', seq MOD 3),
+  seq MOD 5, seq MOD 5, seq MOD 5, seq MOD 5, seq MOD 5, seq MOD 5, seq MOD 5, seq MOD 5, seq MOD 5,
+  seq MOD 5, seq MOD 5, seq MOD 5, seq MOD 5, seq MOD 5, seq MOD 5, seq MOD 5, seq MOD 5
+  FROM seq_0_to_999;
+CREATE TABLE mirror.g LIKE test.g;
+ALTER TABLE mirror.g ENGINE=InnoDB;
+INSERT INTO mirror.g SELECT * FROM test.g;
+
+--let $w16=
+--let $w17=
+--let $i= 1
+while ($i <= 17)
+{
+  --let $w17= $w17 AND c$i >= 0
+  if ($i <= 16)
+  {
+    --let $w16= $w16 AND c$i >= 0
+  }
+  --inc $i
+}
+--let $label= 16 filtered columns: still the engine
+--let $q= SELECT host, COUNT(*) c FROM g WHERE 1 = 1 $w16 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= 17 filtered columns: more than the core takes, the normal path runs
+--let $refused= 1
+--let $q= SELECT host, COUNT(*) c FROM g WHERE 1 = 1 $w17 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $k16=
+--let $k17=
+--let $f68=
+--let $i= 1
+while ($i <= 17)
+{
+  --let $k17= $k17, c$i
+  --let $f68= $f68, SUM(c$i), MIN(c$i), MAX(c$i), COUNT(c$i)
+  if ($i <= 16)
+  {
+    --let $k16= $k16, c$i
+  }
+  --inc $i
+}
+--let $label= 16 keys: still the engine
+--let $q= SELECT COUNT(*) c $k16 FROM g GROUP BY c1 $k16 ORDER BY c1 $k16 LIMIT 3
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= 17 keys: refused
+--let $refused= 1
+--let $q= SELECT COUNT(*) c $k17 FROM g GROUP BY c1 $k17 ORDER BY c1 $k17 LIMIT 3
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= 68 aggregate functions: refused
+--let $refused= 1
+--let $q= SELECT host $f68 FROM g GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+DROP TABLE g;
+DROP TABLE mirror.g;
+
+--echo ##########################################################
+--echo # Parallel sort of the groups (> 65536 groups, no LIMIT): 1 and 8 threads
+--echo ##########################################################
+CREATE TABLE g (
+  ts DATETIME NOT NULL, host VARCHAR(8) NOT NULL COMMENT 'TAG',
+  u BIGINT NOT NULL,
+  s VARCHAR(16) CHARACTER SET utf8mb4 COLLATE utf8mb4_nopad_bin NOT NULL,
+  sc VARCHAR(16) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci NOT NULL,
+  INDEX(ts)
+) ENGINE=MooseDB CHUNK_INTERVAL='1 DAY';
+INSERT INTO g SELECT '2024-03-01' + INTERVAL seq SECOND, CONCAT('h', seq MOD 3),
+  CAST((seq * 7919) MOD 100003 AS SIGNED) - 50000, CONCAT('k', (seq * 104729) MOD 100003), CONCAT('K', (seq * 104729) MOD 100003)
+  FROM seq_0_to_199999;
+CREATE TABLE mirror.g LIKE test.g;
+ALTER TABLE mirror.g ENGINE=InnoDB;
+INSERT INTO mirror.g SELECT * FROM test.g;
+--let $nthr= `SELECT @@global.moosedb_agg_threads`
+--let $thr= 1
+while ($thr <= 8)
+{
+  eval SET GLOBAL moosedb_agg_threads= $thr;
+  --let $label= threads=$thr: integer key, > 65536 groups, full sort
+  --let $q= SELECT u, COUNT(*) c FROM g GROUP BY u
+  --let $sorted= 0
+  --source suite/moosedb/include/gbh_diff.inc
+  --let $label= threads=$thr: byte string key (NO PAD), full sort
+  --let $q= SELECT s, COUNT(*) c FROM g GROUP BY s ORDER BY s DESC
+  --source suite/moosedb/include/gbh_diff.inc
+  --let $label= threads=$thr: collation-merged string key
+  --let $q= SELECT COUNT(*) c FROM g GROUP BY sc ORDER BY c, sc
+  --source suite/moosedb/include/gbh_diff.inc
+  --let $label= threads=$thr: ORDER BY an aggregate (two terms)
+  --let $q= SELECT u, COUNT(*) z FROM g GROUP BY u ORDER BY z DESC, u DESC
+  --source suite/moosedb/include/gbh_diff.inc
+  --let $thr= `SELECT $thr + 7`
+}
+eval SET GLOBAL moosedb_agg_threads= $nthr;
+DROP TABLE g;
+DROP TABLE mirror.g;
+
+--echo ##########################################################
+--echo # Exact value sets: charsets, VARBINARY, strict mode, PAD_CHAR_TO_FULL_LENGTH
+--echo ##########################################################
+CREATE TABLE g (
+  ts DATETIME NOT NULL, host VARCHAR(8) NOT NULL COMMENT 'TAG',
+  u3 VARCHAR(8) CHARACTER SET utf8mb3 COLLATE utf8mb3_nopad_bin,
+  vb VARBINARY(8),
+  ch CHAR(6) CHARACTER SET utf8mb4 COLLATE utf8mb4_nopad_bin,
+  pb VARCHAR(8) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin,
+  pl VARCHAR(8) CHARACTER SET latin1 COLLATE latin1_bin,
+  pc VARCHAR(8) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci,
+  pu VARCHAR(8) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci,
+  bytes INT NOT NULL,
+  INDEX(ts)
+) ENGINE=MooseDB;
+INSERT INTO g SELECT '2024-03-01' + INTERVAL seq SECOND, CONCAT('h', seq MOD 3),
+  ELT(seq MOD 4 + 1, 'a', 'a ', 'b', CONVERT(0xC3A9 USING utf8mb3)),
+  ELT(seq MOD 4 + 1, 'a', 'a ', 'b', 0xFF),
+  ELT(seq MOD 4 + 1, 'a', 'a ', 'b', 'ab'),
+  ELT(seq MOD 4 + 1, 'a', 'a ', 'a   ', 'b'),
+  ELT(seq MOD 4 + 1, 'a', 'a ', 'a   ', 'b'),
+  ELT(seq MOD 4 + 1, 'a', 'a ', 'a   ', 'b'),
+  ELT(seq MOD 4 + 1, 'a', 'a ', 'a   ', 'b'),
+  seq MOD 10
+  FROM seq_0_to_2999;
+CREATE TABLE mirror.g LIKE test.g;
+ALTER TABLE mirror.g ENGINE=InnoDB;
+INSERT INTO mirror.g SELECT * FROM test.g;
+
+--let $label= utf8mb3 NO PAD column against constants of other charsets
+--let $q= SELECT host, COUNT(*) c FROM g WHERE u3 = _utf8mb3'a' GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_sc.inc
+--let $q= SELECT host, COUNT(*) c FROM g WHERE u3 = _utf8mb4'a' GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_sc.inc
+--let $q= SELECT host, COUNT(*) c FROM g WHERE u3 = _latin1'a' GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_sc.inc
+--let $q= SELECT host, COUNT(*) c FROM g WHERE u3 = _latin1 0xE9 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_sc.inc
+--let $q= SELECT host, COUNT(*) c FROM g WHERE u3 IN (_utf8mb4 0xC3A9, 'b') GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_sc.inc
+
+--let $label= VARBINARY column (binary charset branch), hex literals
+--let $q= SELECT host, COUNT(*) c FROM g WHERE vb = 0x61 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_sc.inc
+--let $q= SELECT host, COUNT(*) c FROM g WHERE vb IN (0x61, 'b', 0xFF) GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_sc.inc
+--let $q= SELECT host, COUNT(*) c FROM g WHERE vb = 'a ' GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_sc.inc
+
+--let $label= CHAR NO PAD column with strict sql_mode and PAD_CHAR_TO_FULL_LENGTH
+--let $pre= SET SESSION sql_mode='STRICT_ALL_TABLES,PAD_CHAR_TO_FULL_LENGTH';
+--let $q= SELECT host, COUNT(*) c FROM g WHERE ch = 'a' GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_sc.inc
+--let $pre= SET SESSION sql_mode='STRICT_ALL_TABLES,PAD_CHAR_TO_FULL_LENGTH';
+--let $q= SELECT host, COUNT(*) c FROM g WHERE ch IN ('a ', 'b') OR ch LIKE 'a%' GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_sc.inc
+--let $pre= SET SESSION sql_mode='STRICT_ALL_TABLES';
+--let $q= SELECT host, COUNT(*) c FROM g WHERE ch = 'a' GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_sc.inc
+
+--let $label= binary PAD SPACE collations (utf8mb4_bin, latin1_bin): exact value set with pad_space; _ci stays on the dictionary
+--let $q= SELECT host, COUNT(*) c FROM g WHERE pb = 'a' GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_sc.inc
+--let $q= SELECT host, COUNT(*) c FROM g WHERE pb = 'a   ' GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_sc.inc
+--let $q= SELECT host, COUNT(*) c FROM g WHERE pb IN ('a ', 'zz', 'b   ') GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_sc.inc
+--let $q= SELECT host, COUNT(*) c FROM g WHERE pl = 'a' GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_sc.inc
+--let $q= SELECT host, COUNT(*) c FROM g WHERE pl IN ('a  ', 'b') GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_sc.inc
+--let $q= SELECT host, COUNT(*) c FROM g WHERE pb = 'a' AND pl = 'a ' GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_sc.inc
+--let $q= SELECT host, COUNT(*) c FROM g WHERE pc = 'A' GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_sc.inc
+--let $q= SELECT host, COUNT(*) c FROM g WHERE pu = 'a ' GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_sc.inc
+--let $refused= 1
+--let $q= SELECT host, COUNT(*) c FROM g WHERE pb = 'a' COLLATE utf8mb4_bin GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_sc.inc
+
+--let $label= DECIMAL / TIME constant against an integer column: refused (per-row conversion)
+--let $refused= 1
+--let $q= SELECT host, COUNT(*) c FROM g WHERE bytes = 5.0 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+DROP TABLE g;
+DROP TABLE mirror.g;
+DROP DATABASE mirror;
+
+--echo ##########################################################
+--echo # moosedb_agg_max_memory exhausted; KILL / max_statement_time
+--echo ##########################################################
+CREATE TABLE m (
+  ts DATETIME NOT NULL, host VARCHAR(8) NOT NULL COMMENT 'TAG',
+  f VARCHAR(80) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci NOT NULL, INDEX(ts)
+) ENGINE=MooseDB CHUNK_INTERVAL='1 DAY';
+INSERT INTO m SELECT '2024-03-01' + INTERVAL seq SECOND, CONCAT('h', seq MOD 3),
+  CONCAT('/srv/some/long/directory/name/file_', (seq * 7919) MOD 1000003, '.dat')
+  FROM seq_0_to_699999;
+SET SESSION moosedb_group_by_pushdown = 1;
+SET SESSION moosedb_agg_max_memory = 16777216;
+--error 1105
+SELECT host, COUNT(*) c FROM m WHERE f LIKE '%7%' GROUP BY host;
+SET SESSION moosedb_agg_max_memory = DEFAULT;
+SELECT host, COUNT(*) c FROM m WHERE f LIKE '%7%' GROUP BY host ORDER BY host;
+
+--echo # max_statement_time during the dictionary phase: ends (interrupted or finished), nothing hangs
+SET SESSION max_statement_time = 0.01;
+--error 0,ER_QUERY_INTERRUPTED,ER_STATEMENT_TIMEOUT
+SELECT host, COUNT(*) c FROM m WHERE f LIKE '%7%' AND f LIKE '%3%' GROUP BY host;
+SET SESSION max_statement_time = 0;
+SELECT host, COUNT(*) c FROM m WHERE f LIKE '%7%' AND f LIKE '%3%' GROUP BY host ORDER BY host;
+DROP TABLE m;

@@ -695,18 +695,19 @@ clock	value
 102	2
 # retention: the key of an expired row can be inserted again
 TRUNCATE TABLE tr;
-INSERT INTO tr VALUES (1, UNIX_TIMESTAMP() - 200 * 86400, 1, 1), (1, UNIX_TIMESTAMP() - 100 * 86400, 1, 1), (1, UNIX_TIMESTAMP() - 3600, 1, 1);
+SET @now= UNIX_TIMESTAMP();
+INSERT INTO tr VALUES (1, @now - 200 * 86400, 1, 1), (1, @now - 100 * 86400, 1, 1), (1, @now - 3600, 1, 1);
 FLUSH TABLES tr;
-INSERT INTO tr VALUES (1, UNIX_TIMESTAMP() - 200 * 86400, 2, 1);
+INSERT INTO tr VALUES (1, @now - 200 * 86400, 2, 1);
 ERROR 23000: Duplicate entry '1-<clock>-1' for key 'PRIMARY'
 CALL moosedb_apply_retention('test.tr');
 SELECT COUNT(*) AS rows_left FROM tr;
 rows_left
 1
-INSERT INTO tr VALUES (1, UNIX_TIMESTAMP() - 200 * 86400, 2, 1);
-INSERT INTO tr VALUES (1, UNIX_TIMESTAMP() - 200 * 86400, 3, 1);
+INSERT INTO tr VALUES (1, @now - 200 * 86400, 2, 1);
+INSERT INTO tr VALUES (1, @now - 200 * 86400, 3, 1);
 ERROR 23000: Duplicate entry '1-<clock>-1' for key 'PRIMARY'
-INSERT INTO tr VALUES (1, UNIX_TIMESTAMP() - 3600, 3, 1);
+INSERT INTO tr VALUES (1, @now - 3600, 3, 1);
 ERROR 23000: Duplicate entry '1-<clock>-1' for key 'PRIMARY'
 DROP TABLE tr;
 ##################################################################
@@ -771,6 +772,60 @@ itemid	clock	ns
 1	1	2
 2	1	1
 DROP TABLE al, cv;
+##################################################################
+# Range over the whole key (itemid, clock, ns): clock BETWEEN with ns =, >, <
+# (the start key of the range names every key part) -- never ER_ILLEGAL_HA
+##################################################################
+CREATE TABLE rk (itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG', clock INT NOT NULL, value DOUBLE NOT NULL, ns INT NOT NULL, PRIMARY KEY (itemid, clock, ns))
+ENGINE=MooseDB TIMESTAMP_COLUMN='clock' CHUNK_INTERVAL='1 DAY';
+CREATE TABLE ri (itemid BIGINT UNSIGNED NOT NULL, clock INT NOT NULL, value DOUBLE NOT NULL, ns INT NOT NULL, PRIMARY KEY (itemid, clock, ns)) ENGINE=InnoDB;
+INSERT INTO rk SELECT 1 + a.seq, 1700000000 + b.seq, b.seq, c.seq FROM seq_0_to_2 a, seq_0_to_29 b, seq_0_to_2 c;
+INSERT INTO ri SELECT * FROM rk;
+FLUSH TABLES rk;
+INSERT INTO rk SELECT 1 + a.seq, 1700000030 + b.seq, b.seq, c.seq FROM seq_0_to_2 a, seq_0_to_9 b, seq_0_to_2 c;
+INSERT INTO ri SELECT * FROM rk WHERE clock >= 1700000030;
+# BETWEEN + ns =
+result_rows	vs_innodb
+1	SAME
+# BETWEEN + ns >
+result_rows	vs_innodb
+10	SAME
+# BETWEEN + ns <
+result_rows	vs_innodb
+10	SAME
+# (clock, ns) range across chunk and MemTable, descending
+result_rows	vs_innodb
+6	SAME
+# clock >= with ns =
+result_rows	vs_innodb
+35	SAME
+# clock < with ns = , descending
+result_rows	vs_innodb
+8	SAME
+# IN list of items + range + ns
+result_rows	vs_innodb
+1	SAME
+# the same read as a DELETE
+DELETE FROM rk WHERE itemid = 1 AND clock BETWEEN 1700000010 AND 1700000020 AND ns = 1;
+SELECT ROW_COUNT();
+ROW_COUNT()
+11
+DELETE FROM ri WHERE itemid = 1 AND clock BETWEEN 1700000010 AND 1700000020 AND ns = 1;
+SELECT ROW_COUNT();
+ROW_COUNT()
+11
+DELETE FROM rk WHERE itemid = 2 AND clock > 1700000030 AND ns < 1;
+SELECT ROW_COUNT();
+ROW_COUNT()
+9
+DELETE FROM ri WHERE itemid = 2 AND clock > 1700000030 AND ns < 1;
+SELECT ROW_COUNT();
+ROW_COUNT()
+9
+# after the deletes
+result_rows	vs_innodb
+340	SAME
+DROP TABLE rk, ri;
 DROP TABLE zm, zi, it, sp, si, pr;
 DROP PROCEDURE moosedb_compact;
 DROP PROCEDURE moosedb_apply_retention;

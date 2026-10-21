@@ -1,4 +1,6 @@
-//! Encryption at rest: AES-256-CTR.
+//! Encryption at rest: AES-256-GCM (authenticated), plus read-only support for
+//! the AES-256-CTR files of earlier versions (no MAC: format chunk v2 / WAL v2
+//! with the ENCRYPTED flag).
 //!
 //! Keys come from the server's key management plugin through a provider
 //! callback installed by the FFI layer. Every encrypted file carries the key
@@ -16,6 +18,11 @@ pub const KEY_LEN: usize = 32;
 pub const IV_LEN: usize = 16;
 /// Serialized size of [`CipherParams`] (key id, version, IV, CRC).
 pub const PARAMS_LEN: usize = 32;
+/// GCM authentication tag appended to every sealed unit.
+pub const TAG_LEN: usize = 16;
+
+#[cfg(feature = "encryption")]
+type Gcm = aes_gcm::AesGcm<aes::Aes256, aes_gcm::aead::consts::U16>;
 
 /// `(key_id, version)` → `(version, key)`. `version == None` asks for the latest.
 pub type KeyProvider = dyn Fn(u32, Option<u32>) -> Result<(u32, [u8; KEY_LEN])> + Send + Sync;
@@ -49,6 +56,15 @@ pub struct CipherParams {
     pub key_version: u32,
     iv: [u8; IV_LEN],
     key: [u8; KEY_LEN],
+    /// Present for authenticated (GCM) files: what the tags are bound to.
+    auth: Option<Arc<Auth>>,
+}
+
+#[cfg_attr(not(feature = "encryption"), allow(dead_code))]
+struct Auth {
+    bind: Vec<u8>,
+    #[cfg(feature = "encryption")]
+    gcm: Gcm,
 }
 
 impl std::fmt::Debug for CipherParams {
@@ -63,7 +79,7 @@ impl CipherParams {
         let (key_version, key) = fetch_key(key_id, None)?;
         let mut iv = [0u8; IV_LEN];
         getrandom::getrandom(&mut iv).map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
-        Ok(CipherParams { key_id, key_version, iv, key })
+        Ok(CipherParams { key_id, key_version, iv, key, auth: None })
     }
 
     pub(crate) fn encode(&self) -> [u8; PARAMS_LEN] {
@@ -90,12 +106,77 @@ impl CipherParams {
         let mut iv = [0u8; IV_LEN];
         iv.copy_from_slice(r.take(IV_LEN)?);
         let (key_version, key) = fetch_key(key_id, Some(version))?;
-        Ok(CipherParams { key_id, key_version, iv, key })
+        Ok(CipherParams { key_id, key_version, iv, key, auth: None })
     }
 
-    /// XORs `data` with the keystream starting at byte `offset` of the stream.
+    /// Makes these parameters authenticated: units are sealed with AES-256-GCM
+    /// and the tags are bound to `bind` (the container header bytes).
     #[cfg(feature = "encryption")]
-    pub(crate) fn apply(&self, data: &mut [u8], offset: u64) {
+    pub(crate) fn authenticated(mut self, bind: Vec<u8>) -> CipherParams {
+        use aes_gcm::aead::KeyInit;
+        let gcm = Gcm::new(&self.key.into());
+        self.auth = Some(Arc::new(Auth { bind, gcm }));
+        self
+    }
+
+    #[cfg(not(feature = "encryption"))]
+    pub(crate) fn authenticated(self, _bind: Vec<u8>) -> CipherParams {
+        unreachable!("CipherParams cannot be built without the encryption feature")
+    }
+
+    /// False for files of the earlier, unauthenticated CTR format.
+    pub(crate) fn is_authenticated(&self) -> bool {
+        self.auth.is_some()
+    }
+
+    /// Encrypts `data` in place (the unit that starts at byte `pos` of the
+    /// file) and returns its tag. `ctx` is extra associated data.
+    #[cfg(feature = "encryption")]
+    pub(crate) fn seal(&self, data: &mut [u8], pos: u64, ctx: &[u8]) -> Result<[u8; TAG_LEN]> {
+        use aes_gcm::aead::AeadInPlace;
+        let a = self.auth.as_ref().ok_or_else(|| Error::Crypto("sealing with unauthenticated parameters".into()))?;
+        let aad = [&a.bind[..], ctx].concat();
+        let tag = a
+            .gcm
+            .encrypt_in_place_detached(&self.nonce(pos).into(), &aad, data)
+            .map_err(|_| Error::Crypto("unit too large to encrypt".into()))?;
+        Ok(tag.into())
+    }
+
+    /// Verifies `tag` and decrypts `data` in place. `false` = the unit was
+    /// altered, moved, or the key is wrong (not distinguishable); `data` is
+    /// then unspecified and must not be used.
+    #[cfg(feature = "encryption")]
+    pub(crate) fn open(&self, data: &mut [u8], tag: &[u8], pos: u64, ctx: &[u8]) -> bool {
+        use aes_gcm::aead::AeadInPlace;
+        let (Some(a), Ok(tag)) = (self.auth.as_ref(), <[u8; TAG_LEN]>::try_from(tag)) else { return false };
+        let aad = [&a.bind[..], ctx].concat();
+        a.gcm.decrypt_in_place_detached(&self.nonce(pos).into(), &aad, data, &tag.into()).is_ok()
+    }
+
+    #[cfg(not(feature = "encryption"))]
+    pub(crate) fn seal(&self, _data: &mut [u8], _pos: u64, _ctx: &[u8]) -> Result<[u8; TAG_LEN]> {
+        unreachable!("CipherParams cannot be built without the encryption feature")
+    }
+
+    #[cfg(not(feature = "encryption"))]
+    pub(crate) fn open(&self, _data: &mut [u8], _tag: &[u8], _pos: u64, _ctx: &[u8]) -> bool {
+        unreachable!("CipherParams cannot be built without the encryption feature")
+    }
+
+    #[cfg(feature = "encryption")]
+    fn nonce(&self, pos: u64) -> [u8; IV_LEN] {
+        let mut n = self.iv;
+        for (b, p) in n[IV_LEN - 8..].iter_mut().zip(pos.to_be_bytes()) {
+            *b ^= p;
+        }
+        n
+    }
+
+    /// Legacy AES-256-CTR (no authentication): XORs `data` with the keystream
+    /// starting at byte `offset` of the stream. Only used to read old files.
+    #[cfg(feature = "encryption")]
+    pub(crate) fn apply_ctr(&self, data: &mut [u8], offset: u64) {
         use aes::cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
         let mut c = ctr::Ctr128BE::<aes::Aes256>::new(&self.key.into(), &self.iv.into());
         c.seek(offset);
@@ -103,7 +184,7 @@ impl CipherParams {
     }
 
     #[cfg(not(feature = "encryption"))]
-    pub(crate) fn apply(&self, _data: &mut [u8], _offset: u64) {
+    pub(crate) fn apply_ctr(&self, _data: &mut [u8], _offset: u64) {
         unreachable!("CipherParams cannot be built without the encryption feature")
     }
 }
@@ -144,21 +225,48 @@ mod tests {
         assert_eq!(p.key_version, 2);
         let plain: Vec<u8> = (0..1000u32).map(|i| i as u8).collect();
         let mut whole = plain.clone();
-        p.apply(&mut whole, 0);
+        p.apply_ctr(&mut whole, 0);
         assert_ne!(whole, plain);
         // Decrypting a middle slice on its own gives the same plaintext.
         let mut part = whole[333..777].to_vec();
-        p.apply(&mut part, 333);
+        p.apply_ctr(&mut part, 333);
         assert_eq!(part, &plain[333..777]);
 
         let q = CipherParams::decode(&p.encode()).unwrap();
         let mut back = whole.clone();
-        q.apply(&mut back, 0);
+        q.apply_ctr(&mut back, 0);
         assert_eq!(back, plain);
 
         let mut bad = p.encode();
         bad[5] ^= 1;
         assert!(CipherParams::decode(&bad).is_err());
         assert!(CipherParams::for_new_file(99).is_err());
+    }
+
+    #[test]
+    fn gcm_units_bind_position_context_and_header() {
+        test_keys::install();
+        let p = CipherParams::for_new_file(1).unwrap().authenticated(b"header".to_vec());
+        let plain: Vec<u8> = (0..300u32).map(|i| i as u8).collect();
+        let mut unit = plain.clone();
+        let tag = p.seal(&mut unit, 64, b"x").unwrap();
+        assert_ne!(unit, plain);
+
+        let mut ok = unit.clone();
+        assert!(p.open(&mut ok, &tag, 64, b"x"));
+        assert_eq!(ok, plain);
+        for (pos, ctx) in [(65u64, &b"x"[..]), (64, b"y"), (0, b"x")] {
+            assert!(!p.open(&mut unit.clone(), &tag, pos, ctx), "moved unit accepted");
+        }
+        let other = CipherParams::decode(&p.encode()).unwrap().authenticated(b"headeR".to_vec());
+        assert!(!other.open(&mut unit.clone(), &tag, 64, b"x"), "different header accepted");
+        let same = CipherParams::decode(&p.encode()).unwrap().authenticated(b"header".to_vec());
+        assert!(same.open(&mut unit.clone(), &tag, 64, b"x"));
+        let mut flipped = unit.clone();
+        flipped[17] ^= 1;
+        assert!(!p.open(&mut flipped, &tag, 64, b"x"));
+        let mut bad_tag = tag;
+        bad_tag[0] ^= 1;
+        assert!(!p.open(&mut unit.clone(), &bad_tag, 64, b"x"));
     }
 }

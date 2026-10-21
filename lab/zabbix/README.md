@@ -63,19 +63,15 @@ docker compose --profile tools run --rm tools python scripts/sender.py \
 ```bash
 docker compose stop zabbix-server
 docker exec zbxlab-mariadb mariadb -uroot -pzbxlab zabbix \
-    -e "SOURCE /lab/sql/adapted_history_vtag.sql"     # ou adapted_history.sql (v1)
+    -e "SOURCE /lab/sql/adapted_history_v4.sql"     # recomendada
 docker compose start zabbix-server
-# voltar ao InnoDB: SOURCE /lab/sql/revert_history.sql (as MooseDB ficam como *_moose)
+# voltar ao InnoDB: SOURCE /lab/sql/revert_history.sql (as MooseDB ficam como *_moose;
+# apague-as antes de aplicar o v4 de novo)
 ```
 
-Obrigatório com histórico em MooseDB (config do Zabbix, sem mudar código):
-*Administration → Housekeeping → History*: desmarcar **Enable internal housekeeping**
-(`--history-hk off` faz isso pela API) e, de preferência, marcar **Override item
-history period** com o mesmo período do `RETENTION_PERIOD` da tabela (31 d nos scripts).
-
-Cuidado: v1 e v2 usam nomes de trigger diferentes (`*_moose_ts` / `*_vtag_ts`). Uma
-tabela MooseDB sem o trigger grava `ts = 1970-01-01` e a retenção apagaria tudo
-na próxima varredura — confira com `SELECT COUNT(*) FROM history WHERE ts < '2000-01-01'`.
+O housekeeper de histórico do Zabbix pode ficar **ligado** (o `DELETE` é suportado);
+para expirar só por idade, `RETENTION_PERIOD` da tabela é mais barato (descarta o chunk).
+`REPLACE`/`ON DUPLICATE KEY UPDATE` sobre chave existente seguem recusados (sem `UPDATE`).
 
 ## Medir
 
@@ -94,12 +90,11 @@ docker exec -e ITEMS=5000 -e DAYS=7 -e STEP=60 -e RUNS=5 zbxlab-mariadb \
 #   (o teste de housekeeping é destrutivo: após uma rodada, recarregue)
 ```
 
-`bench.sh` cria o banco `zbxbench` com três tabelas e os **mesmos dados**
-(determinísticos por itemid/clock; conferidos por COUNT e `BIT_XOR(CRC32(...))`):
-
-* `h_innodb` — DDL oficial do Zabbix 7.0 (InnoDB, `PRIMARY KEY (itemid,clock,ns)`);
-* `h_moose_int` — variante v1 (itemid `BIGINT UNSIGNED` TAG, `ts DATETIME(6)` + `INDEX(ts)`);
-* `h_moose_str` — variante v2 (itemid `VARCHAR(20)` TAG).
+`bench.sh` cria o banco `zbxbench` com os **mesmos dados** (determinísticos; conferidos por
+COUNT e checksum) em `h_innodb` (DDL oficial), `h_moose_v3` (sem PK, `INDEX (itemid, clock)`),
+`h_moose_v4` (PK, recomendada) e as variantes antigas `h_moose_int`/`h_moose_str`.
+`scripts/bench_delete.sh` mede os DELETEs do housekeeper (`MYSQL="mariadb -uroot -pzbxlab"`,
+`ITEMS=5000 DAYS=7 STEP=300`, banco `zbxdel`).
 
 Carga no formato do history syncer: um INSERT…SELECT (autocommit) por minuto com
 5.000 linhas, em ordem de clock. Consultas = SQL exato do Zabbix (forma "zabbix")
@@ -115,142 +110,52 @@ docker compose up -d             # reconstrói com os mesmos dados
 docker compose down -v           # apaga também os volumes (esquema recriado do zero)
 ```
 
-## Resultados (2026-10-07, Docker Desktop/WSL2, 24 vCPU, 32 GiB)
+## Resultados (2026-10-20, plugin do commit `ee8550c`, Docker Desktop/WSL2, 24 vCPU, 32 GiB)
 
-### Compatibilidade (`results/compat.txt`)
+Compatibilidade: com `sql/adapted_history_v4.sql` (DDL oficial + `COMMENT 'TAG'` +
+`TIMESTAMP_COLUMN='clock'`) o Zabbix 7.0.31 roda sem mudança de código, usa o caminho com
+PK e o housekeeper/`history.clear` funcionam. Ainda recusados: `REPLACE`/`ON DUPLICATE KEY
+UPDATE` sobre chave existente. Histórico dos erros de versões antigas: `results/compat.txt`.
 
-| Tentativa | Resultado |
-|---|---|
-| `ALTER TABLE history / history_uint / history_str / history_text / history_log / history_bin ENGINE=MooseDB` | **ERROR 1070** `Too many key parts specified; max 1 parts allowed` (PK de 3 colunas) — as 6 tabelas |
-| sem PK e sem índice | **ERROR 1478** `a MooseDB table needs a DATETIME/TIMESTAMP column with an index` |
-| sem PK, `INDEX(clock)` com `clock INT` | **ERROR 1478** (mesma mensagem: eixo inteiro não é aceito) |
-| `PRIMARY KEY`/`UNIQUE (itemid,clock,ns)` + `INDEX(ts)` | **ERROR 1070** |
-| `INDEX(itemid)` extra | **ERROR 1478** `index 'itemid' is not supported` |
-| `clock TIMESTAMP` + INSERT inteiro do Zabbix | **ERROR 1292** `Incorrect datetime value: '1759843200'`; com `sql_mode=''` grava **0000-00-00** em silêncio |
-| `ts` como coluna gerada de `FROM_UNIXTIME(clock)` | **ERROR 1901** (PERSISTENT) / **ERROR 1121** (VIRTUAL não pode ser NOT NULL no índice) |
-| **adaptada**: sem PK, itemid TAG, `clock INT` mantido, `ts DATETIME(6)` + trigger | **aceita**; INSERT/SELECT do Zabbix funcionam |
-| `delete from history where itemid=X and clock<Y` (housekeeper) | **ERROR 1031** `doesn't have this option` |
-| `DELETE … WHERE itemid IN (…)` (history.clear) | **ERROR 1031** |
-| duplicata (itemid,clock,ns) | InnoDB: ERROR 1062; MooseDB: **aceita** (2 linhas) |
-| `alter table history modify value DOUBLE PRECISION …` (dbupgrade 6050008) | OK (ALTER por cópia) |
-
-> Atualização (índice composto): a tabela acima é o registro da rodada de
-> 2026-10-07. Hoje a engine aceita `INDEX (itemid)` e `INDEX (itemid, clock)`
-> (TAG + tempo, não únicos); `PRIMARY KEY`/`UNIQUE` seguem recusados. As
-> variantes `h_moose_v3` e `adapted_history_v3.sql` passaram a declarar
-> `INDEX (itemid, clock)` além de `INDEX (clock)`.
-
-Com a variante adaptada o Zabbix 7.0.31 roda sem mudança de código:
-300.000 valores trapper (500/s por 600 s) processados, 0 falhas, todos gravados;
-`history.get`, `item.get` (lastvalue), `chart.php` e *Latest data* OK. Log do
-server: `database could be upgraded to use primary keys in history tables`
-(frontend passa ao caminho sem PK). Com o housekeeper de histórico ligado:
-`[Z3005] query failed: [1031] … [delete from history where itemid=… and clock<…]`
-(o server segue rodando). `history.clear` → "Database error".
-
-### InnoDB x MooseDB — 5.000 itens × 7 dias × 60 s = 50,4 M linhas por tabela
-
-| Métrica | InnoDB (oficial) | MooseDB v1 (itemid BIGINT) | MooseDB v2 (itemid VARCHAR) |
-|---|---:|---:|---:|
-| Carga (10.080 INSERTs de 5.000 linhas) | 97,6 s (516 k lin/s) | 129,4 s (390 k lin/s) | 135,7 s (371 k lin/s) |
-| Compactação completa (1×, `moosedb_compact`) | — | 19,5 s | 19,9 s |
-| Tamanho em disco após carga | 2.384,0 MiB | 640,5 MiB | 649,6 MiB |
-| Tamanho após compactação | 2.384,0 MiB | **568,1 MiB (4,2× menor)** | **568,1 MiB** |
-| Housekeeping de 1 dia (3,07 M linhas) | 9,08 s (5.000 DELETEs por item) | **0,023 s** (descarta chunk) | **0,019 s** |
-| Tamanho após expirar 1 dia | 2.384,0 MiB (não encolhe) | 533,3 MiB | 533,3 MiB |
-
-Trigger de `ts` (só nas MooseDB adaptadas): 1 dia (7,2 M linhas) em 14,4 s com
-`ts` no SELECT x 18,2 s pelo trigger (**+27%**).
-
-Latência (ms, melhor de 5, cache quente). "zabbix" = SQL exato do Zabbix;
-"nativo" = mesmo SQL filtrando por `ts`:
-
-| Consulta | InnoDB | v1 zabbix | v1 nativo | v2 zabbix | v2 nativo |
-|---|---:|---:|---:|---:|---:|
-| Gráfico 1 item, 1 h (`getGraphAggregationByWidthFromSql`) | 0,53 | 2.173 | 144 | 1,52 | 0,61 |
-| Gráfico 1 item, 24 h | 2,04 | 2.177 | 2.064 | 2,79 | 2,17 |
-| Gráfico 1 item, 7 d | 4,66 | 2.150 | 3.606 | 4,92 | 5,22 |
-| Último valor de 20 itens — caminho com PK | 1,21 | 52.672 | — | 20,97 | — |
-| Último valor de 20 itens — caminho sem PK (usado sem PK) | 1,23 | 87.928 | 876 | 38,30 | 13,17 |
-| Agregação por hora, 100 itens, 24 h (`IN` sem aspas) | 28,1 | 2.734 | 2.187 | 4.721 | 76,7 |
-| Value cache do server, 1 item, 1 h (`itemid=N` sem aspas) | 0,45 | 2.533 | — | 3.292 | — |
-| Agregação LAST por hora, 1 item, 24 h (self-join) | 0,76 | 7.205 | — | 8.947 | — |
-
-Leitura: com **TAG string + itemid entre aspas** (frontend: gráficos, último
-valor) a MooseDB fica na mesma ordem do InnoDB. Sempre que o Zabbix manda o
-itemid como **número** (server/value cache, `dbConditionInt`) ou usa o itemid
-BIGINT como TAG, não há pushdown e cada consulta varre a tabela inteira
-(2–9 s em 50 M linhas, crescendo linearmente com o histórico).
-
-## Atualização: PRIMARY KEY aceita — v4 é a variante recomendada
-
-`PRIMARY KEY`/`UNIQUE (itemid,clock,ns)` **passou a ser aceita** (unicidade verificada
-de verdade; `ER_DUP_ENTRY`, `INSERT IGNORE`). As linhas "PRIMARY KEY … ERROR 1070" e
-"duplicata aceita" da tabela de compatibilidade acima são o registro da rodada de
-2026-10-07. A variante **`sql/adapted_history_v4.sql`** é o DDL oficial do Zabbix 7.0
-com apenas `COMMENT 'TAG'` em `itemid` e `ENGINE=MooseDB TIMESTAMP_COLUMN='clock'`
-(mais as opções de chunk/retenção); sem `INDEX (clock)` nem trigger. Com ela o Zabbix
-7.0.31 detecta a PK e usa o caminho com PK (`ORDER BY clock DESC, ns DESC LIMIT 1`
-sem filesort).
-
-Uso: `docker exec zbxlab-mariadb mariadb -uroot -pzbxlab zabbix -e "SOURCE /lab/sql/adapted_history_v4.sql"`
-(server parado). `bench.sh` agora inclui `h_moose_v4`.
-
-**Mantenha o housekeeper de histórico DESLIGADO** (`--history-hk off`): o
-`DELETE … WHERE itemid=… AND clock<…` por item continua sem suporte (`ER_ILLEGAL_HA`);
-a expiração é por `RETENTION_PERIOD`. `REPLACE`/`ON DUPLICATE KEY UPDATE` sobre
-chave existente também são recusados.
-
-### InnoDB x v3 x v4 (`results/bench_v4_5000x7d.txt`, 5.000 itens × 7 d × 60 s)
+### InnoDB x v3 x v4 (50,4 M linhas por tabela = 5.000 itens × 7 d × 60 s; melhor de 5, cache quente)
 
 | Métrica | InnoDB | MooseDB v3 (sem PK) | MooseDB v4 (PK) |
 |---|---:|---:|---:|
-| Carga (linhas/s) | 524.949 | 463.456 | 433.342 |
-| Disco (MiB) | 2.384 | 393,1 | 393,1 |
-| Último valor, forma com PK (`lastvalue_pk`, ms) | 0,816 | 3,946 | 1,053 |
-| Agregação por hora (`agg_hour`, ms) | 27,9 | 35,3 | 37,1 |
-| Agregação LAST (`agg_last`, ms) | 0,71 | 1,19 | 1,31 |
-| Expirar 1 dia | 16,3 s | 14,5 ms | 14,5 ms |
+| Carga (linhas/s) | 553.505 | 653.615 | 623.602 |
+| Disco após carga / após `moosedb_compact` (MiB) | 2.384 / 2.384 | 446,2 / 392,9 | 448,4 / 392,9 (6,1x menor) |
+| Gráfico 1 item 1 h / 24 h / 7 d (ms) | 0,49 / 1,89 / 4,69 | 0,55 / 1,89 / 4,41 | 0,63 / 1,88 / 4,62 |
+| Último valor de 20 itens, caminho com PK (ms) | 0,91 | 3,20 | 0,96 |
+| Agregação por hora, 100 itens, 24 h (ms) | 27,0 | 26,6 | 26,6 |
+| Agregação LAST, 1 item, 24 h (ms) | 0,81 | 0,73 | 0,82 |
+| Leitura do value cache, 1 h (ms) | 0,43 | 0,35 | 0,34 |
+| Expirar 1 dia (6,76 M linhas) por 5.000 DELETEs | 17,3 s | 8,47 s | 8,53 s |
+| Expirar o mesmo dia por `RETENTION_PERIOD` | — | 0,6 ms | 0,8 ms |
+| **Housekeeper (DELETE por item)**: 1º dia, 1,44 M linhas (`bench_delete.sh`) | 5,69 s | 8,42 s | 8,35 s |
+| Housekeeper: 20 % do 2º dia, `LIMIT 5000` | 4,24 s | 8,39 s | 8,48 s |
+| `OPTIMIZE` com 5.000 tombstones pendentes | — | 0,24 s | 0,24 s |
 
-## Atualização: ingestão e agregação (item 6) — v4 passa o InnoDB na carga
+Conferência: `COUNT(*)` e `sum(clock)`/`sum(ns)` idênticos nas três tabelas (50.400.000);
+`sum(value)` difere na 13ª casa só pela ordem de soma de doubles; depois do housekeeper
+`BIT_XOR(CRC32(itemid,clock,value,ns))` é igual (43.645.000 linhas) e no `bench_delete.sh` as
+três ficam com 8.350.000 linhas. Leituras com tombstones pendentes ficam iguais às de antes de
+apagar (gráfico 0,44 ms, agregação 6,6 ms, `COUNT(*)` 0,2 ms nas MooseDB).
 
-Perfilando a carga (`perf` no `mariadbd`) e a agregação, o tempo estava em: gorilla
-bit a bit no flush, SipHash e alocação por linha no `Batch::write`, um push/pop de
-heap por linha no merge ordenado (e um grupo `Vec` por linha em tabelas com chave
-única), e decodificação repetida das mesmas colunas. As correções (hash rápido com
-semente, buffers reutilizados, dica de tamanho do lote, `BitWriter` de 64 bits,
-merge por corridas, colunas de desempate sob demanda, cache de colunas decodificadas,
-memo de TAG inteira no handler) estão em `docs/architecture.md` §Desempenho. Sem
-mudança de formato em disco nem do protocolo de durabilidade (mesmo `fsync` por
-statement do `innodb_flush_log_at_trx_commit=1`).
+O DELETE do MooseDB custa o `fsync` do WAL por statement (~1,7 ms neste disco, com
+`wal_sync_mode=fsync` e `innodb_flush_log_at_trx_commit=1`): ~1,5–2x mais lento que o
+InnoDB no housekeeper por item, mas o espaço é devolvido (o `.ibd` não encolhe) e a
+expiração por idade via retenção é >10.000x mais rápida.
 
-Mesmo container descartável (`mariadb:11.4.13`, mesmos parâmetros do
-`docker-compose.yml`: `innodb_buffer_pool_size=4G`, `moosedb_chunk_cache_size=1 GiB`),
-5.000 itens × 7 d × 60 s, `bench.sh` completo. `antes` = plugin do commit
-`3538347` (`results/bench_item6_antes_5000x7d.txt`); `depois` = working tree
-(`results/bench_item6_5000x7d.txt`). Consultas em melhor de 5, cache quente.
+### Zabbix 7.0.31 real com history* em v4 (`results/zabbix_server_final.log`)
 
-| Métrica | InnoDB antes → depois | v3 antes → depois | v4 (PK) antes → depois |
-|---|---:|---:|---:|
-| Carga (linhas/s) | 497.364 → 527.224 | 408.783 → 652.441 | 370.973 → 643.802 |
-| Carga relativa ao InnoDB da mesma rodada | 1,00 | 0,82 → 1,24 | 0,75 → 1,22 |
-| `agg_hour` (100 itens × 24 h, ms) | 27,6 → 27,8 | 32,0 → 25,2 | 35,9 → 27,2 |
-| `agg_last` (1 item × 24 h, ms) | 0,76 → 0,78 | 1,05 → 0,86 | 1,15 → 0,93 |
-| `vc_read_1h` (ms) | 0,36 → 0,40 | 0,42 → 0,33 | 0,37 → 0,43 |
-| Disco após `moosedb_compact` (MiB) | 2.384 | 395,0 | 395,0 |
+| Teste | Resultado |
+|---|---|
+| Ingestão trapper, 500 valores/s por 300 s (`sender.py`) | 150.000 enviados = 150.000 processados, 0 falhas |
+| Erros SQL no log do server (`query failed`, `[Z3005]`) | 0 |
+| Housekeeper ligado, por item (`hk_history_global=0`, 50 itens com histórico de 1 h, 5.000 linhas antigas) | `deleted 5000 hist/trends` em 0,15 s; linhas recentes (1.500) intactas |
+| Housekeeper com período global de 1 h (2.000 linhas antigas) | `deleted 2000 hist/trends` em 0,41 s (o server cacheia `min(clock)`: reinicie-o após inserir linhas antigas à mão) |
+| API: `history.get` (float/uint/str), `item.get` lastvalue (200 itens) | ok (6,7–69 ms) |
+| API: `history.clear` de 1 item | ok em 23,8 ms; 0 linhas restantes do item |
+| Frontend: `chart.php` 1 h / 24 h e *Latest data* | HTTP 200 (90 / 29 / 148 ms) |
 
-Rodada original do item 5 (outra hora, mesma máquina): InnoDB 524.949, v3 463.456,
-v4 433.342 linhas/s; `agg_hour` 27,9 / 35,3 / 37,1 ms; `agg_last` 0,71 / 1,19 / 1,31 ms.
-
-`agg_last` é uma consulta de menos de 1 ms (≈ 50 lookups `(itemid, clock[, ns])`) e
-varia ±10 % entre rodadas; reexecutando só as consultas sobre as mesmas tabelas
-(`results/bench_item6_agg_15runs.txt`, 3 × melhor de 15): InnoDB 0,69–0,75 ms,
-v3 0,73–0,78 ms, v4 0,75–0,80 ms (`agg_hour`: InnoDB 27,4–27,8, v3 25,3–25,7, v4
-26,6–27,2 ms). Ou seja, a agregação por hora empata/ganha do InnoDB e o `AGGREGATE_LAST`
-ficou a ~5–10 % (antes: +85 %). Com `SKIP_LOAD=1` (`results/bench_item6_consultas_skipload.txt`,
-depois do teste destrutivo de housekeeping): `agg_last` 0,77 / 0,93 / 0,85 ms.
-Nenhuma outra consulta regrediu além do ruído (gráficos 1 h / 24 h / 7 d, último valor; `vc_read_1h` do v4 mediu 0,43 ms na rodada completa e 0,36–0,37 ms nas repetições).
-
-**Para reproduzir sem tocar nos volumes `zbxlab-*`**: container próprio com
-`--plugin-dir` apontando para uma cópia do `ha_moosedb.so` e os mesmos `-v` de `sql/` e
-`scripts/`, depois `docker exec -e ITEMS=5000 -e DAYS=7 -e STEP=60 <container> bash /lab/scripts/bench.sh`.
+Observação: o housekeeper não removeu o histórico de um item apagado pela API
+(a tabela `housekeeper` recebeu só trends/events; não comparado com InnoDB).

@@ -5,7 +5,8 @@
 
 SELECT ENGINE, SUPPORT, TRANSACTIONS, XA, SAVEPOINTS
   FROM information_schema.ENGINES WHERE ENGINE = 'MooseDB';
-SHOW VARIABLES LIKE 'moosedb%';
+--echo # moosedb_agg_threads defaults to the CPU count (at most 4): not listed
+SHOW VARIABLES WHERE Variable_name LIKE 'moosedb%' AND Variable_name <> 'moosedb_agg_threads';
 
 --echo # Full option syntax (spec §7)
 CREATE TABLE metricas (

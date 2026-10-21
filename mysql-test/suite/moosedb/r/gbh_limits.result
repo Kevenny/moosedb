@@ -1,0 +1,223 @@
+CREATE DATABASE mirror;
+##########################################################
+# Core limits: 16 filters / 16 keys / 64 functions
+##########################################################
+CREATE TABLE g (
+ts DATETIME NOT NULL, host VARCHAR(8) NOT NULL COMMENT 'TAG',
+c1 INT, c2 INT, c3 INT, c4 INT, c5 INT, c6 INT, c7 INT, c8 INT, c9 INT,
+c10 INT, c11 INT, c12 INT, c13 INT, c14 INT, c15 INT, c16 INT, c17 INT,
+INDEX(ts)
+) ENGINE=MooseDB;
+INSERT INTO g SELECT '2024-03-01' + INTERVAL seq SECOND, CONCAT('h', seq MOD 3),
+seq MOD 5, seq MOD 5, seq MOD 5, seq MOD 5, seq MOD 5, seq MOD 5, seq MOD 5, seq MOD 5, seq MOD 5,
+seq MOD 5, seq MOD 5, seq MOD 5, seq MOD 5, seq MOD 5, seq MOD 5, seq MOD 5, seq MOD 5
+FROM seq_0_to_999;
+CREATE TABLE mirror.g LIKE test.g;
+ALTER TABLE mirror.g ENGINE=InnoDB;
+INSERT INTO mirror.g SELECT * FROM test.g;
+# 16 filtered columns: still the engine
+# SELECT host, COUNT(*) c FROM g WHERE 1 = 1  AND c1 >= 0 AND c2 >= 0 AND c3 >= 0 AND c4 >= 0 AND c5 >= 0 AND c6 >= 0 AND c7 >= 0 AND c8 >= 0 AND c9 >= 0 AND c10 >= 0 AND c11 >= 0 AND c12 >= 0 AND c13 >= 0 AND c14 >= 0 AND c15 >= 0 AND c16 >= 0 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# 17 filtered columns: more than the core takes, the normal path runs
+# SELECT host, COUNT(*) c FROM g WHERE 1 = 1  AND c1 >= 0 AND c2 >= 0 AND c3 >= 0 AND c4 >= 0 AND c5 >= 0 AND c6 >= 0 AND c7 >= 0 AND c8 >= 0 AND c9 >= 0 AND c10 >= 0 AND c11 >= 0 AND c12 >= 0 AND c13 >= 0 AND c14 >= 0 AND c15 >= 0 AND c16 >= 0 AND c17 >= 0 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# 16 keys: still the engine
+# SELECT COUNT(*) c , c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11, c12, c13, c14, c15, c16 FROM g GROUP BY c1 , c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11, c12, c13, c14, c15, c16 ORDER BY c1 , c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11, c12, c13, c14, c15, c16 LIMIT 3
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# 17 keys: refused
+# SELECT COUNT(*) c , c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11, c12, c13, c14, c15, c16, c17 FROM g GROUP BY c1 , c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11, c12, c13, c14, c15, c16, c17 ORDER BY c1 , c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11, c12, c13, c14, c15, c16, c17 LIMIT 3
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# 68 aggregate functions: refused
+# SELECT host , SUM(c1), MIN(c1), MAX(c1), COUNT(c1), SUM(c2), MIN(c2), MAX(c2), COUNT(c2), SUM(c3), MIN(c3), MAX(c3), COUNT(c3), SUM(c4), MIN(c4), MAX(c4), COUNT(c4), SUM(c5), MIN(c5), MAX(c5), COUNT(c5), SUM(c6), MIN(c6), MAX(c6), COUNT(c6), SUM(c7), MIN(c7), MAX(c7), COUNT(c7), SUM(c8), MIN(c8), MAX(c8), COUNT(c8), SUM(c9), MIN(c9), MAX(c9), COUNT(c9), SUM(c10), MIN(c10), MAX(c10), COUNT(c10), SUM(c11), MIN(c11), MAX(c11), COUNT(c11), SUM(c12), MIN(c12), MAX(c12), COUNT(c12), SUM(c13), MIN(c13), MAX(c13), COUNT(c13), SUM(c14), MIN(c14), MAX(c14), COUNT(c14), SUM(c15), MIN(c15), MAX(c15), COUNT(c15), SUM(c16), MIN(c16), MAX(c16), COUNT(c16), SUM(c17), MIN(c17), MAX(c17), COUNT(c17) FROM g GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine did not run it
+DROP TABLE g;
+DROP TABLE mirror.g;
+##########################################################
+# Parallel sort of the groups (> 65536 groups, no LIMIT): 1 and 8 threads
+##########################################################
+CREATE TABLE g (
+ts DATETIME NOT NULL, host VARCHAR(8) NOT NULL COMMENT 'TAG',
+u BIGINT NOT NULL,
+s VARCHAR(16) CHARACTER SET utf8mb4 COLLATE utf8mb4_nopad_bin NOT NULL,
+sc VARCHAR(16) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci NOT NULL,
+INDEX(ts)
+) ENGINE=MooseDB CHUNK_INTERVAL='1 DAY';
+INSERT INTO g SELECT '2024-03-01' + INTERVAL seq SECOND, CONCAT('h', seq MOD 3),
+CAST((seq * 7919) MOD 100003 AS SIGNED) - 50000, CONCAT('k', (seq * 104729) MOD 100003), CONCAT('K', (seq * 104729) MOD 100003)
+FROM seq_0_to_199999;
+CREATE TABLE mirror.g LIKE test.g;
+ALTER TABLE mirror.g ENGINE=InnoDB;
+INSERT INTO mirror.g SELECT * FROM test.g;
+SET GLOBAL moosedb_agg_threads= 1;
+# threads=1: integer key, > 65536 groups, full sort
+# SELECT u, COUNT(*) c FROM g GROUP BY u
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# threads=1: byte string key (NO PAD), full sort
+# SELECT s, COUNT(*) c FROM g GROUP BY s ORDER BY s DESC
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# threads=1: collation-merged string key
+# SELECT COUNT(*) c FROM g GROUP BY sc ORDER BY c, sc
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# threads=1: ORDER BY an aggregate (two terms)
+# SELECT u, COUNT(*) z FROM g GROUP BY u ORDER BY z DESC, u DESC
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+SET GLOBAL moosedb_agg_threads= 8;
+# threads=8: integer key, > 65536 groups, full sort
+# SELECT u, COUNT(*) c FROM g GROUP BY u
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# threads=8: byte string key (NO PAD), full sort
+# SELECT s, COUNT(*) c FROM g GROUP BY s ORDER BY s DESC
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# threads=8: collation-merged string key
+# SELECT COUNT(*) c FROM g GROUP BY sc ORDER BY c, sc
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# threads=8: ORDER BY an aggregate (two terms)
+# SELECT u, COUNT(*) z FROM g GROUP BY u ORDER BY z DESC, u DESC
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+SET GLOBAL moosedb_agg_threads= 4;
+DROP TABLE g;
+DROP TABLE mirror.g;
+##########################################################
+# Exact value sets: charsets, VARBINARY, strict mode, PAD_CHAR_TO_FULL_LENGTH
+##########################################################
+CREATE TABLE g (
+ts DATETIME NOT NULL, host VARCHAR(8) NOT NULL COMMENT 'TAG',
+u3 VARCHAR(8) CHARACTER SET utf8mb3 COLLATE utf8mb3_nopad_bin,
+vb VARBINARY(8),
+ch CHAR(6) CHARACTER SET utf8mb4 COLLATE utf8mb4_nopad_bin,
+pb VARCHAR(8) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin,
+pl VARCHAR(8) CHARACTER SET latin1 COLLATE latin1_bin,
+pc VARCHAR(8) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci,
+pu VARCHAR(8) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci,
+bytes INT NOT NULL,
+INDEX(ts)
+) ENGINE=MooseDB;
+INSERT INTO g SELECT '2024-03-01' + INTERVAL seq SECOND, CONCAT('h', seq MOD 3),
+ELT(seq MOD 4 + 1, 'a', 'a ', 'b', CONVERT(0xC3A9 USING utf8mb3)),
+ELT(seq MOD 4 + 1, 'a', 'a ', 'b', 0xFF),
+ELT(seq MOD 4 + 1, 'a', 'a ', 'b', 'ab'),
+ELT(seq MOD 4 + 1, 'a', 'a ', 'a   ', 'b'),
+ELT(seq MOD 4 + 1, 'a', 'a ', 'a   ', 'b'),
+ELT(seq MOD 4 + 1, 'a', 'a ', 'a   ', 'b'),
+ELT(seq MOD 4 + 1, 'a', 'a ', 'a   ', 'b'),
+seq MOD 10
+FROM seq_0_to_2999;
+CREATE TABLE mirror.g LIKE test.g;
+ALTER TABLE mirror.g ENGINE=InnoDB;
+INSERT INTO mirror.g SELECT * FROM test.g;
+# utf8mb3 NO PAD column against constants of other charsets
+# SELECT host, COUNT(*) c FROM g WHERE u3 = _utf8mb3'a' GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=1 core top-N=0
+# utf8mb3 NO PAD column against constants of other charsets
+# SELECT host, COUNT(*) c FROM g WHERE u3 = _utf8mb4'a' GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=1 core top-N=0
+# utf8mb3 NO PAD column against constants of other charsets
+# SELECT host, COUNT(*) c FROM g WHERE u3 = _latin1'a' GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=1 core top-N=0
+# utf8mb3 NO PAD column against constants of other charsets
+# SELECT host, COUNT(*) c FROM g WHERE u3 = _latin1 0xE9 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=1 core top-N=0
+# utf8mb3 NO PAD column against constants of other charsets
+# SELECT host, COUNT(*) c FROM g WHERE u3 IN (_utf8mb4 0xC3A9, 'b') GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=1 core top-N=0
+# VARBINARY column (binary charset branch), hex literals
+# SELECT host, COUNT(*) c FROM g WHERE vb = 0x61 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=1 core top-N=0
+# VARBINARY column (binary charset branch), hex literals
+# SELECT host, COUNT(*) c FROM g WHERE vb IN (0x61, 'b', 0xFF) GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=0 core top-N=0
+# VARBINARY column (binary charset branch), hex literals
+# SELECT host, COUNT(*) c FROM g WHERE vb = 'a ' GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=0 core top-N=0
+# CHAR NO PAD column with strict sql_mode and PAD_CHAR_TO_FULL_LENGTH
+# SELECT host, COUNT(*) c FROM g WHERE ch = 'a' GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=0 core top-N=0
+# CHAR NO PAD column with strict sql_mode and PAD_CHAR_TO_FULL_LENGTH
+# SELECT host, COUNT(*) c FROM g WHERE ch IN ('a ', 'b') OR ch LIKE 'a%' GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=0 core top-N=0
+# CHAR NO PAD column with strict sql_mode and PAD_CHAR_TO_FULL_LENGTH
+# SELECT host, COUNT(*) c FROM g WHERE ch = 'a' GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=0 core top-N=0
+# binary PAD SPACE collations (utf8mb4_bin, latin1_bin): exact value set with pad_space; _ci stays on the dictionary
+# SELECT host, COUNT(*) c FROM g WHERE pb = 'a' GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=1 core top-N=0
+# binary PAD SPACE collations (utf8mb4_bin, latin1_bin): exact value set with pad_space; _ci stays on the dictionary
+# SELECT host, COUNT(*) c FROM g WHERE pb = 'a   ' GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=1 core top-N=0
+# binary PAD SPACE collations (utf8mb4_bin, latin1_bin): exact value set with pad_space; _ci stays on the dictionary
+# SELECT host, COUNT(*) c FROM g WHERE pb IN ('a ', 'zz', 'b   ') GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=1 core top-N=0
+# binary PAD SPACE collations (utf8mb4_bin, latin1_bin): exact value set with pad_space; _ci stays on the dictionary
+# SELECT host, COUNT(*) c FROM g WHERE pl = 'a' GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=1 core top-N=0
+# binary PAD SPACE collations (utf8mb4_bin, latin1_bin): exact value set with pad_space; _ci stays on the dictionary
+# SELECT host, COUNT(*) c FROM g WHERE pl IN ('a  ', 'b') GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=1 core top-N=0
+# binary PAD SPACE collations (utf8mb4_bin, latin1_bin): exact value set with pad_space; _ci stays on the dictionary
+# SELECT host, COUNT(*) c FROM g WHERE pb = 'a' AND pl = 'a ' GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=2 core top-N=0
+# binary PAD SPACE collations (utf8mb4_bin, latin1_bin): exact value set with pad_space; _ci stays on the dictionary
+# SELECT host, COUNT(*) c FROM g WHERE pc = 'A' GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=0 core top-N=0
+# binary PAD SPACE collations (utf8mb4_bin, latin1_bin): exact value set with pad_space; _ci stays on the dictionary
+# SELECT host, COUNT(*) c FROM g WHERE pu = 'a ' GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=0 core top-N=0
+# binary PAD SPACE collations (utf8mb4_bin, latin1_bin): exact value set with pad_space; _ci stays on the dictionary
+# SELECT host, COUNT(*) c FROM g WHERE pb = 'a' COLLATE utf8mb4_bin GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# shortcuts taken: exact filters=0 core top-N=0
+# DECIMAL / TIME constant against an integer column: refused (per-row conversion)
+# SELECT host, COUNT(*) c FROM g WHERE bytes = 5.0 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine did not run it
+DROP TABLE g;
+DROP TABLE mirror.g;
+DROP DATABASE mirror;
+##########################################################
+# moosedb_agg_max_memory exhausted; KILL / max_statement_time
+##########################################################
+CREATE TABLE m (
+ts DATETIME NOT NULL, host VARCHAR(8) NOT NULL COMMENT 'TAG',
+f VARCHAR(80) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci NOT NULL, INDEX(ts)
+) ENGINE=MooseDB CHUNK_INTERVAL='1 DAY';
+INSERT INTO m SELECT '2024-03-01' + INTERVAL seq SECOND, CONCAT('h', seq MOD 3),
+CONCAT('/srv/some/long/directory/name/file_', (seq * 7919) MOD 1000003, '.dat')
+FROM seq_0_to_699999;
+SET SESSION moosedb_group_by_pushdown = 1;
+SET SESSION moosedb_agg_max_memory = 16777216;
+SELECT host, COUNT(*) c FROM m WHERE f LIKE '%7%' GROUP BY host;
+ERROR HY000: MooseDB: full: aggregation exceeds moosedb_agg_max_memory (16777216 bytes); narrow the query or raise the limit
+SET SESSION moosedb_agg_max_memory = DEFAULT;
+SELECT host, COUNT(*) c FROM m WHERE f LIKE '%7%' GROUP BY host ORDER BY host;
+host	c
+h0	109321
+h1	109315
+h2	109333
+# max_statement_time during the dictionary phase: ends (interrupted or finished), nothing hangs
+SET SESSION max_statement_time = 0.01;
+SELECT host, COUNT(*) c FROM m WHERE f LIKE '%7%' AND f LIKE '%3%' GROUP BY host;
+SET SESSION max_statement_time = 0;
+SELECT host, COUNT(*) c FROM m WHERE f LIKE '%7%' AND f LIKE '%3%' GROUP BY host ORDER BY host;
+host	c
+h0	46520
+h1	46479
+h2	46454
+DROP TABLE m;

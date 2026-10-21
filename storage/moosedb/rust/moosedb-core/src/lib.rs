@@ -11,6 +11,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod agg;
 pub mod batch;
 mod block;
 mod bytes;
@@ -22,8 +23,13 @@ mod codec;
 pub mod compaction;
 pub mod compression;
 pub mod crypto;
+pub mod delete;
 pub mod error;
+#[cfg(feature = "fuzz")]
+#[doc(hidden)]
+pub mod fuzz_api;
 mod fasthash;
+mod format;
 mod fsutil;
 pub mod index;
 pub mod inspect;
@@ -31,6 +37,8 @@ mod log;
 pub mod maintenance;
 mod manifest;
 mod memtable;
+#[cfg(test)]
+mod memprobe;
 pub mod options;
 mod rowbatch;
 pub mod scan;
@@ -38,10 +46,12 @@ pub mod schema;
 pub mod settings;
 pub mod table;
 pub mod time;
+mod tomb;
 pub mod unique;
 mod wal;
 
 pub use batch::Batch;
+pub use delete::DeleteBatch;
 pub use compaction::CompactionReport;
 pub use error::{Error, Result};
 pub use index::series::SeriesSnapshot;

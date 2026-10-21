@@ -14,10 +14,12 @@ lz4_flex = { version = "0.11", default-features = false, features = ["safe-encod
 zstd = { version = "0.13", default-features = false, optional = true }
 aes = { version = "0.8", optional = true }
 ctr = { version = "0.9", optional = true }
+aes-gcm = { version = "0.10", default-features = false, features = ["aes"], optional = true }
 
 [features]
+fuzz = []
 default = ["compression-zstd", "compression-lz4", "encryption"]
-encryption = ["dep:aes", "dep:ctr"]
+encryption = ["dep:aes", "dep:ctr", "dep:aes-gcm"]
 compression-zstd = ["dep:zstd"]
 compression-lz4 = ["dep:lz4_flex"]
 

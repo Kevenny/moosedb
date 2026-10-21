@@ -560,20 +560,21 @@ INSERT INTO tr VALUES (1, 101, 3, 1);
 SELECT clock, value FROM tr ORDER BY clock;
 --echo # retention: the key of an expired row can be inserted again
 TRUNCATE TABLE tr;
-INSERT INTO tr VALUES (1, UNIX_TIMESTAMP() - 200 * 86400, 1, 1), (1, UNIX_TIMESTAMP() - 100 * 86400, 1, 1), (1, UNIX_TIMESTAMP() - 3600, 1, 1);
+SET @now= UNIX_TIMESTAMP();
+INSERT INTO tr VALUES (1, @now - 200 * 86400, 1, 1), (1, @now - 100 * 86400, 1, 1), (1, @now - 3600, 1, 1);
 FLUSH TABLES tr;
 --replace_regex /-[0-9]{9,10}-1/-<clock>-1/
 --error ER_DUP_ENTRY
-INSERT INTO tr VALUES (1, UNIX_TIMESTAMP() - 200 * 86400, 2, 1);
+INSERT INTO tr VALUES (1, @now - 200 * 86400, 2, 1);
 CALL moosedb_apply_retention('test.tr');
 SELECT COUNT(*) AS rows_left FROM tr;
-INSERT INTO tr VALUES (1, UNIX_TIMESTAMP() - 200 * 86400, 2, 1);
+INSERT INTO tr VALUES (1, @now - 200 * 86400, 2, 1);
 --replace_regex /-[0-9]{9,10}-1/-<clock>-1/
 --error ER_DUP_ENTRY
-INSERT INTO tr VALUES (1, UNIX_TIMESTAMP() - 200 * 86400, 3, 1);
+INSERT INTO tr VALUES (1, @now - 200 * 86400, 3, 1);
 --replace_regex /-[0-9]{9,10}-1/-<clock>-1/
 --error ER_DUP_ENTRY
-INSERT INTO tr VALUES (1, UNIX_TIMESTAMP() - 3600, 3, 1);
+INSERT INTO tr VALUES (1, @now - 3600, 3, 1);
 DROP TABLE tr;
 
 --echo ##################################################################
@@ -611,6 +612,57 @@ SHOW CREATE TABLE cv;
 INSERT INTO cv VALUES (1, 1, 2);
 SELECT * FROM cv ORDER BY itemid, clock, ns;
 DROP TABLE al, cv;
+
+--echo ##################################################################
+--echo # Range over the whole key (itemid, clock, ns): clock BETWEEN with ns =, >, <
+--echo # (the start key of the range names every key part) -- never ER_ILLEGAL_HA
+--echo ##################################################################
+CREATE TABLE rk (itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG', clock INT NOT NULL, value DOUBLE NOT NULL, ns INT NOT NULL, PRIMARY KEY (itemid, clock, ns))
+  ENGINE=MooseDB TIMESTAMP_COLUMN='clock' CHUNK_INTERVAL='1 DAY';
+CREATE TABLE ri (itemid BIGINT UNSIGNED NOT NULL, clock INT NOT NULL, value DOUBLE NOT NULL, ns INT NOT NULL, PRIMARY KEY (itemid, clock, ns)) ENGINE=InnoDB;
+INSERT INTO rk SELECT 1 + a.seq, 1700000000 + b.seq, b.seq, c.seq FROM seq_0_to_2 a, seq_0_to_29 b, seq_0_to_2 c;
+INSERT INTO ri SELECT * FROM rk;
+FLUSH TABLES rk;
+INSERT INTO rk SELECT 1 + a.seq, 1700000030 + b.seq, b.seq, c.seq FROM seq_0_to_2 a, seq_0_to_9 b, seq_0_to_2 c;
+INSERT INTO ri SELECT * FROM rk WHERE clock >= 1700000030;
+--let $mt= rk
+--let $it= ri
+--let $status= 0
+--let $show= 0
+--let $q= SELECT COUNT(*) AS n, SUM(value) AS s, SUM(ns) AS t FROM {T} WHERE itemid = 1 AND clock BETWEEN 1700000010 AND 1700000020 AND ns = 1
+--let $label= BETWEEN + ns =
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT clock, ns FROM {T} WHERE itemid = 1 AND clock BETWEEN 1700000010 AND 1700000014 AND ns > 0 ORDER BY clock, ns
+--let $label= BETWEEN + ns >
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT clock, ns FROM {T} WHERE itemid = 2 AND clock BETWEEN 1700000010 AND 1700000014 AND ns < 2 ORDER BY clock, ns
+--let $label= BETWEEN + ns <
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT clock, ns FROM {T} WHERE itemid = 2 AND clock > 1700000030 AND clock <= 1700000033 AND ns >= 1 ORDER BY clock DESC, ns DESC
+--let $label= (clock, ns) range across chunk and MemTable, descending
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT clock, ns FROM {T} WHERE itemid = 3 AND clock >= 1700000005 AND ns = 2 ORDER BY clock
+--let $label= clock >= with ns =
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT clock, ns FROM {T} WHERE itemid = 3 AND clock < 1700000008 AND ns = 0 ORDER BY clock DESC
+--let $label= clock < with ns = , descending
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT COUNT(*) FROM {T} WHERE itemid IN (1, 3) AND clock BETWEEN 1700000028 AND 1700000032 AND ns = 1
+--let $label= IN list of items + range + ns
+--source suite/moosedb/include/cmp_query.inc
+--echo # the same read as a DELETE
+DELETE FROM rk WHERE itemid = 1 AND clock BETWEEN 1700000010 AND 1700000020 AND ns = 1;
+SELECT ROW_COUNT();
+DELETE FROM ri WHERE itemid = 1 AND clock BETWEEN 1700000010 AND 1700000020 AND ns = 1;
+SELECT ROW_COUNT();
+DELETE FROM rk WHERE itemid = 2 AND clock > 1700000030 AND ns < 1;
+SELECT ROW_COUNT();
+DELETE FROM ri WHERE itemid = 2 AND clock > 1700000030 AND ns < 1;
+SELECT ROW_COUNT();
+--let $q= SELECT itemid, clock, ns FROM {T} ORDER BY itemid, clock, ns
+--let $label= after the deletes
+--source suite/moosedb/include/cmp_query.inc
+DROP TABLE rk, ri;
 
 DROP TABLE zm, zi, it, sp, si, pr;
 DROP PROCEDURE moosedb_compact;

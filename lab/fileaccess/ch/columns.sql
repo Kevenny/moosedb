@@ -1,0 +1,1 @@
+SELECT arrayStringConcat(groupArray(concat(column, '=', toString(round(c / 1048576)), 'MiB')), ' ') FROM (SELECT column, sum(column_data_compressed_bytes) AS c FROM system.parts_columns WHERE database = 'fileacc' AND table = 'evento' AND active GROUP BY column ORDER BY c DESC)

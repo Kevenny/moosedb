@@ -1,0 +1,187 @@
+SET NAMES utf8mb4;
+CREATE DATABASE mirror;
+Warnings:
+Note	1051	Unknown table 'test.t'
+Warnings:
+Note	1051	Unknown table 'mirror.t'
+##### utf8mb4_general_ci (exact=0)
+# utf8mb4_general_ci: TAG key (many series per value), key not shown
+# SELECT COUNT(*) c, SUM(v) s, MIN(v) mn, MAX(v) mx, AVG(v) a FROM t GROUP BY tg ORDER BY tg
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# utf8mb4_general_ci: plain VARCHAR key with NULLs
+# SELECT COUNT(*) c, SUM(v) s, MIN(ts) t0, MAX(ts) t1 FROM t GROUP BY pc ORDER BY pc
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# utf8mb4_general_ci: both keys, ordered by an aggregate then by the keys
+# SELECT COUNT(*) c, SUM(v) s FROM t GROUP BY tg, pc ORDER BY c DESC, tg DESC, pc LIMIT 12 OFFSET 3
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# utf8mb4_general_ci: TAG equality under the collation, grouped by the plain column
+# SELECT COUNT(*) c, SUM(v) s FROM t WHERE tg = 'a' GROUP BY pc ORDER BY pc
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# utf8mb4_general_ci: TAG IN under the collation, two TAG-derived keys
+# SELECT COUNT(*) c FROM t WHERE tg IN ('B', 'ss') AND rg = 'r1' GROUP BY tg, pc ORDER BY tg, pc
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# utf8mb4_general_ci: GROUP BY the region TAG (the value 'r*' is exact) with the string TAG as hidden key
+# SELECT rg, COUNT(*) c, SUM(v) s FROM t GROUP BY rg, tg ORDER BY rg, tg LIMIT 9
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# utf8mb4_general_ci: HAVING on the merged count
+# SELECT COUNT(*) c FROM t GROUP BY tg HAVING c > 150 ORDER BY c, tg
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# distinct groups: the engine merges exactly as the server does
+DROP TABLE test.t;
+DROP TABLE mirror.t;
+Warnings:
+Note	1051	Unknown table 'test.t'
+Warnings:
+Note	1051	Unknown table 'mirror.t'
+##### uca1400_ai_ci (exact=0)
+# uca1400_ai_ci: TAG key (many series per value), key not shown
+# SELECT COUNT(*) c, SUM(v) s, MIN(v) mn, MAX(v) mx, AVG(v) a FROM t GROUP BY tg ORDER BY tg
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# uca1400_ai_ci: plain VARCHAR key with NULLs
+# SELECT COUNT(*) c, SUM(v) s, MIN(ts) t0, MAX(ts) t1 FROM t GROUP BY pc ORDER BY pc
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# uca1400_ai_ci: both keys, ordered by an aggregate then by the keys
+# SELECT COUNT(*) c, SUM(v) s FROM t GROUP BY tg, pc ORDER BY c DESC, tg DESC, pc LIMIT 12 OFFSET 3
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# uca1400_ai_ci: TAG equality under the collation, grouped by the plain column
+# SELECT COUNT(*) c, SUM(v) s FROM t WHERE tg = 'a' GROUP BY pc ORDER BY pc
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# uca1400_ai_ci: TAG IN under the collation, two TAG-derived keys
+# SELECT COUNT(*) c FROM t WHERE tg IN ('B', 'ss') AND rg = 'r1' GROUP BY tg, pc ORDER BY tg, pc
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# uca1400_ai_ci: GROUP BY the region TAG (the value 'r*' is exact) with the string TAG as hidden key
+# SELECT rg, COUNT(*) c, SUM(v) s FROM t GROUP BY rg, tg ORDER BY rg, tg LIMIT 9
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# uca1400_ai_ci: HAVING on the merged count
+# SELECT COUNT(*) c FROM t GROUP BY tg HAVING c > 150 ORDER BY c, tg
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# distinct groups: the engine merges exactly as the server does
+DROP TABLE test.t;
+DROP TABLE mirror.t;
+Warnings:
+Note	1051	Unknown table 'test.t'
+Warnings:
+Note	1051	Unknown table 'mirror.t'
+##### utf8mb4_bin (exact=1)
+# utf8mb4_bin: TAG key (many series per value), key not shown
+# SELECT COUNT(*) c, SUM(v) s, MIN(v) mn, MAX(v) mx, AVG(v) a FROM t GROUP BY tg ORDER BY tg
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# utf8mb4_bin: plain VARCHAR key with NULLs
+# SELECT COUNT(*) c, SUM(v) s, MIN(ts) t0, MAX(ts) t1 FROM t GROUP BY pc ORDER BY pc
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# utf8mb4_bin: both keys, ordered by an aggregate then by the keys
+# SELECT COUNT(*) c, SUM(v) s FROM t GROUP BY tg, pc ORDER BY c DESC, tg DESC, pc LIMIT 12 OFFSET 3
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# utf8mb4_bin: TAG equality under the collation, grouped by the plain column
+# SELECT COUNT(*) c, SUM(v) s FROM t WHERE tg = 'a' GROUP BY pc ORDER BY pc
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# utf8mb4_bin: TAG IN under the collation, two TAG-derived keys
+# SELECT COUNT(*) c FROM t WHERE tg IN ('B', 'ss') AND rg = 'r1' GROUP BY tg, pc ORDER BY tg, pc
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# utf8mb4_bin: GROUP BY the region TAG (the value 'r*' is exact) with the string TAG as hidden key
+# SELECT rg, COUNT(*) c, SUM(v) s FROM t GROUP BY rg, tg ORDER BY rg, tg LIMIT 9
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# utf8mb4_bin: HAVING on the merged count
+# SELECT COUNT(*) c FROM t GROUP BY tg HAVING c > 150 ORDER BY c, tg
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# utf8mb4_bin: the key itself (exact collation)
+# SELECT tg, COUNT(*) c, SUM(v) s FROM t GROUP BY tg ORDER BY tg
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# utf8mb4_bin: plain column key itself, DESC
+# SELECT pc, COUNT(*) c FROM t GROUP BY pc ORDER BY pc DESC
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# utf8mb4_bin: both keys shown
+# SELECT tg, pc, COUNT(*) c FROM t GROUP BY tg, pc ORDER BY tg, pc LIMIT 15
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# distinct groups: the engine merges exactly as the server does
+DROP TABLE test.t;
+DROP TABLE mirror.t;
+Warnings:
+Note	1051	Unknown table 'test.t'
+Warnings:
+Note	1051	Unknown table 'mirror.t'
+##### utf8mb4_nopad_bin (exact=1)
+# utf8mb4_nopad_bin: TAG key (many series per value), key not shown
+# SELECT COUNT(*) c, SUM(v) s, MIN(v) mn, MAX(v) mx, AVG(v) a FROM t GROUP BY tg ORDER BY tg
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# utf8mb4_nopad_bin: plain VARCHAR key with NULLs
+# SELECT COUNT(*) c, SUM(v) s, MIN(ts) t0, MAX(ts) t1 FROM t GROUP BY pc ORDER BY pc
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# utf8mb4_nopad_bin: both keys, ordered by an aggregate then by the keys
+# SELECT COUNT(*) c, SUM(v) s FROM t GROUP BY tg, pc ORDER BY c DESC, tg DESC, pc LIMIT 12 OFFSET 3
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# utf8mb4_nopad_bin: TAG equality under the collation, grouped by the plain column
+# SELECT COUNT(*) c, SUM(v) s FROM t WHERE tg = 'a' GROUP BY pc ORDER BY pc
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# utf8mb4_nopad_bin: TAG IN under the collation, two TAG-derived keys
+# SELECT COUNT(*) c FROM t WHERE tg IN ('B', 'ss') AND rg = 'r1' GROUP BY tg, pc ORDER BY tg, pc
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# utf8mb4_nopad_bin: GROUP BY the region TAG (the value 'r*' is exact) with the string TAG as hidden key
+# SELECT rg, COUNT(*) c, SUM(v) s FROM t GROUP BY rg, tg ORDER BY rg, tg LIMIT 9
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# utf8mb4_nopad_bin: HAVING on the merged count
+# SELECT COUNT(*) c FROM t GROUP BY tg HAVING c > 150 ORDER BY c, tg
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# utf8mb4_nopad_bin: the key itself (exact collation)
+# SELECT tg, COUNT(*) c, SUM(v) s FROM t GROUP BY tg ORDER BY tg
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# utf8mb4_nopad_bin: plain column key itself, DESC
+# SELECT pc, COUNT(*) c FROM t GROUP BY pc ORDER BY pc DESC
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# utf8mb4_nopad_bin: both keys shown
+# SELECT tg, pc, COUNT(*) c FROM t GROUP BY tg, pc ORDER BY tg, pc LIMIT 15
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# distinct groups: the engine merges exactly as the server does
+DROP TABLE test.t;
+DROP TABLE mirror.t;
+Warnings:
+Note	1051	Unknown table 'test.t'
+Warnings:
+Note	1051	Unknown table 'mirror.t'
+##### latin1_swedish_ci (exact=0)
+# latin1_swedish_ci: TAG key (many series per value), key not shown
+# SELECT COUNT(*) c, SUM(v) s, MIN(v) mn, MAX(v) mx, AVG(v) a FROM t GROUP BY tg ORDER BY tg
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# latin1_swedish_ci: plain VARCHAR key with NULLs
+# SELECT COUNT(*) c, SUM(v) s, MIN(ts) t0, MAX(ts) t1 FROM t GROUP BY pc ORDER BY pc
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# latin1_swedish_ci: both keys, ordered by an aggregate then by the keys
+# SELECT COUNT(*) c, SUM(v) s FROM t GROUP BY tg, pc ORDER BY c DESC, tg DESC, pc LIMIT 12 OFFSET 3
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# latin1_swedish_ci: TAG equality under the collation, grouped by the plain column
+# SELECT COUNT(*) c, SUM(v) s FROM t WHERE tg = 'a' GROUP BY pc ORDER BY pc
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# latin1_swedish_ci: TAG IN under the collation, two TAG-derived keys
+# SELECT COUNT(*) c FROM t WHERE tg IN ('B', 'ss') AND rg = 'r1' GROUP BY tg, pc ORDER BY tg, pc
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# latin1_swedish_ci: GROUP BY the region TAG (the value 'r*' is exact) with the string TAG as hidden key
+# SELECT rg, COUNT(*) c, SUM(v) s FROM t GROUP BY rg, tg ORDER BY rg, tg LIMIT 9
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# latin1_swedish_ci: HAVING on the merged count
+# SELECT COUNT(*) c FROM t GROUP BY tg HAVING c > 150 ORDER BY c, tg
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# distinct groups: the engine merges exactly as the server does
+DROP TABLE test.t;
+DROP TABLE mirror.t;
+##########################################################
+# The key shown for a merged group is the smallest by raw bytes
+# (the server shows whichever spelling it met first), so it is
+# checked on the engine alone
+##########################################################
+CREATE TABLE t (
+ts DATETIME NOT NULL,
+tg VARCHAR(16) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci NOT NULL COMMENT 'TAG',
+v INT,
+INDEX(ts)
+) ENGINE=MooseDB;
+INSERT INTO t VALUES ('2024-01-01 00:00:01', 'a', 1), ('2024-01-01 00:00:02', 'A', 2),
+('2024-01-01 00:00:03', 'b', 3), ('2024-01-01 00:00:04', 'a ', 4), ('2024-01-01 00:00:05', 'B', 5),
+('2024-01-01 00:00:06', 'á', 6);
+SET SESSION moosedb_group_by_pushdown = ON;
+SELECT tg, COUNT(*) c, SUM(v) s FROM t GROUP BY tg ORDER BY tg;
+tg	c	s
+A	4	13
+B	2	8
+SET SESSION moosedb_group_by_pushdown = DEFAULT;
+DROP TABLE t;
+DROP DATABASE mirror;

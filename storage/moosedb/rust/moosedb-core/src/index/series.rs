@@ -114,6 +114,11 @@ fn next_version() -> u64 {
     VERSIONS.fetch_add(1, Ordering::AcqRel) + 1
 }
 
+/// Per series, besides the key and the tag values: `by_key` bucket, `tags_by_id`
+/// bucket, `log` slot and the `Arc` header (hash tables counted at their
+/// power-of-two growth slack).
+const SERIES_FIXED_BYTES: usize = 190;
+
 pub(crate) struct SeriesIndex {
     by_key: HashMap<Vec<u8>, u64>,
     tags_by_id: FastMap<u64, Arc<[Value]>>,
@@ -121,6 +126,8 @@ pub(crate) struct SeriesIndex {
     log: Arc<SeriesLog>,
     /// Number of entries of `log`.
     logged: usize,
+    /// Estimated heap bytes of the series held (see [`SeriesIndex::bytes`]).
+    bytes: usize,
     /// Bumped whenever a series is added or the index is cleared; shared with
     /// the table so it can be read without taking the table mutex.
     version: Arc<AtomicU64>,
@@ -134,6 +141,7 @@ impl Default for SeriesIndex {
             next_id: 0,
             log: Arc::default(),
             logged: 0,
+            bytes: 0,
             version: Arc::new(AtomicU64::new(next_version())),
         }
     }
@@ -142,6 +150,12 @@ impl Default for SeriesIndex {
 impl SeriesIndex {
     pub(crate) fn len(&self) -> usize {
         self.tags_by_id.len()
+    }
+
+    /// Estimated heap bytes of the index (keys, tag values, the three maps
+    /// and the log): what `moosedb_series_list` shares instead of copying.
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
     }
 
     /// Handle on the version counter (read lock-free).
@@ -156,6 +170,9 @@ impl SeriesIndex {
 
     fn add(&mut self, key: Vec<u8>, id: u64, tags: &[Value]) {
         let tags: Arc<[Value]> = Arc::from(tags);
+        self.bytes += SERIES_FIXED_BYTES
+            + 2 * key.len()
+            + tags.iter().map(|v| std::mem::size_of::<Value>() + if let Value::Bytes(b) = v { b.len() } else { 0 }).sum::<usize>();
         self.by_key.insert(key, id);
         self.tags_by_id.insert(id, tags.clone());
         self.log.items.write().unwrap_or_else(std::sync::PoisonError::into_inner).push((id, tags));
@@ -163,7 +180,7 @@ impl SeriesIndex {
         self.version.store(next_version(), Ordering::Release);
     }
 
-    #[cfg(test)]
+    /// Id of the series with these tags, if there is one.
     pub(crate) fn lookup(&self, tags: &[Value]) -> Option<u64> {
         self.by_key.get(&series_key(tags)).copied()
     }
@@ -302,5 +319,24 @@ mod tests {
         let n = idx.get_or_insert(&[Value::Null]);
         let e = idx.get_or_insert(&[Value::Bytes(vec![])]);
         assert_ne!(n, e);
+    }
+
+    /// `cargo test -p moosedb-core --release -- --ignored --nocapture series_index_memory`
+    #[test]
+    #[ignore = "memory measurement (millions of series)"]
+    fn series_index_memory_per_series() {
+        let n: u64 = 2_000_000;
+        let before = crate::memprobe::rss_bytes();
+        let mut idx = SeriesIndex::default();
+        for i in 0..n {
+            idx.get_or_insert(&[Value::Bytes(format!("item-{i:010}").into_bytes())]);
+        }
+        let per = (crate::memprobe::rss_bytes() - before) as f64 / n as f64;
+        eprintln!("series index: {per:.1} B/series ({n} series, accounted {} B)", idx.bytes());
+        let snap = idx.snapshot();
+        let before = crate::memprobe::rss_bytes();
+        let v = snap.to_sorted_vec();
+        let per = (crate::memprobe::rss_bytes() - before) as f64 / n as f64;
+        eprintln!("to_sorted_vec copy: {per:.1} B/series ({} entries)", v.len());
     }
 }

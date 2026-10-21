@@ -1,0 +1,308 @@
+CREATE TABLE g (
+ts    DATETIME NOT NULL,
+host  VARCHAR(16) NOT NULL COMMENT 'TAG',
+proc  VARCHAR(8) COMMENT 'TAG',
+op    VARCHAR(8) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin,
+nm    VARCHAR(12) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci,
+ch    CHAR(6) CHARACTER SET latin1 COLLATE latin1_swedish_ci,
+file  VARCHAR(40) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+n     INT,
+u     BIGINT UNSIGNED,
+bytes BIGINT NOT NULL,
+INDEX(ts)
+) ENGINE=MooseDB CHUNK_INTERVAL='1 DAY';
+# 20000 rows in chunks, 10000 more left in the MemTable
+INSERT INTO g SELECT '2024-03-01' + INTERVAL seq * 20 SECOND,
+CONCAT('h', seq MOD 7),
+IF(seq MOD 11 = 0, NULL, CONCAT('p', seq MOD 5)),
+IF(seq MOD 13 = 0, NULL, ELT(seq MOD 5 + 1, 'read', 'write', 'open', 'close', 'READ')),
+IF(seq MOD 17 = 0, NULL, ELT(seq MOD 4 + 1, 'READ', 'read ', 'Read', 'rEAD  ')),
+IF(seq MOD 19 = 0, NULL, ELT(seq MOD 3 + 1, 'ab', 'AB ', 'b')),
+CONCAT('/d', seq MOD 50, '/f', seq MOD 20011),
+IF(seq MOD 9 = 0, NULL, CAST(seq MOD 100 AS SIGNED) - 20),
+IF(seq MOD 8 = 0, NULL, IF(seq MOD 2, 18446744073709551615 - seq, seq)),
+(seq * 7) MOD 1000
+FROM seq_0_to_19999;
+FLUSH TABLES g;
+INSERT INTO g SELECT '2024-03-01' + INTERVAL seq * 20 SECOND,
+CONCAT('h', seq MOD 7),
+IF(seq MOD 11 = 0, NULL, CONCAT('p', seq MOD 5)),
+IF(seq MOD 13 = 0, NULL, ELT(seq MOD 5 + 1, 'read', 'write', 'open', 'close', 'READ')),
+IF(seq MOD 17 = 0, NULL, ELT(seq MOD 4 + 1, 'READ', 'read ', 'Read', 'rEAD  ')),
+IF(seq MOD 19 = 0, NULL, ELT(seq MOD 3 + 1, 'ab', 'AB ', 'b')),
+CONCAT('/d', seq MOD 50, '/f', seq MOD 20011),
+IF(seq MOD 9 = 0, NULL, CAST(seq MOD 100 AS SIGNED) - 20),
+IF(seq MOD 8 = 0, NULL, IF(seq MOD 2, 18446744073709551615 - seq, seq)),
+(seq * 7) MOD 1000
+FROM seq_20000_to_29999;
+CREATE DATABASE mirror;
+CREATE TABLE mirror.g LIKE test.g;
+ALTER TABLE mirror.g ENGINE=InnoDB;
+INSERT INTO mirror.g SELECT * FROM test.g;
+SELECT (SELECT COUNT(*) FROM test.g) = (SELECT COUNT(*) FROM mirror.g) AS same_rows;
+same_rows
+1
+##########################################################
+# Strings: binary collation
+##########################################################
+# op = const
+# SELECT host, COUNT(*) c, SUM(bytes) s FROM g WHERE op = 'read' GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# op IN (...), NOT IN
+# SELECT host, COUNT(*) c FROM g WHERE op IN ('read', 'open', 'zzz') GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# op IN (...), NOT IN
+# SELECT host, COUNT(*) c FROM g WHERE op NOT IN ('read', 'open') GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# op <> const (NULL rows do not pass)
+# SELECT host, COUNT(*) c FROM g WHERE op <> 'write' GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# op LIKE / NOT LIKE
+# SELECT host, COUNT(*) c FROM g WHERE op LIKE 'r%' GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# op LIKE / NOT LIKE
+# SELECT host, COUNT(*) c FROM g WHERE op NOT LIKE 'r%' GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# op <, >=, BETWEEN (binary order)
+# SELECT host, COUNT(*) c FROM g WHERE op < 'p' AND op >= 'c' GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# op <, >=, BETWEEN (binary order)
+# SELECT host, COUNT(*) c FROM g WHERE op BETWEEN 'o' AND 'w' GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# op IS NULL / IS NOT NULL / <=> NULL / <=> const
+# SELECT host, COUNT(*) c FROM g WHERE op IS NULL GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# op IS NULL / IS NOT NULL / <=> NULL / <=> const
+# SELECT host, COUNT(*) c FROM g WHERE op IS NOT NULL GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# op IS NULL / IS NOT NULL / <=> NULL / <=> const
+# SELECT host, COUNT(*) c FROM g WHERE op <=> NULL GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# op IS NULL / IS NOT NULL / <=> NULL / <=> const
+# SELECT host, COUNT(*) c FROM g WHERE op <=> 'open' GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# no value passes (empty answer)
+# SELECT host, COUNT(*) c FROM g WHERE op = 'zzz' GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# the filtered column is also the key
+# SELECT op, COUNT(*) c, MIN(ts) t0, MAX(ts) t1 FROM g WHERE op LIKE '%e%' GROUP BY op ORDER BY op
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+##########################################################
+# Strings: many distinct values
+##########################################################
+# file = const (the lab query: who accesses a file)
+# SELECT host, proc, COUNT(*) c FROM g WHERE file = '/d7/f7' GROUP BY host, proc ORDER BY c DESC, host, proc LIMIT 50
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# file IN (...) over 20011 distinct values
+# SELECT host, COUNT(*) c, SUM(bytes) s FROM g WHERE file IN ('/d1/f1', '/d2/f2', '/d3/f3', '/d4/f4', '/nope') GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# file LIKE over 20011 distinct values, key = another column
+# SELECT op, COUNT(*) c FROM g WHERE file LIKE '/d1_/f1%' GROUP BY op ORDER BY op
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# file with a time range and a TAG
+# SELECT proc, COUNT(*) c FROM g WHERE file = '/d7/f7' AND host IN ('h0', 'h3') AND ts >= '2024-03-02' AND ts < '2024-03-05' GROUP BY proc ORDER BY proc
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+##########################################################
+# Strings: _ci collation, PAD SPACE, CHAR
+##########################################################
+# nm (_ci, PAD SPACE): equal to 'read' ignoring case and trailing spaces
+# SELECT host, COUNT(*) c FROM g WHERE nm = 'read' GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# nm (_ci, PAD SPACE): equal to 'read' ignoring case and trailing spaces
+# SELECT host, COUNT(*) c FROM g WHERE nm = 'READ   ' GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# nm (_ci, PAD SPACE): equal to 'read' ignoring case and trailing spaces
+# SELECT host, COUNT(*) c FROM g WHERE nm IN ('Read', 'x') GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# nm LIKE does not ignore trailing spaces
+# SELECT host, COUNT(*) c FROM g WHERE nm LIKE 'read' GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# nm LIKE does not ignore trailing spaces
+# SELECT host, COUNT(*) c FROM g WHERE nm LIKE 'rea%' GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# nm order comparisons
+# SELECT host, COUNT(*) c FROM g WHERE nm > 'Q' OR nm < 'A' GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# CHAR column
+# SELECT host, COUNT(*) c FROM g WHERE ch = 'ab' GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# CHAR column
+# SELECT host, COUNT(*) c FROM g WHERE ch LIKE 'a%' OR ch IS NULL GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+##########################################################
+# Integers
+##########################################################
+# INT BETWEEN / NOT BETWEEN, negatives
+# SELECT host, COUNT(*) c, SUM(n) s FROM g WHERE n BETWEEN -5 AND 10 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# INT BETWEEN / NOT BETWEEN, negatives
+# SELECT host, COUNT(*) c FROM g WHERE n NOT BETWEEN -5 AND 70 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# INT comparisons, IN, NOT IN, IS NULL, decimal and double constants
+# SELECT host, COUNT(*) c FROM g WHERE n >= 50 AND n <> 55 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# INT comparisons, IN, NOT IN, IS NULL, decimal and double constants
+# SELECT host, COUNT(*) c FROM g WHERE n IN (-20, 0, 7, 79) GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# INT comparisons, IN, NOT IN, IS NULL, decimal and double constants
+# SELECT host, COUNT(*) c FROM g WHERE n NOT IN (-20, 0, 7, 79) GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# INT comparisons, IN, NOT IN, IS NULL, decimal and double constants
+# SELECT host, COUNT(*) c FROM g WHERE n IS NULL GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# INT comparisons, IN, NOT IN, IS NULL, decimal and double constants
+# SELECT host, COUNT(*) c FROM g WHERE n IS NOT NULL GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# INT comparisons, IN, NOT IN, IS NULL, decimal and double constants
+# SELECT host, COUNT(*) c FROM g WHERE n > 4.95e1 AND n < 1e2 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# the filtered integer column is the key
+# SELECT n, COUNT(*) c FROM g WHERE n BETWEEN 0 AND 5 GROUP BY n ORDER BY n
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# BIGINT UNSIGNED with the high bit set
+# SELECT host, COUNT(*) c FROM g WHERE u > 9223372036854775808 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# BIGINT UNSIGNED with the high bit set
+# SELECT host, COUNT(*) c FROM g WHERE u >= 18446744073709551000 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# BIGINT UNSIGNED with the high bit set
+# SELECT host, COUNT(*) c FROM g WHERE u = 18446744073709551614 OR u = 3 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# BIGINT UNSIGNED with the high bit set
+# SELECT host, COUNT(*) c FROM g WHERE u BETWEEN 9000000000000000000 AND 9300000000000000000 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# BIGINT UNSIGNED with the high bit set
+# SELECT u, COUNT(*) c FROM g WHERE u > 18446744073709551600 GROUP BY u ORDER BY u
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# BIGINT UNSIGNED with the high bit set
+# SELECT host, COUNT(*) c FROM g WHERE u < 0 OR u IS NULL GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+##########################################################
+# OR / NOT over the same column
+##########################################################
+# OR of two comparisons, NOT of an OR
+# SELECT host, COUNT(*) c FROM g WHERE op = 'read' OR op = 'open' GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# OR of two comparisons, NOT of an OR
+# SELECT host, COUNT(*) c FROM g WHERE NOT (op = 'read' OR op LIKE 'w%') GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# OR of two comparisons, NOT of an OR
+# SELECT host, COUNT(*) c FROM g WHERE (n < 0 OR n > 70) AND n <> 75 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# OR of two comparisons, NOT of an OR
+# SELECT host, COUNT(*) c FROM g WHERE NOT (n BETWEEN 0 AND 60) OR n IS NULL GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# OR of two comparisons, NOT of an OR
+# SELECT host, COUNT(*) c FROM g WHERE NOT (op IS NULL) AND NOT (op = 'close') GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+##########################################################
+# Combinations
+##########################################################
+# TAG IN + time range + a column predicate
+# SELECT host, COUNT(*) c, SUM(bytes) s FROM g WHERE host IN ('h1', 'h4') AND ts >= '2024-03-02 00:00:00' AND ts < '2024-03-04 12:00:00' AND op = 'read' GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# predicates on two different columns (AND), each its own dictionary
+# SELECT host, COUNT(*) c FROM g WHERE op = 'read' AND n > 10 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# predicates on two different columns (AND), each its own dictionary
+# SELECT proc, COUNT(*) c, MIN(ts) t0 FROM g WHERE op IN ('read', 'READ') AND nm = 'read' AND u > 9223372036854775808 AND file LIKE '/d1%' GROUP BY proc ORDER BY proc
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# predicates together with every aggregate
+# SELECT host, proc, COUNT(*) c, COUNT(n) cn, SUM(n) sn, AVG(n) an, MIN(n) mn, MAX(n) xn, MIN(ts) t0, MAX(ts) t1 FROM g WHERE op <> 'open' AND n IS NOT NULL GROUP BY host, proc ORDER BY host, proc
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# HAVING, ORDER BY aggregate, LIMIT / OFFSET with a predicate
+# SELECT host, COUNT(*) c, SUM(bytes) s FROM g WHERE op = 'read' GROUP BY host HAVING c > 100 ORDER BY s DESC, host LIMIT 3 OFFSET 1
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+##########################################################
+# Prepared statements: the parameters are bound at every EXECUTE
+##########################################################
+# PREPARE / EXECUTE with different parameters
+# PREPARE p FROM 'SELECT host, COUNT(*) c FROM g WHERE op = ? AND n > ? GROUP BY host ORDER BY host'; SET @a= 'read'; SET @b= 10; EXECUTE p USING @a, @b; SET @a= 'open'; SET @b= -30; EXECUTE p USING @a, @b; SET @a= NULL; EXECUTE p USING @a, @b; DEALLOCATE PREPARE p;
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=3)
+# PREPARE / EXECUTE with different parameters
+# PREPARE p FROM 'SELECT proc, COUNT(*) c FROM g WHERE file IN (?, ?) AND ts >= ? GROUP BY proc ORDER BY proc'; SET @a= '/d7/f7'; SET @b= '/d8/f8'; SET @c= '2024-03-02'; EXECUTE p USING @a, @b, @c; SET @a= '/d9/f9'; SET @c= '2024-03-06'; EXECUTE p USING @a, @b, @c; DEALLOCATE PREPARE p;
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=2)
+##########################################################
+# Refused (same answer, the engine does not run them)
+##########################################################
+# one conjunct over two columns (OR across columns)
+# SELECT host, COUNT(*) c FROM g WHERE op = 'read' OR n > 70 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# comparison between two columns
+# SELECT host, COUNT(*) c FROM g WHERE n > bytes GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# a function of the column
+# SELECT host, COUNT(*) c FROM g WHERE UPPER(op) = 'READ' GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# a string column against a number (the server converts and warns per row)
+# SELECT host, COUNT(*) c FROM g WHERE op = 5 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# a function that is not constant for the statement (SLEEP)
+# SELECT host, COUNT(*) c FROM g WHERE n > SLEEP(0) GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# subquery
+# SELECT host, COUNT(*) c FROM g WHERE n > (SELECT MIN(n) FROM g t2) + 90 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# predicate on a TAG column that is not =/IN
+# SELECT host, COUNT(*) c FROM g WHERE host LIKE 'h1%' GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine did not run it
+##########################################################
+# DELETE (tombstones) and the dictionary
+##########################################################
+DELETE FROM test.g WHERE host = 'h2' AND ts < '2024-03-03';
+DELETE FROM mirror.g WHERE host = 'h2' AND ts < '2024-03-03';
+DELETE FROM test.g WHERE op = 'open' AND n > 30;
+DELETE FROM mirror.g WHERE op = 'open' AND n > 30;
+DELETE FROM test.g WHERE file = '/d7/f7';
+DELETE FROM mirror.g WHERE file = '/d7/f7';
+# after DELETE: the deleted values leave the dictionary and the counts
+# SELECT host, COUNT(*) c FROM g WHERE op IN ('read', 'open') GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# after DELETE: the deleted values leave the dictionary and the counts
+# SELECT proc, COUNT(*) c FROM g WHERE file IN ('/d7/f7', '/d8/f8') GROUP BY proc ORDER BY proc
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# after DELETE: the deleted values leave the dictionary and the counts
+# SELECT op, COUNT(*) c FROM g WHERE n > 30 GROUP BY op ORDER BY op
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+FLUSH TABLES g;
+OPTIMIZE TABLE g;
+Table	Op	Msg_type	Msg_text
+test.g	optimize	status	OK
+# after DELETE: the deleted values leave the dictionary and the counts
+# SELECT host, COUNT(*) c FROM g WHERE op IN ('read', 'open') AND n > 0 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+##########################################################
+# The laboratory queries (q02, q05, q05b) are accepted
+##########################################################
+CREATE TABLE e (
+ts         DATETIME(6)  NOT NULL,
+host       VARCHAR(32)  NOT NULL COMMENT 'TAG',
+process    VARCHAR(63)  NOT NULL COMMENT 'TAG',
+user_name  VARCHAR(32)  NOT NULL,
+folder     VARCHAR(255) NOT NULL,
+file       VARCHAR(512) NOT NULL,
+op         VARCHAR(8)   NOT NULL,
+bytes      BIGINT       NOT NULL,
+latency_us INT          NOT NULL,
+INDEX ix_ts (ts)
+) ENGINE=MooseDB TIMESTAMP_COLUMN='ts' CHUNK_INTERVAL='1 DAY';
+INSERT INTO e SELECT '2024-03-01' + INTERVAL seq * 7 SECOND, CONCAT('host', seq MOD 9),
+CONCAT('proc', seq MOD 13), CONCAT('u', seq MOD 5),
+CONCAT('/srv/d', seq MOD 31), CONCAT('/srv/d', seq MOD 31, '/f', seq MOD 997),
+ELT(seq MOD 3 + 1, 'read', 'write', 'open'), seq MOD 4096, seq MOD 500
+FROM seq_0_to_29999;
+CREATE TABLE mirror.e LIKE test.e;
+ALTER TABLE mirror.e ENGINE=InnoDB;
+INSERT INTO mirror.e SELECT * FROM test.e;
+# q02: top folders read in an hour
+# SELECT folder, COUNT(*) AS n FROM e WHERE op = 'read' AND ts >= '2024-03-01 03:00:00' AND ts < '2024-03-01 04:00:00' GROUP BY folder ORDER BY n DESC, folder LIMIT 20
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# q05: who accesses a file (no time predicate)
+# SELECT host, process, COUNT(*) AS n FROM e WHERE file = '/srv/d5/f5' GROUP BY host, process ORDER BY n DESC, host, process LIMIT 50
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# q05b: who accesses a file, in a day
+# SELECT host, process, COUNT(*) AS n FROM e WHERE file = '/srv/d5/f5' AND ts >= '2024-03-01' AND ts < '2024-03-02' GROUP BY host, process ORDER BY n DESC, host, process LIMIT 50
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+DROP TABLE e;
+DROP DATABASE mirror;
+DROP TABLE g;

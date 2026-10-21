@@ -255,12 +255,25 @@ UPDATE t, c SET t.v = c.v + 100 WHERE t.host = c.host;
 ERROR HY000: Storage engine MooseDB of the table `test`.`t` doesn't have this option
 UPDATE c, t SET t.v = 7 WHERE t.host = c.host;
 ERROR HY000: Storage engine MooseDB of the table `test`.`t` doesn't have this option
+# DELETE is supported (delete.test): range, ORDER BY/LIMIT and multi-table forms
 DELETE FROM t WHERE ts < '2030-01-01';
-ERROR HY000: Storage engine MooseDB of the table `test`.`t` doesn't have this option
+SELECT ROW_COUNT();
+ROW_COUNT()
+2
+INSERT INTO t VALUES ('2026-01-01', 'a', 1), ('2026-01-02', 'b', 2);
 DELETE FROM t ORDER BY ts LIMIT 1;
-ERROR HY000: Storage engine MooseDB of the table `test`.`t` doesn't have this option
+SELECT ROW_COUNT();
+ROW_COUNT()
+1
+SELECT ts, host, v FROM t;
+ts	host	v
+2026-01-02 00:00:00	b	2
+INSERT INTO t VALUES ('2026-01-01', 'a', 1);
 DELETE t FROM t JOIN c ON t.host = c.host;
-ERROR HY000: Storage engine MooseDB of the table `test`.`t` doesn't have this option
+SELECT ROW_COUNT();
+ROW_COUNT()
+2
+INSERT INTO t VALUES ('2026-01-01', 'a', 1), ('2026-01-02', 'b', 2);
 # An impossible WHERE never reaches the engine
 DELETE FROM t WHERE 1 = 0;
 UPDATE t SET v = 0 WHERE 1 = 0;

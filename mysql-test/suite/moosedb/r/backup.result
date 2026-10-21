@@ -1,0 +1,24 @@
+# No MooseDB table: the backup flush works
+BACKUP STAGE START;
+BACKUP STAGE BLOCK_COMMIT;
+FLUSH NO_WRITE_TO_BINLOG ENGINE LOGS;
+BACKUP STAGE END;
+CREATE TABLE bt (ts DATETIME NOT NULL, v INT, INDEX(ts)) ENGINE=MooseDB;
+INSERT INTO bt VALUES ('2026-01-01', 1);
+# Outside a backup, FLUSH ENGINE LOGS (logrotate) still works
+FLUSH NO_WRITE_TO_BINLOG ENGINE LOGS;
+# During a backup it fails, from another connection too
+BACKUP STAGE START;
+BACKUP STAGE BLOCK_COMMIT;
+connect  con2,localhost,root,,test;
+FLUSH NO_WRITE_TO_BINLOG ENGINE LOGS;
+ERROR HY000: MooseDB tables are not copied by mariadb-backup; use mariadb-dump --lock-all-tables (see the user guide, Backup)
+disconnect con2;
+connection default;
+BACKUP STAGE END;
+# After the backup it works again; data intact
+FLUSH NO_WRITE_TO_BINLOG ENGINE LOGS;
+SELECT v FROM bt;
+v
+1
+DROP TABLE bt;

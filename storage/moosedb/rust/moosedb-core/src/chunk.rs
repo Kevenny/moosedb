@@ -1,4 +1,4 @@
-//! On-disk chunk format (`.tfl`), version 2.
+//! On-disk chunk format (`.tfl`), versions 2 and 3.
 //!
 //! ```text
 //! ┌─────────────────────────── Header (64 bytes, plaintext) ─────────────────┐
@@ -8,12 +8,14 @@
 //! │ 48 wal_seq:u64         56 schema_fp:u32    60 header_crc:u32 (of 0..60)  │
 //! ├────────────── Encryption header (32 bytes, only if ENCRYPTED) ───────────┤
 //! │ key_id:u32 key_version:u32 iv[16] reserved:u32 crc:u32                   │
-//! ├──────────────────── Data blocks  ─┐                                      │
-//! │ column blocks (see `block`)       │ encrypted with AES-256-CTR when      │
-//! ├──────────────────── Series index ─┤ ENCRYPTED; keystream offset 0 is the │
-//! │ raw_bytes:u64 bucket:i64×2 n:u32  │ first byte after the headers         │
-//! │ entries (see below)               │                                      │
-//! ├──────────────────── Bloom filter ─┘                                      │
+//! ├──────────────────── Data blocks  ─┐ v3 (ENCRYPTED): each block is       │
+//! │ column blocks (see `block`)       │ AES-256-GCM sealed and followed by   │
+//! ├──────────────────── Series index ─┤ its 16-byte tag (BlockRef.len does   │
+//! │ raw_bytes:u64 bucket:i64×2 n:u32  │ not count the tag, offsets do);      │
+//! │ entries (see below)               │ index + Bloom filter are one sealed  │
+//! ├──────────────────── Bloom filter ─┘ unit plus tag. v2 ENCRYPTED (legacy,│
+//! │ read-only): AES-256-CTR, keystream offset 0 = first byte after headers,  │
+//! │ no tags.                                                                 │
 //! ├──────────────────────────── Footer (24 bytes, plaintext) ────────────────┤
 //! │ index_offset:u64 bloom_offset:u64 file_crc:u32 "TFLE"                    │
 //! └──────────────────────────────────────────────────────────────────────────┘
@@ -24,7 +26,12 @@
 //!
 //! `file_crc` covers every byte before it (as stored, i.e. ciphertext), so
 //! CHECK TABLE works without the key. Each block also has its own CRC over
-//! the plaintext, which catches both corruption and a wrong key on read.
+//! the plaintext. In v3 the GCM tags (nonce and AAD: see `crypto`) are what
+//! authenticate the file: the header bytes are part of every unit's AAD and
+//! the unit position part of its nonce, so blocks cannot be swapped, moved or
+//! edited, and the index (which names the blocks) cannot be forged either.
+//! Plaintext chunks stay v2 (older binaries read them); v3 is refused by
+//! binaries that predate it.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -33,18 +40,28 @@ use std::sync::{Arc, OnceLock};
 
 use crate::bytes::{put_i64, put_u32, put_u64, ByteReader};
 use crate::compression::Codec;
-use crate::crypto::{CipherParams, PARAMS_LEN};
+use crate::crypto::{CipherParams, PARAMS_LEN, TAG_LEN};
 use crate::error::{corrupt, Result};
+use crate::format::{CHUNK_AEAD, CHUNK_PLAIN};
 use crate::fsutil::remove_if_exists;
 use crate::index::bloom::Bloom;
 use crate::schema::Value;
 
 pub(crate) const MAGIC: &[u8; 4] = b"TFLW";
 pub(crate) const FOOTER_MAGIC: &[u8; 4] = b"TFLE";
-pub(crate) const VERSION: u16 = 2;
 pub(crate) const HEADER_LEN: usize = 64;
 pub(crate) const ENC_HEADER_LEN: usize = PARAMS_LEN;
 pub(crate) const FOOTER_LEN: usize = 24;
+/// AAD unit tag of a column block (v3).
+pub(crate) const UNIT_BLOCK: u8 = 0;
+
+/// AAD of the sealed index+bloom unit (v3): unit tag and where the Bloom
+/// filter starts, so the split between the two cannot be moved.
+pub(crate) fn index_ctx(bloom_offset: u64) -> [u8; 9] {
+    let mut c = [1u8; 9];
+    c[1..].copy_from_slice(&bloom_offset.to_le_bytes());
+    c
+}
 
 pub mod flags {
     pub const COMPRESSED: u16 = 1 << 0;
@@ -114,8 +131,14 @@ impl ChunkHeader {
             wal_seq: r.u64()?,
             schema_fingerprint: r.u32()?,
         };
-        if h.version != VERSION {
-            return Err(corrupt(format!("chunk format version {} not supported (expected {VERSION})", h.version)));
+        if h.version != CHUNK_PLAIN && h.version != CHUNK_AEAD {
+            return Err(corrupt(format!(
+                "chunk format version {} not supported (this binary reads {CHUNK_PLAIN} and {CHUNK_AEAD})",
+                h.version
+            )));
+        }
+        if h.version == CHUNK_AEAD && !h.is_encrypted() {
+            return Err(corrupt("chunk version 3 without the ENCRYPTED flag"));
         }
         Ok(h)
     }
@@ -126,6 +149,20 @@ impl ChunkHeader {
 
     pub fn is_encrypted(&self) -> bool {
         self.flags & flags::ENCRYPTED != 0
+    }
+
+    /// Whether blocks and index carry GCM tags (format v3).
+    pub(crate) fn is_authenticated(&self) -> bool {
+        self.version == CHUNK_AEAD
+    }
+
+    /// Bytes a stored block takes beyond its `BlockRef.len`.
+    pub(crate) fn block_overhead(&self) -> usize {
+        if self.is_authenticated() {
+            TAG_LEN
+        } else {
+            0
+        }
     }
 
     /// Offset of the first data block.
@@ -245,6 +282,11 @@ pub struct ChunkMeta {
     /// Indexes of `series`, sorted by `(series_id, index)`; built on first use
     /// (see `entries_of`). `None` when the chunk has more entries than `u32`.
     pub(crate) by_id: OnceLock<Option<Vec<u32>>>,
+    /// Highest tombstone sequence the rows of this chunk already reflect (see
+    /// `tomb`): a range tombstone newer than this hides rows of the chunk.
+    /// Kept in the MANIFEST, not in the chunk file. `u64::MAX` = no tombstone
+    /// applies (a chunk staged by a statement that has not committed yet).
+    pub(crate) born: u64,
 }
 
 impl ChunkMeta {
@@ -352,7 +394,7 @@ mod tests {
     #[test]
     fn header_roundtrip_and_crc() {
         let h = ChunkHeader {
-            version: VERSION,
+            version: CHUNK_AEAD,
             flags: chunk_flags(Codec::Zstd(3), true),
             ts_min: -5,
             ts_max: 99,

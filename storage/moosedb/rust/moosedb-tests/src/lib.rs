@@ -813,7 +813,7 @@ mod encryption_tests {
     /// While set, key id 55 resolves to different key bytes ("wrong key").
     static WRONG_KEY_55: AtomicBool = AtomicBool::new(false);
 
-    fn install() {
+    pub(crate) fn install() {
         static ONCE: Once = Once::new();
         ONCE.call_once(|| {
             set_key_provider(Some(Arc::new(|id: u32, version: Option<u32>| {
@@ -1230,3 +1230,12 @@ mod read_tests;
 
 #[cfg(test)]
 mod unique_tests;
+
+#[cfg(test)]
+mod delete_tests;
+
+#[cfg(test)]
+mod agg_tests;
+
+#[cfg(test)]
+mod compat_tests;

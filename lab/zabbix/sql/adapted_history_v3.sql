@@ -10,7 +10,7 @@
 --     em vez de varrer todas as séries do intervalo. INDEX (clock) continua
 --     obrigatório (consultas sem itemid).
 -- Restrições que permanecem: sem PRIMARY KEY (itemid,clock,ns) (UNIQUE/PRIMARY
--- são recusados), housekeeper de histórico desligado, expiração por
+-- são recusados), o housekeeper de histórico pode ficar ligado (DELETE por tombstones); a expiração por idade é mais barata por
 -- RETENTION_PERIOD.
 --
 -- Requer a engine com TAG inteiro com pushdown, eixo inteiro e índice composto

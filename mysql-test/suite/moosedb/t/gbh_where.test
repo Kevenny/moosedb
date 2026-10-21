@@ -1,0 +1,337 @@
+#
+# GROUP BY done by the engine: WHERE with predicates on ordinary columns
+# (moosedb_group_by_pushdown). The engine lists the distinct values of each
+# filtered column over the query's time range and series, the server's own Items
+# decide each value, and the engine filters by the verdicts. Differential test
+# (OFF / ON / InnoDB must print the same), include/gbh_diff.inc.
+#
+--source include/not_embedded.inc
+--source include/have_innodb.inc
+--source include/have_sequence.inc
+--source suite/moosedb/include/have_moosedb.inc
+
+--let $refused= 0
+--let $sorted= 0
+--let $show= 0
+--let $pre=
+
+CREATE TABLE g (
+  ts    DATETIME NOT NULL,
+  host  VARCHAR(16) NOT NULL COMMENT 'TAG',
+  proc  VARCHAR(8) COMMENT 'TAG',
+  op    VARCHAR(8) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin,
+  nm    VARCHAR(12) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci,
+  ch    CHAR(6) CHARACTER SET latin1 COLLATE latin1_swedish_ci,
+  file  VARCHAR(40) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+  n     INT,
+  u     BIGINT UNSIGNED,
+  bytes BIGINT NOT NULL,
+  INDEX(ts)
+) ENGINE=MooseDB CHUNK_INTERVAL='1 DAY';
+
+--echo # 20000 rows in chunks, 10000 more left in the MemTable
+INSERT INTO g SELECT '2024-03-01' + INTERVAL seq * 20 SECOND,
+                     CONCAT('h', seq MOD 7),
+                     IF(seq MOD 11 = 0, NULL, CONCAT('p', seq MOD 5)),
+                     IF(seq MOD 13 = 0, NULL, ELT(seq MOD 5 + 1, 'read', 'write', 'open', 'close', 'READ')),
+                     IF(seq MOD 17 = 0, NULL, ELT(seq MOD 4 + 1, 'READ', 'read ', 'Read', 'rEAD  ')),
+                     IF(seq MOD 19 = 0, NULL, ELT(seq MOD 3 + 1, 'ab', 'AB ', 'b')),
+                     CONCAT('/d', seq MOD 50, '/f', seq MOD 20011),
+                     IF(seq MOD 9 = 0, NULL, CAST(seq MOD 100 AS SIGNED) - 20),
+                     IF(seq MOD 8 = 0, NULL, IF(seq MOD 2, 18446744073709551615 - seq, seq)),
+                     (seq * 7) MOD 1000
+  FROM seq_0_to_19999;
+FLUSH TABLES g;
+INSERT INTO g SELECT '2024-03-01' + INTERVAL seq * 20 SECOND,
+                     CONCAT('h', seq MOD 7),
+                     IF(seq MOD 11 = 0, NULL, CONCAT('p', seq MOD 5)),
+                     IF(seq MOD 13 = 0, NULL, ELT(seq MOD 5 + 1, 'read', 'write', 'open', 'close', 'READ')),
+                     IF(seq MOD 17 = 0, NULL, ELT(seq MOD 4 + 1, 'READ', 'read ', 'Read', 'rEAD  ')),
+                     IF(seq MOD 19 = 0, NULL, ELT(seq MOD 3 + 1, 'ab', 'AB ', 'b')),
+                     CONCAT('/d', seq MOD 50, '/f', seq MOD 20011),
+                     IF(seq MOD 9 = 0, NULL, CAST(seq MOD 100 AS SIGNED) - 20),
+                     IF(seq MOD 8 = 0, NULL, IF(seq MOD 2, 18446744073709551615 - seq, seq)),
+                     (seq * 7) MOD 1000
+  FROM seq_20000_to_29999;
+
+CREATE DATABASE mirror;
+CREATE TABLE mirror.g LIKE test.g;
+ALTER TABLE mirror.g ENGINE=InnoDB;
+INSERT INTO mirror.g SELECT * FROM test.g;
+SELECT (SELECT COUNT(*) FROM test.g) = (SELECT COUNT(*) FROM mirror.g) AS same_rows;
+
+--echo ##########################################################
+--echo # Strings: binary collation
+--echo ##########################################################
+--let $label= op = const
+--let $q= SELECT host, COUNT(*) c, SUM(bytes) s FROM g WHERE op = 'read' GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= op IN (...), NOT IN
+--let $q= SELECT host, COUNT(*) c FROM g WHERE op IN ('read', 'open', 'zzz') GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $q= SELECT host, COUNT(*) c FROM g WHERE op NOT IN ('read', 'open') GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= op <> const (NULL rows do not pass)
+--let $q= SELECT host, COUNT(*) c FROM g WHERE op <> 'write' GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= op LIKE / NOT LIKE
+--let $q= SELECT host, COUNT(*) c FROM g WHERE op LIKE 'r%' GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $q= SELECT host, COUNT(*) c FROM g WHERE op NOT LIKE 'r%' GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= op <, >=, BETWEEN (binary order)
+--let $q= SELECT host, COUNT(*) c FROM g WHERE op < 'p' AND op >= 'c' GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $q= SELECT host, COUNT(*) c FROM g WHERE op BETWEEN 'o' AND 'w' GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= op IS NULL / IS NOT NULL / <=> NULL / <=> const
+--let $q= SELECT host, COUNT(*) c FROM g WHERE op IS NULL GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $q= SELECT host, COUNT(*) c FROM g WHERE op IS NOT NULL GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $q= SELECT host, COUNT(*) c FROM g WHERE op <=> NULL GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $q= SELECT host, COUNT(*) c FROM g WHERE op <=> 'open' GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= no value passes (empty answer)
+--let $q= SELECT host, COUNT(*) c FROM g WHERE op = 'zzz' GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= the filtered column is also the key
+--let $q= SELECT op, COUNT(*) c, MIN(ts) t0, MAX(ts) t1 FROM g WHERE op LIKE '%e%' GROUP BY op ORDER BY op
+--source suite/moosedb/include/gbh_diff.inc
+
+--echo ##########################################################
+--echo # Strings: many distinct values
+--echo ##########################################################
+--let $label= file = const (the lab query: who accesses a file)
+--let $q= SELECT host, proc, COUNT(*) c FROM g WHERE file = '/d7/f7' GROUP BY host, proc ORDER BY c DESC, host, proc LIMIT 50
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= file IN (...) over 20011 distinct values
+--let $q= SELECT host, COUNT(*) c, SUM(bytes) s FROM g WHERE file IN ('/d1/f1', '/d2/f2', '/d3/f3', '/d4/f4', '/nope') GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= file LIKE over 20011 distinct values, key = another column
+--let $q= SELECT op, COUNT(*) c FROM g WHERE file LIKE '/d1_/f1%' GROUP BY op ORDER BY op
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= file with a time range and a TAG
+--let $q= SELECT proc, COUNT(*) c FROM g WHERE file = '/d7/f7' AND host IN ('h0', 'h3') AND ts >= '2024-03-02' AND ts < '2024-03-05' GROUP BY proc ORDER BY proc
+--source suite/moosedb/include/gbh_diff.inc
+
+--echo ##########################################################
+--echo # Strings: _ci collation, PAD SPACE, CHAR
+--echo ##########################################################
+--let $label= nm (_ci, PAD SPACE): equal to 'read' ignoring case and trailing spaces
+--let $q= SELECT host, COUNT(*) c FROM g WHERE nm = 'read' GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $q= SELECT host, COUNT(*) c FROM g WHERE nm = 'READ   ' GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $q= SELECT host, COUNT(*) c FROM g WHERE nm IN ('Read', 'x') GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= nm LIKE does not ignore trailing spaces
+--let $q= SELECT host, COUNT(*) c FROM g WHERE nm LIKE 'read' GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $q= SELECT host, COUNT(*) c FROM g WHERE nm LIKE 'rea%' GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= nm order comparisons
+--let $q= SELECT host, COUNT(*) c FROM g WHERE nm > 'Q' OR nm < 'A' GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= CHAR column
+--let $q= SELECT host, COUNT(*) c FROM g WHERE ch = 'ab' GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $q= SELECT host, COUNT(*) c FROM g WHERE ch LIKE 'a%' OR ch IS NULL GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+
+--echo ##########################################################
+--echo # Integers
+--echo ##########################################################
+--let $label= INT BETWEEN / NOT BETWEEN, negatives
+--let $q= SELECT host, COUNT(*) c, SUM(n) s FROM g WHERE n BETWEEN -5 AND 10 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $q= SELECT host, COUNT(*) c FROM g WHERE n NOT BETWEEN -5 AND 70 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= INT comparisons, IN, NOT IN, IS NULL, decimal and double constants
+--let $q= SELECT host, COUNT(*) c FROM g WHERE n >= 50 AND n <> 55 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $q= SELECT host, COUNT(*) c FROM g WHERE n IN (-20, 0, 7, 79) GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $q= SELECT host, COUNT(*) c FROM g WHERE n NOT IN (-20, 0, 7, 79) GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $q= SELECT host, COUNT(*) c FROM g WHERE n IS NULL GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $q= SELECT host, COUNT(*) c FROM g WHERE n IS NOT NULL GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $q= SELECT host, COUNT(*) c FROM g WHERE n > 4.95e1 AND n < 1e2 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= the filtered integer column is the key
+--let $q= SELECT n, COUNT(*) c FROM g WHERE n BETWEEN 0 AND 5 GROUP BY n ORDER BY n
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= BIGINT UNSIGNED with the high bit set
+--let $q= SELECT host, COUNT(*) c FROM g WHERE u > 9223372036854775808 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $q= SELECT host, COUNT(*) c FROM g WHERE u >= 18446744073709551000 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $q= SELECT host, COUNT(*) c FROM g WHERE u = 18446744073709551614 OR u = 3 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $q= SELECT host, COUNT(*) c FROM g WHERE u BETWEEN 9000000000000000000 AND 9300000000000000000 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $q= SELECT u, COUNT(*) c FROM g WHERE u > 18446744073709551600 GROUP BY u ORDER BY u
+--source suite/moosedb/include/gbh_diff.inc
+--let $q= SELECT host, COUNT(*) c FROM g WHERE u < 0 OR u IS NULL GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+
+--echo ##########################################################
+--echo # OR / NOT over the same column
+--echo ##########################################################
+--let $label= OR of two comparisons, NOT of an OR
+--let $q= SELECT host, COUNT(*) c FROM g WHERE op = 'read' OR op = 'open' GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $q= SELECT host, COUNT(*) c FROM g WHERE NOT (op = 'read' OR op LIKE 'w%') GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $q= SELECT host, COUNT(*) c FROM g WHERE (n < 0 OR n > 70) AND n <> 75 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $q= SELECT host, COUNT(*) c FROM g WHERE NOT (n BETWEEN 0 AND 60) OR n IS NULL GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $q= SELECT host, COUNT(*) c FROM g WHERE NOT (op IS NULL) AND NOT (op = 'close') GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+
+--echo ##########################################################
+--echo # Combinations
+--echo ##########################################################
+--let $label= TAG IN + time range + a column predicate
+--let $q= SELECT host, COUNT(*) c, SUM(bytes) s FROM g WHERE host IN ('h1', 'h4') AND ts >= '2024-03-02 00:00:00' AND ts < '2024-03-04 12:00:00' AND op = 'read' GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= predicates on two different columns (AND), each its own dictionary
+--let $q= SELECT host, COUNT(*) c FROM g WHERE op = 'read' AND n > 10 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $q= SELECT proc, COUNT(*) c, MIN(ts) t0 FROM g WHERE op IN ('read', 'READ') AND nm = 'read' AND u > 9223372036854775808 AND file LIKE '/d1%' GROUP BY proc ORDER BY proc
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= predicates together with every aggregate
+--let $q= SELECT host, proc, COUNT(*) c, COUNT(n) cn, SUM(n) sn, AVG(n) an, MIN(n) mn, MAX(n) xn, MIN(ts) t0, MAX(ts) t1 FROM g WHERE op <> 'open' AND n IS NOT NULL GROUP BY host, proc ORDER BY host, proc
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= HAVING, ORDER BY aggregate, LIMIT / OFFSET with a predicate
+--let $q= SELECT host, COUNT(*) c, SUM(bytes) s FROM g WHERE op = 'read' GROUP BY host HAVING c > 100 ORDER BY s DESC, host LIMIT 3 OFFSET 1
+--source suite/moosedb/include/gbh_diff.inc
+
+--echo ##########################################################
+--echo # Prepared statements: the parameters are bound at every EXECUTE
+--echo ##########################################################
+--let $label= PREPARE / EXECUTE with different parameters
+--let $q= PREPARE p FROM 'SELECT host, COUNT(*) c FROM g WHERE op = ? AND n > ? GROUP BY host ORDER BY host'; SET @a= 'read'; SET @b= 10; EXECUTE p USING @a, @b; SET @a= 'open'; SET @b= -30; EXECUTE p USING @a, @b; SET @a= NULL; EXECUTE p USING @a, @b; DEALLOCATE PREPARE p;
+--source suite/moosedb/include/gbh_diff.inc
+--let $q= PREPARE p FROM 'SELECT proc, COUNT(*) c FROM g WHERE file IN (?, ?) AND ts >= ? GROUP BY proc ORDER BY proc'; SET @a= '/d7/f7'; SET @b= '/d8/f8'; SET @c= '2024-03-02'; EXECUTE p USING @a, @b, @c; SET @a= '/d9/f9'; SET @c= '2024-03-06'; EXECUTE p USING @a, @b, @c; DEALLOCATE PREPARE p;
+--source suite/moosedb/include/gbh_diff.inc
+
+--echo ##########################################################
+--echo # Refused (same answer, the engine does not run them)
+--echo ##########################################################
+--let $label= one conjunct over two columns (OR across columns)
+--let $refused= 1
+--let $q= SELECT host, COUNT(*) c FROM g WHERE op = 'read' OR n > 70 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= comparison between two columns
+--let $refused= 1
+--let $q= SELECT host, COUNT(*) c FROM g WHERE n > bytes GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= a function of the column
+--let $refused= 1
+--let $q= SELECT host, COUNT(*) c FROM g WHERE UPPER(op) = 'READ' GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= a string column against a number (the server converts and warns per row)
+--let $refused= 1
+--let $q= SELECT host, COUNT(*) c FROM g WHERE op = 5 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= a function that is not constant for the statement (SLEEP)
+--let $refused= 1
+--let $q= SELECT host, COUNT(*) c FROM g WHERE n > SLEEP(0) GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= subquery
+--let $refused= 1
+--let $q= SELECT host, COUNT(*) c FROM g WHERE n > (SELECT MIN(n) FROM g t2) + 90 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+
+--let $label= predicate on a TAG column that is not =/IN
+--let $refused= 1
+--let $q= SELECT host, COUNT(*) c FROM g WHERE host LIKE 'h1%' GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+
+--echo ##########################################################
+--echo # DELETE (tombstones) and the dictionary
+--echo ##########################################################
+DELETE FROM test.g WHERE host = 'h2' AND ts < '2024-03-03';
+DELETE FROM mirror.g WHERE host = 'h2' AND ts < '2024-03-03';
+DELETE FROM test.g WHERE op = 'open' AND n > 30;
+DELETE FROM mirror.g WHERE op = 'open' AND n > 30;
+DELETE FROM test.g WHERE file = '/d7/f7';
+DELETE FROM mirror.g WHERE file = '/d7/f7';
+--let $label= after DELETE: the deleted values leave the dictionary and the counts
+--let $q= SELECT host, COUNT(*) c FROM g WHERE op IN ('read', 'open') GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $q= SELECT proc, COUNT(*) c FROM g WHERE file IN ('/d7/f7', '/d8/f8') GROUP BY proc ORDER BY proc
+--source suite/moosedb/include/gbh_diff.inc
+--let $q= SELECT op, COUNT(*) c FROM g WHERE n > 30 GROUP BY op ORDER BY op
+--source suite/moosedb/include/gbh_diff.inc
+FLUSH TABLES g;
+OPTIMIZE TABLE g;
+--let $q= SELECT host, COUNT(*) c FROM g WHERE op IN ('read', 'open') AND n > 0 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+
+--echo ##########################################################
+--echo # The laboratory queries (q02, q05, q05b) are accepted
+--echo ##########################################################
+CREATE TABLE e (
+  ts         DATETIME(6)  NOT NULL,
+  host       VARCHAR(32)  NOT NULL COMMENT 'TAG',
+  process    VARCHAR(63)  NOT NULL COMMENT 'TAG',
+  user_name  VARCHAR(32)  NOT NULL,
+  folder     VARCHAR(255) NOT NULL,
+  file       VARCHAR(512) NOT NULL,
+  op         VARCHAR(8)   NOT NULL,
+  bytes      BIGINT       NOT NULL,
+  latency_us INT          NOT NULL,
+  INDEX ix_ts (ts)
+) ENGINE=MooseDB TIMESTAMP_COLUMN='ts' CHUNK_INTERVAL='1 DAY';
+INSERT INTO e SELECT '2024-03-01' + INTERVAL seq * 7 SECOND, CONCAT('host', seq MOD 9),
+                     CONCAT('proc', seq MOD 13), CONCAT('u', seq MOD 5),
+                     CONCAT('/srv/d', seq MOD 31), CONCAT('/srv/d', seq MOD 31, '/f', seq MOD 997),
+                     ELT(seq MOD 3 + 1, 'read', 'write', 'open'), seq MOD 4096, seq MOD 500
+  FROM seq_0_to_29999;
+CREATE TABLE mirror.e LIKE test.e;
+ALTER TABLE mirror.e ENGINE=InnoDB;
+INSERT INTO mirror.e SELECT * FROM test.e;
+
+--let $label= q02: top folders read in an hour
+--let $q= SELECT folder, COUNT(*) AS n FROM e WHERE op = 'read' AND ts >= '2024-03-01 03:00:00' AND ts < '2024-03-01 04:00:00' GROUP BY folder ORDER BY n DESC, folder LIMIT 20
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= q05: who accesses a file (no time predicate)
+--let $q= SELECT host, process, COUNT(*) AS n FROM e WHERE file = '/srv/d5/f5' GROUP BY host, process ORDER BY n DESC, host, process LIMIT 50
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= q05b: who accesses a file, in a day
+--let $q= SELECT host, process, COUNT(*) AS n FROM e WHERE file = '/srv/d5/f5' AND ts >= '2024-03-01' AND ts < '2024-03-02' GROUP BY host, process ORDER BY n DESC, host, process LIMIT 50
+--source suite/moosedb/include/gbh_diff.inc
+
+DROP TABLE e;
+DROP DATABASE mirror;
+DROP TABLE g;

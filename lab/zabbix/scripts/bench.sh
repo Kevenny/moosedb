@@ -171,7 +171,12 @@ echo "## Housekeeping: expirar dados com clock < $CUT ($(dtu $CUT) UTC)"
 for t in $TABLES; do echo "rows_to_expire	$t	$(q "SELECT COUNT(*) FROM $t WHERE clock<$CUT")"; done
 s=$(timeit "CALL bench_hk_delete('h_innodb',100001,$ITEMS,$CUT)")
 echo "hk_delete_per_item	h_innodb	${s}s	restantes_antigas=$(q "SELECT COUNT(*) FROM h_innodb WHERE clock<$CUT") size=$(mb $(size_of h_innodb)) MiB (o .ibd não encolhe)"
-echo "hk_delete_moose	h_moose_int	$(timeit "delete from h_moose_int where itemid=100001 and clock<$CUT")"
+# MooseDB suporta DELETE (tombstones): o mesmo housekeeper por item, na tabela com PK (v4) e na sem PK (v3)
+for t in h_moose_v3 h_moose_v4; do
+  n0=$(q "SELECT COUNT(*) FROM $t")
+  s=$(timeit "CALL bench_hk_delete('$t',100001,$ITEMS,$CUT)")
+  echo "hk_delete_per_item	$t	${s}s	apagadas=$(( n0 - $(q "SELECT COUNT(*) FROM $t") )) restantes_antigas=$(q "SELECT COUNT(*) FROM $t WHERE clock<$CUT")"
+done
 for t in h_moose_int h_moose_str h_moose_v3 h_moose_v4; do
   s=$(timeit "CALL moosedb_apply_retention('$t')")
   echo "retention_drop_chunk	$t	${s}s	restantes_antigas=$(q "SELECT COUNT(*) FROM $t WHERE clock<$CUT") total=$(q "SELECT COUNT(*) FROM $t") size=$(mb $(size_of $t)) MiB"

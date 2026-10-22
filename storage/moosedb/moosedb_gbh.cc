@@ -1724,13 +1724,83 @@ int moosedb_gbh::fetch_tags(const uint64_t *ids, uint64_t n)
   /* The series list itself (every series of the table, shared with the server) is outside the budget: it cannot be restricted to the groups. */
   if (!charge(n * sizeof(std::pair<uint64_t, uint32_t>)))
     return HA_ERR_RECORD_FILE_FULL;
+  /* The TAG cells of group g from the series' TAG values; 0 or an error code. */
+  auto fill= [&](uint32_t g, const TFRow &tags) -> int {
+    for (size_t j= 0; j < nk_; j++)
+    {
+      const gkey &k= p_.keys[j];
+      if (!k.is_tag)
+        continue;
+      kcell &c= kc(g, j);
+      if ((uint) k.tag_pos >= tags.col_count || !tags.values ||
+          tags.values[k.tag_pos].is_null)
+      {
+        c.null= 1;
+        continue;
+      }
+      const TFStr s= tags.values[k.tag_pos].data.str_val;
+      const char *sp= s.ptr ? s.ptr : "";
+      if (k.is_str)
+      {
+        if (!arena_add(sp, s.len, &c.v))
+          return HA_ERR_RECORD_FILE_FULL;
+        c.len= (uint32_t) s.len;
+      }
+      else
+      {
+        /* integer TAG: canonical decimal text */
+        const std::string txt(sp, s.len);
+        char *end= nullptr;
+        errno= 0;
+        if (k.is_unsigned)
+          c.v= (int64_t) strtoull(txt.c_str(), &end, 10);
+        else
+          c.v= (int64_t) strtoll(txt.c_str(), &end, 10);
+        if (errno || !end || end == txt.c_str() || *end)
+          return fail("unreadable integer TAG value");
+      }
+    }
+    return 0;
+  };
+
+  const uint64_t len= moosedb_series_list_len(list);
+
+  /*
+    Few groups out of many series (a TAG key with a selective WHERE): look the
+    ids up instead of walking the whole list (O(groups), not O(series)). One
+    miss (cannot happen for ids the snapshot returned) falls back to the walk.
+  */
+  if (n <= len / 8)
+  {
+    bool all= true;
+    for (uint64_t g= 0; g < n && all; g++)
+    {
+      TFRow tags{0, nullptr};
+      if (moosedb_series_list_find(list, ids[g], &tags) != TF_OK)
+      {
+        all= false;
+        break;
+      }
+      int r= fill((uint32_t) g, tags);
+      if (r)
+        return r;
+      if ((g & 0xFFFF) == 0 && check_killed())
+        return HA_ERR_QUERY_INTERRUPTED;
+    }
+    if (all)
+      return 0;
+    for (uint64_t g= 0; g < n; g++)       /* start over: cells may be half filled */
+      for (size_t j= 0; j < nk_; j++)
+        if (p_.keys[j].is_tag)
+          kc((uint32_t) g, j)= kcell();
+  }
+
   std::vector<std::pair<uint64_t, uint32_t>> by_id(n);
   for (uint64_t g= 0; g < n; g++)
     by_id[g]= {ids[g], (uint32_t) g};
   std::sort(by_id.begin(), by_id.end());
 
   uint64_t found= 0;
-  const uint64_t len= moosedb_series_list_len(list);
   for (uint64_t i= 0; i < len; i++)
   {
     if ((i & 0xFFFF) == 0 && check_killed())
@@ -1746,41 +1816,9 @@ int moosedb_gbh::fetch_tags(const uint64_t *ids, uint64_t n)
     for (; lo != by_id.end() && lo->first == id; ++lo)
     {
       found++;
-      const uint32_t g= lo->second;
-      for (size_t j= 0; j < nk_; j++)
-      {
-        const gkey &k= p_.keys[j];
-        if (!k.is_tag)
-          continue;
-        kcell &c= kc(g, j);
-        if ((uint) k.tag_pos >= tags.col_count || !tags.values ||
-            tags.values[k.tag_pos].is_null)
-        {
-          c.null= 1;
-          continue;
-        }
-        const TFStr s= tags.values[k.tag_pos].data.str_val;
-        const char *sp= s.ptr ? s.ptr : "";
-        if (k.is_str)
-        {
-          if (!arena_add(sp, s.len, &c.v))
-            return HA_ERR_RECORD_FILE_FULL;
-          c.len= (uint32_t) s.len;
-        }
-        else
-        {
-          /* integer TAG: canonical decimal text */
-          const std::string txt(sp, s.len);
-          char *end= nullptr;
-          errno= 0;
-          if (k.is_unsigned)
-            c.v= (int64_t) strtoull(txt.c_str(), &end, 10);
-          else
-            c.v= (int64_t) strtoll(txt.c_str(), &end, 10);
-          if (errno || !end || end == txt.c_str() || *end)
-            return fail("unreadable integer TAG value");
-        }
-      }
+      int r= fill(lo->second, tags);
+      if (r)
+        return r;
     }
   }
   if (found < n)

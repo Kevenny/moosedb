@@ -36,7 +36,14 @@ pub(crate) fn row_tags(schema: &Schema, row: &[Value]) -> Vec<Value> {
 struct SeriesLog {
     /// Identity of this log, unique in the process (see `SeriesSnapshot::epoch`).
     epoch: u64,
-    items: RwLock<Vec<(u64, Arc<[Value]>)>>,
+    items: RwLock<LogItems>,
+}
+
+/// The entries plus their position by id (so a few ids are found without a pass over all).
+#[derive(Default)]
+struct LogItems {
+    list: Vec<(u64, Arc<[Value]>)>,
+    pos: FastMap<u64, u32>,
 }
 
 /// Last epoch handed out; every log (new index, clear, reopen) takes the next.
@@ -88,7 +95,15 @@ impl SeriesSnapshot {
             return None;
         }
         let items = self.log.items.read().unwrap_or_else(std::sync::PoisonError::into_inner);
-        items.get(index).cloned()
+        items.list.get(index).cloned()
+    }
+
+    /// Tag values of series `id`, if it is in this snapshot: O(1), no pass over the series.
+    pub fn get_by_id(&self, id: u64) -> Option<Arc<[Value]>> {
+        let items = self.log.items.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let i = *items.pos.get(&id)? as usize;
+        // Appended after this snapshot was taken: not part of it.
+        (i < self.len).then(|| items.list.get(i).map(|(_, t)| t.clone())).flatten()
     }
 
     /// Every entry, in registration order.
@@ -115,9 +130,9 @@ fn next_version() -> u64 {
 }
 
 /// Per series, besides the key and the tag values: `by_key` bucket, `tags_by_id`
-/// bucket, `log` slot and the `Arc` header (hash tables counted at their
+/// bucket, `pos` bucket, `log` slot and the `Arc` header (hash tables counted at their
 /// power-of-two growth slack).
-const SERIES_FIXED_BYTES: usize = 190;
+const SERIES_FIXED_BYTES: usize = 190 + 24; // + `LogItems::pos` bucket
 
 pub(crate) struct SeriesIndex {
     by_key: HashMap<Vec<u8>, u64>,
@@ -175,7 +190,14 @@ impl SeriesIndex {
             + tags.iter().map(|v| std::mem::size_of::<Value>() + if let Value::Bytes(b) = v { b.len() } else { 0 }).sum::<usize>();
         self.by_key.insert(key, id);
         self.tags_by_id.insert(id, tags.clone());
-        self.log.items.write().unwrap_or_else(std::sync::PoisonError::into_inner).push((id, tags));
+        let mut items = self.log.items.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let at = items.list.len();
+        items.list.push((id, tags));
+        // shortcut: past u32::MAX series the id is not indexed (get_by_id says "absent"); callers then scan.
+        if let Ok(i) = u32::try_from(at) {
+            items.pos.insert(id, i);
+        }
+        drop(items);
         self.logged += 1;
         self.version.store(next_version(), Ordering::Release);
     }
@@ -297,6 +319,43 @@ mod tests {
         assert_ne!(SeriesIndex::default().snapshot().epoch(), idx.snapshot().epoch());
         assert_eq!(before.to_sorted_vec().len(), 3);
         assert_eq!(idx.get_or_insert(&tags("z")), 0);
+    }
+
+    #[test]
+    fn get_by_id_follows_the_snapshot() {
+        let mut idx = SeriesIndex::default();
+        let a = idx.get_or_insert(&tags("a"));
+        idx.register(40, &tags("z")).unwrap(); // id and position differ
+        let s = idx.snapshot();
+        let b = idx.get_or_insert(&tags("b")); // after the snapshot
+        assert_eq!(s.get_by_id(a).unwrap().to_vec(), tags("a"));
+        assert_eq!(s.get_by_id(40).unwrap().to_vec(), tags("z"));
+        assert!(s.get_by_id(b).is_none(), "a series added later is not in an older snapshot");
+        assert!(s.get_by_id(7).is_none());
+        assert_eq!(idx.snapshot().get_by_id(b).unwrap().to_vec(), tags("b"));
+        idx.clear();
+        assert!(idx.snapshot().get_by_id(a).is_none());
+        assert_eq!(s.get_by_id(a).unwrap().to_vec(), tags("a"), "the old snapshot outlives the clear");
+    }
+
+    /// `cargo test --release -p moosedb-core -- --ignored --nocapture series_lookup_cost`
+    #[test]
+    #[ignore = "benchmark"]
+    fn series_lookup_cost() {
+        let mut idx = SeriesIndex::default();
+        for i in 0..485_000u32 {
+            idx.get_or_insert(&[Value::Bytes(format!("host-{}", i % 2000).into_bytes()), Value::Bytes(format!("proc-{i}").into_bytes())]);
+        }
+        let s = idx.snapshot();
+        let t = std::time::Instant::now();
+        let n = (0..s.len()).filter(|&i| s.get(i).is_some_and(|(_, t)| t.to_vec().len() == 2)).count();
+        println!("walk 485k series (get + to_vec): {:?} ({n})", t.elapsed());
+        let t = std::time::Instant::now();
+        let n = (0..70_000u64).filter(|&i| s.get_by_id(i * 6).is_some_and(|t| t.to_vec().len() == 2)).count();
+        println!("70k by id: {:?} ({n})", t.elapsed());
+        let t = std::time::Instant::now();
+        let n = (0..35u64).filter(|&i| s.get_by_id(i * 6).is_some_and(|t| t.to_vec().len() == 2)).count();
+        println!("35 by id: {:?} ({n})", t.elapsed());
     }
 
     #[test]

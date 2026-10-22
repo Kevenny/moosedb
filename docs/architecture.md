@@ -1125,6 +1125,7 @@ scan não ordenado: só o commitado; o lote privado do statement é invisível).
 `scan::visible_stretches`/`Visible` (a mesma lógica de `plan`/`split_by_holes`/
 `load_window` do scan em stream; não há segunda cópia).
 
+- **Custo fixo por consulta** (medido no lab fileaccess, 485k séries): snapshot, `Agg::new`, plano e Pruner custam O(chunks)/O(séries pedidas) (~0,1 ms acima do piso de ~0,2 ms de um `SELECT` trivial). O único custo O(séries da tabela) era `fetch_tags` do handler (TAG de GROUP BY: percorria a lista inteira de séries para achar as dos grupos, ~4 ms em 485k séries). Agora, com até 1/8 do total de grupos, usa `moosedb_series_list_find` (id → TAG em O(1), respeitando o corte da lista) e só percorre a lista quando há muitos grupos. q06 em `evento_moose`: 4,5 → 0,4 ms. Teste: `gbh_taglookup`.
 - **Chaves**: `Series` (um estado por série, laço apertado na janela) e
   `Bucket(i, largura_us)` (coluna Timestamp cortada em buckets de largura fixa alinhados à época; a chave é o início do bucket) e
   `Column(i)` (Int64/Timestamp/Bool como inteiro, Varchar/Decimal como bytes;
@@ -1242,7 +1243,7 @@ scan não ordenado: só o commitado; o lote privado do statement é invisível).
   antigas/recentes das séries descartadas fica mais lenta (lookup nos chunks). Com
   orçamento menor que o conjunto quente, o piso sobe até "agora" e toda linha vira
   lookup (correto, lento). Memória do `SeriesIndex` (não limitável: é o catálogo de
-  séries): ~270 B/série com TAG de 20 bytes (`TableStats::series_bytes`, estimativa;
+  séries): ~295 B/série com TAG de 20 bytes (inclui o índice id→posição do log, 24 B) (`TableStats::series_bytes`, estimativa;
   `unique_bytes` mostra o estado de unicidade); `moosedb_series_list` já é um
   snapshot compartilhado (O(1), sem cópia), a cópia ordenada `Table::series()` custa
   ~96 B/série e não é usada pela FFI. Ainda não exposto no INFORMATION_SCHEMA

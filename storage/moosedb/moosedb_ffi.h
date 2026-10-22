@@ -961,6 +961,13 @@ TFStatus moosedb_series_list_get(MooseDBSeriesList *list,
                                  uint64_t *out_id,
                                  TFRow *out_tags);
 
+// TAG values of the series with this id (`TF_ERR_NOT_FOUND` if the list does
+// not have it): O(1), for a caller that needs a few of many series.
+//
+// # Safety
+// `list` must be valid; `out_tags` writable.
+TFStatus moosedb_series_list_find(MooseDBSeriesList *list, uint64_t id, TFRow *out_tags);
+
 // # Safety
 // `list` must come from `moosedb_series_list` and not be used afterwards.
 TFStatus moosedb_series_list_close(MooseDBSeriesList *list);

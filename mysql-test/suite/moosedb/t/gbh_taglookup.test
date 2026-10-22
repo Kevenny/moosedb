@@ -1,0 +1,58 @@
+#
+# GROUP BY on a TAG key: the TAG values of the groups are fetched from the
+# series list by id when there are few groups out of many series (selective
+# WHERE) and by a walk over the list otherwise. Both give the InnoDB answer,
+# also for series created after the first aggregation.
+#
+--source include/not_embedded.inc
+--source include/have_innodb.inc
+--source include/have_sequence.inc
+--source suite/moosedb/include/have_moosedb.inc
+
+--let $refused= 0
+--let $sorted= 0
+--let $show= 0
+--let $pre=
+
+CREATE TABLE g (
+  ts   DATETIME NOT NULL,
+  host VARCHAR(16) NOT NULL COMMENT 'TAG',
+  proc VARCHAR(16) NOT NULL COMMENT 'TAG',
+  n    BIGINT NOT NULL,
+  INDEX(ts)
+) ENGINE=MooseDB CHUNK_INTERVAL='1 DAY';
+
+# 40 hosts x 10 procs = 400 series
+INSERT INTO g SELECT '2024-03-01' + INTERVAL seq * 20 SECOND, CONCAT('h', seq MOD 40),
+    CONCAT('p', seq DIV 40 MOD 10), seq MOD 100 FROM seq_0_to_19999;
+FLUSH TABLES g;
+CREATE DATABASE mirror;
+CREATE TABLE mirror.g LIKE test.g;
+ALTER TABLE mirror.g ENGINE=InnoDB;
+INSERT INTO mirror.g SELECT * FROM test.g;
+
+--echo # 10 groups out of 400 series (lookup by id)
+--let $label= one host
+--let $q= SELECT proc, COUNT(*) c, SUM(n) s FROM g WHERE host = 'h3' GROUP BY proc ORDER BY proc
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= host in two values, both keys
+--let $q= SELECT host, proc, COUNT(*) c FROM g WHERE host IN ('h3', 'h7', 'nope') GROUP BY host, proc ORDER BY host, proc
+--source suite/moosedb/include/gbh_diff.inc
+
+--echo # all 400 series (walk over the list)
+--let $label= whole table
+--let $q= SELECT host, proc, COUNT(*) c, SUM(n) s FROM g GROUP BY host, proc ORDER BY host, proc
+--source suite/moosedb/include/gbh_diff.inc
+
+--echo # new series after the first aggregation are seen by the next one
+INSERT INTO g VALUES ('2024-03-01 01:00:00', 'h3', 'pnew', 5), ('2024-03-01 01:00:01', 'hnew', 'p1', 6);
+INSERT INTO mirror.g SELECT * FROM test.g WHERE proc = 'pnew' OR host = 'hnew';
+--let $label= new series, lookup
+--let $q= SELECT proc, COUNT(*) c, SUM(n) s FROM g WHERE host = 'h3' GROUP BY proc ORDER BY proc
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= new series, walk
+--let $q= SELECT host, proc, COUNT(*) c FROM g GROUP BY host, proc ORDER BY host, proc LIMIT 5
+--source suite/moosedb/include/gbh_diff.inc
+
+DROP DATABASE mirror;
+DROP TABLE g;

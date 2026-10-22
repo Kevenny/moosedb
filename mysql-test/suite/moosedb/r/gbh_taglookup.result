@@ -1,0 +1,36 @@
+CREATE TABLE g (
+ts   DATETIME NOT NULL,
+host VARCHAR(16) NOT NULL COMMENT 'TAG',
+proc VARCHAR(16) NOT NULL COMMENT 'TAG',
+n    BIGINT NOT NULL,
+INDEX(ts)
+) ENGINE=MooseDB CHUNK_INTERVAL='1 DAY';
+INSERT INTO g SELECT '2024-03-01' + INTERVAL seq * 20 SECOND, CONCAT('h', seq MOD 40),
+CONCAT('p', seq DIV 40 MOD 10), seq MOD 100 FROM seq_0_to_19999;
+FLUSH TABLES g;
+CREATE DATABASE mirror;
+CREATE TABLE mirror.g LIKE test.g;
+ALTER TABLE mirror.g ENGINE=InnoDB;
+INSERT INTO mirror.g SELECT * FROM test.g;
+# 10 groups out of 400 series (lookup by id)
+# one host
+# SELECT proc, COUNT(*) c, SUM(n) s FROM g WHERE host = 'h3' GROUP BY proc ORDER BY proc
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# host in two values, both keys
+# SELECT host, proc, COUNT(*) c FROM g WHERE host IN ('h3', 'h7', 'nope') GROUP BY host, proc ORDER BY host, proc
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# all 400 series (walk over the list)
+# whole table
+# SELECT host, proc, COUNT(*) c, SUM(n) s FROM g GROUP BY host, proc ORDER BY host, proc
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# new series after the first aggregation are seen by the next one
+INSERT INTO g VALUES ('2024-03-01 01:00:00', 'h3', 'pnew', 5), ('2024-03-01 01:00:01', 'hnew', 'p1', 6);
+INSERT INTO mirror.g SELECT * FROM test.g WHERE proc = 'pnew' OR host = 'hnew';
+# new series, lookup
+# SELECT proc, COUNT(*) c, SUM(n) s FROM g WHERE host = 'h3' GROUP BY proc ORDER BY proc
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# new series, walk
+# SELECT host, proc, COUNT(*) c FROM g GROUP BY host, proc ORDER BY host, proc LIMIT 5
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+DROP DATABASE mirror;
+DROP TABLE g;

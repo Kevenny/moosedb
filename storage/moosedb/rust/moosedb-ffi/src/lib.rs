@@ -2193,6 +2193,26 @@ pub unsafe extern "C" fn moosedb_series_list_get(
     })
 }
 
+/// TAG values of the series with this id (`TF_ERR_NOT_FOUND` if the list does
+/// not have it): O(1), for a caller that needs a few of many series.
+///
+/// # Safety
+/// `list` must be valid; `out_tags` writable.
+#[no_mangle]
+pub unsafe extern "C" fn moosedb_series_list_find(
+    list: *mut MooseDBSeriesList,
+    id: u64,
+    out_tags: *mut TFRow,
+) -> TFStatus {
+    guard(|| {
+        let l = handle_mut(list, "list")?;
+        let tags = l.snap.get_by_id(id).ok_or_else(|| Error::NotFound(format!("series {id}")))?;
+        let n = tags.len();
+        l.row.publish(tags.to_vec(), std::iter::repeat(ColumnType::Tag).take(n), handle_mut(out_tags, "out_tags")?);
+        Ok(())
+    })
+}
+
 /// # Safety
 /// `list` must come from `moosedb_series_list` and not be used afterwards.
 #[no_mangle]

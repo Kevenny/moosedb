@@ -334,6 +334,17 @@ fn series_versions_and_shared_lists_through_c_abi() {
     check(unsafe { moosedb_series_list_get(list, 0, &mut id, &mut row) }).unwrap();
     assert_eq!(row.col_count, 1);
     assert_eq!(unsafe { moosedb_series_list_get(list, 2, &mut id, &mut row) }, TFStatus::TF_ERR_INVALID_ARG);
+    // By id: the series of the snapshot are found, the one added later (srv03) is not.
+    let mut ids = Vec::new();
+    for i in 0..2 {
+        check(unsafe { moosedb_series_list_get(list, i, &mut id, &mut row) }).unwrap();
+        ids.push((id, unsafe { (*row.values).data.str_val.len }));
+    }
+    for (want, len) in &ids {
+        check(unsafe { moosedb_series_list_find(list, *want, &mut row) }).unwrap();
+        assert_eq!(unsafe { (*row.values).data.str_val.len }, *len);
+    }
+    assert_eq!(unsafe { moosedb_series_list_find(list, 2, &mut row) }, TFStatus::TF_ERR_NOT_FOUND);
     let epoch1 = unsafe { moosedb_series_list_epoch(list) };
     assert_ne!(epoch1, 0);
     assert_eq!(unsafe { moosedb_series_list_epoch(ptr::null()) }, 0);

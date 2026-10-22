@@ -146,7 +146,12 @@ pub(crate) fn read_meta(path: &Path, id: u64) -> Result<ChunkMeta> {
     if total_rows != header.row_count {
         return Err(bad_index("series row counts do not add up to the chunk row count"));
     }
-    let bloom = Bloom::decode(&mut ByteReader::new(bloom_bytes)).map_err(|_| bad_index("unreadable bloom filter"))?;
+    let mut br = ByteReader::new(bloom_bytes);
+    let bloom = Bloom::decode(&mut br).map_err(|_| bad_index("unreadable bloom filter"))?;
+    // Summaries are an optimization: a malformed section means "no pruning".
+    let zones = (header.flags & crate::chunk::flags::ZONES != 0)
+        .then(|| bloom_bytes.get(br.position()..).and_then(|b| crate::zone::decode_section(b, &series)))
+        .flatten();
 
     Ok(ChunkMeta {
         id,
@@ -158,6 +163,7 @@ pub(crate) fn read_meta(path: &Path, id: u64) -> Result<ChunkMeta> {
         series_offsets: series_offsets(&series),
         series,
         bloom,
+        zones,
         cipher,
         by_id: Default::default(),
         born: 0,
@@ -186,6 +192,7 @@ pub(crate) fn read_block(meta: &ChunkMeta, b: BlockRef) -> Result<Arc<BlockPaylo
     if let Some(p) = cache::get_block(uid, b.offset) {
         return Ok(p);
     }
+    let t0 = std::time::Instant::now();
     let file = cache::open_file(uid, meta.path())?;
     if b.len as usize > block::HEADER_LEN + MAX_BLOCK_RAW {
         return Err(corrupt(format!("block of {} bytes is too large", b.len)));
@@ -214,6 +221,7 @@ pub(crate) fn read_block(meta: &ChunkMeta, b: BlockRef) -> Result<Arc<BlockPaylo
         block::unpack(&bytes).map_err(|e| corrupt(format!("{} at offset {}: {e}", meta.path().display(), b.offset)))?,
     );
     cache::put_block(uid, b.offset, payload.clone());
+    crate::zone::note_block_read(u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX));
     Ok(payload)
 }
 

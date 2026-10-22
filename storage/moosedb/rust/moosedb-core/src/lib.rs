@@ -49,6 +49,7 @@ pub mod time;
 mod tomb;
 pub mod unique;
 mod wal;
+pub mod zone;
 
 pub use batch::Batch;
 pub use delete::DeleteBatch;
@@ -61,6 +62,7 @@ pub use scan::{Position, Scan, ScanFilter, Snapshot, POSITION_LEN};
 pub use schema::{Column, ColumnType, Row, Schema, Value};
 pub use table::{Table, TableStats};
 pub use unique::UniqueSpec;
+pub use zone::{prune_stats, reset_prune_stats, ColPred, PruneStats};
 
 /// Bytes held right now by the process-wide decoded block/series cache
 /// (bounded by `settings::chunk_cache_bytes`).

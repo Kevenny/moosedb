@@ -132,7 +132,7 @@ pub fn small_records(data: &[u8]) {
         return;
     }
     let mut r = ByteReader::new(&data[1..]);
-    match data[0] % 8 {
+    match data[0] % 9 {
         0 => drop(decode_series_entry(&mut r)),
         1 => drop(decode_value(&mut r)),
         2 => drop(decode_row(&mut r)),
@@ -140,8 +140,23 @@ pub fn small_records(data: &[u8]) {
         4 => drop(decode_sel(&mut r)),
         5 => drop(decode_range(&mut r)),
         6 => drop(decode_rows(&mut r)),
-        _ => drop(crate::crypto::CipherParams::decode(&data[1..])),
+        7 => drop(crate::crypto::CipherParams::decode(&data[1..])),
+        _ => drop(crate::zone::decode_section(&data[1..], &zone_fuzz_entries())),
     }
+}
+
+/// Three entries of two data columns, the shape the zone-section seeds are cut for.
+fn zone_fuzz_entries() -> Vec<crate::chunk::SeriesEntry> {
+    (0..3)
+        .map(|i| crate::chunk::SeriesEntry {
+            series_id: i,
+            row_count: 10,
+            ts_min: 0,
+            ts_max: 9,
+            tags: Vec::new(),
+            blocks: vec![crate::chunk::BlockRef { offset: 100, len: 40 }; 2],
+        })
+        .collect()
 }
 
 /// MANIFEST bytes, as-is and with the trailing CRC repaired (so the body parser is reached).
@@ -292,6 +307,16 @@ pub fn seeds() -> Vec<(&'static str, String, Vec<u8>)> {
     let mut b = Vec::new();
     bloom.encode(&mut b);
     rec(3, "bloom", &b);
+    let mut zones = Vec::new();
+    for i in 0..3i64 {
+        let vals: Vec<Value> = (0..10).map(|k| Value::Int(i * 100 + k)).collect();
+        zones.push(crate::zone::Zone::build(ColumnType::Int64, &vals.iter().collect::<Vec<_>>()));
+        let notes: Vec<Value> = (0..10).map(|k| Value::Bytes(format!("n{}", k % 3).into_bytes())).collect();
+        zones.push(crate::zone::Zone::build(ColumnType::Varchar, &notes.iter().collect::<Vec<_>>()));
+    }
+    let mut b = Vec::new();
+    crate::zone::encode_section(&mut b, 2, &zones);
+    rec(8, "zones", &b);
     let sel = Sel::from_ids(vec![1, 4, 9]);
     let mut b = Vec::new();
     encode_sel(&mut b, &sel);

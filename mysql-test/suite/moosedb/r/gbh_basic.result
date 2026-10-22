@@ -218,7 +218,7 @@ EXPLAIN
 {
   "query_block": {
     "select_id": 1,
-    "cost": 24.3253478,
+    "cost": 24.3560666,
     "nested_loop": [
       {
         "table": {
@@ -226,7 +226,7 @@ EXPLAIN
           "access_type": "ALL",
           "loops": 1,
           "rows": 30000,
-          "cost": 4.2941448,
+          "cost": 4.3248636,
           "filtered": 100,
           "attached_condition": "g.`host` = 'h1'"
         }

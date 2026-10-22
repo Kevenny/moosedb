@@ -1052,7 +1052,8 @@ impl Table {
                 None => matching,
             });
         }
-        Ok(ResolvedFilter { ts_min: filter.ts_min, ts_max: filter.ts_max, series })
+        let prune = crate::zone::Pruner::from_cols(&self.schema, &filter.cols)?;
+        Ok(ResolvedFilter { ts_min: filter.ts_min, ts_max: filter.ts_max, series, prune })
     }
 
     /// Opens a scan over a snapshot of the table. With `sorted`, rows come in
@@ -1075,7 +1076,7 @@ impl Table {
     /// the same visibility as an unordered scan: `lo <= ts <= hi`, optionally
     /// only the given series (`None` = all).
     pub fn agg_open(&self, lo: i64, hi: i64, series: Option<Vec<u64>>) -> Result<crate::agg::Agg> {
-        let filter = ScanFilter { ts_min: lo, ts_max: hi, tags: Vec::new(), series };
+        let filter = ScanFilter { ts_min: lo, ts_max: hi, series, ..ScanFilter::default() };
         let (snap, resolved) = self.resolved_snapshot(&filter)?;
         Ok(crate::agg::Agg::new(snap, resolved))
     }

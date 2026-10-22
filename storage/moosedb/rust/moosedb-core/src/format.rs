@@ -20,3 +20,7 @@ pub(crate) const WAL_AEAD: u16 = 3;
 pub(crate) const MANIFEST_V1: u16 = 1;
 pub(crate) const MANIFEST_PLAIN: u16 = 2;
 pub(crate) const MANIFEST_TOMB: u16 = 3;
+
+// Chunk flag `ZONES` (chunk.rs `flags::ZONES`): zone-map section at the end of
+// the index+Bloom unit. Not a version: v2/v3 readers stop after the Bloom
+// filter, so they ignore both the bytes and the flag.

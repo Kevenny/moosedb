@@ -35,6 +35,7 @@ use crate::memtable::MemSnapshot;
 use crate::rowbatch::{Plan, ScanBatch, DEFAULT_BATCH_ROWS, MAX_BATCH_ROWS};
 use crate::schema::{Row, Schema, Value};
 use crate::tomb::{split_by_holes, TombSet};
+use crate::zone::{ColPred, Pruner};
 
 pub const POSITION_LEN: usize = 16;
 /// High bit of `Position::source` marks MemTable rows; the remaining bits
@@ -89,11 +90,17 @@ pub struct ScanFilter {
     pub tags: Vec<(usize, Value)>,
     /// Restrict to these series ids (from `Table::series`), if set.
     pub series: Option<Vec<u64>>,
+    /// Value predicates on data columns, ANDed. Unlike the fields above they
+    /// are only a **skip hint**: series entries (chunk blocks) whose zone map
+    /// or column Bloom proves no row can match are not read; rows of the
+    /// entries that are read come back whether they match or not, and the
+    /// MemTable is not pruned. See [`ColPred`] for what the caller may push.
+    pub cols: Vec<ColPred>,
 }
 
 impl Default for ScanFilter {
     fn default() -> Self {
-        ScanFilter { ts_min: i64::MIN, ts_max: i64::MAX, tags: Vec::new(), series: None }
+        ScanFilter { ts_min: i64::MIN, ts_max: i64::MAX, tags: Vec::new(), series: None, cols: Vec::new() }
     }
 }
 
@@ -110,6 +117,8 @@ pub(crate) struct ResolvedFilter {
     pub ts_min: i64,
     pub ts_max: i64,
     pub series: Option<HashSet<u64>>,
+    /// Zone-map / column-Bloom pruning of entries (see `zone`).
+    pub prune: Pruner,
 }
 
 /// Bloom filters are consulted when at most this many series are wanted.
@@ -126,6 +135,12 @@ impl ResolvedFilter {
 
     pub(crate) fn series_matches(&self, id: u64) -> bool {
         self.series.as_ref().map_or(true, |s| s.contains(&id))
+    }
+
+    /// Entry `si` of chunk `c` passed the time and series tests; whether the
+    /// value summaries still allow a matching row.
+    pub(crate) fn entry_wanted(&self, c: &ChunkMeta, si: usize) -> bool {
+        !self.prune.entry_pruned(c, si)
     }
 
     pub(crate) fn chunk_wanted(&self, c: &ChunkMeta) -> bool {
@@ -581,7 +596,11 @@ impl Scan {
                 };
                 let idx = st.next_series;
                 st.next_series += 1;
-                if entry.ts_min <= f.ts_max && entry.ts_max >= f.ts_min && f.series_matches(entry.series_id) {
+                if entry.ts_min <= f.ts_max
+                    && entry.ts_max >= f.ts_min
+                    && f.series_matches(entry.series_id)
+                    && f.entry_wanted(meta, idx)
+                {
                     st.todo = Some(Visible::plan(snap, st.next_chunk, idx, f.ts_min, f.ts_max));
                 }
                 continue;
@@ -623,7 +642,7 @@ impl Scan {
                 };
                 for si in visit {
                     let Some(e) = c.series.get(si) else { continue };
-                    if e.ts_min > f.ts_max || e.ts_max < f.ts_min || !f.series_matches(e.series_id) {
+                    if e.ts_min > f.ts_max || e.ts_max < f.ts_min || !f.series_matches(e.series_id) || !f.entry_wanted(c, si) {
                         continue;
                     }
                     let base = c.series_offsets[si];

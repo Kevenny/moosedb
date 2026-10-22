@@ -21,6 +21,7 @@ use crate::format::{CHUNK_AEAD, CHUNK_PLAIN};
 use crate::error::{invalid, Result};
 use crate::index::bloom::Bloom;
 use crate::schema::{Row, Schema, Value};
+use crate::zone::{self, Zone, ZoneMaps};
 
 /// The rows of one series within one time bucket, cut into parts that each
 /// fit one column block (see `compaction::split_series`).
@@ -77,13 +78,15 @@ pub(crate) struct ChunkBuilder<'a> {
     /// block is followed by `TAG_LEN` zero bytes that `finish` fills in).
     data: Vec<u8>,
     entries: Vec<SeriesEntry>,
+    /// Value summaries, `data_indices().len()` per entry (see `zone`).
+    zones: Vec<Zone>,
     raw_bytes: u64,
 }
 
 impl<'a> ChunkBuilder<'a> {
     pub(crate) fn new(schema: &'a Schema, codec: Codec, cipher: Option<CipherParams>) -> ChunkBuilder<'a> {
         let data_start = (HEADER_LEN + if cipher.is_some() { crate::chunk::ENC_HEADER_LEN } else { 0 }) as u64;
-        ChunkBuilder { schema, codec, cipher, data_start, data: Vec::new(), entries: Vec::new(), raw_bytes: 0 }
+        ChunkBuilder { schema, codec, cipher, data_start, data: Vec::new(), entries: Vec::new(), zones: Vec::new(), raw_bytes: 0 }
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -101,10 +104,14 @@ impl<'a> ChunkBuilder<'a> {
         }
         let mut blocks = Vec::with_capacity(self.schema.data_indices().len());
         let mut column: Vec<&Value> = Vec::with_capacity(rows.len());
+        let mut zones = Vec::with_capacity(self.schema.data_indices().len());
         for &col in self.schema.data_indices() {
             column.clear();
             column.extend(rows.iter().map(|r| &r[col]));
-            let b = block::encode(self.schema.columns()[col].ty, &column, self.codec)?;
+            let ty = self.schema.columns()[col].ty;
+            // the table timestamp is covered by the entry bounds
+            zones.push(if col == self.schema.ts_index() { Zone::none() } else { Zone::build(ty, &column) });
+            let b = block::encode(ty, &column, self.codec)?;
             blocks.push(BlockRef {
                 offset: self.data_start + self.data.len() as u64,
                 len: u32::try_from(b.bytes.len()).map_err(|_| invalid("column block exceeds 4GiB"))?,
@@ -115,6 +122,7 @@ impl<'a> ChunkBuilder<'a> {
             }
             self.raw_bytes += b.plain_len as u64;
         }
+        self.zones.extend(zones);
         self.entries.push(SeriesEntry {
             series_id,
             row_count: n,
@@ -153,10 +161,13 @@ impl<'a> ChunkBuilder<'a> {
         }
         let bloom_offset = buf.len() as u64;
         bloom.encode(&mut buf);
+        // Inside the index unit (sealed with it when encrypted); older readers
+        // stop after the Bloom filter and ignore it.
+        let has_zones = zone::encode_section(&mut buf, self.schema.data_indices().len(), &self.zones);
 
         let header = ChunkHeader {
             version: if self.cipher.is_some() { CHUNK_AEAD } else { CHUNK_PLAIN },
-            flags: chunk_flags(self.codec, self.cipher.is_some()),
+            flags: chunk_flags(self.codec, self.cipher.is_some()) | if has_zones { crate::chunk::flags::ZONES } else { 0 },
             ts_min,
             ts_max,
             row_count,
@@ -216,6 +227,7 @@ impl<'a> ChunkBuilder<'a> {
             series_offsets: series_offsets(&self.entries),
             series: self.entries,
             bloom,
+            zones: has_zones.then(|| ZoneMaps::new(self.schema.data_indices().len(), self.zones)),
             cipher,
             by_id: Default::default(),
             // Callers that publish the chunk set the real value (`Table`).

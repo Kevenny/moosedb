@@ -24,6 +24,12 @@
 //!                 block_count:u16 (offset:u64 len:u32)*
 //! ```
 //!
+//! With the `ZONES` flag the index+Bloom unit ends with a zone-map section
+//! after the Bloom filter (`zone`): per series entry and data column a
+//! min/max/NULL count (numbers) or a value Bloom (strings). It sits inside the
+//! unit, so a v3 chunk seals and authenticates it with the index (header flag
+//! in the AAD: it cannot be added, removed or edited unnoticed).
+//!
 //! `file_crc` covers every byte before it (as stored, i.e. ciphertext), so
 //! CHECK TABLE works without the key. Each block also has its own CRC over
 //! the plaintext. In v3 the GCM tags (nonce and AAD: see `crypto`) are what
@@ -67,6 +73,11 @@ pub mod flags {
     pub const COMPRESSED: u16 = 1 << 0;
     pub const ENCRYPTED: u16 = 1 << 1;
     pub const SEALED: u16 = 1 << 2;
+    /// A zone-map section follows the series Bloom, inside the same
+    /// index+Bloom unit (see `zone`). Readers that predate it ignore the
+    /// flag and the trailing bytes, so no version bump: a chunk without
+    /// useful summaries does not set it.
+    pub const ZONES: u16 = 1 << 3;
     /// Bits 8-9: codec the chunk was written with (`compression::CODEC_*`).
     pub const CODEC_SHIFT: u16 = 8;
     pub const CODEC_MASK: u16 = 0b11 << CODEC_SHIFT;
@@ -278,6 +289,9 @@ pub struct ChunkMeta {
     /// Ordinal of the first row of each series entry.
     pub series_offsets: Vec<u64>,
     pub bloom: Bloom,
+    /// Value summaries per (entry, data column); `None` for chunks written
+    /// before they existed (they are simply never pruned by value).
+    pub zones: Option<crate::zone::ZoneMaps>,
     pub(crate) cipher: Option<CipherParams>,
     /// Indexes of `series`, sorted by `(series_id, index)`; built on first use
     /// (see `entries_of`). `None` when the chunk has more entries than `u32`.

@@ -29,7 +29,7 @@ use moosedb_core::DeleteBatch;
 use moosedb_core::compression::Codec;
 use moosedb_core::inspect::{ChunkStatus, TableInfo};
 use moosedb_core::{
-    crypto, maintenance, settings, Batch, BatchColumn, Column, ColumnType, Error, Position, RawOptions, Row, Scan,
+    crypto, maintenance, settings, Batch, BatchColumn, ColPred, Column, ColumnType, Error, Position, RawOptions, Row, Scan,
     ScanFilter, Schema, SeriesSnapshot, Snapshot, Table, TableConfig, Value, POSITION_LEN,
 };
 
@@ -1198,6 +1198,175 @@ pub unsafe extern "C" fn moosedb_scan_open_projected(
         return status;
     }
     open_scan(table, &filter, sorted, mask.as_deref(), out_scan)
+}
+
+/// `TFColPred::kind`: `lo <= v <= hi` on an INT64 / TIMESTAMP / BOOL (0/1)
+/// column, bounds in `int_lo` / `int_hi`.
+pub const TF_PRED_INT: u8 = 0;
+/// `TFColPred::kind`: `lo <= v <= hi` on a FLOAT64 / FLOAT32 column, bounds in
+/// `float_lo` / `float_hi` (IEEE; use -inf / +inf for an open side).
+pub const TF_PRED_FLOAT: u8 = 1;
+/// `TFColPred::kind`: the value equals one of the listed byte strings, on a
+/// VARCHAR / DECIMAL column.
+pub const TF_PRED_BYTES: u8 = 2;
+
+/// A value predicate that lets a scan **skip** chunk blocks (zone maps / column
+/// Blooms); ANDed with the others. It is a hint, not a filter: rows of blocks
+/// that are read come back whether they match or not (the SQL layer keeps
+/// evaluating its WHERE), and MemTable rows are never skipped. Rules for the
+/// caller: NULL must never satisfy the SQL condition it replaces (no `IS NULL`,
+/// `<=>`, `OR` across columns, ...); a strict bound is passed as the inclusive
+/// one; `TF_PRED_BYTES` only when the SQL comparison is a byte comparison
+/// (binary NO PAD collation; with `pad_space` non-zero: binary PAD SPACE of a
+/// charset whose space is the single byte 0x20, as `TFAggFilter::pad_space`).
+/// An empty list matches nothing. Only the fields of its `kind` are read.
+/// A column of the wrong type, a TAG or out-of-range column is
+/// `TF_ERR_INVALID_ARG`; the table's timestamp column is accepted and ignored.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TFColPred {
+    pub col: u32,
+    /// `TF_PRED_INT`, `TF_PRED_FLOAT` or `TF_PRED_BYTES`.
+    pub kind: u8,
+    pub pad_space: u8,
+    pub int_lo: i64,
+    pub int_hi: i64,
+    pub float_lo: f64,
+    pub float_hi: f64,
+    /// `TF_PRED_BYTES`: value `i` is
+    /// `value_data[value_starts[i] .. value_starts[i] + value_lens[i]]`.
+    pub value_starts: *const u64,
+    pub value_lens: *const u32,
+    pub value_count: u64,
+    pub value_data: *const u8,
+    pub value_data_len: u64,
+}
+
+/// # Safety
+/// `preds` must hold `count` valid `TFColPred`s whose arrays obey their contract.
+unsafe fn col_preds(preds: *const TFColPred, count: u32) -> Result<Vec<ColPred>, Error> {
+    // SAFETY: caller contract.
+    let preds = unsafe { slice(preds, count as usize, "preds") }?;
+    let mut out = Vec::with_capacity(preds.len());
+    for p in preds {
+        let col = p.col as usize;
+        out.push(match p.kind {
+            TF_PRED_INT => ColPred::Int { col, lo: p.int_lo, hi: p.int_hi },
+            TF_PRED_FLOAT => ColPred::Float { col, lo: p.float_lo, hi: p.float_hi },
+            TF_PRED_BYTES => {
+                let to_n = |v: u64, what: &str| usize::try_from(v).map_err(|_| invalid(&format!("{what} too long")));
+                let (nv, nd) = (to_n(p.value_count, "value_count")?, to_n(p.value_data_len, "value_data_len")?);
+                // SAFETY: caller contract for every array.
+                let (starts, lens, data) = unsafe {
+                    (
+                        slice(p.value_starts, nv, "pred.value_starts")?,
+                        slice(p.value_lens, nv, "pred.value_lens")?,
+                        slice(p.value_data, nd, "pred.value_data")?,
+                    )
+                };
+                let mut values = Vec::with_capacity(nv);
+                for (&st, &len) in starts.iter().zip(lens) {
+                    let range = usize::try_from(st).ok().and_then(|st| st.checked_add(len as usize).map(|e| (st, e)));
+                    let (st, end) = range
+                        .filter(|&(_, e)| e <= data.len())
+                        .ok_or_else(|| invalid("predicate value out of range"))?;
+                    values.push(data[st..end].to_vec());
+                }
+                ColPred::Bytes { col, values, pad_space: p.pad_space != 0 }
+            }
+            other => return Err(invalid(&format!("unknown predicate kind {other}"))),
+        });
+    }
+    Ok(out)
+}
+
+/// `moosedb_scan_open_projected` plus value predicates that skip chunk blocks
+/// (see `TFColPred`). `preds` holds `pred_count` elements (may be NULL with 0).
+///
+/// # Safety
+/// As `moosedb_scan_open_projected`; `preds` and the arrays inside it must be
+/// valid for the call.
+#[no_mangle]
+pub unsafe extern "C" fn moosedb_scan_open_pruned(
+    table: *mut MooseDBTable,
+    ts_start_us: i64,
+    ts_end_us: i64,
+    series_ids: *const u64,
+    series_count: i64,
+    sorted: bool,
+    columns_mask: *const u8,
+    mask_len: u32,
+    preds: *const TFColPred,
+    pred_count: u32,
+    out_scan: *mut *mut MooseDBScan,
+) -> TFStatus {
+    let mut filter = ScanFilter::default();
+    let mut mask: Option<Vec<bool>> = None;
+    let status = guard(|| {
+        // SAFETY: caller contract for every pointer.
+        unsafe {
+            filter = series_filter(ts_start_us, ts_end_us, series_ids, series_count)?;
+            filter.cols = col_preds(preds, pred_count)?;
+            if mask_len > 0 || !columns_mask.is_null() {
+                mask = Some(slice(columns_mask, mask_len as usize, "columns_mask")?.iter().map(|&b| b != 0).collect());
+            }
+        }
+        Ok(())
+    });
+    if status != TFStatus::TF_OK {
+        return status;
+    }
+    open_scan(table, &filter, sorted, mask.as_deref(), out_scan)
+}
+
+/// Process-wide counters of the zone-map / column-Bloom pruning (scans and
+/// aggregations of every table). An "entry" is one series of one chunk: its
+/// column blocks are read together and pruned together.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TFPruneStats {
+    /// Entries that reached the value test.
+    pub entries_tested: u64,
+    pub pruned_by_zone: u64,
+    pub pruned_by_bloom: u64,
+    /// Rows of the pruned entries, never decoded.
+    pub rows_skipped: u64,
+    /// Column blocks inside pruned entries, never read.
+    pub blocks_skipped: u64,
+    /// Column blocks read from disk (cache misses).
+    pub blocks_read: u64,
+    /// Nanoseconds reading + decrypting + decompressing those blocks (all threads).
+    pub block_read_ns: u64,
+}
+
+/// Reads the pruning counters.
+///
+/// # Safety
+/// `out` must be writable.
+#[no_mangle]
+pub unsafe extern "C" fn moosedb_prune_stats(out: *mut TFPruneStats) -> TFStatus {
+    guard(|| {
+        let s = moosedb_core::prune_stats();
+        *handle_mut(out, "out")? = TFPruneStats {
+            entries_tested: s.entries_tested,
+            pruned_by_zone: s.pruned_by_zone,
+            pruned_by_bloom: s.pruned_by_bloom,
+            rows_skipped: s.rows_skipped,
+            blocks_skipped: s.blocks_skipped,
+            blocks_read: s.blocks_read,
+            block_read_ns: s.block_read_ns,
+        };
+        Ok(())
+    })
+}
+
+/// Zeroes the pruning counters.
+#[no_mangle]
+pub extern "C" fn moosedb_prune_stats_reset() -> TFStatus {
+    guard(|| {
+        moosedb_core::reset_prune_stats();
+        Ok(())
+    })
 }
 
 fn step(scan: *mut MooseDBScan, out_row: *mut TFRow, out_end: *mut bool, backward: bool) -> TFStatus {

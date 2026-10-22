@@ -1,0 +1,265 @@
+CREATE TABLE z (
+ts   DATETIME NOT NULL,
+host VARCHAR(8) NOT NULL COMMENT 'TAG',
+i    INT,
+d    DOUBLE,
+vb   VARCHAR(16) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin,
+vc   VARCHAR(16) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci,
+t    TIMESTAMP NULL DEFAULT NULL,
+df   DOUBLE(10,2),
+INDEX(ts)
+) ENGINE=MooseDB CHUNK_INTERVAL='1 DAY';
+# 6 days (= 6 chunks), 2 series; day k holds i in [k*100, k*100+99],
+# d in [k*10, k*10+9.9], vb/vc 'k-..' ; NULLs sprinkled; one flush per day
+CREATE DATABASE mirror;
+CREATE TABLE mirror.z LIKE test.z;
+ALTER TABLE mirror.z ENGINE=InnoDB;
+INSERT INTO mirror.z SELECT * FROM test.z;
+# ---- INT ----
+# WHERE tt.i >= 450
+a	b	c	vs_innodb
+282	148014	441094427	SAME
+# pruned=1 expected=1: as expected
+# WHERE tt.i > 450
+a	b	c	vs_innodb
+280	147114	3968131720	SAME
+# pruned=1 expected=1: as expected
+# WHERE tt.i < 120
+a	b	c	vs_innodb
+224	13320	2211432605	SAME
+# pruned=1 expected=1: as expected
+# WHERE tt.i <= 100
+a	b	c	vs_innodb
+189	9478	3251697972	SAME
+# pruned=1 expected=1: as expected
+# WHERE tt.i = 333
+a	b	c	vs_innodb
+2	666	1258517984	SAME
+# pruned=1 expected=1: as expected
+# WHERE 450 <= tt.i
+a	b	c	vs_innodb
+282	148014	441094427	SAME
+# pruned=1 expected=1: as expected
+# WHERE tt.i BETWEEN 205 AND 215
+a	b	c	vs_innodb
+22	4620	4190480605	SAME
+# pruned=1 expected=1: as expected
+# WHERE tt.i IN (307, 340)
+a	b	c	vs_innodb
+4	1294	2042894814	SAME
+# pruned=1 expected=1: as expected
+# WHERE tt.i > 199 AND tt.i < 300 AND tt.host = 'h1'
+a	b	c	vs_innodb
+94	23488	2592641895	SAME
+# pruned=1 expected=1: as expected
+# the server itself rewrites NOT (i < 450) into i >= 450
+# WHERE NOT (tt.i < 450)
+a	b	c	vs_innodb
+282	148014	441094427	SAME
+# pruned=1 expected=1: as expected
+# decimal / double constants against INT round outwards
+# WHERE tt.i > 449.5
+a	b	c	vs_innodb
+282	148014	441094427	SAME
+# pruned=1 expected=1: as expected
+# WHERE tt.i < 100.5e0
+a	b	c	vs_innodb
+189	9478	3251697972	SAME
+# pruned=1 expected=1: as expected
+# WHERE tt.i = 333.0
+a	b	c	vs_innodb
+2	666	1258517984	SAME
+# pruned=1 expected=1: as expected
+# WHERE tt.i BETWEEN 199.5 AND 200.5
+a	b	c	vs_innodb
+1	200	164355902	SAME
+# pruned=1 expected=1: as expected
+# nothing can match: constants beyond the data, IN with NULL
+# WHERE tt.i > 100000
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# pruned=1 expected=1: as expected
+# WHERE tt.i IN (NULL, 1000)
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# pruned=1 expected=1: as expected
+# not pushed: string constant, expression, NOT, OR, IS NULL, column=column
+# WHERE tt.i > '450'
+a	b	c	vs_innodb
+280	147114	3968131720	SAME
+# pruned=0 expected=0: as expected
+# WHERE tt.i + 0 > 450
+a	b	c	vs_innodb
+280	147114	3968131720	SAME
+# pruned=0 expected=0: as expected
+# WHERE tt.i < 50 OR tt.i > 550
+a	b	c	vs_innodb
+186	55278	441446885	SAME
+# pruned=0 expected=0: as expected
+# WHERE tt.i IS NULL
+a	b	c	vs_innodb
+72	NULL	2018326855	SAME
+# pruned=0 expected=0: as expected
+# WHERE tt.i <=> NULL
+a	b	c	vs_innodb
+72	NULL	2018326855	SAME
+# pruned=0 expected=0: as expected
+# WHERE tt.i NOT BETWEEN 100 AND 599
+a	b	c	vs_innodb
+188	9378	1878744426	SAME
+# pruned=0 expected=0: as expected
+# WHERE tt.i > tt.d * 50
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# pruned=0 expected=0: as expected
+# WHERE tt.i = NULL
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# pruned=0 expected=0: as expected
+# ---- DOUBLE ----
+# WHERE tt.d >= 45
+a	b	c	vs_innodb
+283	139628	94265892	SAME
+# pruned=1 expected=1: as expected
+# WHERE tt.d < 10.5
+a	b	c	vs_innodb
+198	9651	3915955145	SAME
+# pruned=1 expected=1: as expected
+# WHERE tt.d BETWEEN 22.5 AND 23.5
+a	b	c	vs_innodb
+21	4593	1324413882	SAME
+# pruned=1 expected=1: as expected
+# WHERE tt.d = 31.5
+a	b	c	vs_innodb
+2	630	2712670449	SAME
+# pruned=1 expected=1: as expected
+# WHERE tt.d IN (31.5, 33.5)
+a	b	c	vs_innodb
+4	1300	2454519066	SAME
+# pruned=1 expected=1: as expected
+# WHERE tt.d > 45.5e0 AND tt.i < 1000
+a	b	c	vs_innodb
+257	135554	2184828644	SAME
+# pruned=1 expected=1: as expected
+# WHERE tt.d > 'x'
+a	b	c	vs_innodb
+1133	319998	4155225491	SAME
+# pruned=0 expected=0: as expected
+# WHERE ABS(tt.d) > 45
+a	b	c	vs_innodb
+281	138728	4082110903	SAME
+# pruned=0 expected=0: as expected
+# WHERE tt.d > 45 OR tt.d < 1
+a	b	c	vs_innodb
+300	138816	2307739501	SAME
+# pruned=0 expected=0: as expected
+# WHERE tt.d IS NULL
+a	b	c	vs_innodb
+66	18270	894691149	SAME
+# pruned=0 expected=0: as expected
+# ---- DOUBLE(M,D): the server compares with an epsilon, never pushed ----
+# WHERE tt.df = 31.5
+a	b	c	vs_innodb
+2	630	2712670449	SAME
+# pruned=0 expected=0: as expected
+# WHERE tt.df >= 45
+a	b	c	vs_innodb
+283	139628	94265892	SAME
+# pruned=0 expected=0: as expected
+# ---- VARCHAR utf8mb4_bin (PAD SPACE binary: Bloom) ----
+# WHERE tt.vb = 'd3-4'
+a	b	c	vs_innodb
+19	6342	2976458029	SAME
+# pruned=1 expected=1: as expected
+# WHERE tt.vb IN ('d1-1', 'd5-9')
+a	b	c	vs_innodb
+37	12031	3303302349	SAME
+# pruned=1 expected=1: as expected
+# WHERE tt.vb = 'd3-4   '
+a	b	c	vs_innodb
+19	6342	2976458029	SAME
+# pruned=1 expected=1: as expected
+# WHERE tt.vb = 'nosuchvalue'
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# pruned=1 expected=1: as expected
+# WHERE 'd2-2' = tt.vb
+a	b	c	vs_innodb
+18	4204	3858407624	SAME
+# pruned=1 expected=1: as expected
+# WHERE tt.vb LIKE 'd3-%'
+a	b	c	vs_innodb
+184	60518	3442667072	SAME
+# pruned=0 expected=0: as expected
+# WHERE tt.vb = 'd3-4' OR tt.vb = 'd1-1'
+a	b	c	vs_innodb
+38	8920	2989763386	SAME
+# pruned=0 expected=0: as expected
+# WHERE tt.vb IS NULL
+a	b	c	vs_innodb
+96	27060	2166326224	SAME
+# pruned=0 expected=0: as expected
+# WHERE tt.vb > 'd4'
+a	b	c	vs_innodb
+368	172936	1626372501	SAME
+# pruned=0 expected=0: as expected
+# WHERE tt.vb = 4
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# pruned=0 expected=0: as expected
+# WHERE tt.vb COLLATE utf8mb4_general_ci = 'D3-4'
+a	b	c	vs_innodb
+19	6342	2976458029	SAME
+# pruned=0 expected=0: as expected
+# WHERE tt.vb NOT IN ('d3-4')
+a	b	c	vs_innodb
+1085	304866	1541905431	SAME
+# pruned=0 expected=0: as expected
+# ---- VARCHAR utf8mb4_general_ci: never pushed (case/accent folding) ----
+# WHERE tt.vc = 'd3-4'
+a	b	c	vs_innodb
+19	6342	2976458029	SAME
+# pruned=0 expected=0: as expected
+# WHERE tt.vc = 'D3-4'
+a	b	c	vs_innodb
+19	6342	2976458029	SAME
+# pruned=0 expected=0: as expected
+# WHERE tt.vc IN ('d1-1', 'D5-9')
+a	b	c	vs_innodb
+37	12031	3303302349	SAME
+# pruned=0 expected=0: as expected
+# WHERE tt.vc = _utf8mb4'D3-4' COLLATE utf8mb4_bin
+a	b	c	vs_innodb
+19	6342	2976458029	SAME
+# pruned=0 expected=0: as expected
+# ---- TIMESTAMP value column: never pushed ----
+# WHERE tt.t >= '2024-03-01 00:08:00'
+a	b	c	vs_innodb
+308	147991	2756111074	SAME
+# pruned=0 expected=0: as expected
+# WHERE tt.t IS NULL
+a	b	c	vs_innodb
+114	30864	1225321746	SAME
+# pruned=0 expected=0: as expected
+# ---- Mixed: a pushable conjunct next to non-pushable ones still prunes ----
+# WHERE tt.i >= 450 AND (tt.vc = 'd5-1' OR tt.d IS NULL)
+a	b	c	vs_innodb
+33	17593	4010010111	SAME
+# pruned=1 expected=1: as expected
+# WHERE tt.i >= 450 AND tt.vc = 'D5-1'
+a	b	c	vs_innodb
+18	9778	1097273549	SAME
+# pruned=1 expected=1: as expected
+# ---- MemTable rows are never skipped ----
+INSERT INTO z VALUES ('2024-03-20 00:00:00', 'h0', 5000, 500.5, 'fresh', 'FRESH', NULL, 500.5);
+INSERT INTO mirror.z VALUES ('2024-03-20 00:00:00', 'h0', 5000, 500.5, 'fresh', 'FRESH', NULL, 500.5);
+# WHERE tt.i >= 4000
+a	b	c	vs_innodb
+1	5000	1940828876	SAME
+# pruned=1 expected=1: as expected
+# WHERE tt.vb = 'fresh'
+a	b	c	vs_innodb
+1	5000	1940828876	SAME
+# pruned=1 expected=1: as expected
+DROP DATABASE mirror;
+DROP TABLE z;

@@ -77,6 +77,66 @@ Chunks **quentes** (intervalo mais novo que `HOT_THRESHOLD`) usam LZ4; os
 **frios** usam o codec da tabela (`COMPRESSION`, ZSTD por padrão, nível
 `COMPRESSION_LEVEL`). A compactação recodifica chunks que esfriaram.
 
+#### Zone maps e Bloom por coluna (poda por valor)
+
+Além de tempo e TAG (índice de séries + Bloom de séries), o chunk guarda, por
+**bloco** (uma entrada de série × uma coluna de dados; a entrada é a unidade
+que o scan pula, com todos os blocos dela), um resumo de valores
+(`moosedb-core/src/zone.rs`):
+
+| Coluna | Resumo | Bytes por bloco |
+|---|---|---|
+| INT64 / TIMESTAMP / BOOL | min, max, nº de NULLs | 17 (+4 se há NULLs) |
+| FLOAT64 / FLOAT32 | min, max dos não-NaN, "tem NaN", NULLs | 17 (+4) |
+| VARCHAR / DECIMAL | Bloom de valores do bloco (1% FPR, hash FNV-1a 64 do valor exato e do sem espaços finais), NULLs | ≥14 (+4); ~1,2 B por valor distinto; sem Bloom se o bloco tem >65536 distintos (≈80 KiB), sem teto de linhas |
+| coluna de tempo da tabela | nenhum (os limites da entrada já cobrem) | 1 |
+
+Layout: seção opcional **no fim da unidade índice+Bloom**, depois do Bloom de
+séries: `ndata:u32 len:u32 registros crc32:u32`, um registro por (entrada,
+coluna) em ordem de entrada. A flag `ZONES` (bit 3 de `flags` do header) a
+anuncia; **sem bump de versão**: v2 continua v2 e v3 continua v3, pois leitores
+anteriores param após o Bloom e ignoram bytes e flag (por leitura do código; não testado com um
+binário antigo de verdade). Só é gravada se algum resumo for útil. Em v3 a seção está dentro da
+unidade selada com AES-GCM (nonce por posição, AAD = header, incluindo a flag, +
+tipo de unidade `1`/`bloom_offset`): adulterar, truncar ou remover a seção ou
+limpar a flag falha a autenticação (`Error::Crypto`, fail-closed); não há tipo
+de unidade novo porque não há unidade nova. Em chunk v2 em claro um CRC32 próprio
+da seção a protege: seção malformada ou com CRC errado vira "sem resumos"
+(nunca erro, nunca poda errada). Chunks antigos não têm a seção e não são
+podados; `OPTIMIZE`/compactação regrava com resumos (tudo passa por
+`ChunkBuilder::add_series`). Custo em memória: 32 B por bloco em `ChunkMeta`, mais o Bloom
+(≥~60 B de estruturas + ~1,2 B por distinto) em blocos VARCHAR/DECIMAL; fica
+residente para todo chunk vivo e não entra em nenhum orçamento (medido no lab
+fileaccess, 20 M linhas: +75 MB de RSS com 14 mil séries×dia, +332 MB com 485
+mil; disco +6% e +10%). Chunks gravados antes da seção (ou já compactados) só
+ganham resumos quando regravados — `OPTIMIZE` não reescreve chunk já compactado.
+
+Poda (sempre conservadora; `Pruner::entry_pruned`):
+
+* só descarta a entrada se **nenhuma** linha dela pode casar; NULL nunca casa
+  os predicados empurrados; resumo ausente/desconhecido ⇒ não poda;
+* FLOAT: comparação IEEE; chunk com NaN no bloco nunca poda; ±0.0 são iguais;
+  limite NaN não poda; em FLOAT32 o limite é alargado para cobrir o
+  arredondamento a `float` e o valor `double`;
+* VARCHAR/DECIMAL: **só igualdade exata em bytes** (collation binária NO PAD,
+  ou PAD SPACE de charset com espaço 0x20 com `pad_space`, como
+  `TFAggFilter`); sem min/max (a ordem de bytes não é a ordem SQL);
+* DELETE: o resumo vem das linhas gravadas, ou seja, só pode ser mais largo que
+  as linhas vivas; tombstones continuam aplicados depois;
+* MemTable/WAL: sem resumo, nunca podadas; resumos de chunk com `schema_fp` ou
+  nº de colunas diferente do schema atual são ignorados.
+
+Onde liga: (1) **scan** — `ScanFilter::cols` (`ColPred`: faixa inteira, faixa
+float, conjunto de bytes), testado junto de tempo/série nos modos stream e
+merge; é só dica (linhas das entradas lidas voltam mesmo sem casar; o servidor
+reavalia o WHERE); C ABI `moosedb_scan_open_pruned`. (2) **agregação** — os
+`filters` já existentes (`TF_AGG_FILTER_VALUES` e máscara de dicionário, incl.
+`null_ok`) viram `Pruner` em `Plan::new`, aplicado em `Plan::units`; sem mudança
+de ABI. Contadores globais (`moosedb_prune_stats`): entradas testadas, podadas
+por zone map, podadas por Bloom, linhas e blocos pulados, blocos lidos do disco e ns gastos lendo/decifrando/descomprimindo (`read_block`). Não há poda no nível do chunk
+inteiro além da que já vem de tempo/Bloom de séries (um chunk cujas entradas
+são todas podadas não decodifica nada, mas ainda é percorrido).
+
 ### Protocolo de durabilidade
 
 Toda mudança estrutural (flush, compactação, retenção, truncate) segue:
@@ -578,6 +638,7 @@ comuns a todos os arquivos:
 |---|---|---|---|---|
 | `chunk_*.tfl` | `TFLW` … `TFLE` | **2** | em claro; ou, com a flag `ENCRYPTED`, AES-256-CTR sem tags (legado, só leitura) | v0.x e v1.0 |
 | | | **3** | sempre `ENCRYPTED`: blocos e índice+Bloom selados com AES-256-GCM + tag de 16 B | v1.0 |
+| | | flag `ZONES` (v2 e v3) | bit 3 de `flags`: seção de zone maps no fim da unidade índice+Bloom (§Zone maps); sem versão nova, leitores anteriores a ignoram | v1.0 com zone maps; ignorada por anteriores |
 | `wal_*.tfl.wal` | `TFWL` | **1** | linhas puras, tudo confirmado (só leitura) | v0.x e v1.0 |
 | | | **2** | entradas `ROW`/`COMMIT`/`ROW_COMMIT`/`DELETE_*`; em claro ou, com `ENCRYPTED`, AES-256-CTR (legado) | v0.x e v1.0 |
 | | | **3** | idem v2, sempre `ENCRYPTED`, entradas seladas com AES-256-GCM (`len` inclui a tag) | v1.0 |
@@ -601,6 +662,7 @@ em `moosedb-tests/fixtures/`, cada uma um diretório de tabela pequeno):
 | `wal_v1` | idem, WAL reescrito no layout v1 | WAL v1 |
 | `deleted_v3` | idem | MANIFEST v3 com tombstone |
 | `aead_v3` | v1.0 | chunk v3 e WAL v3 (trava o formato novo) |
+| `zones_v2`, `zones_v3` | v1.0 + zone maps | chunk com a flag `ZONES`, em claro (v2) e selado (v3); `gen_fixture_zones` |
 
 Cada teste copia a fixture, abre com o código atual e exige as mesmas linhas e
 `CHECK TABLE` limpo. Os geradores são testes `#[ignore]`

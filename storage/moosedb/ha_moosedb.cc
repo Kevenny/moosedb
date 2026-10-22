@@ -512,7 +512,45 @@ void moosedb_gbh_shortcuts(ulonglong exact, ulonglong topn)
   __atomic_fetch_add(&srv_gbh_topn, topn, __ATOMIC_RELAXED);
 }
 
+/* Zone-map / Bloom pruning counters of the core (Moosedb_prune_*). */
+static int show_prune_stats(THD *, SHOW_VAR *var, void *buff,
+                            system_status_var *, enum_var_type)
+{
+  struct out_t
+  {
+    ulonglong v[7];
+    SHOW_VAR vars[8];
+  };
+  static_assert(sizeof(out_t) <= SHOW_VAR_FUNC_BUFF_SIZE, "status buffer");
+  if (!var || !buff)
+    return 1;
+  out_t *o= static_cast<out_t *>(buff);
+  TFPruneStats st{};
+  if (moosedb_prune_stats(&st) != TF_OK)
+  {
+    take_last_error();
+    st= TFPruneStats{};
+  }
+  const ulonglong vals[7]= {st.entries_tested, st.pruned_by_zone,
+                            st.pruned_by_bloom, st.rows_skipped,
+                            st.blocks_skipped, st.blocks_read,
+                            st.block_read_ns};
+  static const char *const names[7]= {
+    "entries_tested", "zone_pruned", "bloom_pruned", "rows_skipped",
+    "blocks_skipped", "blocks_read", "block_read_ns"};
+  for (int i= 0; i < 7; i++)
+  {
+    o->v[i]= vals[i];
+    o->vars[i]= {names[i], (char *) &o->v[i], SHOW_LONGLONG};
+  }
+  o->vars[7]= {NullS, NullS, SHOW_LONG};
+  var->type= SHOW_ARRAY;
+  var->value= (char *) o->vars;
+  return 0;
+}
+
 static SHOW_VAR moosedb_status_variables[]= {
+  {"prune", (char *) &show_prune_stats, SHOW_FUNC},
   {"gbh_queries", (char *) &srv_gbh_queries, SHOW_LONGLONG},
   {"gbh_dict_us", (char *) &srv_gbh_dict_us, SHOW_LONGLONG},
   {"gbh_agg_us", (char *) &srv_gbh_agg_us, SHOW_LONGLONG},
@@ -2320,12 +2358,343 @@ void ha_moosedb::collect_tag_predicates(const Item *cond,
   }
 }
 
+/* ── Value predicates (zone-map / Bloom pruning hints) ────────────────── */
+
+namespace {
+
+enum class vp_op { EQ, GE, LE, BETWEEN };
+
+/* floor/ceil of an exact or small-real constant as int64 (saturating). */
+bool int_bounds(Item *c, bool any_real, int64_t *fl, int64_t *ce)
+{
+  if (!c || !fl || !ce || c->type() == Item::NULL_ITEM || !c->const_item() ||
+      c->is_expensive())
+    return false;
+  const __int128 lim= (__int128) EXACT_DOUBLE_LIMIT;
+  __int128 f= 0, g= 0;
+  switch (c->cmp_type()) {
+  case INT_RESULT:
+  {
+    const longlong v= c->val_int();
+    if (c->null_value || (c->unsigned_flag && v < 0))
+      return false;
+    f= g= v;
+    break;
+  }
+  case DECIMAL_RESULT:
+  {
+    StringBuffer<MAX_FIELD_WIDTH> buf;
+    String *s= c->val_str(&buf);
+    if (!s || c->null_value)
+      return false;
+    const char *p= s->ptr();
+    const size_t n= s->length();
+    size_t i= 0;
+    bool neg= false;
+    if (i < n && p[i] == '-')
+      neg= true, i++;
+    const size_t from= i;
+    while (i < n && p[i] >= '0' && p[i] <= '9')
+      i++;
+    const size_t to= i;
+    bool frac= false;
+    if (i < n && p[i] == '.')
+    {
+      i++;
+      while (i < n && p[i] >= '0' && p[i] <= '9')
+      {
+        if (p[i] != '0')
+          frac= true;
+        i++;
+      }
+    }
+    if (i != n || to == from)
+      return false;
+    uint64_t mag= 0;
+    if (!digits_to_u64(p, from, to, &mag))
+      mag= UINT64_MAX;             /* saturates below */
+    const __int128 m= neg ? -(__int128) mag : (__int128) mag;
+    f= frac && neg ? m - 1 : m;
+    g= frac && !neg ? m + 1 : m;
+    break;
+  }
+  case REAL_RESULT:
+  {
+    const double d= c->val_real();
+    if (c->null_value || !std::isfinite(d) ||
+        std::fabs(d) >= (double) EXACT_DOUBLE_LIMIT)
+      return false;
+    f= (__int128) std::floor(d);
+    g= (__int128) std::ceil(d);
+    break;
+  }
+  default:
+    return false;                  /* strings, temporal: the server decides */
+  }
+  /* a REAL sibling makes the server compare as DOUBLE: exact only below 2^53 */
+  if (any_real && (f >= lim || f <= -lim || g >= lim || g <= -lim))
+    return false;
+  auto clamp= [](__int128 x) -> int64_t {
+    return x > (__int128) INT64_MAX ? INT64_MAX
+         : x < (__int128) INT64_MIN ? INT64_MIN : (int64_t) x;
+  };
+  *fl= clamp(f);
+  *ce= clamp(g);
+  return true;
+}
+
+bool double_value(Item *c, double *out)
+{
+  if (!c || !out || c->type() == Item::NULL_ITEM || !c->const_item() ||
+      c->is_expensive())
+    return false;
+  const Item_result t= c->cmp_type();
+  if (t != INT_RESULT && t != DECIMAL_RESULT && t != REAL_RESULT)
+    return false;
+  const double d= c->val_real();
+  if (c->null_value || std::isnan(d))
+    return false;
+  *out= d;
+  return true;
+}
+
+} // namespace
+
+void ha_moosedb::collect_value_predicates(const Item *cond,
+                                          std::vector<tf_val_pred> *out)
+{
+  assert(out);
+  if (!cond || !out || !share_ || !table)
+    return;
+  Item *item= const_cast<Item *>(cond);
+  if (item->type() == Item::COND_ITEM)
+  {
+    auto *c= static_cast<Item_cond *>(item);
+    if (c->functype() != Item_func::COND_AND_FUNC)
+      return;
+    List_iterator_fast<Item> it(*c->argument_list());
+    while (Item *arg= it++)
+      collect_value_predicates(arg, out);
+    return;
+  }
+  if (item->type() != Item::FUNC_ITEM)
+    return;
+  auto *fn= static_cast<Item_func *>(item);
+
+  /* `f` (op) the constants `c[0..n)`; BETWEEN has n == 2 (lo, hi). */
+  auto add= [&](const Item_field *f, vp_op op, Item **c, uint n,
+                CHARSET_INFO *cmp_cs) {
+    if (!f || !f->field || !c || n == 0)
+      return;
+    const tf_layout &l= share_->layout;
+    size_t ci= 0;
+    while (ci < l.columns.size() &&
+           l.columns[ci].field_index != f->field->field_index)
+      ci++;
+    if (ci >= l.columns.size() || ci == l.ts_column)
+      return;
+    const tf_conv conv= l.columns[ci].conv;
+    tf_val_pred p;
+    p.col= (uint32_t) ci;
+    /* NULL constants never match: dropped from lists, fatal elsewhere */
+    std::vector<Item *> k;
+    for (uint i= 0; i < n; i++)
+    {
+      if (!c[i])
+        return;
+      if (c[i]->type() == Item::NULL_ITEM)
+      {
+        if (op == vp_op::EQ && n > 1)
+          continue;
+        return;
+      }
+      k.push_back(c[i]);
+    }
+    if (k.empty())
+      return;
+    if (conv == tf_conv::INT)
+    {
+      switch (f->field->real_type()) {
+      case MYSQL_TYPE_TINY: case MYSQL_TYPE_SHORT: case MYSQL_TYPE_INT24:
+      case MYSQL_TYPE_LONG:
+        break;
+      case MYSQL_TYPE_LONGLONG:
+        if (f->field->is_unsigned())
+          return;                       /* stored wrapped as signed */
+        break;
+      default:
+        return;                         /* YEAR, BIT */
+      }
+      bool any_real= false;
+      for (Item *x : k)
+        if (x->cmp_type() == REAL_RESULT)
+          any_real= true;
+      p.kind= TF_PRED_INT;
+      int64_t mn= INT64_MAX, mx= INT64_MIN;
+      std::vector<std::pair<int64_t, int64_t>> b;
+      for (Item *x : k)
+      {
+        int64_t fl= 0, ce= 0;
+        if (!int_bounds(x, any_real, &fl, &ce))
+          return;
+        b.emplace_back(fl, ce);
+        mn= std::min(mn, fl);
+        mx= std::max(mx, ce);
+      }
+      switch (op) {
+      case vp_op::EQ: p.ilo= mn; p.ihi= mx; break;
+      case vp_op::GE: p.ilo= b[0].first; break;
+      case vp_op::LE: p.ihi= b[0].second; break;
+      case vp_op::BETWEEN:
+        if (b.size() != 2)
+          return;
+        p.ilo= b[0].first;
+        p.ihi= b[1].second;
+        break;
+      }
+    }
+    else if (conv == tf_conv::DOUBLE || conv == tf_conv::FLOAT)
+    {
+      // FLOAT(M,D)/DOUBLE(M,D) compare with an epsilon on the server
+      // (compare_real_fixed), so exact bounds could prune a matching row.
+      if (f->field->decimals() != NOT_FIXED_DEC)
+        return;
+      p.kind= TF_PRED_FLOAT;
+      p.flo= -HUGE_VAL;
+      p.fhi= HUGE_VAL;
+      std::vector<double> v;
+      for (Item *x : k)
+      {
+        double d= 0;
+        if (!double_value(x, &d))
+          return;
+        v.push_back(d);
+      }
+      const double mn= *std::min_element(v.begin(), v.end());
+      const double mx= *std::max_element(v.begin(), v.end());
+      switch (op) {
+      case vp_op::EQ: p.flo= mn; p.fhi= mx; break;
+      case vp_op::GE: p.flo= v[0]; break;
+      case vp_op::LE: p.fhi= v[0]; break;
+      case vp_op::BETWEEN:
+        if (v.size() != 2)
+          return;
+        p.flo= v[0];
+        p.fhi= v[1];
+        break;
+      }
+    }
+    else if (conv == tf_conv::STRING && op == vp_op::EQ)
+    {
+      /*
+        Only a byte comparison: the comparison collation is the column's own
+        (not just the same charset), binary NO PAD, or binary PAD SPACE in
+        charsets whose space is the single byte 0x20. DECIMAL columns are not
+        pushed at all.
+      */
+      CHARSET_INFO *fcs= f->field->charset();
+      if (!fcs || !cmp_cs || cmp_cs->number != fcs->number ||
+          f->field->real_type() != MYSQL_TYPE_VARCHAR ||
+          !(fcs == &my_charset_bin || (fcs->state & MY_CS_BINSORT)))
+        return;
+      if (fcs == &my_charset_bin || (fcs->state & MY_CS_NOPAD))
+        p.pad_space= 0;
+      else
+      {
+        const char *nm= fcs->cs_name.str;
+        if (fcs->mbminlen != 1 || !nm ||
+            !(strcmp(nm, "utf8mb4") == 0 || strcmp(nm, "utf8mb3") == 0 ||
+              strcmp(nm, "latin1") == 0 || strcmp(nm, "ascii") == 0))
+          return;
+        p.pad_space= 1;
+      }
+      p.kind= TF_PRED_BYTES;
+      for (Item *x : k)
+      {
+        std::string v;
+        bool is_null= false;
+        if (!const_string(x, fcs, &v, &is_null))
+          return;
+        if (!is_null)
+          p.values.push_back(std::move(v));
+      }
+    }
+    else
+      return;
+    out->push_back(std::move(p));
+  };
+
+  switch (fn->functype()) {
+  case Item_func::EQ_FUNC:
+  case Item_func::GE_FUNC:
+  case Item_func::GT_FUNC:
+  case Item_func::LE_FUNC:
+  case Item_func::LT_FUNC:
+  {
+    if (fn->argument_count() != 2)
+      return;
+    Item **a= fn->arguments();
+    CHARSET_INFO *cs= fn->functype() == Item_func::EQ_FUNC
+        ? static_cast<Item_bool_rowready_func2 *>(fn)->compare_collation()
+        : nullptr;
+    for (int side= 0; side < 2; side++)
+      if (const Item_field *f= field_of(a[side], table))
+      {
+        /* `col op K` as is; `K op col` mirrors the operator */
+        vp_op op= vp_op::EQ;
+        switch (fn->functype()) {
+        case Item_func::GE_FUNC:
+        case Item_func::GT_FUNC:
+          op= side == 0 ? vp_op::GE : vp_op::LE;
+          break;
+        case Item_func::LE_FUNC:
+        case Item_func::LT_FUNC:
+          op= side == 0 ? vp_op::LE : vp_op::GE;
+          break;
+        default:
+          break;
+        }
+        add(f, op, &a[1 - side], 1, cs);
+        return;
+      }
+    return;
+  }
+  case Item_func::BETWEEN:
+  {
+    auto *b= static_cast<Item_func_between *>(fn);
+    if (b->negated || fn->argument_count() != 3)
+      return;
+    if (const Item_field *f= field_of(fn->arguments()[0], table))
+      add(f, vp_op::BETWEEN, fn->arguments() + 1, 2, nullptr);
+    return;
+  }
+  case Item_func::IN_FUNC:
+  {
+    auto *in= static_cast<Item_func_in *>(fn);
+    if (in->negated || fn->argument_count() < 2)
+      return;
+    if (const Item_field *f= field_of(fn->arguments()[0], table))
+      add(f, vp_op::EQ, fn->arguments() + 1, fn->argument_count() - 1,
+          in->compare_collation());
+    return;
+  }
+  default:
+    return;
+  }
+}
+
 const COND *ha_moosedb::cond_push(const COND *cond)
 {
   std::vector<tf_tag_predicate> preds;
   if (share_ && cond)
     collect_tag_predicates(cond, &preds);
   pushed_.push_back(std::move(preds));
+  {
+    std::vector<tf_val_pred> vp;
+    if (share_ && cond && table)
+      collect_value_predicates(cond, &vp);
+    pushed_val_.push_back(std::move(vp));
+  }
   pushed_valid_= false;
   /*
     A DELETE whose whole WHERE is TAG equalities and time bounds can be done by
@@ -2362,6 +2731,8 @@ void ha_moosedb::cond_pop()
 {
   if (!pushed_.empty())
     pushed_.pop_back();
+  if (!pushed_val_.empty())
+    pushed_val_.pop_back();
   pushed_valid_= false;
 }
 
@@ -2386,6 +2757,7 @@ int ha_moosedb::reset()
   ddel_cap_valid_= false;
   ddel_cap_item_= nullptr;
   pushed_.clear();
+  pushed_val_.clear();
   pushed_valid_= false;
   scan_.reset();
   reset_batch_state();
@@ -3209,6 +3581,57 @@ int ha_moosedb::open_scan(longlong lo, longlong hi, bool sorted,
   int error= 0;
   MooseDBScan *s= nullptr;
   bool unfiltered= false;
+  /*
+    Value predicates (zone maps / Blooms) are a hint: the server re-evaluates
+    the whole WHERE. The buffers behind the TFColPred array live in `bufs`
+    until the scan is open.
+  */
+  struct pred_bufs
+  {
+    std::vector<uint64_t> starts;
+    std::vector<uint32_t> lens;
+    std::vector<uint8_t> data;
+  };
+  std::vector<pred_bufs> bufs;
+  std::vector<TFColPred> cp;
+  {
+    size_t total= 0;
+    for (const auto &level : pushed_val_)
+      total+= level.size();
+    bufs.resize(total);
+    cp.reserve(total);
+    size_t bi= 0;
+    for (const auto &level : pushed_val_)
+      for (const tf_val_pred &p : level)
+      {
+        if (bi >= bufs.size())
+          break;
+        pred_bufs &b= bufs[bi++];
+        TFColPred c{};
+        c.col= p.col;
+        c.kind= p.kind;
+        c.pad_space= p.pad_space;
+        c.int_lo= p.ilo;
+        c.int_hi= p.ihi;
+        c.float_lo= p.flo;
+        c.float_hi= p.fhi;
+        if (p.kind == TF_PRED_BYTES)
+        {
+          for (const std::string &v : p.values)
+          {
+            b.starts.push_back((uint64_t) b.data.size());
+            b.lens.push_back((uint32_t) v.size());
+            b.data.insert(b.data.end(), v.begin(), v.end());
+          }
+          c.value_starts= b.starts.data();
+          c.value_lens= b.lens.data();
+          c.value_count= (uint64_t) b.starts.size();
+          c.value_data= b.data.data();
+          c.value_data_len= (uint64_t) b.data.size();
+        }
+        cp.push_back(c);
+      }
+  }
   for (int attempt= 0; attempt <= 16; attempt++)
   {
     uint64_t v0= 0;
@@ -3226,11 +3649,19 @@ int ha_moosedb::open_scan(longlong lo, longlong hi, bool sorted,
     if (filtered)
       pushed_version_= v0;
     s= nullptr;
-    error= map_status(moosedb_scan_open_projected(
-        share_->table.get(), lo, hi, filtered ? ids->data() : nullptr,
-        filtered ? (int64_t) ids->size() : -1, sorted,
-        proj_all_ ? nullptr : proj_mask_.data(),
-        proj_all_ ? 0 : (uint32_t) proj_mask_.size(), &s));
+    if (cp.empty())
+      error= map_status(moosedb_scan_open_projected(
+          share_->table.get(), lo, hi, filtered ? ids->data() : nullptr,
+          filtered ? (int64_t) ids->size() : -1, sorted,
+          proj_all_ ? nullptr : proj_mask_.data(),
+          proj_all_ ? 0 : (uint32_t) proj_mask_.size(), &s));
+    else
+      error= map_status(moosedb_scan_open_pruned(
+          share_->table.get(), lo, hi, filtered ? ids->data() : nullptr,
+          filtered ? (int64_t) ids->size() : -1, sorted,
+          proj_all_ ? nullptr : proj_mask_.data(),
+          proj_all_ ? 0 : (uint32_t) proj_mask_.size(), cp.data(),
+          (uint32_t) cp.size(), &s));
     if (error || !filtered)
       break;
     uint64_t v1= 0;

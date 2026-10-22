@@ -571,3 +571,88 @@ fn seek_start_and_seek_end_continue_after_an_end_on_the_same_snapshot() {
     assert_eq!(drain(scan, 100, false, &ALL).0.len(), 380);
     check(unsafe { moosedb_scan_close(scan) }).unwrap();
 }
+
+fn pred(col: u32, kind: u8) -> TFColPred {
+    TFColPred {
+        col,
+        kind,
+        pad_space: 0,
+        int_lo: 0,
+        int_hi: 0,
+        float_lo: 0.0,
+        float_hi: 0.0,
+        value_starts: ptr::null(),
+        value_lens: ptr::null(),
+        value_count: 0,
+        value_data: ptr::null(),
+        value_data_len: 0,
+    }
+}
+
+fn open_pruned(t: &Table, preds: &[TFColPred]) -> Result<*mut MooseDBScan, (TFStatus, String)> {
+    let mut scan = ptr::null_mut();
+    check(unsafe {
+        moosedb_scan_open_pruned(
+            t.0,
+            i64::MIN,
+            i64::MAX,
+            ptr::null(),
+            -1,
+            false,
+            ptr::null(),
+            0,
+            if preds.is_empty() { ptr::null() } else { preds.as_ptr() },
+            preds.len() as u32,
+            &mut scan,
+        )
+    })?;
+    Ok(scan)
+}
+
+#[test]
+fn value_predicates_skip_chunk_blocks_and_the_counters_show_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = Table::create(dir.path().join("t").to_str().unwrap());
+    let all = written(&t, 300, 300); // everything in chunks
+    let count = |preds: &[TFColPred]| {
+        let scan = open_pruned(&t, preds).unwrap();
+        let (rows, _) = drain(scan, 0, false, &ALL);
+        check(unsafe { moosedb_scan_close(scan) }).unwrap();
+        rows.len()
+    };
+    assert_eq!(count(&[]), all.len());
+
+    let stats = || {
+        let mut s = TFPruneStats { entries_tested: 0, pruned_by_zone: 0, pruned_by_bloom: 0, rows_skipped: 0, blocks_skipped: 0, blocks_read: 0, block_read_ns: 0 };
+        check(unsafe { moosedb_prune_stats(&mut s) }).unwrap();
+        s
+    };
+    let before = stats();
+    // cnt (column 3) never reaches i64::MAX: every block is skipped
+    let mut none = pred(3, TF_PRED_INT);
+    (none.int_lo, none.int_hi) = (i64::MAX - 1, i64::MAX);
+    assert_eq!(count(&[none]), 0);
+    let mid = stats();
+    assert!(mid.pruned_by_zone > before.pruned_by_zone && mid.rows_skipped >= before.rows_skipped + 300);
+    assert!(mid.blocks_skipped > before.blocks_skipped && mid.blocks_read >= before.blocks_read);
+    // an open range keeps everything
+    let mut open = pred(3, TF_PRED_INT);
+    (open.int_lo, open.int_hi) = (i64::MIN, i64::MAX);
+    assert_eq!(count(&[open]), all.len());
+    // a string that no row holds: the column Bloom skips the blocks
+    let (data, starts, lens) = (b"never-written".to_vec(), [0u64], [13u32]);
+    let mut s = pred(4, TF_PRED_BYTES);
+    (s.value_starts, s.value_lens, s.value_count) = (starts.as_ptr(), lens.as_ptr(), 1);
+    (s.value_data, s.value_data_len) = (data.as_ptr(), data.len() as u64);
+    assert_eq!(count(&[s]), 0);
+    assert!(stats().pruned_by_bloom > mid.pruned_by_bloom);
+    // a value outside its data
+    let long = [99u32];
+    s.value_lens = long.as_ptr();
+    assert_eq!(open_pruned(&t, &[s]).unwrap_err().0, TFStatus::TF_ERR_INVALID_ARG);
+    // unknown kind, wrong column type
+    assert_eq!(open_pruned(&t, &[pred(3, 9)]).unwrap_err().0, TFStatus::TF_ERR_INVALID_ARG);
+    assert_eq!(open_pruned(&t, &[pred(2, TF_PRED_INT)]).unwrap_err().0, TFStatus::TF_ERR_INVALID_ARG);
+    check(moosedb_prune_stats_reset()).unwrap();
+    assert_eq!(stats().entries_tested, 0);
+}

@@ -13,6 +13,18 @@
 // Size in bytes of a row position (`handler::ref_length`).
 #define TF_POSITION_LEN 16
 
+// `TFColPred::kind`: `lo <= v <= hi` on an INT64 / TIMESTAMP / BOOL (0/1)
+// column, bounds in `int_lo` / `int_hi`.
+#define TF_PRED_INT 0
+
+// `TFColPred::kind`: `lo <= v <= hi` on a FLOAT64 / FLOAT32 column, bounds in
+// `float_lo` / `float_hi` (IEEE; use -inf / +inf for an open side).
+#define TF_PRED_FLOAT 1
+
+// `TFColPred::kind`: the value equals one of the listed byte strings, on a
+// VARCHAR / DECIMAL column.
+#define TF_PRED_BYTES 2
+
 // Group key kinds of `TFAggKey::kind`.
 #define TF_AGG_KEY_SERIES 0
 
@@ -198,6 +210,54 @@ typedef struct {
   uint32_t col_count;
   TFValue *values;
 } TFRow;
+
+// A value predicate that lets a scan **skip** chunk blocks (zone maps / column
+// Blooms); ANDed with the others. It is a hint, not a filter: rows of blocks
+// that are read come back whether they match or not (the SQL layer keeps
+// evaluating its WHERE), and MemTable rows are never skipped. Rules for the
+// caller: NULL must never satisfy the SQL condition it replaces (no `IS NULL`,
+// `<=>`, `OR` across columns, ...); a strict bound is passed as the inclusive
+// one; `TF_PRED_BYTES` only when the SQL comparison is a byte comparison
+// (binary NO PAD collation; with `pad_space` non-zero: binary PAD SPACE of a
+// charset whose space is the single byte 0x20, as `TFAggFilter::pad_space`).
+// An empty list matches nothing. Only the fields of its `kind` are read.
+// A column of the wrong type, a TAG or out-of-range column is
+// `TF_ERR_INVALID_ARG`; the table's timestamp column is accepted and ignored.
+typedef struct {
+  uint32_t col;
+  // `TF_PRED_INT`, `TF_PRED_FLOAT` or `TF_PRED_BYTES`.
+  uint8_t kind;
+  uint8_t pad_space;
+  int64_t int_lo;
+  int64_t int_hi;
+  double float_lo;
+  double float_hi;
+  // `TF_PRED_BYTES`: value `i` is
+  // `value_data[value_starts[i] .. value_starts[i] + value_lens[i]]`.
+  const uint64_t *value_starts;
+  const uint32_t *value_lens;
+  uint64_t value_count;
+  const uint8_t *value_data;
+  uint64_t value_data_len;
+} TFColPred;
+
+// Process-wide counters of the zone-map / column-Bloom pruning (scans and
+// aggregations of every table). An "entry" is one series of one chunk: its
+// column blocks are read together and pruned together.
+typedef struct {
+  // Entries that reached the value test.
+  uint64_t entries_tested;
+  uint64_t pruned_by_zone;
+  uint64_t pruned_by_bloom;
+  // Rows of the pruned entries, never decoded.
+  uint64_t rows_skipped;
+  // Column blocks inside pruned entries, never read.
+  uint64_t blocks_skipped;
+  // Column blocks read from disk (cache misses).
+  uint64_t blocks_read;
+  // Nanoseconds reading + decrypting + decompressing those blocks (all threads).
+  uint64_t block_read_ns;
+} TFPruneStats;
 
 // One column of a `TFBatch` (see `moosedb_scan_next_batch`). All pointers
 // belong to the scan and follow the lifetime of the batch.
@@ -660,6 +720,33 @@ TFStatus moosedb_scan_open_projected(MooseDBTable *table,
                                      const uint8_t *columns_mask,
                                      uint32_t mask_len,
                                      MooseDBScan **out_scan);
+
+// `moosedb_scan_open_projected` plus value predicates that skip chunk blocks
+// (see `TFColPred`). `preds` holds `pred_count` elements (may be NULL with 0).
+//
+// # Safety
+// As `moosedb_scan_open_projected`; `preds` and the arrays inside it must be
+// valid for the call.
+TFStatus moosedb_scan_open_pruned(MooseDBTable *table,
+                                  int64_t ts_start_us,
+                                  int64_t ts_end_us,
+                                  const uint64_t *series_ids,
+                                  int64_t series_count,
+                                  bool sorted,
+                                  const uint8_t *columns_mask,
+                                  uint32_t mask_len,
+                                  const TFColPred *preds,
+                                  uint32_t pred_count,
+                                  MooseDBScan **out_scan);
+
+// Reads the pruning counters.
+//
+// # Safety
+// `out` must be writable.
+TFStatus moosedb_prune_stats(TFPruneStats *out);
+
+// Zeroes the pruning counters.
+TFStatus moosedb_prune_stats_reset(void);
 
 // Advances the scan. At the end, `*out_eof` is set and `out_row` emptied.
 //

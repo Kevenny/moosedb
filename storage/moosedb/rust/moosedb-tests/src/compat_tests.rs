@@ -224,10 +224,14 @@ fn outcome(dir: &Path) -> Result<Vec<Row>, moosedb_core::Error> {
 }
 
 fn tampered_copy(f: impl FnOnce(&Path)) -> (tempfile::TempDir, PathBuf) {
+    tampered_copy_of("aead_v3", f)
+}
+
+fn tampered_copy_of(case: &str, f: impl FnOnce(&Path)) -> (tempfile::TempDir, PathBuf) {
     crate::encryption_tests::install();
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("t");
-    copy_dir(&fixtures().join("aead_v3"), &path);
+    copy_dir(&fixtures().join(case), &path);
     f(&path);
     (tmp, path)
 }
@@ -368,4 +372,124 @@ fn a_plaintext_wal_segment_in_an_encrypted_table_is_refused() {
     // The reverse is refused the same way as for chunks.
     std::fs::write(wal_path(&plain), enc_wal).unwrap();
     assert!(Table::open(config(&plain, opts(false))).is_err());
+}
+
+// --- Zone maps (a section inside the index+Bloom unit, flag ZONES) -----------
+
+#[test]
+#[ignore = "writes fixtures with the current format"]
+fn gen_fixture_zones() {
+    generate("zones_v2", false);
+    generate("zones_v3", true);
+}
+
+/// Scan with a value predicate that no chunk row meets, minus the rows the
+/// predicate rejects: identical whether or not summaries exist.
+fn pruned_equals_unpruned(t: &Table, case: &str) -> u64 {
+    use moosedb_core::{prune_stats, ColPred, ScanFilter};
+    let preds = [ColPred::Int { col: 4, lo: 4, hi: 6 }, ColPred::Int { col: 4, lo: 5_000, hi: 6_000 }];
+    let before = prune_stats().entries_tested;
+    for p in preds {
+        let want = |f: &ScanFilter| -> Vec<Row> {
+            let mut s = t.scan(f, false).unwrap();
+            let mut out = Vec::new();
+            while let Some((_, r)) = s.next_row().unwrap() {
+                if let (ColPred::Int { lo, hi, .. }, moosedb_core::Value::Int(v)) = (&p, &r[4]) {
+                    if lo <= v && v <= hi {
+                        out.push(r);
+                    }
+                }
+            }
+            sorted(out)
+        };
+        let f = ScanFilter { cols: vec![p.clone()], ..ScanFilter::default() };
+        assert_eq!(want(&f), want(&ScanFilter::default()), "{case}: {p:?}");
+    }
+    prune_stats().entries_tested - before
+}
+
+#[test]
+fn chunks_without_zone_maps_are_read_and_never_pruned() {
+    for (case, enc) in [("plain_v2", false), ("ctr_v2", true), ("aead_v3", true)] {
+        let (_d, t) = check_case(case, enc);
+        assert!(t.chunks().unwrap().iter().all(|c| c.zones.is_none()), "{case}");
+        // no summaries: the value test is never even reached (modulo parallel tests)
+        pruned_equals_unpruned(&t, case);
+    }
+}
+
+#[test]
+fn chunks_with_zone_maps_are_read_and_pruned() {
+    for (case, enc, version) in [("zones_v2", false, 2), ("zones_v3", true, 3)] {
+        let (_d, t) = check_case(case, enc);
+        assert_eq!(chunk_versions(&t), vec![version], "{case}: summaries need no new version");
+        assert!(t.chunks().unwrap().iter().all(|c| c.zones.is_some()), "{case}");
+        assert!(pruned_equals_unpruned(&t, case) >= 2, "{case}: entries were tested");
+    }
+}
+
+#[test]
+fn any_bit_flip_in_the_sealed_zone_section_is_never_served() {
+    let dir = fixtures().join("zones_v3");
+    let name = chunk_path(&dir);
+    let orig = std::fs::read(&name).unwrap();
+    let want = sorted(expected("zones_v3"));
+    let flag_zones = 1u16 << 3;
+    assert_ne!(u16::from_le_bytes([orig[6], orig[7]]) & flag_zones, 0);
+    // every byte from the first block to the footer: blocks, index, Bloom, summaries
+    for pos in 96..orig.len() - 24 {
+        let (_d, path) = tampered_copy_of("zones_v3", |p| {
+            let c = chunk_path(p);
+            let mut b = std::fs::read(&c).unwrap();
+            b[pos] ^= 1 << (pos % 8);
+            fix_chunk_crcs(&mut b);
+            std::fs::write(&c, b).unwrap();
+        });
+        match outcome(&path) {
+            Err(moosedb_core::Error::Corrupt(_) | moosedb_core::Error::Crypto(_) | moosedb_core::Error::NotFound(_)) => {}
+            Err(e) => panic!("byte {pos}: unexpected error {e}"),
+            Ok(rows) => panic!("byte {pos}: damaged chunk served {} rows (want {})", rows.len(), want.len()),
+        }
+    }
+    // clearing the header flag (and fixing the header CRC) strips the summaries: the AAD notices
+    let (_d, path) = tampered_copy_of("zones_v3", |p| {
+        let c = chunk_path(p);
+        let mut b = std::fs::read(&c).unwrap();
+        b[6] &= !(1 << 3);
+        fix_chunk_crcs(&mut b);
+        std::fs::write(&c, b).unwrap();
+    });
+    assert!(matches!(outcome(&path), Err(moosedb_core::Error::Crypto(_))));
+}
+
+#[test]
+fn a_damaged_plaintext_zone_section_is_ignored_not_trusted() {
+    use moosedb_core::{ColPred, ScanFilter};
+    let dir = fixtures().join("zones_v2");
+    let orig = std::fs::read(chunk_path(&dir)).unwrap();
+    let f = orig.len() - 24;
+    let bloom_offset = u64::from_le_bytes(orig[f + 8..f + 16].try_into().unwrap()) as usize;
+    let words = u32::from_le_bytes(orig[bloom_offset + 1..bloom_offset + 5].try_into().unwrap()) as usize;
+    let zone_start = bloom_offset + 5 + 8 * words;
+    assert!(zone_start < f, "a zone section follows the series Bloom");
+    // the predicate matches row 4 only; a lying summary must not hide it
+    let probe = ScanFilter { cols: vec![ColPred::Int { col: 4, lo: 4, hi: 4 }], ..ScanFilter::default() };
+    for pos in zone_start..f {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("t");
+        copy_dir(&dir, &path);
+        let c = chunk_path(&path);
+        let mut b = std::fs::read(&c).unwrap();
+        b[pos] ^= 1 << (pos % 8);
+        fix_chunk_crcs(&mut b);
+        std::fs::write(&c, b).unwrap();
+        let t = Table::open(config(&path, opts(false))).unwrap();
+        assert!(t.chunks().unwrap().iter().all(|c| c.zones.is_none()), "byte {pos}: summary kept");
+        let mut s = t.scan(&probe, false).unwrap();
+        let mut hit = false;
+        while let Some((_, r)) = s.next_row().unwrap() {
+            hit |= r[4] == moosedb_core::Value::Int(4);
+        }
+        assert!(hit, "byte {pos}: row hidden by a damaged summary");
+    }
 }

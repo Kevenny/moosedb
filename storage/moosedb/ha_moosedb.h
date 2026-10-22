@@ -127,6 +127,21 @@ struct tf_tag_predicate
 };
 
 /*
+  A value predicate on a non-TAG column, handed to the core as a TFColPred to
+  skip chunk blocks (zone maps / Blooms). A hint only: the server still
+  evaluates the whole WHERE. `col` indexes tf_layout::columns.
+*/
+struct tf_val_pred
+{
+  uint32_t col;
+  uint8_t kind;                      /* TF_PRED_INT / FLOAT / BYTES */
+  uint8_t pad_space= 0;
+  int64_t ilo= INT64_MIN, ihi= INT64_MAX;
+  double flo= 0, fhi= 0;
+  std::vector<std::string> values;   /* TF_PRED_BYTES */
+};
+
+/*
   Series of one TAG column grouped by value under one collation. Values that
   compare equal (strnncollsp == 0) share a group; groups are found through
   CHARSET_INFO::hash_sort buckets and confirmed with strnncollsp, so lookups
@@ -342,6 +357,8 @@ private:
 
   void collect_tag_predicates(const Item *cond,
                               std::vector<tf_tag_predicate> *out);
+  void collect_value_predicates(const Item *cond,
+                                std::vector<tf_val_pred> *out);
   bool pushed_series(const std::vector<uint64_t> **ids);
   bool resolve_series(const std::vector<const tf_tag_predicate *> &preds,
                       std::vector<uint64_t> *out);
@@ -454,6 +471,7 @@ private:
 
   /* Pushed-down TAG predicates: one entry per cond_push() call. */
   std::vector<std::vector<tf_tag_predicate>> pushed_;
+  std::vector<std::vector<tf_val_pred>> pushed_val_;   /* parallel to pushed_ */
   uint64_t pushed_version_= 0;          /* series version pushed_ids_ is for */
   bool pushed_valid_= false;            /* pushed_ids_ is up to date      */
   bool pushed_filter_= false;           /* some predicate restricts rows  */

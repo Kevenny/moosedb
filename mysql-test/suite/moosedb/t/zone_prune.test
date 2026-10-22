@@ -1,0 +1,205 @@
+#
+# Zone maps (INT / DOUBLE min-max) and column Blooms (VARCHAR): the engine
+# hands value predicates of the WHERE to the core, which skips chunk blocks
+# that cannot match. A hint only: every answer must equal the InnoDB mirror's,
+# and conditions that cannot be proven safe (_ci collation, IS NULL, OR,
+# functions, NOT) must not prune at all (Moosedb_prune_* counters).
+#
+--source include/not_embedded.inc
+--source include/have_innodb.inc
+--source include/have_sequence.inc
+--source suite/moosedb/include/have_moosedb.inc
+
+CREATE TABLE z (
+  ts   DATETIME NOT NULL,
+  host VARCHAR(8) NOT NULL COMMENT 'TAG',
+  i    INT,
+  d    DOUBLE,
+  vb   VARCHAR(16) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin,
+  vc   VARCHAR(16) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci,
+  t    TIMESTAMP NULL DEFAULT NULL,
+  df   DOUBLE(10,2),
+  INDEX(ts)
+) ENGINE=MooseDB CHUNK_INTERVAL='1 DAY';
+
+--echo # 6 days (= 6 chunks), 2 series; day k holds i in [k*100, k*100+99],
+--echo # d in [k*10, k*10+9.9], vb/vc 'k-..' ; NULLs sprinkled; one flush per day
+--disable_query_log
+let $day= 0;
+while ($day < 6)
+{
+  eval INSERT INTO z
+    SELECT '2024-03-01' + INTERVAL $day DAY + INTERVAL seq MINUTE,
+           CONCAT('h', seq MOD 2),
+           IF(seq MOD 17 = 0, NULL, $day * 100 + seq MOD 100),
+           IF(seq MOD 19 = 0, NULL, $day * 10 + (seq MOD 100) / 10),
+           IF(seq MOD 13 = 0, NULL, CONCAT('d', $day, '-', seq MOD 10)),
+           IF(seq MOD 13 = 0, NULL, CONCAT('D', $day, '-', seq MOD 10)),
+           IF(seq MOD 11 = 0, NULL, '2024-03-01 00:00:00' + INTERVAL $day*100 + seq SECOND),
+           IF(seq MOD 19 = 0, NULL, $day * 10 + (seq MOD 100) / 10)
+    FROM seq_0_to_199;
+  FLUSH TABLES z;
+  inc $day;
+}
+--enable_query_log
+
+CREATE DATABASE mirror;
+CREATE TABLE mirror.z LIKE test.z;
+ALTER TABLE mirror.z ENGINE=InnoDB;
+INSERT INTO mirror.z SELECT * FROM test.z;
+
+--let $mt= test.z
+--let $it= mirror.z
+--let $quiet= 0
+--let $show_status= 0
+--let $sel= COUNT(*), SUM(tt.i), BIT_XOR(CRC32(CONCAT_WS('|', tt.ts, tt.i, tt.d, tt.vb, tt.vc, tt.t)))
+
+--echo # ---- INT ----
+--let $expect= 1
+--let $tail= WHERE tt.i >= 450
+--source suite/moosedb/include/prune_case.inc
+--let $tail= WHERE tt.i > 450
+--source suite/moosedb/include/prune_case.inc
+--let $tail= WHERE tt.i < 120
+--source suite/moosedb/include/prune_case.inc
+--let $tail= WHERE tt.i <= 100
+--source suite/moosedb/include/prune_case.inc
+--let $tail= WHERE tt.i = 333
+--source suite/moosedb/include/prune_case.inc
+--let $tail= WHERE 450 <= tt.i
+--source suite/moosedb/include/prune_case.inc
+--let $tail= WHERE tt.i BETWEEN 205 AND 215
+--source suite/moosedb/include/prune_case.inc
+--let $tail= WHERE tt.i IN (307, 340)
+--source suite/moosedb/include/prune_case.inc
+--let $tail= WHERE tt.i > 199 AND tt.i < 300 AND tt.host = 'h1'
+--source suite/moosedb/include/prune_case.inc
+--echo # the server itself rewrites NOT (i < 450) into i >= 450
+--let $tail= WHERE NOT (tt.i < 450)
+--source suite/moosedb/include/prune_case.inc
+--echo # decimal / double constants against INT round outwards
+--let $tail= WHERE tt.i > 449.5
+--source suite/moosedb/include/prune_case.inc
+--let $tail= WHERE tt.i < 100.5e0
+--source suite/moosedb/include/prune_case.inc
+--let $tail= WHERE tt.i = 333.0
+--source suite/moosedb/include/prune_case.inc
+--let $tail= WHERE tt.i BETWEEN 199.5 AND 200.5
+--source suite/moosedb/include/prune_case.inc
+--echo # nothing can match: constants beyond the data, IN with NULL
+--let $tail= WHERE tt.i > 100000
+--source suite/moosedb/include/prune_case.inc
+--let $tail= WHERE tt.i IN (NULL, 1000)
+--source suite/moosedb/include/prune_case.inc
+--echo # not pushed: string constant, expression, NOT, OR, IS NULL, column=column
+--let $expect= 0
+--let $tail= WHERE tt.i > '450'
+--source suite/moosedb/include/prune_case.inc
+--let $tail= WHERE tt.i + 0 > 450
+--source suite/moosedb/include/prune_case.inc
+--let $tail= WHERE tt.i < 50 OR tt.i > 550
+--source suite/moosedb/include/prune_case.inc
+--let $tail= WHERE tt.i IS NULL
+--source suite/moosedb/include/prune_case.inc
+--let $tail= WHERE tt.i <=> NULL
+--source suite/moosedb/include/prune_case.inc
+--let $tail= WHERE tt.i NOT BETWEEN 100 AND 599
+--source suite/moosedb/include/prune_case.inc
+--let $tail= WHERE tt.i > tt.d * 50
+--source suite/moosedb/include/prune_case.inc
+--let $tail= WHERE tt.i = NULL
+--source suite/moosedb/include/prune_case.inc
+
+--echo # ---- DOUBLE ----
+--let $expect= 1
+--let $tail= WHERE tt.d >= 45
+--source suite/moosedb/include/prune_case.inc
+--let $tail= WHERE tt.d < 10.5
+--source suite/moosedb/include/prune_case.inc
+--let $tail= WHERE tt.d BETWEEN 22.5 AND 23.5
+--source suite/moosedb/include/prune_case.inc
+--let $tail= WHERE tt.d = 31.5
+--source suite/moosedb/include/prune_case.inc
+--let $tail= WHERE tt.d IN (31.5, 33.5)
+--source suite/moosedb/include/prune_case.inc
+--let $tail= WHERE tt.d > 45.5e0 AND tt.i < 1000
+--source suite/moosedb/include/prune_case.inc
+--let $expect= 0
+--let $tail= WHERE tt.d > 'x'
+--source suite/moosedb/include/prune_case.inc
+--let $tail= WHERE ABS(tt.d) > 45
+--source suite/moosedb/include/prune_case.inc
+--let $tail= WHERE tt.d > 45 OR tt.d < 1
+--source suite/moosedb/include/prune_case.inc
+--let $tail= WHERE tt.d IS NULL
+--source suite/moosedb/include/prune_case.inc
+
+--echo # ---- DOUBLE(M,D): the server compares with an epsilon, never pushed ----
+--let $expect= 0
+--let $tail= WHERE tt.df = 31.5
+--source suite/moosedb/include/prune_case.inc
+--let $tail= WHERE tt.df >= 45
+--source suite/moosedb/include/prune_case.inc
+
+--echo # ---- VARCHAR utf8mb4_bin (PAD SPACE binary: Bloom) ----
+--let $expect= 1
+--let $tail= WHERE tt.vb = 'd3-4'
+--source suite/moosedb/include/prune_case.inc
+--let $tail= WHERE tt.vb IN ('d1-1', 'd5-9')
+--source suite/moosedb/include/prune_case.inc
+--let $tail= WHERE tt.vb = 'd3-4   '
+--source suite/moosedb/include/prune_case.inc
+--let $tail= WHERE tt.vb = 'nosuchvalue'
+--source suite/moosedb/include/prune_case.inc
+--let $tail= WHERE 'd2-2' = tt.vb
+--source suite/moosedb/include/prune_case.inc
+--let $expect= 0
+--let $tail= WHERE tt.vb LIKE 'd3-%'
+--source suite/moosedb/include/prune_case.inc
+--let $tail= WHERE tt.vb = 'd3-4' OR tt.vb = 'd1-1'
+--source suite/moosedb/include/prune_case.inc
+--let $tail= WHERE tt.vb IS NULL
+--source suite/moosedb/include/prune_case.inc
+--let $tail= WHERE tt.vb > 'd4'
+--source suite/moosedb/include/prune_case.inc
+--let $tail= WHERE tt.vb = 4
+--source suite/moosedb/include/prune_case.inc
+--let $tail= WHERE tt.vb COLLATE utf8mb4_general_ci = 'D3-4'
+--source suite/moosedb/include/prune_case.inc
+--let $tail= WHERE tt.vb NOT IN ('d3-4')
+--source suite/moosedb/include/prune_case.inc
+
+--echo # ---- VARCHAR utf8mb4_general_ci: never pushed (case/accent folding) ----
+--let $expect= 0
+--let $tail= WHERE tt.vc = 'd3-4'
+--source suite/moosedb/include/prune_case.inc
+--let $tail= WHERE tt.vc = 'D3-4'
+--source suite/moosedb/include/prune_case.inc
+--let $tail= WHERE tt.vc IN ('d1-1', 'D5-9')
+--source suite/moosedb/include/prune_case.inc
+--let $tail= WHERE tt.vc = _utf8mb4'D3-4' COLLATE utf8mb4_bin
+--source suite/moosedb/include/prune_case.inc
+
+--echo # ---- TIMESTAMP value column: never pushed ----
+--let $tail= WHERE tt.t >= '2024-03-01 00:08:00'
+--source suite/moosedb/include/prune_case.inc
+--let $tail= WHERE tt.t IS NULL
+--source suite/moosedb/include/prune_case.inc
+
+--echo # ---- Mixed: a pushable conjunct next to non-pushable ones still prunes ----
+--let $expect= 1
+--let $tail= WHERE tt.i >= 450 AND (tt.vc = 'd5-1' OR tt.d IS NULL)
+--source suite/moosedb/include/prune_case.inc
+--let $tail= WHERE tt.i >= 450 AND tt.vc = 'D5-1'
+--source suite/moosedb/include/prune_case.inc
+
+--echo # ---- MemTable rows are never skipped ----
+INSERT INTO z VALUES ('2024-03-20 00:00:00', 'h0', 5000, 500.5, 'fresh', 'FRESH', NULL, 500.5);
+INSERT INTO mirror.z VALUES ('2024-03-20 00:00:00', 'h0', 5000, 500.5, 'fresh', 'FRESH', NULL, 500.5);
+--let $tail= WHERE tt.i >= 4000
+--source suite/moosedb/include/prune_case.inc
+--let $tail= WHERE tt.vb = 'fresh'
+--source suite/moosedb/include/prune_case.inc
+
+DROP DATABASE mirror;
+DROP TABLE z;

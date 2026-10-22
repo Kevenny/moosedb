@@ -55,6 +55,7 @@ use crate::error::{corrupt, invalid, Error, Result};
 use crate::memtable::MemRow;
 use crate::scan::{visible_stretches, ResolvedFilter, Snapshot};
 use crate::schema::{ColumnType, Value};
+use crate::zone::Pruner;
 
 pub const MAX_KEYS: usize = 16;
 pub const MAX_FUNCS: usize = 64;
@@ -478,6 +479,9 @@ struct Plan<'a> {
     keys: Vec<KeySpec>,
     funcs: Vec<FuncSpec>,
     filters: Vec<(usize, FilterSet)>,
+    /// The filters as zone-map / column-Bloom tests: entries that cannot hold
+    /// an accepted row are not read (they would create no group either).
+    prune: Pruner,
     kinds: Vec<Kind>,
     want: Vec<bool>,
     /// Some key is a column (the group changes from row to row).
@@ -586,9 +590,14 @@ impl<'a> Plan<'a> {
                 }
             }
         }
-        for (c, _) in &filters {
-            if key_kind(col(*c)?.ty).is_none() {
-                return Err(invalid(format!("column {c} cannot be filtered")));
+        let mut prune = Pruner::new(&snap.schema);
+        for (c, set) in &filters {
+            match key_kind(col(*c)?.ty) {
+                None => return Err(invalid(format!("column {c} cannot be filtered"))),
+                Some(Kind::Int) => prune.add_ints(&snap.schema, *c, set.ints.iter().copied(), set.null_ok),
+                Some(Kind::Bytes) => {
+                    prune.add_bytes(&snap.schema, *c, set.bytes.iter().map(|b| &**b), set.pad_space, set.null_ok)
+                }
             }
             want[*c] = true;
         }
@@ -598,6 +607,7 @@ impl<'a> Plan<'a> {
             keys: spec.keys.clone(),
             funcs: spec.funcs.clone(),
             filters,
+            prune,
             kinds,
             want,
             col_keys,
@@ -682,6 +692,20 @@ impl<'a> Plan<'a> {
                 let list: Vec<usize> = match picked.and_then(|s| c.entries_of(s)) {
                     Some(v) => v,
                     None => (0..c.series.len()).collect(),
+                };
+                // Entries the time/series tests drop anyway stay (the worker
+                // skips them); the others go through the value summaries.
+                let list: Vec<usize> = if self.prune.is_empty() {
+                    list
+                } else {
+                    list.into_iter()
+                        .filter(|&si| {
+                            c.series.get(si).map_or(true, |e| {
+                                let live = e.ts_min <= f.ts_max && e.ts_max >= f.ts_min && f.series_matches(e.series_id);
+                                !live || !self.prune.entry_pruned(c, si)
+                            })
+                        })
+                        .collect()
                 };
                 let (mut from, mut rows) = (0, 0usize);
                 for (k, &si) in list.iter().enumerate() {

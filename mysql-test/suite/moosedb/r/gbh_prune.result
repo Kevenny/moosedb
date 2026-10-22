@@ -1,0 +1,139 @@
+CREATE TABLE g (
+ts   DATETIME NOT NULL,
+host VARCHAR(8) NOT NULL COMMENT 'TAG',
+i    INT,
+b    BIGINT NOT NULL,
+u    BIGINT UNSIGNED,
+d    DOUBLE,
+df   DOUBLE(10,2),
+vc   VARCHAR(16) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci,
+INDEX(ts)
+) ENGINE=MooseDB CHUNK_INTERVAL='1 DAY';
+# 6 days = 6 chunks, 2 series; day k holds i in [k*100, k*100+99], b = i * 1000
+# (NULLs sprinkled); day 6 stays in the MemTable with values in the middle
+INSERT INTO g
+SELECT '2024-03-07' + INTERVAL seq MINUTE, CONCAT('h', seq MOD 2), 250 + seq MOD 100,
+(250 + seq MOD 100) * 1000, 250 + seq MOD 100, 25 + (seq MOD 100) / 10,
+25 + (seq MOD 100) / 10, 'D2-1'
+  FROM seq_0_to_99;
+DELETE FROM g WHERE ts >= '2024-03-03' AND ts < '2024-03-03 00:30:00';
+CREATE DATABASE mirror;
+CREATE TABLE mirror.g LIKE test.g;
+ALTER TABLE mirror.g ENGINE=InnoDB;
+INSERT INTO mirror.g SELECT * FROM test.g;
+# ---- INT / BIGINT ranges: the engine aggregates and prunes ----
+# i >= 450
+# SELECT host, COUNT(*) c, SUM(b) s FROM g WHERE i >= 450 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# pruned=1 expected=1: as expected
+# i > 450, scalar
+# SELECT COUNT(*), SUM(b), MIN(i), MAX(i) FROM g WHERE i > 450
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# pruned=1 expected=1: as expected
+# i < 120
+# SELECT host, COUNT(*) c FROM g WHERE i < 120 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# pruned=1 expected=1: as expected
+# BETWEEN
+# SELECT host, COUNT(*) c, SUM(i) s FROM g WHERE i BETWEEN 205 AND 215 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# pruned=1 expected=1: as expected
+# constant on the left, two bounds
+# SELECT host, COUNT(*) c FROM g WHERE 199 < i AND 300 > i GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# pruned=1 expected=1: as expected
+# BIGINT column, double constant (the 1e9 shape of the lab)
+# SELECT host, COUNT(*) c, SUM(b) s FROM g WHERE b > 4.5e5 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# pruned=1 expected=1: as expected
+# decimal constant (outside the pushdown's scope: the normal path runs and prunes)
+# SELECT host, COUNT(*) c FROM g WHERE i > 449.5 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# pruned=1 expected=1: as expected
+# a time bound and a range in the same query
+# SELECT host, COUNT(*) c FROM g WHERE ts >= '2024-03-02' AND ts < '2024-03-06' AND i > 350 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# pruned=1 expected=1: as expected
+# two columns
+# SELECT host, COUNT(*) c FROM g WHERE i > 250 AND b < 480000 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# pruned=1 expected=1: as expected
+# range plus an exact value set on another column
+# SELECT COUNT(*), SUM(b) FROM g WHERE i >= 400 AND i <= 420 AND b IN (410000, 415000, 99)
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# pruned=1 expected=1: as expected
+# nothing can match
+# SELECT host, COUNT(*) c FROM g WHERE i > 100000 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# pruned=1 expected=1: as expected
+# nothing can match, scalar (one row: zero count, NULLs)
+# SELECT COUNT(*), SUM(b), MIN(i) FROM g WHERE i > 100000
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# pruned=1 expected=1: as expected
+# MemTable rows only (the chunks are outside the time range; day 6 is never pruned)
+# SELECT host, COUNT(*) c FROM g WHERE i BETWEEN 340 AND 349 AND ts >= '2024-03-07' GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# pruned=0 expected=0: as expected
+# the deleted rows (day 2, first 30 minutes) stay out
+# SELECT host, COUNT(*) c, MIN(i) lo FROM g WHERE i BETWEEN 200 AND 230 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# pruned=1 expected=1: as expected
+# ---- no hint is extracted (OR, IS NULL, <=>, a string constant) and the
+# ---- dictionary mask keeps every entry: same answer, no pruning ----
+# OR that keeps every value
+# SELECT host, COUNT(*) c FROM g WHERE i < 1000 OR i > 2000 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# pruned=0 expected=0: as expected
+# IS NULL
+# SELECT host, COUNT(*) c FROM g WHERE i IS NULL GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# pruned=0 expected=0: as expected
+# null-safe equal
+# SELECT host, COUNT(*) c FROM g WHERE i <=> NULL GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# pruned=0 expected=0: as expected
+# NOT BETWEEN that keeps every value
+# SELECT host, COUNT(*) c FROM g WHERE i NOT BETWEEN 1000 AND 2000 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# pruned=0 expected=0: as expected
+# BIGINT UNSIGNED (stored wrapped: never a hint)
+# SELECT host, COUNT(*) c FROM g WHERE u >= 0 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# pruned=0 expected=0: as expected
+# string collation _ci, every non-NULL value accepted
+# SELECT host, COUNT(*) c FROM g WHERE vc >= '' GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# pruned=0 expected=0: as expected
+# string constant against INT (refused, normal path; no hint)
+# SELECT host, COUNT(*) c FROM g WHERE i > '450' GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# pruned=0 expected=0: as expected
+# ---- no hint, but the dictionary mask is an exact set of values, which the
+# ---- core already used to skip entries (answers must still match) ----
+# OR
+# SELECT host, COUNT(*) c FROM g WHERE i < 50 OR i > 550 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# pruned=1 expected=1: as expected
+# NOT BETWEEN
+# SELECT host, COUNT(*) c FROM g WHERE i NOT BETWEEN 100 AND 599 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# pruned=1 expected=1: as expected
+# BIGINT UNSIGNED
+# SELECT host, COUNT(*) c FROM g WHERE u > 450 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# pruned=1 expected=1: as expected
+# string collation _ci
+# SELECT host, COUNT(*) c FROM g WHERE vc = 'd3-1' GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# pruned=1 expected=1: as expected
+# ---- DOUBLE: outside the pushdown (the normal path runs and prunes) ----
+# d >= 45
+# SELECT host, COUNT(*) c FROM g WHERE d >= 45 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# pruned=1 expected=1: as expected
+# DOUBLE(10,2) compares with an epsilon: never pushed
+# SELECT host, COUNT(*) c FROM g WHERE df >= 45 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# pruned=0 expected=0: as expected
+DROP DATABASE mirror;
+DROP TABLE g;

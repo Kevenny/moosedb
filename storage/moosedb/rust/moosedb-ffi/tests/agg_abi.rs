@@ -95,6 +95,8 @@ fn spec(keys: &[TFAggKey], funcs: &[TFAggFunc], filters: &[TFAggFilter], max_mem
         top_mode: TF_AGG_TOP_NONE,
         top_func: 0,
         top_limit: 0,
+        preds: ptr::null(),
+        pred_count: 0,
     }
 }
 

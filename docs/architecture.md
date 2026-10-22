@@ -132,7 +132,16 @@ merge; é só dica (linhas das entradas lidas voltam mesmo sem casar; o servidor
 reavalia o WHERE); C ABI `moosedb_scan_open_pruned`. (2) **agregação** — os
 `filters` já existentes (`TF_AGG_FILTER_VALUES` e máscara de dicionário, incl.
 `null_ok`) viram `Pruner` em `Plan::new`, aplicado em `Plan::units`; sem mudança
-de ABI. Contadores globais (`moosedb_prune_stats`): entradas testadas, podadas
+de ABI. Além deles, `AggSpec::preds` / `TFAggSpec::preds` (`TFColPred`, mesma
+semântica do scan: dica, NULL nunca casa) entram no mesmo `Pruner`; o gbh passa
+os limites de faixa do WHERE (`INT`/`BIGINT`; para `FLOAT`/`DOUBLE` sem `(M,D)` a dica `TF_PRED_FLOAT` também é gerada, mas hoje o gbh recusa colunas DOUBLE como filtro, então não chega ao core por ele) (`col > K`, `BETWEEN`, ...) extraídos
+por `collect_value_predicates` (a mesma extração do scan normal: `FLOAT(M,D)`/
+`DOUBLE(M,D)`, `BIGINT UNSIGNED`, `YEAR`, `BIT`, string e `OR`/`NOT`/`IS NULL`
+não geram dica) tanto na **fase de dicionário** quanto na execução final. É na
+fase de dicionário que a faixa importa: a máscara só vira conjunto exato
+(`null_ok` incluso) depois que o dicionário percorreu todos os blocos da coluna;
+com a dica, as entradas fora da faixa nem são lidas. A avaliação exata
+(máscara/valores) não muda. Contadores globais (`moosedb_prune_stats`): entradas testadas, podadas
 por zone map, podadas por Bloom, linhas e blocos pulados, blocos lidos do disco e ns gastos lendo/decifrando/descomprimindo (`read_block`). Não há poda no nível do chunk
 inteiro além da que já vem de tempo/Bloom de séries (um chunk cujas entradas
 são todas podadas não decodifica nada, mas ainda é percorrido).
@@ -960,7 +969,7 @@ também não (exigiriam os pesos da collation no core; o handler continua agrupa
 por `strnncollsp` e ordenando todos os grupos). Status `Moosedb_gbh_exact_filters`
 e `Moosedb_gbh_topn`. O pós-processamento ordena em paralelo
 (`moosedb_agg_threads`) e o merge por collation ordena pares (hash, grupo).
-Testes: `gbh_shortcuts`, `gbh_pad_scalar`.
+Testes: `gbh_shortcuts`, `gbh_pad_scalar`. Dicas de faixa para a poda por zone map (§Zone maps e Bloom): `gbh_prune`.
 
 **Chave string binária PAD SPACE** (`TF_AGG_KEY_COLUMN_PAD` / `KeySpec::ColumnPad`).
 Valores que diferem só por 0x20 finais são o MESMO grupo no servidor. Em vez de

@@ -395,6 +395,10 @@ typedef struct {
   uint8_t top_mode;
   uint32_t top_func;
   uint64_t top_limit;
+  // Zone-map hints (see `TFColPred`): entries that cannot hold a row inside
+  // them are skipped, on top of the filters. `preds` may be NULL with 0.
+  const TFColPred *preds;
+  uint32_t pred_count;
 } TFAggSpec;
 
 // Polled about every 10 ms on the calling thread; a non-zero return cancels

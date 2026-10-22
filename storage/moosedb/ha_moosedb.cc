@@ -1119,6 +1119,19 @@ bool ha_moosedb::moosedb_gbh_where(Item *where,
   return ok;
 }
 
+void ha_moosedb::moosedb_gbh_value_preds(Item *where,
+                                         std::vector<tf_val_pred> *out)
+{
+  if (!where || !out)
+    return;
+  std::vector<tf_val_pred> all;
+  collect_value_predicates(where, &all);
+  /* TF_PRED_BYTES is dropped on purpose: the gbh already sends exact string sets as TF_AGG_FILTER_VALUES or as the dictionary mask, which the core turns into the same test. */
+  for (tf_val_pred &p : all)
+    if (p.kind == TF_PRED_INT || p.kind == TF_PRED_FLOAT)
+      out->push_back(std::move(p));
+}
+
 bool ha_moosedb::moosedb_gbh_series(const std::vector<tf_tag_predicate> &preds,
                                     std::vector<uint64_t> *out)
 {

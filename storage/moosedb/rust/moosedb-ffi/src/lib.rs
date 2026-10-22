@@ -1781,6 +1781,10 @@ pub struct TFAggSpec {
     pub top_mode: u8,
     pub top_func: u32,
     pub top_limit: u64,
+    /// Zone-map hints (see `TFColPred`): entries that cannot hold a row inside
+    /// them are skipped, on top of the filters. `preds` may be NULL with 0.
+    pub preds: *const TFColPred,
+    pub pred_count: u32,
 }
 
 /// Polled about every 10 ms on the calling thread; a non-zero return cancels
@@ -1976,6 +1980,8 @@ pub unsafe extern "C" fn moosedb_agg_run(
             funcs,
             filters: fs,
             value_filters: vfs,
+            // SAFETY: caller contract for `preds`.
+            preds: unsafe { col_preds(s.preds, s.pred_count) }?,
             top,
             max_memory: usize::try_from(s.max_memory).unwrap_or(usize::MAX),
             threads: s.threads as usize,

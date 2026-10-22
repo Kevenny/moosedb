@@ -346,3 +346,108 @@ fn aggregation_filter_with_null_ok_mask_keeps_null_entries() {
     assert_eq!(agg.result().funcs[0].count, vec![6]);
 }
 
+/// The float stored with the integer `v` in the hints model: every special value
+/// is reachable from the INT column, so an exact filter on INT is exactly a
+/// filter on the float.
+fn float_of(v: i64) -> f64 {
+    match v.rem_euclid(40) {
+        0 => f64::NAN,
+        1 => -0.0,
+        2 => 0.0,
+        3 => f64::INFINITY,
+        4 => f64::NEG_INFINITY,
+        _ => v as f64 / 100.0,
+    }
+}
+
+/// Per-series COUNT(*) of the rows `keep` accepts (an exact mask on the INT
+/// dictionary), with or without `hint`; the dictionary phase gets the hint too,
+/// as in the gbh.
+fn counts(t: &Table, keep: &dyn Fn(i64) -> bool, hint: Option<&ColPred>, threads: usize) -> BTreeMap<u64, u64> {
+    let mut agg = t.agg_open(i64::MIN, i64::MAX, None).unwrap();
+    agg.set_min_parallel_rows(0);
+    let preds: Vec<ColPred> = hint.cloned().into_iter().collect();
+    agg.run(&AggSpec { keys: vec![KeySpec::Column(INT)], preds: preds.clone(), threads, ..AggSpec::default() }, None)
+        .unwrap();
+    let Some(KeyCol::Int { nulls, vals }) = agg.result().keys.first().cloned() else { return BTreeMap::new() };
+    let mask = nulls.iter().zip(&vals).map(|(&n, &v)| !n && keep(v)).collect();
+    let spec = AggSpec {
+        keys: vec![KeySpec::Series],
+        funcs: vec![FuncSpec::CountStar],
+        filters: vec![moosedb_core::agg::ColFilter { col: INT, mask }],
+        preds,
+        threads,
+        ..AggSpec::default()
+    };
+    agg.run(&spec, None).unwrap();
+    let r = agg.result();
+    let Some(KeyCol::Series(ids)) = r.keys.first() else { return BTreeMap::new() }; // no group
+    ids.iter().copied().zip(r.funcs[0].count.iter().copied()).collect()
+}
+
+/// Range hints (`AggSpec::preds`) only cut entries: with the exact filter that
+/// is equivalent to the predicate, the result with hints (dictionary phase and
+/// final run) equals the one without, and both equal the row-by-row oracle
+/// (chunks + MemTable + range delete).
+#[test]
+fn aggregation_range_hints_do_not_change_the_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = create_open(&dir.path().join("t"), RawOptions::default());
+    let mut g = Lcg(4242);
+    let mut sec = 0;
+    for round in 0..4 {
+        for _ in 0..1500 {
+            sec += 1 + g.below(3) as i64;
+            let host = g.below(6);
+            let mut r = model_row(&mut g, host, sec);
+            r[VALUE] = match r[INT] {
+                Value::Int(v) => Value::Float64(float_of(v)),
+                _ => Value::Null,
+            };
+            t.write(r).unwrap();
+        }
+        if round < 3 {
+            t.flush().unwrap();
+        }
+    }
+    let by_host: BTreeMap<Vec<u8>, u64> = t
+        .series()
+        .unwrap()
+        .into_iter()
+        .map(|(id, tags)| match &tags[0] {
+            Value::Bytes(b) => (b.clone(), id),
+            _ => panic!(),
+        })
+        .collect();
+    let lo = base_ts() + 300 * MICROS_PER_SEC;
+    t.delete_range(Some(&[by_host[&b"h2".to_vec()]]), lo, lo + 900 * MICROS_PER_SEC, None, true).unwrap();
+    let before = prune_stats();
+    for round in 0..120u64 {
+        let threads = 1 + (round % 3) as usize;
+        let p = loop {
+            let p = random_pred(&mut g);
+            if !matches!(p, ColPred::Bytes { .. }) {
+                break p;
+            }
+        };
+        let keep = |v: i64| match &p {
+            ColPred::Int { lo, hi, .. } => *lo <= v && v <= *hi,
+            ColPred::Float { lo, hi, .. } => *lo <= float_of(v) && float_of(v) <= *hi,
+            ColPred::Bytes { .. } => unreachable!(),
+        };
+        let mut want: BTreeMap<u64, u64> = BTreeMap::new();
+        let mut s = t.scan(&ScanFilter::default(), false).unwrap();
+        while let Some((_, r)) = s.next_row().unwrap() {
+            if matches(&r, &p) {
+                let Value::Bytes(h) = &r[1] else { panic!() };
+                *want.entry(by_host[h]).or_default() += 1;
+            }
+        }
+        let plain = counts(&t, &keep, None, threads);
+        let hinted = counts(&t, &keep, Some(&p), threads);
+        assert_eq!(hinted, plain, "{p:?}");
+        let got: BTreeMap<u64, u64> = plain.into_iter().filter(|&(_, n)| n > 0).collect();
+        assert_eq!(got, want, "{p:?}");
+    }
+    assert!(prune_stats().pruned_by_zone > before.pruned_by_zone, "the hints must prune something");
+}

@@ -55,7 +55,7 @@ use crate::error::{corrupt, invalid, Error, Result};
 use crate::memtable::MemRow;
 use crate::scan::{visible_stretches, ResolvedFilter, Snapshot};
 use crate::schema::{ColumnType, Value};
-use crate::zone::Pruner;
+use crate::zone::{ColPred, Pruner};
 
 pub const MAX_KEYS: usize = 16;
 pub const MAX_FUNCS: usize = 64;
@@ -152,6 +152,11 @@ pub struct AggSpec {
     pub funcs: Vec<FuncSpec>,
     pub filters: Vec<ColFilter>,
     pub value_filters: Vec<ValueFilter>,
+    /// Extra zone-map tests (hints, ANDed with the filters): entries that cannot
+    /// hold a row inside them are not read. Never change the result as long as
+    /// each predicate is implied by the caller's WHERE (NULL never matches);
+    /// the exact evaluation stays in `filters`.
+    pub preds: Vec<ColPred>,
     pub top: Option<TopN>,
     /// Budget in bytes (keys, states, overhead, result).
     pub max_memory: usize,
@@ -166,6 +171,7 @@ impl Default for AggSpec {
             funcs: Vec::new(),
             filters: Vec::new(),
             value_filters: Vec::new(),
+            preds: Vec::new(),
             top: None,
             max_memory: 1 << 30,
             threads: 1,
@@ -613,7 +619,7 @@ impl<'a> Plan<'a> {
                 funcs.push(FuncSpec::Min(c));
             }
         }
-        let mut prune = Pruner::new(&snap.schema);
+        let mut prune = Pruner::from_cols(&snap.schema, &spec.preds)?;
         for (c, set) in &filters {
             match key_kind(col(*c)?.ty) {
                 None => return Err(invalid(format!("column {c} cannot be filtered"))),

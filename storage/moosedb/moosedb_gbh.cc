@@ -198,6 +198,7 @@ struct gplan
   std::vector<gorder> order;
   std::vector<tf_tag_predicate> preds;
   std::vector<gfilter> filters;
+  Item *where= nullptr;            /* the WHERE, for the zone-map hints */
   longlong lo= LONGLONG_MIN, hi= LONGLONG_MAX;
   ulonglong limit= HA_POS_ERROR;
   bool has_having= false;
@@ -694,6 +695,7 @@ const char *where_refusal(gplan *p, Item *cond)
     return nullptr;
   std::vector<Item *> conj;
   flatten_and(cond, &conj);
+  p->where= cond;
   for (Item *c : conj)
   {
     if (!c)
@@ -1080,6 +1082,7 @@ private:
   const char *kptr(const kcell &c) const { return arena_.data() + c.v; }
 
   gplan p_;
+  std::vector<TFColPred> hints_;               /* zone-map hints of the WHERE (INT/FLOAT ranges), set in compute() */
   std::string msg_;
   bool killed_= false;
   std::vector<Field *> slots_;
@@ -1291,6 +1294,29 @@ int moosedb_gbh::compute()
   using clk= std::chrono::steady_clock;
   const auto t_dict= clk::now();
   uint64_t dict_values= 0;
+  /*
+    Range predicates of the WHERE (`col > K`, BETWEEN, ...) as zone-map hints:
+    the core skips entries that cannot hold a matching row, in the dictionary
+    phase and in the final run alike. Extraction is the one of the normal scan
+    (collect_value_predicates); the exact test stays with the mask / value set.
+  */
+  hints_.clear();
+  {
+    std::vector<tf_val_pred> vp;
+    if (p_.handler)
+      p_.handler->moosedb_gbh_value_preds(p_.where, &vp);
+    for (const tf_val_pred &v : vp)
+    {
+      TFColPred c{};
+      c.col= v.col;
+      c.kind= v.kind;
+      c.int_lo= v.ilo;
+      c.int_hi= v.ihi;
+      c.float_lo= v.flo;
+      c.float_hi= v.fhi;
+      hints_.push_back(c);
+    }
+  }
   std::vector<std::vector<uint8_t>> masks(p_.filters.size());
   std::vector<exact_set> sets(p_.filters.size());     /* never resized: the filters point into them */
   std::vector<TFAggFilter> tfs;
@@ -1351,6 +1377,8 @@ int moosedb_gbh::compute()
   spec.func_count= (uint32_t) p_.funcs.size();
   spec.filters= tfs.empty() ? nullptr : tfs.data();
   spec.filter_count= (uint32_t) tfs.size();
+  spec.preds= hints_.empty() ? nullptr : hints_.data();
+  spec.pred_count= (uint32_t) hints_.size();
   if (used_ >= max_memory_)
     return budget_exceeded();
   spec.max_memory= max_memory_ - used_;
@@ -1482,6 +1510,8 @@ int moosedb_gbh::build_mask(const gfilter &f, std::vector<uint8_t> *mask,
   TFAggSpec spec{};
   spec.keys= &key;
   spec.key_count= 1;
+  spec.preds= hints_.empty() ? nullptr : hints_.data();
+  spec.pred_count= (uint32_t) hints_.size();
   if (used_ >= max_memory_)
     return budget_exceeded();
   spec.max_memory= max_memory_ - used_;

@@ -1,0 +1,170 @@
+#
+# GROUP BY pushdown + zone maps: range predicates of the WHERE (INT/BIGINT,
+# strict and inclusive bounds, BETWEEN, decimal/double constants) reach the
+# core's aggregation as hints and skip chunk entries that cannot match. The
+# exact filter is unchanged, so every answer must equal the server without
+# pushdown and InnoDB; the Moosedb_prune_* counters show whether the ON run
+# pruned. What the hints must not cover (OR, IS NULL, <=>, NOT BETWEEN,
+# _ci strings, DOUBLE(M,D), BIGINT UNSIGNED, string constants) must not
+# prune. DOUBLE columns are outside the pushdown's scope: the query runs on the
+# normal path, which prunes by itself. MemTable rows are never pruned; DELETEd
+# rows stay deleted.
+#
+--source include/not_embedded.inc
+--source include/have_innodb.inc
+--source include/have_sequence.inc
+--source suite/moosedb/include/have_moosedb.inc
+
+--let $refused= 0
+--let $sorted= 0
+--let $show= 0
+--let $pre=
+
+CREATE TABLE g (
+  ts   DATETIME NOT NULL,
+  host VARCHAR(8) NOT NULL COMMENT 'TAG',
+  i    INT,
+  b    BIGINT NOT NULL,
+  u    BIGINT UNSIGNED,
+  d    DOUBLE,
+  df   DOUBLE(10,2),
+  vc   VARCHAR(16) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci,
+  INDEX(ts)
+) ENGINE=MooseDB CHUNK_INTERVAL='1 DAY';
+
+--echo # 6 days = 6 chunks, 2 series; day k holds i in [k*100, k*100+99], b = i * 1000
+--echo # (NULLs sprinkled); day 6 stays in the MemTable with values in the middle
+--disable_query_log
+let $day= 0;
+while ($day < 6)
+{
+  eval INSERT INTO g
+    SELECT '2024-03-01' + INTERVAL $day DAY + INTERVAL seq MINUTE,
+           CONCAT('h', seq MOD 2),
+           IF(seq MOD 17 = 0, NULL, $day * 100 + seq MOD 100),
+           ($day * 100 + seq MOD 100) * 1000,
+           IF(seq MOD 11 = 0, NULL, $day * 100 + seq MOD 100),
+           IF(seq MOD 19 = 0, NULL, $day * 10 + (seq MOD 100) / 10),
+           IF(seq MOD 19 = 0, NULL, $day * 10 + (seq MOD 100) / 10),
+           IF(seq MOD 13 = 0, NULL, CONCAT('D', $day, '-', seq MOD 10))
+    FROM seq_0_to_199;
+  FLUSH TABLES g;
+  inc $day;
+}
+--enable_query_log
+INSERT INTO g
+  SELECT '2024-03-07' + INTERVAL seq MINUTE, CONCAT('h', seq MOD 2), 250 + seq MOD 100,
+         (250 + seq MOD 100) * 1000, 250 + seq MOD 100, 25 + (seq MOD 100) / 10,
+         25 + (seq MOD 100) / 10, 'D2-1'
+  FROM seq_0_to_99;
+DELETE FROM g WHERE ts >= '2024-03-03' AND ts < '2024-03-03 00:30:00';
+
+CREATE DATABASE mirror;
+CREATE TABLE mirror.g LIKE test.g;
+ALTER TABLE mirror.g ENGINE=InnoDB;
+INSERT INTO mirror.g SELECT * FROM test.g;
+
+--echo # ---- INT / BIGINT ranges: the engine aggregates and prunes ----
+--let $expect= 1
+--let $label= i >= 450
+--let $q= SELECT host, COUNT(*) c, SUM(b) s FROM g WHERE i >= 450 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_prune_case.inc
+--let $label= i > 450, scalar
+--let $q= SELECT COUNT(*), SUM(b), MIN(i), MAX(i) FROM g WHERE i > 450
+--source suite/moosedb/include/gbh_prune_case.inc
+--let $label= i < 120
+--let $q= SELECT host, COUNT(*) c FROM g WHERE i < 120 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_prune_case.inc
+--let $label= BETWEEN
+--let $q= SELECT host, COUNT(*) c, SUM(i) s FROM g WHERE i BETWEEN 205 AND 215 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_prune_case.inc
+--let $label= constant on the left, two bounds
+--let $q= SELECT host, COUNT(*) c FROM g WHERE 199 < i AND 300 > i GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_prune_case.inc
+--let $label= BIGINT column, double constant (the 1e9 shape of the lab)
+--let $q= SELECT host, COUNT(*) c, SUM(b) s FROM g WHERE b > 4.5e5 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_prune_case.inc
+--let $label= decimal constant (outside the pushdown's scope: the normal path runs and prunes)
+--let $refused= 1
+--let $q= SELECT host, COUNT(*) c FROM g WHERE i > 449.5 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_prune_case.inc
+--let $label= a time bound and a range in the same query
+--let $q= SELECT host, COUNT(*) c FROM g WHERE ts >= '2024-03-02' AND ts < '2024-03-06' AND i > 350 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_prune_case.inc
+--let $label= two columns
+--let $q= SELECT host, COUNT(*) c FROM g WHERE i > 250 AND b < 480000 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_prune_case.inc
+--let $label= range plus an exact value set on another column
+--let $q= SELECT COUNT(*), SUM(b) FROM g WHERE i >= 400 AND i <= 420 AND b IN (410000, 415000, 99)
+--source suite/moosedb/include/gbh_prune_case.inc
+--let $label= nothing can match
+--let $q= SELECT host, COUNT(*) c FROM g WHERE i > 100000 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_prune_case.inc
+--let $label= nothing can match, scalar (one row: zero count, NULLs)
+--let $q= SELECT COUNT(*), SUM(b), MIN(i) FROM g WHERE i > 100000
+--source suite/moosedb/include/gbh_prune_case.inc
+--let $expect= 0
+--let $label= MemTable rows only (the chunks are outside the time range; day 6 is never pruned)
+--let $q= SELECT host, COUNT(*) c FROM g WHERE i BETWEEN 340 AND 349 AND ts >= '2024-03-07' GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_prune_case.inc
+--let $expect= 1
+--let $label= the deleted rows (day 2, first 30 minutes) stay out
+--let $q= SELECT host, COUNT(*) c, MIN(i) lo FROM g WHERE i BETWEEN 200 AND 230 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_prune_case.inc
+
+--echo # ---- no hint is extracted (OR, IS NULL, <=>, a string constant) and the
+--echo # ---- dictionary mask keeps every entry: same answer, no pruning ----
+--let $expect= 0
+--let $label= OR that keeps every value
+--let $q= SELECT host, COUNT(*) c FROM g WHERE i < 1000 OR i > 2000 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_prune_case.inc
+--let $label= IS NULL
+--let $q= SELECT host, COUNT(*) c FROM g WHERE i IS NULL GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_prune_case.inc
+--let $label= null-safe equal
+--let $q= SELECT host, COUNT(*) c FROM g WHERE i <=> NULL GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_prune_case.inc
+--let $label= NOT BETWEEN that keeps every value
+--let $q= SELECT host, COUNT(*) c FROM g WHERE i NOT BETWEEN 1000 AND 2000 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_prune_case.inc
+--let $label= BIGINT UNSIGNED (stored wrapped: never a hint)
+--let $q= SELECT host, COUNT(*) c FROM g WHERE u >= 0 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_prune_case.inc
+--let $label= string collation _ci, every non-NULL value accepted
+--let $q= SELECT host, COUNT(*) c FROM g WHERE vc >= '' GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_prune_case.inc
+--let $label= string constant against INT (refused, normal path; no hint)
+--let $refused= 1
+--let $q= SELECT host, COUNT(*) c FROM g WHERE i > '450' GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_prune_case.inc
+
+--echo # ---- no hint, but the dictionary mask is an exact set of values, which the
+--echo # ---- core already used to skip entries (answers must still match) ----
+--let $expect= 1
+--let $label= OR
+--let $q= SELECT host, COUNT(*) c FROM g WHERE i < 50 OR i > 550 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_prune_case.inc
+--let $label= NOT BETWEEN
+--let $q= SELECT host, COUNT(*) c FROM g WHERE i NOT BETWEEN 100 AND 599 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_prune_case.inc
+--let $label= BIGINT UNSIGNED
+--let $q= SELECT host, COUNT(*) c FROM g WHERE u > 450 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_prune_case.inc
+--let $label= string collation _ci
+--let $q= SELECT host, COUNT(*) c FROM g WHERE vc = 'd3-1' GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_prune_case.inc
+
+--echo # ---- DOUBLE: outside the pushdown (the normal path runs and prunes) ----
+--let $refused= 1
+--let $expect= 1
+--let $label= d >= 45
+--let $q= SELECT host, COUNT(*) c FROM g WHERE d >= 45 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_prune_case.inc
+--let $refused= 1
+--let $expect= 0
+--let $label= DOUBLE(10,2) compares with an epsilon: never pushed
+--let $q= SELECT host, COUNT(*) c FROM g WHERE df >= 45 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_prune_case.inc
+
+DROP DATABASE mirror;
+DROP TABLE g;

@@ -319,6 +319,8 @@ public:
   /* Absorbs a WHERE made only of exact TAG equalities/IN and time bounds. */
   bool moosedb_gbh_where(Item *where, std::vector<tf_tag_predicate> *preds,
                          longlong *lo, longlong *hi);
+  /* Zone-map hints (TF_PRED_INT / TF_PRED_FLOAT only) implied by the AND-ed conjuncts of `where`. */
+  void moosedb_gbh_value_preds(Item *where, std::vector<tf_val_pred> *out);
   /* Series (sorted ids) satisfying every predicate; false = not resolvable. */
   bool moosedb_gbh_series(const std::vector<tf_tag_predicate> &preds,
                           std::vector<uint64_t> *out);

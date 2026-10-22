@@ -124,7 +124,15 @@ DEALLOCATE PREPARE p;
 --echo # Refused: what the statement is part of
 --echo ##########################################################
 --let $q= SELECT COUNT(*) c, SUM(n) s FROM {T} WHERE n > 5
---let $label= no GROUP BY
+--let $label= aggregates without GROUP BY: accepted (one implicit group), see gbh_pad_scalar
+--source suite/moosedb/include/gbh_case.inc
+
+--let $q= SELECT COUNT(*) + 1 c FROM {T} WHERE n > 5
+--let $label= expression over an aggregate, no GROUP BY
+--source suite/moosedb/include/gbh_case.inc
+
+--let $q= SELECT COUNT(DISTINCT n) c FROM {T}
+--let $label= COUNT(DISTINCT), no GROUP BY
 --source suite/moosedb/include/gbh_case.inc
 
 --let $q= SELECT host FROM {T} WHERE n > 45 ORDER BY ts LIMIT 5

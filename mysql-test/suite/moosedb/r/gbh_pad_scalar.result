@@ -1,0 +1,370 @@
+CREATE TABLE p (
+ts   DATETIME NOT NULL,
+host VARCHAR(16) NOT NULL COMMENT 'TAG',
+kp   VARCHAR(8) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin,
+kl   VARCHAR(8) CHARACTER SET latin1 COLLATE latin1_bin,
+ku   VARCHAR(8) CHARACTER SET utf8mb3 COLLATE utf8mb3_bin,
+kb   VARCHAR(8) CHARACTER SET utf8mb4 COLLATE utf8mb4_nopad_bin,
+kc   VARCHAR(8) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci,
+v    BIGINT NOT NULL,
+bg   BIGINT NOT NULL,
+w    INT,
+INDEX(ts)
+) ENGINE=MooseDB CHUNK_INTERVAL='1 DAY';
+CREATE TABLE e (
+ts   DATETIME NOT NULL,
+host VARCHAR(16) NOT NULL COMMENT 'TAG',
+kp   VARCHAR(8) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin,
+v    BIGINT NOT NULL,
+w    INT,
+INDEX(ts)
+) ENGINE=MooseDB CHUNK_INTERVAL='1 DAY';
+# classes of kp under PAD SPACE: {a, 'a ', 'a   '}, {'', '  '}, 'a<0x01>', 'a<TAB>', ' a', 'a b', 'b', NULL
+# 20000 rows in chunks, 10000 more in the MemTable
+INSERT INTO p SELECT '2024-03-01' + INTERVAL seq * 20 SECOND, CONCAT('h', seq MOD 5),
+k, k, k, k, k, (seq * 37) MOD 1000, 9223372036854775807 - seq MOD 3,
+IF(seq MOD 4 = 0, NULL, seq MOD 50)
+FROM (SELECT seq, ELT(seq MOD 11 + 1, 'a', 'a ', 'a   ', '', '  ', CONCAT('a', CHAR(1)), CONCAT('a', CHAR(9)), ' a', 'a b ', 'b', NULL) k
+FROM seq_0_to_19999) x;
+FLUSH TABLES p;
+INSERT INTO p SELECT '2024-03-01' + INTERVAL seq * 20 SECOND, CONCAT('h', seq MOD 5),
+k, k, k, k, k, (seq * 37) MOD 1000, 9223372036854775807 - seq MOD 3,
+IF(seq MOD 4 = 0, NULL, seq MOD 50)
+FROM (SELECT seq, ELT(seq MOD 11 + 1, 'a', 'a ', 'a   ', '', '  ', CONCAT('a', CHAR(1)), CONCAT('a', CHAR(9)), ' a', 'a b ', 'b', NULL) k
+FROM seq_20000_to_29999) x;
+CREATE DATABASE mirror;
+CREATE TABLE mirror.p LIKE test.p;
+ALTER TABLE mirror.p ENGINE=InnoDB;
+INSERT INTO mirror.p SELECT * FROM test.p;
+CREATE TABLE mirror.e LIKE test.e;
+ALTER TABLE mirror.e ENGINE=InnoDB;
+##########################################################
+# PAD SPACE keys: one group per class, one of its values as the key
+##########################################################
+# groups (a, 'a ' and 'a   ' are one group; '' and '  ' too)
+# SELECT kp, COUNT(*) c, SUM(v) s, MIN(ts) t FROM p GROUP BY kp ORDER BY kp
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=0 core top-N=0
+# groups (a, 'a ' and 'a   ' are one group; '' and '  ' too)
+# SELECT kl, COUNT(*) c FROM p GROUP BY kl ORDER BY kl
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=0 core top-N=0
+# groups (a, 'a ' and 'a   ' are one group; '' and '  ' too)
+# SELECT ku, COUNT(*) c FROM p GROUP BY ku ORDER BY ku
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=0 core top-N=0
+# PAD SPACE key together with a TAG
+# SELECT host, kp, COUNT(*) c FROM p GROUP BY host, kp ORDER BY host, kp
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=0 core top-N=0
+##########################################################
+# Core top-N on PAD SPACE keys (topn=1): ties at the LIMIT boundary follow the
+# collation order, not the byte order ('a<0x01>' sorts before 'a': 0x01 < ' ')
+##########################################################
+# ORDER BY aggregate DESC, key
+# SELECT kp, COUNT(*) c FROM p GROUP BY kp ORDER BY c DESC, kp LIMIT 1
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=0 core top-N=1
+# ORDER BY aggregate DESC, key
+# SELECT kp, COUNT(*) c FROM p GROUP BY kp ORDER BY c DESC, kp LIMIT 2
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=0 core top-N=1
+# ORDER BY aggregate DESC, key
+# SELECT kp, COUNT(*) c FROM p GROUP BY kp ORDER BY c DESC, kp LIMIT 4
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=0 core top-N=1
+# ORDER BY aggregate DESC, key
+# SELECT kp, COUNT(*) c FROM p GROUP BY kp ORDER BY c DESC, kp LIMIT 20
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=0 core top-N=1
+# ORDER BY aggregate ASC, key (the singletons tie)
+# SELECT kp, COUNT(*) c FROM p GROUP BY kp ORDER BY c, kp LIMIT 3
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=0 core top-N=1
+# ORDER BY aggregate ASC, key (the singletons tie)
+# SELECT kp, COUNT(*) c FROM p GROUP BY kp ORDER BY c, kp LIMIT 4 OFFSET 2
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=0 core top-N=1
+# ORDER BY aggregate ASC, key (the singletons tie)
+# SELECT kp, COUNT(*) c FROM p GROUP BY kp ORDER BY c, kp LIMIT 100
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=0 core top-N=1
+# other aggregates, filters
+# SELECT kp, SUM(v) s FROM p WHERE ts >= '2024-03-04' GROUP BY kp ORDER BY s DESC, kp LIMIT 3
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=0 core top-N=1
+# other aggregates, filters
+# SELECT kp, MIN(ts) t FROM p GROUP BY kp ORDER BY t, kp LIMIT 5
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=0 core top-N=1
+# other aggregates, filters
+# SELECT kp, MAX(ts) t FROM p WHERE host = 'h1' GROUP BY kp ORDER BY t DESC, kp LIMIT 5
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=0 core top-N=1
+# other aggregates, filters
+# SELECT kp, COUNT(w) c FROM p WHERE v > 500 GROUP BY kp ORDER BY c DESC, kp LIMIT 4
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=0 core top-N=1
+# other aggregates, filters
+# SELECT kp, COUNT(*) c FROM p WHERE kp IN ('a', 'b ', '') GROUP BY kp ORDER BY c DESC, kp LIMIT 2
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=1 core top-N=1
+# other aggregates, filters
+# SELECT kp, COUNT(*) c FROM p WHERE kp LIKE 'a%' GROUP BY kp ORDER BY c DESC, kp LIMIT 3
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=0 core top-N=1
+# latin1_bin and utf8mb3_bin
+# SELECT kl, COUNT(*) c FROM p GROUP BY kl ORDER BY c DESC, kl LIMIT 3
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=0 core top-N=1
+# latin1_bin and utf8mb3_bin
+# SELECT ku, COUNT(*) c FROM p GROUP BY ku ORDER BY c, ku LIMIT 4
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=0 core top-N=1
+# a single ORDER BY term without ties at the boundary
+# SELECT kp, SUM(v) s FROM p WHERE kp IN ('a', 'a ', 'b') GROUP BY kp ORDER BY s DESC LIMIT 1
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=1 core top-N=1
+##########################################################
+# Still without the core top-N (topn=0, same answer)
+##########################################################
+# case-insensitive key, key DESC in the second term
+# SELECT kc, COUNT(*) c FROM p GROUP BY kc ORDER BY c DESC, kc LIMIT 3
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=0 core top-N=0
+# case-insensitive key, key DESC in the second term
+# SELECT kp, COUNT(*) c FROM p GROUP BY kp ORDER BY c DESC, kp DESC LIMIT 3
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=0 core top-N=0
+##########################################################
+# Aggregates without GROUP BY
+##########################################################
+# all the aggregates, whole table
+# SELECT COUNT(*), COUNT(w), SUM(v), SUM(w), MIN(v), MAX(v), MIN(w), MAX(w), AVG(v), AVG(w), MIN(ts), MAX(ts) FROM p
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=0 core top-N=0
+# SUM beyond 64 bits (128-bit accumulator)
+# SELECT SUM(bg), AVG(bg), COUNT(*) FROM p
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=0 core top-N=0
+# WHERE: time, TAG, column value, exact PAD SPACE value, case-insensitive value
+# SELECT COUNT(*), SUM(v), MIN(v), MAX(v), AVG(v) FROM p WHERE ts >= '2024-03-02' AND ts < '2024-03-04'
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=0 core top-N=0
+# WHERE: time, TAG, column value, exact PAD SPACE value, case-insensitive value
+# SELECT COUNT(*), SUM(v), MIN(ts), MAX(ts) FROM p WHERE host = 'h2'
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=0 core top-N=0
+# WHERE: time, TAG, column value, exact PAD SPACE value, case-insensitive value
+# SELECT COUNT(*), SUM(v), AVG(w) FROM p WHERE host IN ('h0', 'h4') AND v >= 700
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=0 core top-N=0
+# WHERE: time, TAG, column value, exact PAD SPACE value, case-insensitive value
+# SELECT COUNT(*), SUM(v), MIN(w) FROM p WHERE kp = 'a'
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=1 core top-N=0
+# WHERE: time, TAG, column value, exact PAD SPACE value, case-insensitive value
+# SELECT COUNT(*), SUM(v) FROM p WHERE kc = 'A' OR kc = 'B'
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=0 core top-N=0
+# WHERE: time, TAG, column value, exact PAD SPACE value, case-insensitive value
+# SELECT COUNT(*), COUNT(w), SUM(w), MIN(w), MAX(w), AVG(w) FROM p WHERE kp IS NULL
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=0 core top-N=0
+# nothing matches: still one row, COUNT = 0 and NULLs
+# SELECT COUNT(*), COUNT(w), SUM(v), SUM(w), MIN(v), MAX(w), AVG(v), MIN(ts), MAX(ts) FROM p WHERE ts > '2100-01-01'
+# same output with and without pushdown and on InnoDB; the server answered by itself (the engine did not run it)
+# shortcuts taken: exact filters=0 core top-N=0
+# nothing matches: still one row, COUNT = 0 and NULLs
+# SELECT COUNT(*), SUM(v), MIN(ts) FROM p WHERE host = 'nope'
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=0 core top-N=0
+# nothing matches: still one row, COUNT = 0 and NULLs
+# SELECT COUNT(*), SUM(v), MIN(ts) FROM p WHERE kp = 'zzz'
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=1 core top-N=0
+# nothing matches: still one row, COUNT = 0 and NULLs
+# SELECT COUNT(*), SUM(v), MIN(ts) FROM p WHERE kc = 'zzz'
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=0 core top-N=0
+# nothing matches: still one row, COUNT = 0 and NULLs
+# SELECT COUNT(*), SUM(v), MAX(v) FROM p WHERE v < 0
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=0 core top-N=0
+# nothing matches: still one row, COUNT = 0 and NULLs
+# SELECT COUNT(*), COUNT(w), SUM(w), MIN(w), AVG(w) FROM p WHERE w IS NULL
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=0 core top-N=0
+# empty table
+# SELECT COUNT(*), COUNT(w), SUM(v), SUM(w), MIN(v), MAX(w), AVG(v), MIN(ts), MAX(ts) FROM e
+# same output with and without pushdown and on InnoDB; the server answered by itself (the engine did not run it)
+# shortcuts taken: exact filters=0 core top-N=0
+# HAVING, ORDER BY, LIMIT and OFFSET stay with the server
+# SELECT COUNT(*) c, SUM(v) s FROM p HAVING c > 5
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=0 core top-N=0
+# HAVING, ORDER BY, LIMIT and OFFSET stay with the server
+# SELECT COUNT(*) c, SUM(v) s FROM p HAVING c > 1000000
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=0 core top-N=0
+# HAVING, ORDER BY, LIMIT and OFFSET stay with the server
+# SELECT COUNT(*) c FROM p WHERE ts > '2100-01-01' HAVING c = 0
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=0 core top-N=0
+# HAVING, ORDER BY, LIMIT and OFFSET stay with the server
+# SELECT COUNT(*) c FROM p ORDER BY c LIMIT 1
+# same output with and without pushdown and on InnoDB; the server answered by itself (the engine did not run it)
+# shortcuts taken: exact filters=0 core top-N=0
+# HAVING, ORDER BY, LIMIT and OFFSET stay with the server
+# SELECT COUNT(*) c FROM p LIMIT 1 OFFSET 1
+# same output with and without pushdown and on InnoDB; the server answered by itself (the engine did not run it)
+# shortcuts taken: exact filters=0 core top-N=0
+# HAVING, ORDER BY, LIMIT and OFFSET stay with the server
+# SELECT COUNT(*) c, 7 k, SUM(v) FROM p WHERE host = 'h1' ORDER BY 2
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=0 core top-N=0
+# HAVING, ORDER BY, LIMIT and OFFSET stay with the server
+# SELECT SUM(v) s FROM p LIMIT 1 OFFSET 1
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=0 core top-N=0
+# HAVING, ORDER BY, LIMIT and OFFSET stay with the server
+# SELECT SUM(v) s FROM p LIMIT 1
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=0 core top-N=0
+# HAVING, ORDER BY, LIMIT and OFFSET stay with the server
+# SELECT SUM(v) s FROM p LIMIT 0
+# same output with and without pushdown and on InnoDB; the server answered by itself (the engine did not run it)
+# shortcuts taken: exact filters=0 core top-N=0
+# aggregate used only in HAVING
+# SELECT 1 FROM p HAVING COUNT(*) > 0
+# same output with and without pushdown and on InnoDB; the server answered by itself (the engine did not run it)
+# shortcuts taken: exact filters=0 core top-N=0
+# constant arguments are not folded by the server: they must be computed
+# SELECT SUM(1), COUNT(5), MAX(5), MIN(7), AVG(2) FROM p
+# same output with and without pushdown and on InnoDB; the server answered by itself (the engine did not run it)
+# shortcuts taken: exact filters=0 core top-N=0
+# constant arguments are not folded by the server: they must be computed
+# SELECT SUM(1), COUNT(5), MAX(5), AVG(2) FROM p WHERE host = 'h1' AND v > 100
+# same output with and without pushdown and on InnoDB; the server answered by itself (the engine did not run it)
+# shortcuts taken: exact filters=0 core top-N=0
+# constant arguments are not folded by the server: they must be computed
+# SELECT SUM(1), COUNT(5), MAX(5), AVG(2) FROM p WHERE ts > '2100-01-01'
+# same output with and without pushdown and on InnoDB; the server answered by itself (the engine did not run it)
+# shortcuts taken: exact filters=0 core top-N=0
+# constant arguments are not folded by the server: they must be computed
+# SELECT host, SUM(1), COUNT(5), MAX(5), AVG(2) FROM p GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the server answered by itself (the engine did not run it)
+# shortcuts taken: exact filters=0 core top-N=0
+# constant arguments are not folded by the server: they must be computed
+# SELECT kp, SUM(1), COUNT(5), MAX(5) FROM p WHERE v > 100 GROUP BY kp ORDER BY kp
+# same output with and without pushdown and on InnoDB; the server answered by itself (the engine did not run it)
+# shortcuts taken: exact filters=0 core top-N=0
+# aggregates the server folds (COUNT(*), MIN/MAX of the indexed time) mixed with computed ones
+# SELECT MIN(ts), MAX(ts) FROM p
+# same output with and without pushdown and on InnoDB; the server answered by itself (the engine did not run it)
+# shortcuts taken: exact filters=0 core top-N=0
+# aggregates the server folds (COUNT(*), MIN/MAX of the indexed time) mixed with computed ones
+# SELECT COUNT(*), MAX(ts) FROM p
+# same output with and without pushdown and on InnoDB; the server answered by itself (the engine did not run it)
+# shortcuts taken: exact filters=0 core top-N=0
+# aggregates the server folds (COUNT(*), MIN/MAX of the indexed time) mixed with computed ones
+# SELECT COUNT(*), SUM(v) FROM p
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=0 core top-N=0
+# aggregates the server folds (COUNT(*), MIN/MAX of the indexed time) mixed with computed ones
+# SELECT COUNT(*), MIN(ts), SUM(v), MAX(v) FROM p
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=0 core top-N=0
+# aggregates the server folds (COUNT(*), MIN/MAX of the indexed time) mixed with computed ones
+# SELECT host, COUNT(*), MIN(ts), SUM(v) FROM p GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=0 core top-N=0
+# a prepared statement, executed twice
+# EXECUTE s USING @a, @b
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=2)
+# shortcuts taken: exact filters=0 core top-N=0
+# not taken: expression over an aggregate, DISTINCT inside the aggregate, a plain query
+# SELECT COUNT(*) + 1, SUM(v) FROM p
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# shortcuts taken: exact filters=0 core top-N=0
+# not taken: expression over an aggregate, DISTINCT inside the aggregate, a plain query
+# SELECT COUNT(DISTINCT v) FROM p
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# shortcuts taken: exact filters=0 core top-N=0
+# not taken: expression over an aggregate, DISTINCT inside the aggregate, a plain query
+# SELECT v FROM p WHERE host = 'h1' ORDER BY ts LIMIT 3
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# shortcuts taken: exact filters=0 core top-N=0
+##########################################################
+# After DELETE (tombstones) and with a row only in the MemTable
+##########################################################
+DELETE FROM p WHERE host = 'h3' AND ts < '2024-03-02';
+DELETE FROM mirror.p WHERE host = 'h3' AND ts < '2024-03-02';
+DELETE FROM p WHERE ts >= '2024-03-05 12:00:00' AND ts < '2024-03-05 13:00:00';
+DELETE FROM mirror.p WHERE ts >= '2024-03-05 12:00:00' AND ts < '2024-03-05 13:00:00';
+INSERT INTO p VALUES ('2024-03-09 00:00:00', 'h1', 'a  ', 'a  ', 'a  ', 'a  ', 'a  ', 5, 1, 7);
+INSERT INTO mirror.p VALUES ('2024-03-09 00:00:00', 'h1', 'a  ', 'a  ', 'a  ', 'a  ', 'a  ', 5, 1, 7);
+# scalar aggregates, then PAD SPACE top-N, over tombstones and the MemTable
+# SELECT COUNT(*), SUM(v), SUM(bg), MIN(ts), MAX(ts), AVG(w) FROM p
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=0 core top-N=0
+# scalar aggregates, then PAD SPACE top-N, over tombstones and the MemTable
+# SELECT COUNT(*), SUM(v) FROM p WHERE host = 'h3'
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=0 core top-N=0
+# scalar aggregates, then PAD SPACE top-N, over tombstones and the MemTable
+# SELECT kp, COUNT(*) c FROM p GROUP BY kp ORDER BY c DESC, kp LIMIT 3
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=0 core top-N=1
+# scalar aggregates, then PAD SPACE top-N, over tombstones and the MemTable
+# SELECT kp, COUNT(*) c FROM p GROUP BY kp ORDER BY c, kp LIMIT 4
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=0 core top-N=1
+DELETE FROM p;
+DELETE FROM mirror.p;
+# everything deleted
+# SELECT COUNT(*), SUM(v), MIN(ts), AVG(w) FROM p
+# same output with and without pushdown and on InnoDB; the server answered by itself (the engine did not run it)
+# shortcuts taken: exact filters=0 core top-N=0
+# everything deleted
+# SELECT kp, COUNT(*) c FROM p GROUP BY kp ORDER BY c DESC, kp LIMIT 3
+# same output with and without pushdown and on InnoDB; the server answered by itself (the engine did not run it)
+# shortcuts taken: exact filters=0 core top-N=0
+##########################################################
+# The key of a PAD SPACE group is its SHORTEST real member (bytes shown with cat -A,
+# end of line shown as a dollar sign by cat -A, a tab as ^I, spaces are visible before it)
+##########################################################
+CREATE TABLE r (ts DATETIME NOT NULL, host VARCHAR(8) NOT NULL COMMENT 'TAG', k VARCHAR(8) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin, INDEX(ts)) ENGINE=MooseDB;
+INSERT INTO r VALUES ('2024-03-01 00:00:01', 'a', 'x   '), ('2024-03-01 00:00:02', 'a', 'x  '), ('2024-03-01 00:00:03', 'a', 'y '),
+('2024-03-01 00:00:04', 'a', 'w'), ('2024-03-01 00:00:05', 'b', 'v '), ('2024-03-01 00:00:06', 'b', 'a b ');
+FLUSH TABLES r;
+INSERT INTO r VALUES ('2024-03-01 00:00:07', 'b', 'x    '), ('2024-03-01 00:00:08', 'b', 'y   '), ('2024-03-01 00:00:09', 'b', 'y'),
+('2024-03-01 00:00:10', 'a', 'v   '), ('2024-03-01 00:00:11', 'a', NULL), ('2024-03-01 00:00:12', 'a', 'u  '), ('2024-03-01 00:00:13', 'a', '  ');
+# expected: u (3 chars), v (2: the chunk row beats the MemTable 4), w, x (3), y (1: from the MemTable), 'a b ' (alone, keeps its space), '  ' (alone: the trimmed '' is not a member, so it is not returned), NULL
+NULL^I1$
+  ^I1$
+a b ^I1$
+u  ^I1$
+v ^I2$
+w^I1$
+x  ^I3$
+y^I3$
+x  ^I3$
+y^I3$
+v ^I2$
+NULL^I1$
+a^INULL^I1$
+a^I  ^I1$
+a^Iu  ^I1$
+a^Iv   ^I1$
+a^Iw^I1$
+a^Ix  ^I2$
+a^Iy ^I1$
+b^Ia b ^I1$
+b^Iv ^I1$
+b^Ix    ^I1$
+b^Iy^I2$
+# engine runs: 3
+DROP TABLE r;
+DROP DATABASE mirror;
+DROP TABLE p, e;

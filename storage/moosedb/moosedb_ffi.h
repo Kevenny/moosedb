@@ -30,6 +30,11 @@
 
 #define TF_AGG_KEY_COLUMN 1
 
+// A VARCHAR column under a binary PAD SPACE collation (utf8mb4_bin, latin1_bin, ...; charsets whose
+// space is the byte 0x20): values differing only by trailing 0x20 bytes are one group, keyed by the
+// value without them; a top-N breaks ties in that collation order.
+#define TF_AGG_KEY_COLUMN_PAD 2
+
 // Function codes of `TFAggFunc::op`.
 #define TF_AGG_COUNT_STAR 0
 
@@ -307,7 +312,7 @@ typedef struct {
 
 // One group-by key: the series (`col` ignored) or a column.
 typedef struct {
-  // `TF_AGG_KEY_SERIES` or `TF_AGG_KEY_COLUMN`.
+  // `TF_AGG_KEY_SERIES`, `TF_AGG_KEY_COLUMN` or `TF_AGG_KEY_COLUMN_PAD`.
   uint8_t kind;
   uint32_t col;
 } TFAggKey;

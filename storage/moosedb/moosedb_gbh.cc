@@ -90,6 +90,23 @@ bool cs_exact(const CHARSET_INFO *cs)
          ((cs->state & MY_CS_BINSORT) && (cs->state & MY_CS_NOPAD));
 }
 
+/*
+  Binary PAD SPACE collation (utf8mb4_bin, latin1_bin...) of a charset whose
+  space is the single byte 0x20: equal after trimming trailing 0x20, and the
+  order is that of the trimmed bytes with the shorter operand padded by spaces.
+  The core groups such a key by the trimmed value (TF_AGG_KEY_COLUMN_PAD).
+*/
+bool cs_pad_bin(const CHARSET_INFO *cs)
+{
+  if (!cs || cs_exact(cs))
+    return false;
+  const char *n= cs->cs_name.str;
+  return (cs->state & MY_CS_BINSORT) && !(cs->state & MY_CS_NOPAD) &&
+         cs->mbminlen == 1 && n &&
+         (strcmp(n, "utf8mb4") == 0 || strcmp(n, "utf8mb3") == 0 ||
+          strcmp(n, "latin1") == 0 || strcmp(n, "ascii") == 0);
+}
+
 /* The column `item` is, or nullptr (not a column of `table`). */
 Field *column_of(Item *item, const TABLE *table)
 {
@@ -120,6 +137,7 @@ struct gkey
   CHARSET_INFO *cs= nullptr;       /* strings                               */
   bool is_str= false;
   bool is_unsigned= false;
+  bool pad= false;                 /* non-TAG string, binary PAD SPACE: the core trims and groups it */
   int res= -1;                     /* key index in the core's result        */
 };
 
@@ -184,6 +202,7 @@ struct gplan
   ulonglong limit= HA_POS_ERROR;
   bool has_having= false;
   bool need_merge= false;
+  bool scalar= false;              /* aggregates without GROUP BY: one group, one row, even over no rows */
   int top_func= -1;                /* core top-N: index into funcs, -1 = off */
   bool top_desc= false;
 
@@ -265,7 +284,10 @@ const char *group_by_refusal(gplan *p, ORDER *group_by)
     else
       return "GROUP BY: unsupported column type";
     if (k.is_str)
+    {
       k.cs= f->charset();
+      k.pad= !k.is_tag && cs_pad_bin(k.cs);
+    }
     if (p->key_of(f) < 0)
       p->keys.push_back(k);
   }
@@ -380,6 +402,19 @@ const char *item_refusal(gplan *p, Item *item, const char *expr_reason,
   {
   case Item::SUM_FUNC_ITEM:
   {
+    /*
+      The server already folded this one (opt_sum_query: COUNT(*) with no WHERE
+      from the table's row count, MIN/MAX from an index): it is a constant with
+      no field in the temporary table. Item_sum::const_item() is only true then:
+      Item_func_or_sum::const_item() returns const_item_cache (item.h:5904),
+      Item_sum::mark_as_sum_func() clears it (item_sum.cc:525) and only
+      Item_sum::make_const() sets it (item_sum.h:503), so SUM(1), COUNT(5)... are not.
+    */
+    if (real->const_item())
+    {
+      out->k= ikind::CONST;
+      return nullptr;
+    }
     int idx= -1;
     const char *r= agg_refusal(p, static_cast<Item_sum *>(real), &idx);
     if (r)
@@ -636,11 +671,7 @@ void exact_shape(const gplan *p, gfilter *g)
       return;
     if (!cs_exact(fcs))
     {
-      /* binary PAD SPACE (utf8mb4_bin, latin1_bin...): equal after trimming trailing 0x20, in charsets where 0x20 is a whole character */
-      const char *n= fcs->cs_name.str;
-      if (!(fcs->state & MY_CS_BINSORT) || (fcs->state & MY_CS_NOPAD) || fcs->mbminlen != 1 || !n ||
-          !(strcmp(n, "utf8mb4") == 0 || strcmp(n, "utf8mb3") == 0 || strcmp(n, "latin1") == 0 ||
-            strcmp(n, "ascii") == 0))
+      if (!cs_pad_bin(fcs))
         return;
       g->pad= true;
     }
@@ -737,9 +768,23 @@ const char *analyze(THD *thd, Query *q, gplan *p)
   if (!p->handler->moosedb_layout() || !p->handler->moosedb_table_handle())
     return "internal: table not open";
 
+  /*
+    Without GROUP BY the server still calls us for every query; only the ones
+    with an aggregate (implicit grouping: one group, one row even over no rows)
+    are ours.
+  */
+  p->scalar= !q->group_by;
+  if (p->scalar)
+  {
+    bool has_sum= false;
+    List_iterator_fast<Item> si(*q->select);
+    for (Item *x; !has_sum && (x= si++);)
+      has_sum= x->with_sum_func();
+    if (!has_sum)
+      return "no GROUP BY";
+  }
+
   /* Clauses the engine does not do. */
-  if (!q->group_by)
-    return "no GROUP BY";
   if (q->distinct)
     return "DISTINCT";
   if (sl->olap != UNSPECIFIED_OLAP_TYPE)
@@ -769,6 +814,10 @@ const char *analyze(THD *thd, Query *q, gplan *p)
     p->items.push_back(gi);
   }
 
+  /* Everything folded by the server: nothing left for the engine. */
+  if (p->scalar && p->aggs.empty())
+    return "no aggregate left for the engine";
+
   r= where_refusal(p, q->where);
   if (r)
     return r;
@@ -793,15 +842,19 @@ const char *analyze(THD *thd, Query *q, gplan *p)
   p->has_having= q->having != nullptr;
   p->need_merge= p->has_series;
   for (const gkey &k : p->keys)
-    if (!k.is_tag && k.is_str && !cs_exact(k.cs))
+    if (!k.is_tag && k.is_str && !cs_exact(k.cs) && !k.pad)
       p->need_merge= true;
   /*
     Core top-N (ORDER BY one aggregate LIMIT K, one key). Ties: the core breaks
     them by ascending key (signed integer, unsigned bytes, NULL first) which is
     the handler's own tiebreak (cmp_raw) for these keys, so the K groups kept are
-    the same. Not for a TAG key (tiebreak by series id, not by TAG value, and
-    series may need merging), a collation-merged string, BIGINT UNSIGNED (core
-    compares signed), AVG, HAVING, or a second ORDER BY term.
+    the same. A binary PAD SPACE key (gkey::pad) is grouped by the core on the
+    trimmed value, so need_merge stays false, and its tiebreak is the collation
+    order (pad_cmp in agg.rs = strnncollsp). Not for a TAG key (tiebreak by
+    series id, not by TAG value, and series may need merging), a _ci/_ai or
+    other collation-merged string (the core would need the collation weights),
+    BIGINT UNSIGNED (core compares signed), AVG, HAVING, a second ORDER BY term
+    other than the key ASC, or no GROUP BY.
   */
   if (!p->has_having && p->limit != HA_POS_ERROR && p->limit > 0 && !p->has_series &&
       !p->need_merge && p->keys.size() == 1 &&
@@ -1163,7 +1216,16 @@ int moosedb_gbh::do_init_scan()
     return r;
   if (p_.limit == 0)
     return 0;                               /* LIMIT 0: nothing to deliver */
-  return compute();
+  r= compute();
+  if (r || !p_.scalar || !live_.empty())
+    return r;
+  /* Implicit grouping over no row (an early "nothing can match" exit): the one row COUNT = 0, the rest NULL. */
+  if (!charge(nf_ * sizeof(acell)))
+    return HA_ERR_RECORD_FILE_FULL;
+  ngroups_= 1;
+  acells_.assign(nf_, acell());
+  live_.assign(1, 0u);
+  return 0;
 }
 
 int moosedb_gbh::compute()
@@ -1177,7 +1239,7 @@ int moosedb_gbh::compute()
     keys.push_back(TFAggKey{TF_AGG_KEY_SERIES, 0});
   for (const gkey &k : p_.keys)
     if (!k.is_tag)
-      keys.push_back(TFAggKey{TF_AGG_KEY_COLUMN, k.col});
+      keys.push_back(TFAggKey{(uint8_t) (k.pad ? TF_AGG_KEY_COLUMN_PAD : TF_AGG_KEY_COLUMN), k.col});
 
   /*
     The series ids of a TAG filter and the aggregation snapshot are two calls:
@@ -1687,8 +1749,8 @@ int moosedb_gbh::build_groups(const TFAggBatch &b)
   }
   if (!charge(ngroups_ * sizeof(uint32_t)))
     return HA_ERR_RECORD_FILE_FULL;
-  /* Every group the core returns has at least one row; a COUNT(*) column lets us check it cheaply. */
-  for (size_t fi= 0; fi < nf_; fi++)
+  /* Every group the core returns has at least one row (but the one group of a scalar aggregate); a COUNT(*) column lets us check it cheaply. */
+  for (size_t fi= 0; fi < nf_ && !p_.scalar; fi++)
     if (p_.funcs[fi].op == TF_AGG_COUNT_STAR)
       for (uint64_t g= 0; g < ngroups_; g++)
         if (!ac((uint32_t) g, (int) fi).count)

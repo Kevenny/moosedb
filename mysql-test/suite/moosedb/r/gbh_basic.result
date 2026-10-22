@@ -79,9 +79,9 @@ same_rows
 # time range with no data
 # SELECT host, COUNT(*) c FROM g WHERE ts >= '2030-01-01' GROUP BY host ORDER BY host
 # same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
-# implicit single group over no rows (no GROUP BY: not the engine)
+# implicit single group over no rows (no GROUP BY: the engine still returns the one row)
 # SELECT COUNT(*) c, SUM(bytes) s, MIN(bytes) m, AVG(latency) a FROM g WHERE host = 'nobody'
-# same output with and without pushdown and on InnoDB; the engine did not run it
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
 ##########################################################
 # Predicates: TAG equality / IN, time bounds
 ##########################################################

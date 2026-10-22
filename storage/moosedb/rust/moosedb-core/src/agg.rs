@@ -88,6 +88,12 @@ const MAX_PARTS: usize = 256;
 pub enum KeySpec {
     Series,
     Column(usize),
+    /// A VARCHAR column compared under a binary PAD SPACE collation of a
+    /// charset whose space is the single byte 0x20 (utf8mb4, utf8mb3, latin1,
+    /// ascii): values that differ only by trailing 0x20 bytes are ONE group; the
+    /// key returned is the shortest value of the group (the smallest by bytes).
+    /// A top-N then breaks ties in that collation's order (see [`pad_cmp`]).
+    ColumnPad(usize),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -477,7 +483,13 @@ struct Plan<'a> {
     snap: &'a Snapshot,
     filter: &'a ResolvedFilter,
     keys: Vec<KeySpec>,
+    /// The functions of the spec, then one hidden `Min` per [`KeySpec::ColumnPad`]
+    /// (the shortest raw length seen in the group, see `pad_slots`).
     funcs: Vec<FuncSpec>,
+    /// Functions of the spec: `funcs[..nuf]`.
+    nuf: usize,
+    /// Per PAD key: (index in `keys`, column, index of its hidden function).
+    pad_slots: Vec<(usize, usize, usize)>,
     filters: Vec<(usize, FilterSet)>,
     /// The filters as zone-map / column-Bloom tests: entries that cannot hold
     /// an accepted row are not read (they would create no group either).
@@ -554,10 +566,13 @@ impl<'a> Plan<'a> {
         for k in &spec.keys {
             match *k {
                 KeySpec::Series => kinds.push(Kind::Int),
-                KeySpec::Column(c) => {
+                KeySpec::Column(c) | KeySpec::ColumnPad(c) => {
                     let kind = key_kind(col(c)?.ty).ok_or_else(|| {
                         invalid(format!("column {c} cannot be a group key (use the series for TAGs)"))
                     })?;
+                    if matches!(k, KeySpec::ColumnPad(_)) && !matches!(kind, Kind::Bytes) {
+                        return Err(invalid(format!("column {c}: PAD SPACE needs a string key")));
+                    }
                     kinds.push(kind);
                     want[c] = true;
                     col_keys = true;
@@ -590,6 +605,14 @@ impl<'a> Plan<'a> {
                 }
             }
         }
+        let mut funcs = spec.funcs.clone();
+        let mut pad_slots = Vec::new();
+        for (j, k) in spec.keys.iter().enumerate() {
+            if let KeySpec::ColumnPad(c) = *k {
+                pad_slots.push((j, c, funcs.len()));
+                funcs.push(FuncSpec::Min(c));
+            }
+        }
         let mut prune = Pruner::new(&snap.schema);
         for (c, set) in &filters {
             match key_kind(col(*c)?.ty) {
@@ -605,14 +628,16 @@ impl<'a> Plan<'a> {
             snap,
             filter,
             keys: spec.keys.clone(),
-            funcs: spec.funcs.clone(),
+            init: funcs.iter().map(|&f| Acc::init(f)).collect(),
+            nuf: spec.funcs.len(),
+            funcs,
+            pad_slots,
             filters,
             prune,
             kinds,
             want,
             col_keys,
             top: spec.top,
-            init: spec.funcs.iter().map(|&f| Acc::init(f)).collect(),
             hasher: RandomState::new(),
             parts: 1,
             max: spec.max_memory,
@@ -967,7 +992,8 @@ impl<'a> Col<'a> {
     }
 
     /// Appends the key image of row `i`.
-    fn encode(&self, i: usize, out: &mut Vec<u8>) -> Result<()> {
+    /// With `pad`, a string drops its trailing 0x20 bytes ([`KeySpec::ColumnPad`]).
+    fn encode(&self, i: usize, pad: bool, out: &mut Vec<u8>) -> Result<()> {
         if self.is_null(i) {
             out.push(0);
             return Ok(());
@@ -976,6 +1002,7 @@ impl<'a> Col<'a> {
         match self {
             Col::Bytes { .. } => {
                 let b = self.bytes(i)?;
+                let b = if pad { trim_spaces(b) } else { b };
                 out.extend_from_slice(&(b.len() as u32).to_le_bytes());
                 out.extend_from_slice(b);
             }
@@ -1201,6 +1228,8 @@ struct Local {
     last_gid: u32,
     gids: Vec<u32>,
     keep: Vec<bool>,
+    /// Raw lengths of a PAD key column over a stretch (scratch of `fold_all`).
+    padlens: Vec<i64>,
     /// Batch of distinct key images of a stretch (see `rows_to_groups`).
     batch: Batch,
     /// Group numbers by hash partition: `part_order[part_start[p]..part_start[p + 1]]`
@@ -1220,6 +1249,7 @@ impl Local {
             last_gid: NONE,
             gids: Vec::new(),
             keep: Vec::new(),
+            padlens: Vec::new(),
             batch: Batch::default(),
             part_order: Vec::new(),
             part_start: Vec::new(),
@@ -1314,7 +1344,7 @@ impl Local {
         for (k, key) in p.keys.iter().enumerate() {
             match *key {
                 KeySpec::Series => self.scratch.extend_from_slice(&sid.to_le_bytes()),
-                KeySpec::Column(c) => cols.push((k, Col::of(win, c, b)?)),
+                KeySpec::Column(c) | KeySpec::ColumnPad(c) => cols.push((k, Col::of(win, c, b)?)),
             }
         }
         let mut gids = std::mem::take(&mut self.gids);
@@ -1385,8 +1415,8 @@ impl Local {
                 for spec in &p.keys {
                     match spec {
                         KeySpec::Series => bt.imgs.extend_from_slice(&sid.to_le_bytes()),
-                        KeySpec::Column(_) => {
-                            cols[at].1.encode(i, &mut bt.imgs)?;
+                        KeySpec::Column(_) | KeySpec::ColumnPad(_) => {
+                            cols[at].1.encode(i, matches!(spec, KeySpec::ColumnPad(_)), &mut bt.imgs)?;
                             at += 1;
                         }
                     }
@@ -1439,7 +1469,19 @@ impl Local {
         let nf = p.funcs.len();
         let ts = p.snap.schema.ts_index();
         let accs = &mut self.groups.accs;
-        for (fi, f) in p.funcs.iter().enumerate() {
+        // Shortest raw length of each PAD key per group (the key image is trimmed).
+        for &(_, c, fi) in &p.pad_slots {
+            let col = Col::of(win, c, b)?;
+            self.padlens.clear();
+            self.padlens.resize(a, 0);
+            for i in a..b {
+                self.padlens.push(if col.is_null(i) { 0 } else { col.bytes(i)?.len() as i64 });
+            }
+            if !kernel::<FMin>(accs, nf, fi, &self.padlens, col.nulls(), a, b, gid) {
+                return Err(overflow());
+            }
+        }
+        for (fi, f) in p.funcs[..p.nuf].iter().enumerate() {
             let ok = match *f {
                 FuncSpec::CountStar => kernel::<FCount>(accs, nf, fi, &[], &[], a, b, gid),
                 FuncSpec::Count(c) => {
@@ -1490,7 +1532,7 @@ impl Local {
             for key in &p.keys {
                 match *key {
                     KeySpec::Series => self.scratch.extend_from_slice(&m.series_id.to_le_bytes()),
-                    KeySpec::Column(c) => match cell(m, c)? {
+                    KeySpec::Column(c) | KeySpec::ColumnPad(c) => match cell(m, c)? {
                         Value::Null => self.scratch.push(0),
                         Value::Int(i) | Value::Timestamp(i) => {
                             self.scratch.push(1);
@@ -1501,6 +1543,7 @@ impl Local {
                             self.scratch.extend_from_slice(&i64::from(*b).to_le_bytes());
                         }
                         Value::Bytes(b) => {
+                            let b = if matches!(key, KeySpec::ColumnPad(_)) { trim_spaces(b) } else { b.as_slice() };
                             self.scratch.push(1);
                             self.scratch.extend_from_slice(&(b.len() as u32).to_le_bytes());
                             self.scratch.extend_from_slice(b);
@@ -1510,7 +1553,12 @@ impl Local {
                 }
             }
             let g = self.group_of(p)? as usize;
-            for (fi, f) in p.funcs.iter().enumerate() {
+            for &(_, c, fi) in &p.pad_slots {
+                if let Value::Bytes(b) = cell(m, c)? {
+                    FMin::add(&mut self.groups.accs[g * nf + fi], b.len() as i64);
+                }
+            }
+            for (fi, f) in p.funcs[..p.nuf].iter().enumerate() {
                 let acc = &mut self.groups.accs[g * nf + fi];
                 let ok = match *f {
                     FuncSpec::CountStar => FCount::add(acc, 0),
@@ -1825,6 +1873,10 @@ impl Plan<'_> {
         match (self.keys[0], self.kinds[0]) {
             (KeySpec::Series, _) => series_of(a).cmp(&series_of(b)),
             (_, Kind::Int) => int_of(a).cmp(&int_of(b)),
+            (KeySpec::ColumnPad(_), _) => match (bytes_of(a), bytes_of(b)) {
+                (Some(x), Some(y)) => pad_cmp(x, y),
+                (x, y) => x.cmp(&y),
+            },
             (_, Kind::Bytes) => bytes_of(a).cmp(&bytes_of(b)),
         }
     }
@@ -1860,9 +1912,25 @@ impl Plan<'_> {
     /// Returns it with the bytes charged for it.
     fn piece(&self, l: &Groups, ids: Option<&[u32]>) -> Result<(AggResult, usize)> {
         let nf = self.funcs.len();
+        let nuf = self.nuf;
         let groups = ids.map_or(l.len(), <[u32]>::len);
         let gid = |k: usize| ids.map_or(k, |v| v[k] as usize);
-        let key_bytes: usize = (0..groups).map(|k| l.key(gid(k)).len()).sum();
+        // A PAD key is returned as its group's shortest raw value: the trimmed image plus spaces.
+        let pad_of = |j: usize| self.pad_slots.iter().find(|s| s.0 == j).map(|s| s.2);
+        // shortest raw length of the group's PAD key j (0 for a NULL key: its minimum was never set)
+        let pad_raw = |g: usize, j: usize| -> usize {
+            pad_of(j).map_or(0, |fi| {
+                let a = &l.accs[g * nf + fi];
+                if a.n == 0 { 0 } else { usize::try_from(a.v).unwrap_or(0) }
+            })
+        };
+        // (the spaces added never exceed the raw length: an upper bound for the budget)
+        let key_bytes: usize = (0..groups)
+            .map(|k| {
+                let g = gid(k);
+                l.key(g).len() + self.pad_slots.iter().map(|s| pad_raw(g, s.0)).sum::<usize>()
+            })
+            .sum();
         let charged = groups.saturating_mul(self.keys.len() * 13 + nf * 16).saturating_add(key_bytes);
         self.charge(charged)?;
         let oom = || budget_error(self.max);
@@ -1882,8 +1950,8 @@ impl Plan<'_> {
                 }
             }
         }
-        let mut funcs: Vec<FuncCol> = vec![FuncCol::default(); nf];
-        for (fc, f) in funcs.iter_mut().zip(&self.funcs) {
+        let mut funcs: Vec<FuncCol> = vec![FuncCol::default(); nuf];
+        for (fc, f) in funcs.iter_mut().zip(&self.funcs[..nuf]) {
             fc.count.try_reserve_exact(groups).map_err(|_| oom())?;
             if matches!(f, FuncSpec::Sum(_)) {
                 fc.sum_lo.try_reserve_exact(groups).map_err(|_| oom())?;
@@ -1902,7 +1970,7 @@ impl Plan<'_> {
                 r = t;
                 Ok(h)
             };
-            for kc in &mut keys {
+            for (j, kc) in keys.iter_mut().enumerate() {
                 match kc {
                     KeyCol::Series(v) => v.push(u64::from_le_bytes(take(8)?.try_into().map_err(|_| short())?)),
                     KeyCol::Int { nulls, vals } => {
@@ -1918,13 +1986,17 @@ impl Plan<'_> {
                             lens.push(0);
                         } else {
                             let n = u32::from_le_bytes(take(4)?.try_into().map_err(|_| short())?);
-                            lens.push(n);
                             data.extend_from_slice(take(n as usize)?);
+                            let extra = pad_raw(g, j).saturating_sub(n as usize);
+                            // within the `key_bytes` reserved above (pad_raw bounds n + extra)
+                            data.resize(data.len() + extra, b' ');
+                            let total = u32::try_from(n as usize + extra).map_err(|_| corrupt("PAD key longer than 4 GiB"))?;
+                            lens.push(total);
                         }
                     }
                 }
             }
-            for (fi, (fc, f)) in funcs.iter_mut().zip(&self.funcs).enumerate() {
+            for (fi, (fc, f)) in funcs.iter_mut().zip(&self.funcs[..nuf]).enumerate() {
                 let a = &l.accs[g * nf + fi];
                 fc.count.push(a.n);
                 match f {
@@ -1939,6 +2011,25 @@ impl Plan<'_> {
         }
         Ok((AggResult { groups, keys, funcs }, charged))
     }
+}
+
+/// Order of two strings already without trailing 0x20 under a binary PAD SPACE
+/// collation (`strnncollsp`): bytes as unsigned up to the first difference; if
+/// one is a prefix of the other, the longer one is compared with spaces, so it
+/// is smaller when its next byte is below 0x20 (a followed by byte 1 sorts before a), else larger.
+fn pad_cmp(a: &[u8], b: &[u8]) -> Cmp {
+    let n = a.len().min(b.len());
+    match a[..n].cmp(&b[..n]) {
+        Cmp::Equal => {}
+        o => return o,
+    }
+    let (rest, longer_is_a) = if a.len() > n { (&a[n..], true) } else { (&b[n..], false) };
+    let o = match rest.iter().find(|&&c| c != b' ') {
+        None => return Cmp::Equal,
+        Some(&c) if c < b' ' => Cmp::Less,
+        Some(_) => Cmp::Greater,
+    };
+    if longer_is_a { o } else { o.reverse() }
 }
 
 fn series_of(img: &[u8]) -> u64 {

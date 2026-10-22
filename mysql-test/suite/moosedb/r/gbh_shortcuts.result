@@ -202,12 +202,8 @@ SET SESSION moosedb_group_by_pushdown = ON;
 # SELECT host, SUM(bytes) s FROM g GROUP BY host ORDER BY s DESC LIMIT 3
 # same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
 # shortcuts taken: exact filters=0 core top-N=0
-# case-insensitive and PAD SPACE keys are merged by the collation
+# case-insensitive keys are merged by the collation (only binary PAD SPACE keys are grouped by the core)
 # SELECT SUM(bytes) s FROM g GROUP BY kc ORDER BY s DESC LIMIT 3
-# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
-# shortcuts taken: exact filters=0 core top-N=0
-# case-insensitive and PAD SPACE keys are merged by the collation
-# SELECT SUM(bytes) s FROM g GROUP BY kp ORDER BY s DESC LIMIT 3
 # same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
 # shortcuts taken: exact filters=0 core top-N=0
 # BIGINT UNSIGNED key
@@ -261,17 +257,21 @@ SET SESSION moosedb_group_by_pushdown = ON;
 # SELECT kb, MIN(ts) t FROM g GROUP BY kb ORDER BY t, kb LIMIT 4
 # same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
 # shortcuts taken: exact filters=0 core top-N=1
-# key DESC in the second term, BIGINT UNSIGNED key, PAD SPACE string key: no core top-N
+# key DESC in the second term, BIGINT UNSIGNED key: no core top-N
 # SELECT i, COUNT(*) c FROM g WHERE i < 10 GROUP BY i ORDER BY c, i DESC LIMIT 4
 # same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
 # shortcuts taken: exact filters=0 core top-N=0
-# key DESC in the second term, BIGINT UNSIGNED key, PAD SPACE string key: no core top-N
+# key DESC in the second term, BIGINT UNSIGNED key: no core top-N
 # SELECT bu, COUNT(*) c FROM g WHERE ts < '2024-03-01 00:10:00' GROUP BY bu ORDER BY c DESC, bu LIMIT 3
 # same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
 # shortcuts taken: exact filters=0 core top-N=0
-# key DESC in the second term, BIGINT UNSIGNED key, PAD SPACE string key: no core top-N
+# PAD SPACE string key (binary utf8mb4_bin): 'a' and 'a ' are one group, the core does the top-N
 # SELECT COUNT(*) c FROM g GROUP BY kp ORDER BY c DESC, kp LIMIT 3
 # same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
-# shortcuts taken: exact filters=0 core top-N=0
+# shortcuts taken: exact filters=0 core top-N=1
+# PAD SPACE string key (binary utf8mb4_bin): 'a' and 'a ' are one group, the core does the top-N
+# SELECT kp, SUM(bytes) s FROM g GROUP BY kp ORDER BY s DESC LIMIT 3
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=0 core top-N=1
 DROP DATABASE mirror;
 DROP TABLE g;

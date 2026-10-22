@@ -468,7 +468,7 @@ Na restauração, copie os diretórios de volta com o mesmo
 | `moosedb_batch_memory_budget` | 1 GiB | memória total de statements em andamento; acima disso, os grandes fazem spill antecipado |
 | `moosedb_max_open_chunks` | 100 | descritores de chunk mantidos abertos |
 | `moosedb_unique_lock_wait_timeout` | 50 | segundos que um INSERT espera outro statement que escreve a mesma série (tabelas com PK/UNIQUE); 0 = falha na hora |
-| `moosedb_group_by_pushdown` | `OFF` | (sessão) `ON` = a engine calcula o GROUP BY de TAG/VARCHAR/INT com COUNT/SUM/AVG/MIN/MAX (ver architecture.md); o resultado não muda |
+| `moosedb_group_by_pushdown` | `OFF` | (sessão) `ON` = a engine calcula o GROUP BY de TAG/VARCHAR/INT com COUNT/SUM/AVG/MIN/MAX, inclusive agregados sem GROUP BY (uma linha, mesmo sem dados) e `ORDER BY agregado, chave LIMIT n` em chave VARCHAR binária (`utf8mb4_bin`, `latin1_bin`...; `_ci` continua no caminho geral) (ver architecture.md); o resultado não muda, salvo qual dos valores `'a'`/`'a '` de um mesmo grupo PAD SPACE é mostrado (o servidor mostra o que o plano vê primeiro, a engine o mais curto) |
 | `moosedb_agg_max_memory` | 1 GiB | (sessão) memória máxima dos grupos de um GROUP BY empurrado (mín. 16 MiB) |
 | `moosedb_agg_threads` | min(4, CPUs) | threads de um GROUP BY empurrado (1 a 64) |
 

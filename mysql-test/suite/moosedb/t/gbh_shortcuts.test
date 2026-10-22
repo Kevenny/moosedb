@@ -187,10 +187,8 @@ SET SESSION moosedb_group_by_pushdown = ON;
 --let $label= TAG key (tiebreak would be the series id, not the TAG value)
 --let $q= SELECT host, SUM(bytes) s FROM g GROUP BY host ORDER BY s DESC LIMIT 3
 --source suite/moosedb/include/gbh_sc.inc
---let $label= case-insensitive and PAD SPACE keys are merged by the collation
+--let $label= case-insensitive keys are merged by the collation (only binary PAD SPACE keys are grouped by the core)
 --let $q= SELECT SUM(bytes) s FROM g GROUP BY kc ORDER BY s DESC LIMIT 3
---source suite/moosedb/include/gbh_sc.inc
---let $q= SELECT SUM(bytes) s FROM g GROUP BY kp ORDER BY s DESC LIMIT 3
 --source suite/moosedb/include/gbh_sc.inc
 --let $label= BIGINT UNSIGNED key
 --let $q= SELECT bu, SUM(bytes) s FROM g GROUP BY bu ORDER BY s DESC LIMIT 3
@@ -225,13 +223,18 @@ SET SESSION moosedb_group_by_pushdown = ON;
 --source suite/moosedb/include/gbh_sc.inc
 --let $q= SELECT kb, MIN(ts) t FROM g GROUP BY kb ORDER BY t, kb LIMIT 4
 --source suite/moosedb/include/gbh_sc.inc
---let $label= key DESC in the second term, BIGINT UNSIGNED key, PAD SPACE string key: no core top-N
+--let $label= key DESC in the second term, BIGINT UNSIGNED key: no core top-N
 --let $q= SELECT i, COUNT(*) c FROM g WHERE i < 10 GROUP BY i ORDER BY c, i DESC LIMIT 4
 --source suite/moosedb/include/gbh_sc.inc
 --let $q= SELECT bu, COUNT(*) c FROM g WHERE ts < '2024-03-01 00:10:00' GROUP BY bu ORDER BY c DESC, bu LIMIT 3
 --source suite/moosedb/include/gbh_sc.inc
+--let $label= PAD SPACE string key (binary utf8mb4_bin): 'a' and 'a ' are one group, the core does the top-N
+--let $nomaxlen= 1
 --let $q= SELECT COUNT(*) c FROM g GROUP BY kp ORDER BY c DESC, kp LIMIT 3
 --source suite/moosedb/include/gbh_sc.inc
+--let $q= SELECT kp, SUM(bytes) s FROM g GROUP BY kp ORDER BY s DESC LIMIT 3
+--source suite/moosedb/include/gbh_sc.inc
+--let $nomaxlen= 0
 
 DROP DATABASE mirror;
 DROP TABLE g;

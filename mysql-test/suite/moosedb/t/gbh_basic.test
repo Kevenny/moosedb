@@ -111,8 +111,7 @@ SELECT (SELECT COUNT(*) FROM test.g) = (SELECT COUNT(*) FROM mirror.g) AS same_r
 --let $q= SELECT host, COUNT(*) c FROM g WHERE ts >= '2030-01-01' GROUP BY host ORDER BY host
 --source suite/moosedb/include/gbh_diff.inc
 
---let $label= implicit single group over no rows (no GROUP BY: not the engine)
---let $refused= 1
+--let $label= implicit single group over no rows (no GROUP BY: the engine still returns the one row)
 --let $q= SELECT COUNT(*) c, SUM(bytes) s, MIN(bytes) m, AVG(latency) a FROM g WHERE host = 'nobody'
 --source suite/moosedb/include/gbh_diff.inc
 

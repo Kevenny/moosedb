@@ -1662,6 +1662,10 @@ pub unsafe extern "C" fn moosedb_snapshot_close(snapshot: *mut MooseDBSnapshot) 
 /// Group key kinds of `TFAggKey::kind`.
 pub const TF_AGG_KEY_SERIES: u8 = 0;
 pub const TF_AGG_KEY_COLUMN: u8 = 1;
+/// A VARCHAR column under a binary PAD SPACE collation (utf8mb4_bin, latin1_bin, ...; charsets whose
+/// space is the byte 0x20): values differing only by trailing 0x20 bytes are one group, keyed by the
+/// value without them; a top-N breaks ties in that collation order.
+pub const TF_AGG_KEY_COLUMN_PAD: u8 = 2;
 /// Function codes of `TFAggFunc::op`.
 pub const TF_AGG_COUNT_STAR: u8 = 0;
 pub const TF_AGG_COUNT: u8 = 1;
@@ -1677,7 +1681,7 @@ pub const TF_AGG_KEYCOL_BYTES: u8 = 2;
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct TFAggKey {
-    /// `TF_AGG_KEY_SERIES` or `TF_AGG_KEY_COLUMN`.
+    /// `TF_AGG_KEY_SERIES`, `TF_AGG_KEY_COLUMN` or `TF_AGG_KEY_COLUMN_PAD`.
     pub kind: u8,
     pub col: u32,
 }
@@ -1900,6 +1904,7 @@ pub unsafe extern "C" fn moosedb_agg_run(
             .map(|k| match k.kind {
                 TF_AGG_KEY_SERIES => Ok(KeySpec::Series),
                 TF_AGG_KEY_COLUMN => Ok(KeySpec::Column(k.col as usize)),
+                TF_AGG_KEY_COLUMN_PAD => Ok(KeySpec::ColumnPad(k.col as usize)),
                 other => Err(invalid(&format!("unknown key kind {other}"))),
             })
             .collect::<Result<Vec<_>, Error>>()?;

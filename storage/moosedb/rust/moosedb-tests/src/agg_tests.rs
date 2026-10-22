@@ -554,6 +554,111 @@ fn pad_space_value_filters_ignore_trailing_spaces_on_both_sides() {
 }
 
 #[test]
+fn pad_space_keys_group_by_trimmed_value_and_top_n_ties_follow_the_collation() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_new(&dir.path().join("t"));
+    // classes under PAD SPACE: {a, "a ", "a   "}, {""," "}, {"a\x01"} < {"a"}, {"a\t"}, {" a"}, {"a b"}, {"b"}, NULL
+    let names: [Option<&[u8]>; 12] = [
+        Some(b"a"),
+        Some(b"a "),
+        Some(b"a   "),
+        Some(b""),
+        Some(b"  "),
+        Some(b"a"),
+        Some(b"a	"),
+        Some(b" a"),
+        Some(b"a b "),
+        Some(b"b"),
+        Some(b"b"),
+        None,
+    ];
+    let mk = |i: usize| -> Row {
+        vec![
+            Value::Timestamp(base() + i as i64 * MICROS_PER_SEC),
+            Value::Bytes(format!("h{}", i % 3).into_bytes()),
+            Value::Int(1),
+            names[i % names.len()].map_or(Value::Null, |n| Value::Bytes(n.to_vec())),
+            Value::Float64(0.0),
+        ]
+    };
+    put(&t, (0..60).map(mk));
+    t.flush().unwrap();
+    put(&t, (60..120).map(mk)); // MemTable too: 10 rows per name slot
+    // oracle: group by the trimmed value, shown as its shortest raw member ("a b " stays "a b ");
+    // order = count, then the collation (pad with spaces, bytes)
+    let trim = |v: &[u8]| v.iter().rposition(|&c| c != b' ').map_or(&v[..0], |i| &v[..=i]).to_vec();
+    let mut cls: BTreeMap<Option<Vec<u8>>, (u64, usize)> = BTreeMap::new();
+    for i in 0..120 {
+        let raw = names[i % names.len()];
+        let e = cls.entry(raw.map(trim)).or_insert((0, usize::MAX));
+        e.0 += 1;
+        e.1 = e.1.min(raw.map_or(0, <[u8]>::len));
+    }
+    // (order key, shown key, count)
+    type OptBytes = Option<Vec<u8>>;
+    let want: Vec<(OptBytes, OptBytes, u64)> = cls
+        .into_iter()
+        .map(|(t, (n, len))| {
+            let shown = t.clone().map(|mut v| {
+                v.resize(len, b' ');
+                v
+            });
+            (t, shown, n)
+        })
+        .collect();
+    let padded = |v: &Option<Vec<u8>>| -> Option<Vec<u8>> {
+        v.as_ref().map(|v| {
+            let mut v = v.clone();
+            v.resize(8, b' ');
+            v
+        })
+    };
+    let run = |top: Option<TopN>, threads: usize| -> Vec<(Option<Vec<u8>>, u64)> {
+        let mut agg = parallel_agg(&t);
+        let sp = AggSpec {
+            keys: vec![KeySpec::ColumnPad(3)],
+            funcs: vec![FuncSpec::CountStar],
+            top,
+            threads,
+            ..AggSpec::default()
+        };
+        agg.run(&sp, None).unwrap();
+        let r = agg.result();
+        let KeyCol::Bytes { nulls, starts, lens, data } = &r.keys[0] else { panic!() };
+        (0..r.groups)
+            .map(|g| {
+                let k = (!nulls[g]).then(|| data[starts[g] as usize..starts[g] as usize + lens[g] as usize].to_vec());
+                (k, r.funcs[0].count[g])
+            })
+            .collect()
+    };
+    for threads in [1, 3] {
+        let mut all = run(None, threads);
+        all.sort();
+        let mut exp: Vec<_> = want.iter().map(|(_, s, n)| (s.clone(), *n)).collect();
+        exp.sort();
+        assert_eq!(all, exp, "groups, threads={threads}");
+        for desc in [true, false] {
+            let mut full = want.clone();
+            full.sort_by(|x, y| {
+                let o = x.2.cmp(&y.2);
+                let o = if desc { o.reverse() } else { o };
+                o.then_with(|| padded(&x.0).cmp(&padded(&y.0)))
+            });
+            let full: Vec<_> = full.into_iter().map(|(_, s, n)| (s, n)).collect();
+            for limit in [0, 1, 2, 3, 5, 8, 100] {
+                let got = run(Some(TopN { func: 0, desc, limit }), threads);
+                assert_eq!(got, full[..limit.min(full.len())], "desc={desc} limit={limit} threads={threads}");
+            }
+        }
+    }
+    // a PAD key needs a string column
+    let mut agg = parallel_agg(&t);
+    let sp = AggSpec { keys: vec![KeySpec::ColumnPad(2)], funcs: vec![FuncSpec::CountStar], ..AggSpec::default() };
+    assert!(matches!(agg.run(&sp, None), Err(Error::InvalidArg(_))));
+}
+
+#[test]
 fn series_groups_without_an_accepted_row_are_not_returned() {
     let dir = tempfile::tempdir().unwrap();
     let t = open_new(&dir.path().join("t"));

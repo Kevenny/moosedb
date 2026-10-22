@@ -907,7 +907,8 @@ normal. Com `moosedb_gbh_debug=ON` o veredito sai como nota (`gbh: accepted` /
 executadas pelo handler.
 
 **Escopo aceito**: SELECT de nível superior, uma tabela MooseDB, GROUP BY de
-colunas TAG (string ou inteira), VARCHAR ou INT comuns; select list só com
+colunas TAG (string ou inteira), VARCHAR ou INT comuns (ou **nenhum GROUP BY**,
+ver §Agregação escalar); select list só com
 essas colunas, constantes e `COUNT(*)`/`COUNT(col)`/`SUM`/`AVG` de inteiro (menos
 `BIGINT UNSIGNED`, que não cabe nos agregados de 64 bits com sinal do core) e
 `MIN`/`MAX` de inteiro ou do eixo de tempo; WHERE = conjunção de igualdades/IN
@@ -951,13 +952,44 @@ binária NO PAD (`utf8mb4_nopad_bin`) ou binária PAD SPACE (`utf8mb4_bin`, `lat
 collation de comparação seja a da coluna e cujas constantes estejam no charset da
 coluna. Qualquer outro caso fica no dicionário + máscara. (2) *Top-N*:
 uma chave não-TAG, `ORDER BY` de um único agregado (COUNT/SUM/MIN/MAX, não AVG)
-com `LIMIT` (ou `ORDER BY agregado, a própria chave ASC`: ordem SQL total, 2º termo = desempate do core), sem HAVING, chave inteira (não `BIGINT UNSIGNED`) ou string
-binária NO PAD; o desempate do core (chave crescente) é o do handler
-(`cmp_raw`), então os K grupos são os mesmos. Chave TAG nunca usa (o core
-desempata por id de série, o handler pelo valor). Status `Moosedb_gbh_exact_filters`
+com `LIMIT` (ou `ORDER BY agregado, a própria chave ASC`: ordem SQL total, 2º termo = desempate do core), sem HAVING, chave inteira (não `BIGINT UNSIGNED`), string
+binária NO PAD ou string **binária PAD SPACE** (`utf8mb4_bin`, `utf8mb3_bin`, `latin1_bin`, `ascii_bin`; ver abaixo); o desempate do core (chave crescente, na
+ordem da collation) é o do handler, então os K grupos são os mesmos. Chave TAG nunca usa (o core
+desempata por id de série, o handler pelo valor); `_ci`/`_ai` e demais collations
+também não (exigiriam os pesos da collation no core; o handler continua agrupando
+por `strnncollsp` e ordenando todos os grupos). Status `Moosedb_gbh_exact_filters`
 e `Moosedb_gbh_topn`. O pós-processamento ordena em paralelo
 (`moosedb_agg_threads`) e o merge por collation ordena pares (hash, grupo).
-Testes: `gbh_shortcuts`.
+Testes: `gbh_shortcuts`, `gbh_pad_scalar`.
+
+**Chave string binária PAD SPACE** (`TF_AGG_KEY_COLUMN_PAD` / `KeySpec::ColumnPad`).
+Valores que diferem só por 0x20 finais são o MESMO grupo no servidor. Em vez de
+fundir os grupos depois (`merge_groups`, que exige materializar todos), o core
+agrupa pela forma sem espaços finais e guarda por grupo o menor comprimento bruto
+visto (uma função `Min` oculta por chave PAD, fora do `AggResult`); a chave
+devolvida é o aparado mais espaços até esse comprimento, isto é, o menor valor
+do grupo por bytes (o mesmo que o merge do handler escolhia). Sem `need_merge`, o
+top-N roda no core. O desempate é `pad_cmp` (= `strnncollsp`: bytes sem sinal até a
+primeira diferença; se um é prefixo do outro, o resto do maior comparado com
+espaços, então `'a' < 'a' < 'a	'`), que NÃO é a ordem dos bytes quando o resto
+tem byte < 0x20. Só charsets com espaço de 1 byte e `mbminlen = 1` (`cs_pad_bin`).
+Qual valor do grupo o servidor mostra (`'a'` ou `'a  '`) depende do plano dele; os
+testes comparam sem o `Max_length` do metadata nesses casos (`$nomaxlen`).
+
+**Agregação escalar (sem GROUP BY)**. O servidor chama `create_group_by` também
+para consultas com agregado e sem `group_list` (`JOIN::make_aggr_tables_info`,
+`Query.group_by == NULL`; confirmado no fonte do 11.4 e medido). `analyze()` aceita
+quando há `Item_sum` na lista (`with_sum_func`) e trata como um único grupo
+(chaves vazias; o core já devolve um grupo mesmo sem linhas). Semântica de tabela
+vazia: se o core devolve 0 grupos (saída antecipada "nada casa": TAG inexistente,
+conjunto exato vazio, máscara vazia) o handler sintetiza a linha (COUNT = 0,
+SUM/MIN/MAX/AVG = NULL); a checagem "grupo com COUNT(*) = 0" não vale no escalar.
+HAVING, LIMIT/OFFSET, ORDER BY seguem no servidor. Agregados que o servidor já
+dobrou (`opt_sum_query`: `COUNT(*)` sem WHERE pelo nº de linhas da tabela, MIN/MAX
+por índice) são `const_item()` e não têm campo na tabela temporária: viram `CONST`
+no plano (sem isso o mapeamento de campos falha); se só sobrar isso, a consulta
+fica com o servidor. Continuam fora: expressão sobre agregado (`COUNT(*)+1`),
+`COUNT(DISTINCT)`, coluna fora de agregado.
 
 **Execução** (`init_scan`): mapeia `all_fields` para os campos da tmp table,
 resolve as séries do WHERE, abre a agregação (`moosedb_agg_open`, reconferindo
@@ -1084,10 +1116,11 @@ scan não ordenado: só o commitado; o lote privado do statement é invisível).
   melhores grupos por uma função (COUNT, SUM, MIN, MAX; ASC/DESC), melhor
   primeiro. NULL (grupo sem valores) é o menor valor; empate resolvido SEMPRE
   pela chave crescente (id da série, inteiro com sinal, ou bytes sem sinal
-  lexicográfico, prefixo menor primeiro; chave NULL primeiro). Seleção por
+  lexicográfico, prefixo menor primeiro; chave NULL primeiro; `KeySpec::ColumnPad`:
+  `pad_cmp`, ver acima). Seleção por
   partição (`select_nth_unstable`) e depois global; `limit = 0` devolve nenhum
-  grupo. Só vale quando essa ordem é a que o SQL pede (chave inteira ou bytes
-  em collation binária NO PAD).
+  grupo. Só vale quando essa ordem é a que o SQL pede (chave inteira, bytes
+  em collation binária NO PAD ou chave `KeySpec::ColumnPad`, cujos grupos já são os do servidor).
 - **Paralelismo**: `std::thread::scope`; unidades de ~32 Ki linhas (entradas de
   chunk inteiras, no máximo 1024) e de 64 Ki linhas da MemTable via
   `AtomicUsize`; uma tabela de grupos por worker. Com mais de um worker o

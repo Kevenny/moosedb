@@ -312,13 +312,33 @@ DEALLOCATE PREPARE p;
 ##########################################################
 # Refused: what the statement is part of
 ##########################################################
-# no GROUP BY
+# aggregates without GROUP BY: accepted (one implicit group), see gbh_pad_scalar
 SELECT COUNT(*) c, SUM(n) s FROM g WHERE n > 5
 SELECT COUNT(*) c, SUM(n) s FROM g WHERE n > 5;
 c	s
 320	8768
 Warnings:
-Note	1105	gbh: refused: no GROUP BY
+Note	1105	gbh: accepted
+# same as InnoDB
+result_rows	vs_innodb
+1	SAME
+# expression over an aggregate, no GROUP BY
+SELECT COUNT(*) + 1 c FROM g WHERE n > 5
+SELECT COUNT(*) + 1 c FROM g WHERE n > 5;
+c
+321
+Warnings:
+Note	1105	gbh: refused: select list: expression
+# same as InnoDB
+result_rows	vs_innodb
+1	SAME
+# COUNT(DISTINCT), no GROUP BY
+SELECT COUNT(DISTINCT n) c FROM g
+SELECT COUNT(DISTINCT n) c FROM g;
+c
+50
+Warnings:
+Note	1105	gbh: refused: aggregate: unsupported function
 # same as InnoDB
 result_rows	vs_innodb
 1	SAME

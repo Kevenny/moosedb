@@ -1,0 +1,298 @@
+#
+# GROUP BY done by the engine:
+#  1. binary PAD SPACE string keys (utf8mb4_bin, latin1_bin, utf8mb3_bin) are
+#     grouped by the core on the value without trailing spaces (no merge in the
+#     handler) and take the core top-N, ties broken in the collation order;
+#  2. aggregates without GROUP BY (implicit grouping, always one row).
+# Every query is compared with the server without pushdown and with InnoDB.
+#
+--source include/not_embedded.inc
+--source include/have_innodb.inc
+--source include/have_sequence.inc
+--source suite/moosedb/include/have_moosedb.inc
+
+--let $refused= 0
+--let $sorted= 0
+--let $show= 0
+--let $pre=
+
+CREATE TABLE p (
+  ts   DATETIME NOT NULL,
+  host VARCHAR(16) NOT NULL COMMENT 'TAG',
+  kp   VARCHAR(8) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin,
+  kl   VARCHAR(8) CHARACTER SET latin1 COLLATE latin1_bin,
+  ku   VARCHAR(8) CHARACTER SET utf8mb3 COLLATE utf8mb3_bin,
+  kb   VARCHAR(8) CHARACTER SET utf8mb4 COLLATE utf8mb4_nopad_bin,
+  kc   VARCHAR(8) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci,
+  v    BIGINT NOT NULL,
+  bg   BIGINT NOT NULL,
+  w    INT,
+  INDEX(ts)
+) ENGINE=MooseDB CHUNK_INTERVAL='1 DAY';
+CREATE TABLE e (
+  ts   DATETIME NOT NULL,
+  host VARCHAR(16) NOT NULL COMMENT 'TAG',
+  kp   VARCHAR(8) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin,
+  v    BIGINT NOT NULL,
+  w    INT,
+  INDEX(ts)
+) ENGINE=MooseDB CHUNK_INTERVAL='1 DAY';
+
+--echo # classes of kp under PAD SPACE: {a, 'a ', 'a   '}, {'', '  '}, 'a<0x01>', 'a<TAB>', ' a', 'a b', 'b', NULL
+--echo # 20000 rows in chunks, 10000 more in the MemTable
+INSERT INTO p SELECT '2024-03-01' + INTERVAL seq * 20 SECOND, CONCAT('h', seq MOD 5),
+    k, k, k, k, k, (seq * 37) MOD 1000, 9223372036854775807 - seq MOD 3,
+    IF(seq MOD 4 = 0, NULL, seq MOD 50)
+  FROM (SELECT seq, ELT(seq MOD 11 + 1, 'a', 'a ', 'a   ', '', '  ', CONCAT('a', CHAR(1)), CONCAT('a', CHAR(9)), ' a', 'a b ', 'b', NULL) k
+        FROM seq_0_to_19999) x;
+FLUSH TABLES p;
+INSERT INTO p SELECT '2024-03-01' + INTERVAL seq * 20 SECOND, CONCAT('h', seq MOD 5),
+    k, k, k, k, k, (seq * 37) MOD 1000, 9223372036854775807 - seq MOD 3,
+    IF(seq MOD 4 = 0, NULL, seq MOD 50)
+  FROM (SELECT seq, ELT(seq MOD 11 + 1, 'a', 'a ', 'a   ', '', '  ', CONCAT('a', CHAR(1)), CONCAT('a', CHAR(9)), ' a', 'a b ', 'b', NULL) k
+        FROM seq_20000_to_29999) x;
+CREATE DATABASE mirror;
+CREATE TABLE mirror.p LIKE test.p;
+ALTER TABLE mirror.p ENGINE=InnoDB;
+INSERT INTO mirror.p SELECT * FROM test.p;
+CREATE TABLE mirror.e LIKE test.e;
+ALTER TABLE mirror.e ENGINE=InnoDB;
+
+# The key shown for a class ('a', 'a ', 'a   ') is one of its values, whichever the plan sees
+# first on the server and the shortest on the engine: compare without Max_length.
+--let $nomaxlen= 1
+--echo ##########################################################
+--echo # PAD SPACE keys: one group per class, one of its values as the key
+--echo ##########################################################
+--let $label= groups (a, 'a ' and 'a   ' are one group; '' and '  ' too)
+--let $q= SELECT kp, COUNT(*) c, SUM(v) s, MIN(ts) t FROM p GROUP BY kp ORDER BY kp
+--source suite/moosedb/include/gbh_sc.inc
+--let $q= SELECT kl, COUNT(*) c FROM p GROUP BY kl ORDER BY kl
+--source suite/moosedb/include/gbh_sc.inc
+--let $q= SELECT ku, COUNT(*) c FROM p GROUP BY ku ORDER BY ku
+--source suite/moosedb/include/gbh_sc.inc
+--let $label= PAD SPACE key together with a TAG
+--let $q= SELECT host, kp, COUNT(*) c FROM p GROUP BY host, kp ORDER BY host, kp
+--source suite/moosedb/include/gbh_sc.inc
+
+--echo ##########################################################
+--echo # Core top-N on PAD SPACE keys (topn=1): ties at the LIMIT boundary follow the
+--echo # collation order, not the byte order ('a<0x01>' sorts before 'a': 0x01 < ' ')
+--echo ##########################################################
+--let $label= ORDER BY aggregate DESC, key
+--let $q= SELECT kp, COUNT(*) c FROM p GROUP BY kp ORDER BY c DESC, kp LIMIT 1
+--source suite/moosedb/include/gbh_sc.inc
+--let $q= SELECT kp, COUNT(*) c FROM p GROUP BY kp ORDER BY c DESC, kp LIMIT 2
+--source suite/moosedb/include/gbh_sc.inc
+--let $q= SELECT kp, COUNT(*) c FROM p GROUP BY kp ORDER BY c DESC, kp LIMIT 4
+--source suite/moosedb/include/gbh_sc.inc
+--let $q= SELECT kp, COUNT(*) c FROM p GROUP BY kp ORDER BY c DESC, kp LIMIT 20
+--source suite/moosedb/include/gbh_sc.inc
+--let $label= ORDER BY aggregate ASC, key (the singletons tie)
+--let $q= SELECT kp, COUNT(*) c FROM p GROUP BY kp ORDER BY c, kp LIMIT 3
+--source suite/moosedb/include/gbh_sc.inc
+--let $q= SELECT kp, COUNT(*) c FROM p GROUP BY kp ORDER BY c, kp LIMIT 4 OFFSET 2
+--source suite/moosedb/include/gbh_sc.inc
+--let $q= SELECT kp, COUNT(*) c FROM p GROUP BY kp ORDER BY c, kp LIMIT 100
+--source suite/moosedb/include/gbh_sc.inc
+--let $label= other aggregates, filters
+--let $q= SELECT kp, SUM(v) s FROM p WHERE ts >= '2024-03-04' GROUP BY kp ORDER BY s DESC, kp LIMIT 3
+--source suite/moosedb/include/gbh_sc.inc
+--let $q= SELECT kp, MIN(ts) t FROM p GROUP BY kp ORDER BY t, kp LIMIT 5
+--source suite/moosedb/include/gbh_sc.inc
+--let $q= SELECT kp, MAX(ts) t FROM p WHERE host = 'h1' GROUP BY kp ORDER BY t DESC, kp LIMIT 5
+--source suite/moosedb/include/gbh_sc.inc
+--let $q= SELECT kp, COUNT(w) c FROM p WHERE v > 500 GROUP BY kp ORDER BY c DESC, kp LIMIT 4
+--source suite/moosedb/include/gbh_sc.inc
+--let $q= SELECT kp, COUNT(*) c FROM p WHERE kp IN ('a', 'b ', '') GROUP BY kp ORDER BY c DESC, kp LIMIT 2
+--source suite/moosedb/include/gbh_sc.inc
+--let $q= SELECT kp, COUNT(*) c FROM p WHERE kp LIKE 'a%' GROUP BY kp ORDER BY c DESC, kp LIMIT 3
+--source suite/moosedb/include/gbh_sc.inc
+--let $label= latin1_bin and utf8mb3_bin
+--let $q= SELECT kl, COUNT(*) c FROM p GROUP BY kl ORDER BY c DESC, kl LIMIT 3
+--source suite/moosedb/include/gbh_sc.inc
+--let $q= SELECT ku, COUNT(*) c FROM p GROUP BY ku ORDER BY c, ku LIMIT 4
+--source suite/moosedb/include/gbh_sc.inc
+--let $label= a single ORDER BY term without ties at the boundary
+--let $q= SELECT kp, SUM(v) s FROM p WHERE kp IN ('a', 'a ', 'b') GROUP BY kp ORDER BY s DESC LIMIT 1
+--source suite/moosedb/include/gbh_sc.inc
+
+--echo ##########################################################
+--echo # Still without the core top-N (topn=0, same answer)
+--echo ##########################################################
+--let $label= case-insensitive key, key DESC in the second term
+--let $q= SELECT kc, COUNT(*) c FROM p GROUP BY kc ORDER BY c DESC, kc LIMIT 3
+--source suite/moosedb/include/gbh_sc.inc
+--let $q= SELECT kp, COUNT(*) c FROM p GROUP BY kp ORDER BY c DESC, kp DESC LIMIT 3
+--source suite/moosedb/include/gbh_sc.inc
+
+--let $nomaxlen= 0
+--echo ##########################################################
+--echo # Aggregates without GROUP BY
+--echo ##########################################################
+--let $label= all the aggregates, whole table
+--let $q= SELECT COUNT(*), COUNT(w), SUM(v), SUM(w), MIN(v), MAX(v), MIN(w), MAX(w), AVG(v), AVG(w), MIN(ts), MAX(ts) FROM p
+--source suite/moosedb/include/gbh_sc.inc
+--let $label= SUM beyond 64 bits (128-bit accumulator)
+--let $q= SELECT SUM(bg), AVG(bg), COUNT(*) FROM p
+--source suite/moosedb/include/gbh_sc.inc
+--let $label= WHERE: time, TAG, column value, exact PAD SPACE value, case-insensitive value
+--let $q= SELECT COUNT(*), SUM(v), MIN(v), MAX(v), AVG(v) FROM p WHERE ts >= '2024-03-02' AND ts < '2024-03-04'
+--source suite/moosedb/include/gbh_sc.inc
+--let $q= SELECT COUNT(*), SUM(v), MIN(ts), MAX(ts) FROM p WHERE host = 'h2'
+--source suite/moosedb/include/gbh_sc.inc
+--let $q= SELECT COUNT(*), SUM(v), AVG(w) FROM p WHERE host IN ('h0', 'h4') AND v >= 700
+--source suite/moosedb/include/gbh_sc.inc
+--let $q= SELECT COUNT(*), SUM(v), MIN(w) FROM p WHERE kp = 'a'
+--source suite/moosedb/include/gbh_sc.inc
+--let $q= SELECT COUNT(*), SUM(v) FROM p WHERE kc = 'A' OR kc = 'B'
+--source suite/moosedb/include/gbh_sc.inc
+--let $q= SELECT COUNT(*), COUNT(w), SUM(w), MIN(w), MAX(w), AVG(w) FROM p WHERE kp IS NULL
+--source suite/moosedb/include/gbh_sc.inc
+--let $label= nothing matches: still one row, COUNT = 0 and NULLs
+--let $either= 1
+--let $q= SELECT COUNT(*), COUNT(w), SUM(v), SUM(w), MIN(v), MAX(w), AVG(v), MIN(ts), MAX(ts) FROM p WHERE ts > '2100-01-01'
+--source suite/moosedb/include/gbh_sc.inc
+--let $either= 1
+--let $q= SELECT COUNT(*), SUM(v), MIN(ts) FROM p WHERE host = 'nope'
+--source suite/moosedb/include/gbh_sc.inc
+--let $either= 1
+--let $q= SELECT COUNT(*), SUM(v), MIN(ts) FROM p WHERE kp = 'zzz'
+--source suite/moosedb/include/gbh_sc.inc
+--let $either= 1
+--let $q= SELECT COUNT(*), SUM(v), MIN(ts) FROM p WHERE kc = 'zzz'
+--source suite/moosedb/include/gbh_sc.inc
+--let $either= 1
+--let $q= SELECT COUNT(*), SUM(v), MAX(v) FROM p WHERE v < 0
+--source suite/moosedb/include/gbh_sc.inc
+--let $q= SELECT COUNT(*), COUNT(w), SUM(w), MIN(w), AVG(w) FROM p WHERE w IS NULL
+--source suite/moosedb/include/gbh_sc.inc
+--let $label= empty table
+--let $either= 1
+--let $q= SELECT COUNT(*), COUNT(w), SUM(v), SUM(w), MIN(v), MAX(w), AVG(v), MIN(ts), MAX(ts) FROM e
+--source suite/moosedb/include/gbh_sc.inc
+--let $label= HAVING, ORDER BY, LIMIT and OFFSET stay with the server
+--let $q= SELECT COUNT(*) c, SUM(v) s FROM p HAVING c > 5
+--source suite/moosedb/include/gbh_sc.inc
+--let $q= SELECT COUNT(*) c, SUM(v) s FROM p HAVING c > 1000000
+--source suite/moosedb/include/gbh_sc.inc
+--let $either= 1
+--let $q= SELECT COUNT(*) c FROM p WHERE ts > '2100-01-01' HAVING c = 0
+--source suite/moosedb/include/gbh_sc.inc
+--let $either= 1
+--let $q= SELECT COUNT(*) c FROM p ORDER BY c LIMIT 1
+--source suite/moosedb/include/gbh_sc.inc
+--let $either= 1
+--let $q= SELECT COUNT(*) c FROM p LIMIT 1 OFFSET 1
+--source suite/moosedb/include/gbh_sc.inc
+--let $q= SELECT COUNT(*) c, 7 k, SUM(v) FROM p WHERE host = 'h1' ORDER BY 2
+--source suite/moosedb/include/gbh_sc.inc
+--let $q= SELECT SUM(v) s FROM p LIMIT 1 OFFSET 1
+--source suite/moosedb/include/gbh_sc.inc
+--let $q= SELECT SUM(v) s FROM p LIMIT 1
+--source suite/moosedb/include/gbh_sc.inc
+--let $q= SELECT SUM(v) s FROM p LIMIT 0
+--let $either= 1
+--source suite/moosedb/include/gbh_sc.inc
+--let $label= aggregate used only in HAVING
+--let $either= 1
+--let $q= SELECT 1 FROM p HAVING COUNT(*) > 0
+--source suite/moosedb/include/gbh_sc.inc
+--let $label= constant arguments are not folded by the server: they must be computed
+--let $either= 1
+--let $q= SELECT SUM(1), COUNT(5), MAX(5), MIN(7), AVG(2) FROM p
+--source suite/moosedb/include/gbh_sc.inc
+--let $either= 1
+--let $q= SELECT SUM(1), COUNT(5), MAX(5), AVG(2) FROM p WHERE host = 'h1' AND v > 100
+--source suite/moosedb/include/gbh_sc.inc
+--let $either= 1
+--let $q= SELECT SUM(1), COUNT(5), MAX(5), AVG(2) FROM p WHERE ts > '2100-01-01'
+--let $either= 1
+--source suite/moosedb/include/gbh_sc.inc
+--let $either= 1
+--let $q= SELECT host, SUM(1), COUNT(5), MAX(5), AVG(2) FROM p GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_sc.inc
+--let $either= 1
+--let $q= SELECT kp, SUM(1), COUNT(5), MAX(5) FROM p WHERE v > 100 GROUP BY kp ORDER BY kp
+--source suite/moosedb/include/gbh_sc.inc
+--let $label= aggregates the server folds (COUNT(*), MIN/MAX of the indexed time) mixed with computed ones
+--let $either= 1
+--let $q= SELECT MIN(ts), MAX(ts) FROM p
+--source suite/moosedb/include/gbh_sc.inc
+--let $either= 1
+--let $q= SELECT COUNT(*), MAX(ts) FROM p
+--source suite/moosedb/include/gbh_sc.inc
+--let $either= 1
+--let $q= SELECT COUNT(*), SUM(v) FROM p
+--source suite/moosedb/include/gbh_sc.inc
+--let $either= 1
+--let $q= SELECT COUNT(*), MIN(ts), SUM(v), MAX(v) FROM p
+--source suite/moosedb/include/gbh_sc.inc
+--let $either= 1
+--let $q= SELECT host, COUNT(*), MIN(ts), SUM(v) FROM p GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_sc.inc
+--let $label= a prepared statement, executed twice
+--let $pre= PREPARE s FROM 'SELECT COUNT(*), SUM(v) FROM p WHERE ts >= ? AND host = ?'; SET @a = '2024-03-03'; SET @b = 'h3'; EXECUTE s USING @a, @b; SET @a = '2100-01-01';
+--let $q= EXECUTE s USING @a, @b
+--source suite/moosedb/include/gbh_sc.inc
+--let $label= not taken: expression over an aggregate, DISTINCT inside the aggregate, a plain query
+--let $refused= 1
+--let $q= SELECT COUNT(*) + 1, SUM(v) FROM p
+--source suite/moosedb/include/gbh_sc.inc
+--let $refused= 1
+--let $q= SELECT COUNT(DISTINCT v) FROM p
+--source suite/moosedb/include/gbh_sc.inc
+--let $refused= 1
+--let $q= SELECT v FROM p WHERE host = 'h1' ORDER BY ts LIMIT 3
+--source suite/moosedb/include/gbh_sc.inc
+
+--let $nomaxlen= 1
+--echo ##########################################################
+--echo # After DELETE (tombstones) and with a row only in the MemTable
+--echo ##########################################################
+DELETE FROM p WHERE host = 'h3' AND ts < '2024-03-02';
+DELETE FROM mirror.p WHERE host = 'h3' AND ts < '2024-03-02';
+DELETE FROM p WHERE ts >= '2024-03-05 12:00:00' AND ts < '2024-03-05 13:00:00';
+DELETE FROM mirror.p WHERE ts >= '2024-03-05 12:00:00' AND ts < '2024-03-05 13:00:00';
+INSERT INTO p VALUES ('2024-03-09 00:00:00', 'h1', 'a  ', 'a  ', 'a  ', 'a  ', 'a  ', 5, 1, 7);
+INSERT INTO mirror.p VALUES ('2024-03-09 00:00:00', 'h1', 'a  ', 'a  ', 'a  ', 'a  ', 'a  ', 5, 1, 7);
+--let $label= scalar aggregates, then PAD SPACE top-N, over tombstones and the MemTable
+--let $q= SELECT COUNT(*), SUM(v), SUM(bg), MIN(ts), MAX(ts), AVG(w) FROM p
+--source suite/moosedb/include/gbh_sc.inc
+--let $q= SELECT COUNT(*), SUM(v) FROM p WHERE host = 'h3'
+--source suite/moosedb/include/gbh_sc.inc
+--let $q= SELECT kp, COUNT(*) c FROM p GROUP BY kp ORDER BY c DESC, kp LIMIT 3
+--source suite/moosedb/include/gbh_sc.inc
+--let $q= SELECT kp, COUNT(*) c FROM p GROUP BY kp ORDER BY c, kp LIMIT 4
+--source suite/moosedb/include/gbh_sc.inc
+DELETE FROM p;
+DELETE FROM mirror.p;
+--let $label= everything deleted
+--let $either= 1
+--let $q= SELECT COUNT(*), SUM(v), MIN(ts), AVG(w) FROM p
+--source suite/moosedb/include/gbh_sc.inc
+--let $either= 1
+--let $q= SELECT kp, COUNT(*) c FROM p GROUP BY kp ORDER BY c DESC, kp LIMIT 3
+--source suite/moosedb/include/gbh_sc.inc
+
+--echo ##########################################################
+--echo # The key of a PAD SPACE group is its SHORTEST real member (bytes shown with cat -A,
+--echo # end of line shown as a dollar sign by cat -A, a tab as ^I, spaces are visible before it)
+--echo ##########################################################
+CREATE TABLE r (ts DATETIME NOT NULL, host VARCHAR(8) NOT NULL COMMENT 'TAG', k VARCHAR(8) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin, INDEX(ts)) ENGINE=MooseDB;
+INSERT INTO r VALUES ('2024-03-01 00:00:01', 'a', 'x   '), ('2024-03-01 00:00:02', 'a', 'x  '), ('2024-03-01 00:00:03', 'a', 'y '),
+  ('2024-03-01 00:00:04', 'a', 'w'), ('2024-03-01 00:00:05', 'b', 'v '), ('2024-03-01 00:00:06', 'b', 'a b ');
+FLUSH TABLES r;
+INSERT INTO r VALUES ('2024-03-01 00:00:07', 'b', 'x    '), ('2024-03-01 00:00:08', 'b', 'y   '), ('2024-03-01 00:00:09', 'b', 'y'),
+  ('2024-03-01 00:00:10', 'a', 'v   '), ('2024-03-01 00:00:11', 'a', NULL), ('2024-03-01 00:00:12', 'a', 'u  '), ('2024-03-01 00:00:13', 'a', '  ');
+--let $hx_cl= $MYSQL -uroot -S$MASTER_MYSOCK -N -B --init-command="SET SESSION moosedb_group_by_pushdown=1" test
+--let $hx_c0= `SELECT VARIABLE_VALUE FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME = 'MOOSEDB_GBH_QUERIES'`
+--echo # expected: u (3 chars), v (2: the chunk row beats the MemTable 4), w, x (3), y (1: from the MemTable), 'a b ' (alone, keeps its space), '  ' (alone: the trimmed '' is not a member, so it is not returned), NULL
+--exec $hx_cl -e "SELECT k, COUNT(*) FROM r GROUP BY k ORDER BY k" 2>&1 | cat -A
+--exec $hx_cl -e "SELECT k, COUNT(*) c FROM r GROUP BY k ORDER BY c DESC, k LIMIT 4" 2>&1 | cat -A
+--exec $hx_cl -e "SELECT host, k, COUNT(*) c FROM r GROUP BY host, k ORDER BY host, k" 2>&1 | cat -A
+--let $hx_c1= `SELECT VARIABLE_VALUE - $hx_c0 FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME = 'MOOSEDB_GBH_QUERIES'`
+--echo # engine runs: $hx_c1
+DROP TABLE r;
+DROP DATABASE mirror;
+DROP TABLE p, e;

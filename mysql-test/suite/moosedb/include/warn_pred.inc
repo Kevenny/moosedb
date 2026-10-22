@@ -1,0 +1,9 @@
+--let $q= SELECT COUNT(*) FROM {T} IGNORE INDEX(ts) WHERE $p
+--let $label= SELECT $p
+--source suite/moosedb/include/warn_pair.inc
+--let $q= DELETE FROM {T} WHERE $p
+--let $label= DELETE $p
+--source suite/moosedb/include/warn_pair.inc
+--let $q= DELETE FROM {T} WHERE $p AND host = 'h1'
+--let $label= DELETE $p AND host = 'h1'
+--source suite/moosedb/include/warn_pair.inc

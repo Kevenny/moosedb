@@ -377,7 +377,16 @@ Segmento cifrado só com header não exige a chave no replay.
   são SELECT e `read_set` ampliado após a abertura usam a linha inteira;
   `rnd_pos` sempre devolve a linha inteira.
 * **Full scan**: chunk por chunk, série por série (blocos lidos sob demanda,
-  via cache LRU), e por fim a MemTable.
+  via cache LRU), e por fim a MemTable. A faixa de tempo do WHERE (conjuntos
+  de topo `ts <op> const` / `BETWEEN` que `capture_delete_cond` reproduz com
+  exatidão, também com constante string comparada como DATETIME) é guardada
+  por `cond_push` (`pushed_time_`) e `rnd_init` abre o stream sobre ela: poda
+  de chunks e busca binária por série, sem merge. O servidor reavalia o WHERE
+  inteiro, então a faixa é só um superconjunto. Medido (8,6 M linhas, 10 k
+  séries): `ts >= X` com plano ALL 0,81 → 0,29 s. Quando o otimizador escolhe
+  *index range* em `INDEX(ts)` o scan continua sendo o merge ordenado: o
+  servidor sempre pede `HA_MRR_SORTED` (opt_range.cc:12124), então o handler
+  não sabe se a ordem é dispensável.
 * **Scan por índice** (`index_read_map`, `index_first/last`, `ORDER BY ts`):
   *k-way merge* ordenado por `(ts, origem, ordinal)`, ascendente ou
   descendente. Cada série só é decodificada quando chega ao topo do heap, então

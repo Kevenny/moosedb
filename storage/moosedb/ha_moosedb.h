@@ -408,6 +408,7 @@ private:
   std::vector<tf_tag_predicate> ddel_cap_preds_;
   longlong ddel_cap_lo_= LONGLONG_MIN, ddel_cap_hi_= LONGLONG_MAX;
   uint64_t del_rows_= 0;      /* delete_row() calls of the open DELETE */
+  bool capture_for_scan_= false;  /* capture_delete_cond runs for rnd_init: a superset is enough, but a string constant must be a clean literal so that no diagnostic (and no cached conversion) is produced behind the server's back */
   bool capture_str_time_= false;  /* capture_delete_cond: a string constant is a DATETIME one when the comparison is */
   bool in_bulk_insert_= false;
   uint dup_key_= MAX_KEY;     /* key of the last HA_ERR_FOUND_DUPP_KEY (info ERRKEY) */
@@ -474,6 +475,7 @@ private:
   /* Pushed-down TAG predicates: one entry per cond_push() call. */
   std::vector<std::vector<tf_tag_predicate>> pushed_;
   std::vector<std::vector<tf_val_pred>> pushed_val_;   /* parallel to pushed_ */
+  std::vector<std::pair<longlong, longlong>> pushed_time_; /* per cond_push level: time bounds in us */
   uint64_t pushed_version_= 0;          /* series version pushed_ids_ is for */
   bool pushed_valid_= false;            /* pushed_ids_ is up to date      */
   bool pushed_filter_= false;           /* some predicate restricts rows  */

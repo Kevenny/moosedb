@@ -1,0 +1,14 @@
+--let $p= ts > 'lixo'
+--source suite/moosedb/include/warn_pred.inc
+--let $p= ts > '2026-02-30'
+--source suite/moosedb/include/warn_pred.inc
+--let $p= ts > '0000-00-00'
+--source suite/moosedb/include/warn_pred.inc
+--let $p= ts > NULL
+--source suite/moosedb/include/warn_pred.inc
+--let $p= ts BETWEEN 'lixo' AND '2026-03-01 00:10:00'
+--source suite/moosedb/include/warn_pred.inc
+--let $p= ts < '2026-03-01 00:10:00.9999995'
+--source suite/moosedb/include/warn_pred.inc
+--let $p= ts >= '2026-03-01 00:50:00' AND ts <= '2026-03-01 00:5x:00'
+--source suite/moosedb/include/warn_pred.inc

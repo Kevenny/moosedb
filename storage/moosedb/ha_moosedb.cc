@@ -43,6 +43,95 @@ static handlerton *moosedb_hton;
 
 namespace {
 
+/*
+  RAII: while alive, every diagnostic raised on `thd` is swallowed (the server
+  raises its own when it evaluates the WHERE) and `flag` is true. The
+  destructor pops the handler and restores `flag`, whatever the exit path.
+*/
+class Quiet_capture
+{
+  THD *thd_;
+  bool &flag_, &flag2_;
+  bool saved_, saved2_;
+  Dummy_error_handler h_;
+
+public:
+  Quiet_capture(THD *thd, bool &flag, bool &flag2)
+    : thd_(thd), flag_(flag), flag2_(flag2), saved_(flag), saved2_(flag2)
+  {
+    flag_= flag2_= true;
+    if (thd_)
+      thd_->push_internal_handler(&h_);
+  }
+  ~Quiet_capture()
+  {
+    if (thd_)
+      thd_->pop_internal_handler();
+    flag_= saved_;
+    flag2_= saved2_;
+  }
+  Quiet_capture(const Quiet_capture &)= delete;
+  Quiet_capture &operator=(const Quiet_capture &)= delete;
+};
+
+/*
+  A constant that converts to DATETIME with no diagnostic at all: a string
+  literal 'YYYY-MM-DD[ HH:MM:SS[.f{1,6}]]' naming a valid calendar day. Anything else
+  is left to the server: converting it here could raise (or, through a cached
+  conversion, hide) a warning the statement must report exactly once.
+*/
+bool scan_literal_ok(Item *cst)
+{
+  /* BETWEEN/comparisons wrap the converted constant in a cache: judge the
+     original item it was made from. */
+  if (cst->type() == Item::CACHE_ITEM)
+  {
+    cst= static_cast<Item_cache *>(cst)->get_example();
+    if (!cst)
+      return false;
+  }
+  if (cst->type() != Item::CONST_ITEM || cst->cmp_type() != STRING_RESULT)
+    return false;
+  String tmp;
+  String *r= cst->val_str(&tmp);
+  if (!r || cst->null_value || r->charset()->mbminlen != 1)
+    return false;
+  const char *p= r->ptr();
+  const size_t n= r->length();
+  auto dig= [&](size_t i) { return i < n && p[i] >= '0' && p[i] <= '9'; };
+  auto num= [&](size_t i, size_t len) {
+    uint v= 0;
+    for (size_t k= 0; k < len; k++)
+      v= v * 10 + (uint) (p[i + k] - '0');
+    return v;
+  };
+  if (n != 10 && n != 19 && !(n >= 21 && n <= 26))
+    return false;
+  for (size_t i= 0; i < 10; i++)
+    if (i == 4 || i == 7 ? p[i] != '-' : !dig(i))
+      return false;
+  const uint y= num(0, 4), mo= num(5, 2), d= num(8, 2);
+  const uint dim= mo == 2 ? 28u + (((y % 4 == 0 && y % 100 != 0) || y % 400 == 0) ? 1u : 0u)
+                          : (mo == 4 || mo == 6 || mo == 9 || mo == 11) ? 30u : 31u;
+  if (y < 1000 || mo < 1 || mo > 12 || d < 1 || d > dim)
+    return false;
+  if (n == 10)
+    return true;
+  if (p[10] != ' ' || !dig(11) || !dig(12) || p[13] != ':' || !dig(14) ||
+      !dig(15) || p[16] != ':' || !dig(17) || !dig(18))
+    return false;
+  if (num(11, 2) > 23 || num(14, 2) > 59 || num(17, 2) > 59)
+    return false;
+  if (n == 19)
+    return true;
+  if (p[19] != '.')
+    return false;
+  for (size_t i= 20; i < n; i++)
+    if (!dig(i))
+      return false;
+  return true;
+}
+
 constexpr longlong MICROS_PER_SEC= 1000000LL;
 constexpr longlong MICROS_PER_DAY= 86400LL * MICROS_PER_SEC;
 
@@ -2710,6 +2799,47 @@ const COND *ha_moosedb::cond_push(const COND *cond)
   }
   pushed_valid_= false;
   /*
+    Time bounds of the WHERE for the unordered scan (rnd_init): every
+    top-level conjunct capture_delete_cond() reproduces exactly narrows
+    [lo, hi]; the others are ignored. The server still evaluates the whole
+    WHERE, so a wider range is only slower, never wrong.
+  */
+  {
+    longlong tlo= LONGLONG_MIN, thi= LONGLONG_MAX;
+    if (share_ && table && cond)
+    {
+      /*
+        capture_str_time_ is true only inside this scope (a string constant
+        compared as DATETIME is a bound too): a SUPERSET is enough here. The
+        direct DELETE below runs without the server re-checking rows and
+        needs exactness, so it uses the flag off (see capture_delete_cond).
+        Converting a constant may raise a note; the server raises its own.
+      */
+      Quiet_capture guard(ha_thd(), capture_str_time_, capture_for_scan_);
+      auto one= [&](Item *c) {
+        std::vector<tf_tag_predicate> scratch;
+        longlong l= tlo, h= thi;
+        if (capture_delete_cond(c, &scratch, &l, &h))
+        {
+          tlo= l;
+          thi= h;
+        }
+      };
+      Item *it= const_cast<Item *>(cond);
+      if (it->type() == Item::COND_ITEM &&
+          static_cast<Item_cond *>(it)->functype() == Item_func::COND_AND_FUNC)
+      {
+        List_iterator_fast<Item> li(*static_cast<Item_cond *>(it)->argument_list());
+        while (Item *arg= li++)
+          one(arg);
+      }
+      else
+        one(it);
+    }
+    /* Keep pushed_ and pushed_time_ paired: no early return above this line. */
+    pushed_time_.emplace_back(tlo, thi);
+  }
+  /*
     A DELETE whose whole WHERE is TAG equalities and time bounds can be done by
     the engine alone (direct delete). The server asks for that by calling
     cond_push on the target table of the DELETE and treating a NULL return as
@@ -2746,6 +2876,8 @@ void ha_moosedb::cond_pop()
     pushed_.pop_back();
   if (!pushed_val_.empty())
     pushed_val_.pop_back();
+  if (!pushed_time_.empty())
+    pushed_time_.pop_back();
   pushed_valid_= false;
 }
 
@@ -2771,6 +2903,7 @@ int ha_moosedb::reset()
   ddel_cap_item_= nullptr;
   pushed_.clear();
   pushed_val_.clear();
+  pushed_time_.clear();
   pushed_valid_= false;
   scan_.reset();
   reset_batch_state();
@@ -3200,11 +3333,24 @@ bool ha_moosedb::capture_delete_cond(Item *item,
     {
       THD *thd= ha_thd();
       MYSQL_TIME lt;
+      /* For rnd_init only clean string literals are converted (see scan_literal_ok). */
+      if (capture_for_scan_ && !scan_literal_ok(cst))
+        return false;
       if (!thd || (cst->cmp_type() != TIME_RESULT && !cmp_time) ||
           cst->get_date(thd, &lt, Datetime::Options_cmp(thd)) /* the comparator's own flags and rounding */ || cst->null_value ||
           lt.month == 0 || lt.day == 0 || lt.neg ||
           (lt.time_type != MYSQL_TIMESTAMP_DATETIME && lt.time_type != MYSQL_TIMESTAMP_DATE))
         return false;
+      /* ALLOW_INVALID_DATES lets '2026-02-30' through the conversion; the
+         server orders it by its packed value, which time_to_micros() does not
+         reproduce: leave such constants to the server. */
+      {
+        const uint dim= lt.month == 2
+            ? 28u + (((lt.year % 4 == 0 && lt.year % 100 != 0) || lt.year % 400 == 0) ? 1u : 0u)
+            : ((lt.month == 4 || lt.month == 6 || lt.month == 9 || lt.month == 11) ? 30u : 31u);
+        if (lt.month > 12 || lt.day > dim)
+          return false;
+      }
       key= time_to_micros(lt);
       step= 1;
     }
@@ -3702,7 +3848,17 @@ int ha_moosedb::rnd_init(bool scan)
   DBUG_ENTER("ha_moosedb::rnd_init");
   /* scan == false: only rnd_pos() follows; positions resolve through the
      snapshots kept by position(). */
-  DBUG_RETURN(scan ? open_scan(LONGLONG_MIN, LONGLONG_MAX, false, false) : 0);
+  if (!scan)
+    DBUG_RETURN(0);
+  /* Unordered anyway: bound the scan by the time range of the pushed WHERE
+     (prunes chunks and rows, see cond_push). */
+  longlong lo= LONGLONG_MIN, hi= LONGLONG_MAX;
+  for (const auto &t : pushed_time_)
+  {
+    lo= std::max(lo, t.first);
+    hi= std::min(hi, t.second);
+  }
+  DBUG_RETURN(open_scan(lo, hi, false, false));
 }
 
 /*

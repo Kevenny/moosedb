@@ -1,0 +1,235 @@
+#
+# time_range_scan, part 2: diagnostics, lifecycle of the pushed time range and
+# odd corners. Everything is compared with an InnoDB mirror.
+#
+--source include/have_innodb.inc
+--source include/have_sequence.inc
+--source suite/moosedb/include/have_moosedb.inc
+
+CREATE TABLE m (ts DATETIME NOT NULL, host VARCHAR(8) NOT NULL COMMENT 'TAG',
+                v INT NOT NULL, INDEX(ts)) ENGINE=MooseDB CHUNK_INTERVAL='1 HOUR';
+CREATE TABLE i (ts DATETIME NOT NULL, host VARCHAR(8) NOT NULL,
+                v INT NOT NULL, KEY(ts)) ENGINE=InnoDB;
+# small outer table (InnoDB) for joins and subqueries
+CREATE TABLE s (ts DATETIME NOT NULL, host VARCHAR(8) NOT NULL, v INT NOT NULL, k INT NOT NULL) ENGINE=InnoDB;
+INSERT INTO s VALUES ('2026-03-01 00:10:00', 'h0', 3, 1), ('2026-03-01 00:30:00', 'h1', 7, 2),
+                     ('2026-03-01 00:55:00', 'h2', 9, 3), ('2027-01-01 00:00:00', 'h0', 1, 4);
+
+--echo ##################################################################
+--echo # Bad constants: errors and warnings must equal InnoDB's, strict or not
+--echo # (each pair: the "# MooseDB" block and the "# InnoDB" block are identical)
+--echo ##################################################################
+SET sql_mode = '';
+--source suite/moosedb/include/warn_cases.inc
+SET sql_mode = 'STRICT_ALL_TABLES,NO_ZERO_DATE,NO_ZERO_IN_DATE,ERROR_FOR_DIVISION_BY_ZERO';
+--source suite/moosedb/include/warn_cases.inc
+SET sql_mode = DEFAULT;
+--echo # same with the GROUP BY pushdown off: only the scan path is involved
+SET SESSION moosedb_group_by_pushdown = OFF;
+--source suite/moosedb/include/warn_cases.inc
+SET SESSION moosedb_group_by_pushdown = DEFAULT;
+
+--echo # UPDATE on MooseDB is refused by the engine (not a time range matter)
+INSERT INTO m SELECT '2026-03-01 00:00:00' + INTERVAL seq MINUTE, CONCAT('h', seq MOD 3), seq FROM seq_0_to_59;
+INSERT INTO i SELECT '2026-03-01 00:00:00' + INTERVAL seq MINUTE, CONCAT('h', seq MOD 3), seq FROM seq_0_to_59;
+--error ER_ILLEGAL_HA
+UPDATE m SET v = v + 1 WHERE ts > '2026-03-01 00:30:00';
+--error ER_ILLEGAL_HA
+UPDATE m SET ts = ts + INTERVAL 1 DAY WHERE ts > '2026-03-01 00:30:00';
+--error ER_ILLEGAL_HA
+UPDATE m, s SET m.v = 0 WHERE m.host = s.host AND m.ts > '2026-03-01 00:30:00';
+
+--echo ##################################################################
+--echo # Lifecycle of the pushed range
+--echo ##################################################################
+--echo # PREPARE ts > ? executed with different values
+SET @sm = 'SELECT COUNT(*), SUM(v), MIN(ts), MAX(ts) INTO @c1, @s1, @a1, @b1 FROM m IGNORE INDEX(ts) WHERE ts > ?';
+SET @si = 'SELECT COUNT(*), SUM(v), MIN(ts), MAX(ts) INTO @c2, @s2, @a2, @b2 FROM i IGNORE INDEX(ts) WHERE ts > ?';
+PREPARE pm FROM @sm;
+PREPARE pi FROM @si;
+--let $n= 0
+while ($n < 7)
+{
+  --disable_query_log
+  eval SET @a = ELT($n + 1, '2026-03-01 00:30:00', '2026-03-01 00:58:00', '2020-01-01', '2026-03-01 00:00:00', '2027-01-01', '2026-03-01 00:00:00.5', '2026-03-01 00:59:00');
+  EXECUTE pm USING @a;
+  EXECUTE pi USING @a;
+  SELECT @a AS bound, @c1 AS cnt, IF(@c1 <=> @c2 AND @s1 <=> @s2 AND @a1 <=> @a2 AND @b1 <=> @b2, 'SAME', 'DIFFERENT') AS vs_innodb;
+  --enable_query_log
+  --inc $n
+}
+DEALLOCATE PREPARE pm;
+DEALLOCATE PREPARE pi;
+
+--echo # stored procedure: loop with a variable in the bound
+--delimiter |
+CREATE PROCEDURE p_m(OUT r VARCHAR(500))
+BEGIN
+  DECLARE n INT DEFAULT 0;
+  DECLARE c INT;
+  DECLARE b DATETIME;
+  SET r = '';
+  WHILE n < 6 DO
+    SET b = '2026-03-01 00:00:00' + INTERVAL (n * 11) MINUTE;
+    SELECT COUNT(*) INTO c FROM m IGNORE INDEX(ts) WHERE ts > b;
+    SET r = CONCAT(r, c, ',');
+    SET n = n + 1;
+  END WHILE;
+END|
+CREATE PROCEDURE p_i(OUT r VARCHAR(500))
+BEGIN
+  DECLARE n INT DEFAULT 0;
+  DECLARE c INT;
+  DECLARE b DATETIME;
+  SET r = '';
+  WHILE n < 6 DO
+    SET b = '2026-03-01 00:00:00' + INTERVAL (n * 11) MINUTE;
+    SELECT COUNT(*) INTO c FROM i IGNORE INDEX(ts) WHERE ts > b;
+    SET r = CONCAT(r, c, ',');
+    SET n = n + 1;
+  END WHILE;
+END|
+--delimiter ;
+CALL p_m(@r1);
+CALL p_i(@r2);
+CALL p_m(@r3);
+SELECT @r1 AS counts, IF(@r1 = @r2 AND @r1 = @r3, 'SAME', 'DIFFERENT') AS vs_innodb;
+DROP PROCEDURE p_m;
+DROP PROCEDURE p_i;
+
+--let $show= 0
+--let $status= 0
+--let $mt= m
+--let $it= i
+--echo # inner side of a join rescanned per outer row, constant bound on the inner table
+--let $q= SELECT s.k, COUNT(t.v) c, SUM(t.v) sv FROM s JOIN {T} t IGNORE INDEX(ts) ON t.host = s.host WHERE t.ts > '2026-03-01 00:40:00' GROUP BY s.k ORDER BY s.k
+--let $label= join, default
+--source suite/moosedb/include/cmp_query.inc
+SET SESSION join_cache_level = 0;
+--let $label= join, no join buffer (inner scan restarted for every outer row)
+--source suite/moosedb/include/cmp_query.inc
+SET SESSION join_cache_level = DEFAULT;
+--let $q= SELECT s.k, COUNT(t.v) c FROM {T} t IGNORE INDEX(ts) STRAIGHT_JOIN s ON t.host = s.host WHERE t.ts > '2026-03-01 00:40:00' AND s.v > 3 GROUP BY s.k ORDER BY s.k
+--let $label= join, MooseDB table as the outer table
+--source suite/moosedb/include/cmp_query.inc
+--echo # correlated subquery and IN (SELECT ...)
+--let $q= SELECT s.k, (SELECT COUNT(*) FROM {T} t IGNORE INDEX(ts) WHERE t.ts > s.ts) c FROM s ORDER BY s.k
+--let $label= scalar subquery, bound is the outer column
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT s.k FROM s WHERE EXISTS (SELECT 1 FROM {T} t IGNORE INDEX(ts) WHERE t.ts > s.ts AND t.host = s.host AND t.ts > '2026-03-01 00:50:00') ORDER BY s.k
+--let $label= EXISTS, outer bound plus constant bound
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT COUNT(*), SUM(v) FROM {T} IGNORE INDEX(ts) WHERE ts > '2026-03-01 00:20:00' AND ts IN (SELECT ts FROM s UNION SELECT '2026-03-01 00:45:00')
+--let $label= IN (SELECT ...)
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT COUNT(*) FROM s WHERE s.ts IN (SELECT ts FROM {T} IGNORE INDEX(ts) WHERE ts > '2026-03-01 00:20:00')
+--let $label= IN (SELECT ...) with the MooseDB table inside
+--source suite/moosedb/include/cmp_query.inc
+--echo # LEFT JOIN with the bound in ON, and in WHERE
+--let $q= SELECT s.k, COUNT(b.v) c, SUM(b.v) sv FROM s LEFT JOIN {T} b IGNORE INDEX(ts) ON b.host = s.host AND b.ts > '2026-03-01 00:40:00' GROUP BY s.k ORDER BY s.k
+--let $label= LEFT JOIN ... ON b.ts > X
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT s.k, COUNT(b.v) c FROM s LEFT JOIN {T} b IGNORE INDEX(ts) ON b.host = s.host WHERE b.ts > '2026-03-01 00:40:00' OR b.ts IS NULL GROUP BY s.k ORDER BY s.k
+--let $label= LEFT JOIN with the bound in WHERE (OR IS NULL)
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT COUNT(*) FROM s LEFT JOIN {T} b IGNORE INDEX(ts) ON b.host = s.host AND b.ts > s.ts WHERE b.v IS NULL
+--let $label= LEFT JOIN, anti-join on the outer column
+--source suite/moosedb/include/cmp_query.inc
+
+--echo ##################################################################
+--echo # Filesort in rowid mode: position()/rnd_pos over the pruned scan
+--echo ##################################################################
+SET SESSION max_length_for_sort_data = 4;
+--let $q= SELECT ts, host, v FROM {T} IGNORE INDEX(ts) WHERE ts BETWEEN '2026-03-01 00:20:00' AND '2026-03-01 00:40:00' ORDER BY v DESC, ts, host
+--let $label= ORDER BY v over the range, rowid filesort
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT ts, host, v FROM {T} IGNORE INDEX(ts) WHERE ts > '2026-03-01 00:50:00' ORDER BY host, v LIMIT 7
+--let $label= ORDER BY host, v LIMIT over an open range
+--source suite/moosedb/include/cmp_query.inc
+FLUSH STATUS;
+--disable_result_log
+SELECT ts, host, v FROM m IGNORE INDEX(ts) WHERE ts > '2026-03-01 00:50:00' ORDER BY host, v;
+--enable_result_log
+SELECT VARIABLE_VALUE > 0 AS rnd_pos_used FROM information_schema.SESSION_STATUS WHERE VARIABLE_NAME = 'Handler_read_rnd';
+SET SESSION max_length_for_sort_data = DEFAULT;
+
+--echo ##################################################################
+--echo # sql_mode corners: DATETIME(0) with .5, TIME_ROUND_FRACTIONAL, ALLOW_INVALID_DATES
+--echo ##################################################################
+--let $quiet= 0
+--let $show_status= 1
+--let $sel= COUNT(*), SUM(v), BIT_XOR(CRC32(CONCAT(ts, '|', host, '|', v)))
+--let $mt= m
+--let $it= i
+SET sql_mode = CONCAT(@@sql_mode, ',TIME_ROUND_FRACTIONAL');
+--let $tail= IGNORE INDEX(ts) WHERE tt.ts >= '2026-03-01 00:10:00.5'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= IGNORE INDEX(ts) WHERE tt.ts > '2026-03-01 00:10:00.5'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= IGNORE INDEX(ts) WHERE tt.ts <= '2026-03-01 00:10:00.5'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= IGNORE INDEX(ts) WHERE tt.ts < '2026-03-01 00:10:00.5'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= IGNORE INDEX(ts) WHERE tt.ts = '2026-03-01 00:10:00.5'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= IGNORE INDEX(ts) WHERE tt.ts BETWEEN '2026-03-01 00:10:00.5' AND '2026-03-01 00:20:00.4'
+--source suite/moosedb/include/mirror_cmp.inc
+SET sql_mode = DEFAULT;
+--let $tail= IGNORE INDEX(ts) WHERE tt.ts >= '2026-03-01 00:10:00.5'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= IGNORE INDEX(ts) WHERE tt.ts < '2026-03-01 00:10:00.5'
+--source suite/moosedb/include/mirror_cmp.inc
+SET sql_mode = CONCAT(@@sql_mode, ',ALLOW_INVALID_DATES');
+--let $tail= IGNORE INDEX(ts) WHERE tt.ts > '2026-02-30 00:00:00'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= IGNORE INDEX(ts) WHERE tt.ts < '2026-02-31'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= IGNORE INDEX(ts) WHERE tt.ts BETWEEN '2026-03-01 00:10:00' AND '2026-03-00'
+--source suite/moosedb/include/mirror_cmp.inc
+SET sql_mode = DEFAULT;
+
+--echo ##################################################################
+--echo # TIMESTAMP column: not pruned by the engine, same answers
+--echo ##################################################################
+CREATE TABLE tm (ts TIMESTAMP NOT NULL, host VARCHAR(8) NOT NULL COMMENT 'TAG',
+                 v INT NOT NULL, INDEX(ts)) ENGINE=MooseDB CHUNK_INTERVAL='1 HOUR';
+CREATE TABLE ti (ts TIMESTAMP NOT NULL, host VARCHAR(8) NOT NULL,
+                 v INT NOT NULL, KEY(ts)) ENGINE=InnoDB;
+SET time_zone = '+05:30';
+INSERT INTO tm SELECT '2026-03-01 00:00:00' + INTERVAL seq MINUTE, CONCAT('h', seq MOD 3), seq FROM seq_0_to_59;
+INSERT INTO ti SELECT '2026-03-01 00:00:00' + INTERVAL seq MINUTE, CONCAT('h', seq MOD 3), seq FROM seq_0_to_59;
+--let $mt= tm
+--let $it= ti
+--let $tail= IGNORE INDEX(ts) WHERE tt.ts >= '2026-03-01 00:30:00'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= IGNORE INDEX(ts) WHERE tt.ts BETWEEN '2026-03-01 00:10:00' AND '2026-03-01 00:20:00'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= IGNORE INDEX(ts) WHERE tt.ts < '2026-03-01 00:05:00.5'
+--source suite/moosedb/include/mirror_cmp.inc
+SET time_zone = '-08:00';
+--let $tail= IGNORE INDEX(ts) WHERE tt.ts >= '2026-03-01 00:30:00'
+--source suite/moosedb/include/mirror_cmp.inc
+SET time_zone = DEFAULT;
+DROP TABLE tm, ti;
+
+--echo ##################################################################
+--echo # Multi-table DELETE and DELETE that reads through the pruned scan
+--echo ##################################################################
+TRUNCATE m;
+TRUNCATE i;
+INSERT INTO m SELECT '2026-03-01 00:00:00' + INTERVAL seq MINUTE, CONCAT('h', seq MOD 3), seq FROM seq_0_to_59;
+INSERT INTO i SELECT '2026-03-01 00:00:00' + INTERVAL seq MINUTE, CONCAT('h', seq MOD 3), seq FROM seq_0_to_59;
+DELETE m FROM m JOIN s ON m.host = s.host AND m.ts = s.ts WHERE m.ts > '2026-03-01 00:05:00';
+DELETE i FROM i JOIN s ON i.host = s.host AND i.ts = s.ts WHERE i.ts > '2026-03-01 00:05:00';
+DELETE m FROM m JOIN s ON m.host = s.host WHERE m.ts BETWEEN '2026-03-01 00:40:00' AND '2026-03-01 00:45:00' AND s.k = 1;
+DELETE i FROM i JOIN s ON i.host = s.host WHERE i.ts BETWEEN '2026-03-01 00:40:00' AND '2026-03-01 00:45:00' AND s.k = 1;
+DELETE FROM m WHERE ts < '2026-03-01 00:03:00' AND v MOD 2 = 0 ORDER BY ts LIMIT 2;
+DELETE FROM i WHERE ts < '2026-03-01 00:03:00' AND v MOD 2 = 0 ORDER BY ts LIMIT 2;
+--let $mt= m
+--let $it= i
+--let $tail=
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= IGNORE INDEX(ts) WHERE tt.ts > '2026-03-01 00:00:00'
+--source suite/moosedb/include/mirror_cmp.inc
+
+DROP TABLE m, i, s;

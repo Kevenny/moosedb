@@ -1,0 +1,181 @@
+#
+# Time bounds of the WHERE reach the unordered (rnd) scan: cond_push records
+# the bounds on the time column and rnd_init opens the scan on that range
+# (chunk pruning + binary search inside each series). The server still
+# evaluates the whole WHERE, so the answer must equal the InnoDB mirror's.
+#
+# IGNORE INDEX(ts) forces the table scan; without it the optimizer may pick
+# an index range (ordered merge) -- both are compared. Handler_read_rnd_next
+# shows how many rows the engine handed to the server: just the range
+# (+1 for the end of the scan), not the whole table.
+#
+--source include/have_innodb.inc
+--source include/have_sequence.inc
+--source suite/moosedb/include/have_moosedb.inc
+
+CREATE TABLE m (ts DATETIME NOT NULL, host VARCHAR(8) NOT NULL COMMENT 'TAG',
+                v INT NOT NULL, INDEX(ts)) ENGINE=MooseDB CHUNK_INTERVAL='1 HOUR';
+CREATE TABLE i (ts DATETIME NOT NULL, host VARCHAR(8) NOT NULL,
+                v INT NOT NULL, KEY(ts)) ENGINE=InnoDB;
+
+--echo # 10 hosts x 240 minutes: 2 sealed batches (4 hourly chunks) and a MemTable tail
+--let $gen= '2026-03-01 00:00:00' + INTERVAL s.seq MINUTE
+eval INSERT INTO m SELECT $gen, CONCAT('h', h.seq), s.seq * 10 + h.seq FROM seq_0_to_119 s JOIN seq_0_to_9 h;
+eval INSERT INTO i SELECT $gen, CONCAT('h', h.seq), s.seq * 10 + h.seq FROM seq_0_to_119 s JOIN seq_0_to_9 h;
+FLUSH TABLES m;
+eval INSERT INTO m SELECT $gen, CONCAT('h', h.seq), s.seq * 10 + h.seq FROM seq_120_to_199 s JOIN seq_0_to_9 h;
+eval INSERT INTO i SELECT $gen, CONCAT('h', h.seq), s.seq * 10 + h.seq FROM seq_120_to_199 s JOIN seq_0_to_9 h;
+FLUSH TABLES m;
+eval INSERT INTO m SELECT $gen, CONCAT('h', h.seq), s.seq * 10 + h.seq FROM seq_200_to_239 s JOIN seq_0_to_9 h;
+eval INSERT INTO i SELECT $gen, CONCAT('h', h.seq), s.seq * 10 + h.seq FROM seq_200_to_239 s JOIN seq_0_to_9 h;
+SELECT COUNT(*) FROM m;
+
+--let $quiet= 0
+--let $show_status= 1
+--let $mt= m
+--let $it= i
+--let $sel= COUNT(*), SUM(v), BIT_XOR(CRC32(CONCAT(ts, '|', host, '|', v)))
+
+--echo ##################################################################
+--echo # Table scan (IGNORE INDEX): bounds in every form the engine captures
+--echo ##################################################################
+--let $tail= IGNORE INDEX(ts) WHERE tt.ts BETWEEN '2026-03-01 01:10:00' AND '2026-03-01 01:19:59'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= IGNORE INDEX(ts) WHERE tt.ts >= '2026-03-01 03:30:00'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= IGNORE INDEX(ts) WHERE tt.ts > '2026-03-01 03:30:00'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= IGNORE INDEX(ts) WHERE tt.ts < '2026-03-01 00:05:00'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= IGNORE INDEX(ts) WHERE tt.ts <= '2026-03-01 00:05:00'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= IGNORE INDEX(ts) WHERE '2026-03-01 02:00:00' <= tt.ts AND tt.ts < '2026-03-01 02:03:00'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= IGNORE INDEX(ts) WHERE tt.ts = '2026-03-01 02:00:00'
+--source suite/moosedb/include/mirror_cmp.inc
+--echo # empty range, range outside the data
+--let $tail= IGNORE INDEX(ts) WHERE tt.ts > '2026-03-01 02:00:00' AND tt.ts < '2026-03-01 01:00:00'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= IGNORE INDEX(ts) WHERE tt.ts >= '2027-01-01 00:00:00'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= IGNORE INDEX(ts) WHERE tt.ts < '2020-01-01 00:00:00'
+--source suite/moosedb/include/mirror_cmp.inc
+--echo # constants with a fraction, DATE-only constants, other types of constant
+--let $tail= IGNORE INDEX(ts) WHERE tt.ts >= '2026-03-01 02:00:00.5' AND tt.ts <= '2026-03-01 02:02:00.4'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= IGNORE INDEX(ts) WHERE tt.ts > '2026-03-01 03:58:59.999999'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= IGNORE INDEX(ts) WHERE tt.ts < '2026-03-01' + INTERVAL 5 MINUTE
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= IGNORE INDEX(ts) WHERE tt.ts > '2026-03-01' AND tt.ts < '2026-03-02'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= IGNORE INDEX(ts) WHERE tt.ts >= DATE('2026-03-01 03:00:00')
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= IGNORE INDEX(ts) WHERE tt.ts >= 20260301035000
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= IGNORE INDEX(ts) WHERE tt.ts >= '2026-03-01 03:55:00' AND tt.ts >= '2026-03-01 03:57:00' AND tt.ts <= '2026-03-01 03:58:00' AND tt.ts <= '2026-03-01 03:59:00'
+--source suite/moosedb/include/mirror_cmp.inc
+--echo # range crossing the sealed/MemTable boundary, with a TAG pushdown, with a non-key conjunct
+--let $tail= IGNORE INDEX(ts) WHERE tt.ts BETWEEN '2026-03-01 03:15:00' AND '2026-03-01 03:45:00'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= IGNORE INDEX(ts) WHERE tt.ts BETWEEN '2026-03-01 00:30:00' AND '2026-03-01 02:30:00' AND tt.host IN ('h1', 'h7')
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= IGNORE INDEX(ts) WHERE tt.ts BETWEEN '2026-03-01 00:30:00' AND '2026-03-01 02:30:00' AND tt.v MOD 3 = 0
+--source suite/moosedb/include/mirror_cmp.inc
+--echo # not captured (OR, NOT BETWEEN, expression on ts): every row is read, answer unchanged
+--let $tail= IGNORE INDEX(ts) WHERE tt.ts < '2026-03-01 00:10:00' OR tt.ts > '2026-03-01 03:50:00'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= IGNORE INDEX(ts) WHERE tt.ts NOT BETWEEN '2026-03-01 00:10:00' AND '2026-03-01 03:50:00'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= IGNORE INDEX(ts) WHERE tt.ts + INTERVAL 1 MINUTE > '2026-03-01 03:50:00'
+--source suite/moosedb/include/mirror_cmp.inc
+
+--echo ##################################################################
+--echo # Optimizer's own choice (index range or table scan)
+--echo ##################################################################
+--let $tail= WHERE tt.ts BETWEEN '2026-03-01 01:10:00' AND '2026-03-01 01:19:59'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE tt.ts >= '2026-03-01 00:00:00'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= WHERE tt.ts >= '2026-03-01 02:00:00' AND tt.host = 'h4'
+--source suite/moosedb/include/mirror_cmp.inc
+
+--echo ##################################################################
+--echo # Server-side GROUP BY / DISTINCT / ORDER BY / LIMIT over a range
+--echo ##################################################################
+--let $show= 0
+--let $status= 0
+--let $q= SELECT host, COUNT(*) c, SUM(v) s, MIN(ts) a, MAX(ts) b FROM {T} IGNORE INDEX(ts) WHERE ts BETWEEN '2026-03-01 01:00:00' AND '2026-03-01 02:59:59' GROUP BY host ORDER BY host
+--let $label= GROUP BY host on the table scan
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT DATE_FORMAT(ts, '%H') h, COUNT(*) c, SUM(v) s FROM {T} IGNORE INDEX(ts) WHERE ts >= '2026-03-01 01:30:00' AND ts < '2026-03-01 03:30:00' GROUP BY h ORDER BY h
+--let $label= GROUP BY expression
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT DISTINCT host FROM {T} IGNORE INDEX(ts) WHERE ts BETWEEN '2026-03-01 03:00:00' AND '2026-03-01 03:00:30' ORDER BY host
+--let $label= DISTINCT
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT ts, host, v FROM {T} IGNORE INDEX(ts) WHERE ts BETWEEN '2026-03-01 01:00:00' AND '2026-03-01 01:30:00' ORDER BY ts DESC, host LIMIT 25
+--let $label= ORDER BY ts DESC LIMIT (filesort over the table scan)
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT ts, host, v FROM {T} IGNORE INDEX(ts) WHERE ts >= '2026-03-01 02:00:00' ORDER BY ts, host LIMIT 15
+--let $label= ORDER BY ts ASC LIMIT
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT ts, host, v FROM {T} WHERE ts >= '2026-03-01 03:00:00' ORDER BY ts, host LIMIT 15
+--let $label= ORDER BY ts LIMIT, optimizer's choice (index order must stay ascending)
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT ts, host, v FROM {T} WHERE ts >= '2026-03-01 01:00:00' ORDER BY ts DESC, host DESC LIMIT 15
+--let $label= ORDER BY ts DESC LIMIT, optimizer's choice
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT MIN(ts), MAX(ts), COUNT(*) FROM {T} WHERE ts BETWEEN '2026-03-01 01:00:00' AND '2026-03-01 02:00:00'
+--let $label= MIN/MAX on the time column
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT COUNT(*) FROM {T} a JOIN {T} b ON a.host = b.host AND a.ts = b.ts WHERE a.ts BETWEEN '2026-03-01 02:00:00' AND '2026-03-01 02:04:59' AND b.ts >= '2026-03-01 02:02:00'
+--let $label= self-join, one time bound per side
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT COUNT(*) FROM {T} WHERE ts BETWEEN '2026-03-01 01:00:00' AND '2026-03-01 01:59:59' AND v IN (SELECT v FROM {T} WHERE ts > '2026-03-01 03:00:00')
+--let $label= subquery with its own bound
+--source suite/moosedb/include/cmp_query.inc
+
+--echo ##################################################################
+--echo # Rows hidden by DELETE (tombstones) and MemTable rows
+--echo ##################################################################
+DELETE FROM m WHERE host = 'h3' AND ts BETWEEN '2026-03-01 01:00:00' AND '2026-03-01 01:29:59';
+DELETE FROM i WHERE host = 'h3' AND ts BETWEEN '2026-03-01 01:00:00' AND '2026-03-01 01:29:59';
+DELETE FROM m WHERE v MOD 7 = 0 AND ts >= '2026-03-01 03:20:00';
+DELETE FROM i WHERE v MOD 7 = 0 AND ts >= '2026-03-01 03:20:00';
+INSERT INTO m VALUES ('2026-03-01 01:15:00', 'h3', 1), ('2026-03-01 03:59:30', 'h99', 2);
+INSERT INTO i VALUES ('2026-03-01 01:15:00', 'h3', 1), ('2026-03-01 03:59:30', 'h99', 2);
+--let $tail= IGNORE INDEX(ts) WHERE tt.ts BETWEEN '2026-03-01 00:50:00' AND '2026-03-01 01:40:00'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= IGNORE INDEX(ts) WHERE tt.ts >= '2026-03-01 03:00:00'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= IGNORE INDEX(ts) WHERE tt.ts BETWEEN '2026-03-01 01:00:00' AND '2026-03-01 01:29:59' AND tt.host = 'h3'
+--source suite/moosedb/include/mirror_cmp.inc
+
+--echo # DELETE by range (row by row: the server reads through the same scan)
+DELETE FROM m WHERE v MOD 2 = 0 AND ts BETWEEN '2026-03-01 02:00:00' AND '2026-03-01 02:09:59';
+DELETE FROM i WHERE v MOD 2 = 0 AND ts BETWEEN '2026-03-01 02:00:00' AND '2026-03-01 02:09:59';
+--let $tail= WHERE tt.ts BETWEEN '2026-03-01 01:55:00' AND '2026-03-01 02:15:00'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail=
+--source suite/moosedb/include/mirror_cmp.inc
+
+DROP TABLE m, i;
+
+--echo # Fractional stored values (DATETIME(3)) against constants with more or fewer digits
+CREATE TABLE m (ts DATETIME(3) NOT NULL, host VARCHAR(8) NOT NULL COMMENT 'TAG',
+                v INT NOT NULL, INDEX(ts)) ENGINE=MooseDB CHUNK_INTERVAL='1 HOUR';
+CREATE TABLE i (ts DATETIME(3) NOT NULL, host VARCHAR(8) NOT NULL,
+                v INT NOT NULL, KEY(ts)) ENGINE=InnoDB;
+INSERT INTO m SELECT '2026-03-01 00:00:00' + INTERVAL (seq * 250) MICROSECOND, CONCAT('h', seq MOD 3), seq FROM seq_0_to_399;
+INSERT INTO i SELECT '2026-03-01 00:00:00' + INTERVAL (seq * 250) MICROSECOND, CONCAT('h', seq MOD 3), seq FROM seq_0_to_399;
+FLUSH TABLES m;
+--let $tail= IGNORE INDEX(ts) WHERE tt.ts >= '2026-03-01 00:00:00.0125' AND tt.ts < '2026-03-01 00:00:00.0505'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= IGNORE INDEX(ts) WHERE tt.ts > '2026-03-01 00:00:00.5' AND tt.ts <= '2026-03-01 00:00:00.75'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= IGNORE INDEX(ts) WHERE tt.ts = '2026-03-01 00:00:00.25'
+--source suite/moosedb/include/mirror_cmp.inc
+--let $tail= IGNORE INDEX(ts) WHERE tt.ts BETWEEN '2026-03-01 00:00:00' AND '2026-03-01 00:00:00.4999'
+--source suite/moosedb/include/mirror_cmp.inc
+DROP TABLE m, i;

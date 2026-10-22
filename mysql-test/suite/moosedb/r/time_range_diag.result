@@ -1,0 +1,1248 @@
+CREATE TABLE m (ts DATETIME NOT NULL, host VARCHAR(8) NOT NULL COMMENT 'TAG',
+v INT NOT NULL, INDEX(ts)) ENGINE=MooseDB CHUNK_INTERVAL='1 HOUR';
+CREATE TABLE i (ts DATETIME NOT NULL, host VARCHAR(8) NOT NULL,
+v INT NOT NULL, KEY(ts)) ENGINE=InnoDB;
+CREATE TABLE s (ts DATETIME NOT NULL, host VARCHAR(8) NOT NULL, v INT NOT NULL, k INT NOT NULL) ENGINE=InnoDB;
+INSERT INTO s VALUES ('2026-03-01 00:10:00', 'h0', 3, 1), ('2026-03-01 00:30:00', 'h1', 7, 2),
+('2026-03-01 00:55:00', 'h2', 9, 3), ('2027-01-01 00:00:00', 'h0', 1, 4);
+##################################################################
+# Bad constants: errors and warnings must equal InnoDB's, strict or not
+# (each pair: the "# MooseDB" block and the "# InnoDB" block are identical)
+##################################################################
+SET sql_mode = '';
+# SELECT ts > 'lixo'
+# MooseDB
+COUNT(*)
+60
+Warnings:
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+Level	Code	Message
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+ROW_COUNT()
+-1
+# InnoDB
+COUNT(*)
+60
+Warnings:
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+Level	Code	Message
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+ROW_COUNT()
+-1
+rows_m	rows_i
+60	60
+# DELETE ts > 'lixo'
+# MooseDB
+Warnings:
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+Level	Code	Message
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+ROW_COUNT()
+-1
+# InnoDB
+Warnings:
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+Level	Code	Message
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+ROW_COUNT()
+-1
+rows_m	rows_i
+0	0
+# DELETE ts > 'lixo' AND host = 'h1'
+# MooseDB
+Warnings:
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+Level	Code	Message
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+ROW_COUNT()
+-1
+# InnoDB
+Warnings:
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+Level	Code	Message
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+ROW_COUNT()
+-1
+rows_m	rows_i
+40	40
+# SELECT ts > '2026-02-30'
+# MooseDB
+COUNT(*)
+60
+Level	Code	Message
+ROW_COUNT()
+-1
+# InnoDB
+COUNT(*)
+60
+Level	Code	Message
+ROW_COUNT()
+-1
+rows_m	rows_i
+60	60
+# DELETE ts > '2026-02-30'
+# MooseDB
+Level	Code	Message
+ROW_COUNT()
+-1
+# InnoDB
+Level	Code	Message
+ROW_COUNT()
+-1
+rows_m	rows_i
+60	0
+# DELETE ts > '2026-02-30' AND host = 'h1'
+# MooseDB
+Level	Code	Message
+ROW_COUNT()
+-1
+# InnoDB
+Level	Code	Message
+ROW_COUNT()
+-1
+rows_m	rows_i
+60	40
+# SELECT ts > '0000-00-00'
+# MooseDB
+COUNT(*)
+60
+Level	Code	Message
+ROW_COUNT()
+-1
+# InnoDB
+COUNT(*)
+60
+Level	Code	Message
+ROW_COUNT()
+-1
+rows_m	rows_i
+60	60
+# DELETE ts > '0000-00-00'
+# MooseDB
+Level	Code	Message
+ROW_COUNT()
+-1
+# InnoDB
+Level	Code	Message
+ROW_COUNT()
+-1
+rows_m	rows_i
+0	0
+# DELETE ts > '0000-00-00' AND host = 'h1'
+# MooseDB
+Level	Code	Message
+ROW_COUNT()
+-1
+# InnoDB
+Level	Code	Message
+ROW_COUNT()
+-1
+rows_m	rows_i
+40	40
+# SELECT ts > NULL
+# MooseDB
+COUNT(*)
+0
+Level	Code	Message
+ROW_COUNT()
+-1
+# InnoDB
+COUNT(*)
+0
+Level	Code	Message
+ROW_COUNT()
+-1
+rows_m	rows_i
+60	60
+# DELETE ts > NULL
+# MooseDB
+Level	Code	Message
+ROW_COUNT()
+-1
+# InnoDB
+Level	Code	Message
+ROW_COUNT()
+-1
+rows_m	rows_i
+60	60
+# DELETE ts > NULL AND host = 'h1'
+# MooseDB
+Level	Code	Message
+ROW_COUNT()
+-1
+# InnoDB
+Level	Code	Message
+ROW_COUNT()
+-1
+rows_m	rows_i
+60	60
+# SELECT ts BETWEEN 'lixo' AND '2026-03-01 00:10:00'
+# MooseDB
+COUNT(*)
+11
+Warnings:
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+Level	Code	Message
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+ROW_COUNT()
+-1
+# InnoDB
+COUNT(*)
+11
+Warnings:
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+Level	Code	Message
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+ROW_COUNT()
+-1
+rows_m	rows_i
+60	60
+# DELETE ts BETWEEN 'lixo' AND '2026-03-01 00:10:00'
+# MooseDB
+Warnings:
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+Level	Code	Message
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+ROW_COUNT()
+-1
+# InnoDB
+Warnings:
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+Level	Code	Message
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+ROW_COUNT()
+-1
+rows_m	rows_i
+49	49
+# DELETE ts BETWEEN 'lixo' AND '2026-03-01 00:10:00' AND host = 'h1'
+# MooseDB
+Warnings:
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+Level	Code	Message
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+ROW_COUNT()
+-1
+# InnoDB
+Warnings:
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+Level	Code	Message
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+ROW_COUNT()
+-1
+rows_m	rows_i
+56	56
+# SELECT ts < '2026-03-01 00:10:00.9999995'
+# MooseDB
+COUNT(*)
+11
+Warnings:
+Note	1292	Truncated incorrect datetime value: '2026-03-01 00:10:00.9999995'
+Level	Code	Message
+Note	1292	Truncated incorrect datetime value: '2026-03-01 00:10:00.9999995'
+ROW_COUNT()
+-1
+# InnoDB
+COUNT(*)
+11
+Warnings:
+Note	1292	Truncated incorrect datetime value: '2026-03-01 00:10:00.9999995'
+Level	Code	Message
+Note	1292	Truncated incorrect datetime value: '2026-03-01 00:10:00.9999995'
+ROW_COUNT()
+-1
+rows_m	rows_i
+60	60
+# DELETE ts < '2026-03-01 00:10:00.9999995'
+# MooseDB
+Warnings:
+Note	1292	Truncated incorrect datetime value: '2026-03-01 00:10:00.9999995'
+Level	Code	Message
+Note	1292	Truncated incorrect datetime value: '2026-03-01 00:10:00.9999995'
+ROW_COUNT()
+-1
+# InnoDB
+Warnings:
+Note	1292	Truncated incorrect datetime value: '2026-03-01 00:10:00.9999995'
+Level	Code	Message
+Note	1292	Truncated incorrect datetime value: '2026-03-01 00:10:00.9999995'
+ROW_COUNT()
+-1
+rows_m	rows_i
+49	49
+# DELETE ts < '2026-03-01 00:10:00.9999995' AND host = 'h1'
+# MooseDB
+Warnings:
+Note	1292	Truncated incorrect datetime value: '2026-03-01 00:10:00.9999995'
+Level	Code	Message
+Note	1292	Truncated incorrect datetime value: '2026-03-01 00:10:00.9999995'
+ROW_COUNT()
+-1
+# InnoDB
+Warnings:
+Note	1292	Truncated incorrect datetime value: '2026-03-01 00:10:00.9999995'
+Level	Code	Message
+Note	1292	Truncated incorrect datetime value: '2026-03-01 00:10:00.9999995'
+ROW_COUNT()
+-1
+rows_m	rows_i
+56	56
+# SELECT ts >= '2026-03-01 00:50:00' AND ts <= '2026-03-01 00:5x:00'
+# MooseDB
+COUNT(*)
+0
+Warnings:
+Warning	1292	Truncated incorrect datetime value: '2026-03-01 00:5x:00'
+Level	Code	Message
+Warning	1292	Truncated incorrect datetime value: '2026-03-01 00:5x:00'
+ROW_COUNT()
+-1
+# InnoDB
+COUNT(*)
+0
+Warnings:
+Warning	1292	Truncated incorrect datetime value: '2026-03-01 00:5x:00'
+Level	Code	Message
+Warning	1292	Truncated incorrect datetime value: '2026-03-01 00:5x:00'
+ROW_COUNT()
+-1
+rows_m	rows_i
+60	60
+# DELETE ts >= '2026-03-01 00:50:00' AND ts <= '2026-03-01 00:5x:00'
+# MooseDB
+Warnings:
+Warning	1292	Truncated incorrect datetime value: '2026-03-01 00:5x:00'
+Level	Code	Message
+Warning	1292	Truncated incorrect datetime value: '2026-03-01 00:5x:00'
+ROW_COUNT()
+-1
+# InnoDB
+Warnings:
+Warning	1292	Truncated incorrect datetime value: '2026-03-01 00:5x:00'
+Level	Code	Message
+Warning	1292	Truncated incorrect datetime value: '2026-03-01 00:5x:00'
+ROW_COUNT()
+-1
+rows_m	rows_i
+60	60
+# DELETE ts >= '2026-03-01 00:50:00' AND ts <= '2026-03-01 00:5x:00' AND host = 'h1'
+# MooseDB
+Warnings:
+Warning	1292	Truncated incorrect datetime value: '2026-03-01 00:5x:00'
+Level	Code	Message
+Warning	1292	Truncated incorrect datetime value: '2026-03-01 00:5x:00'
+ROW_COUNT()
+-1
+# InnoDB
+Warnings:
+Warning	1292	Truncated incorrect datetime value: '2026-03-01 00:5x:00'
+Level	Code	Message
+Warning	1292	Truncated incorrect datetime value: '2026-03-01 00:5x:00'
+ROW_COUNT()
+-1
+rows_m	rows_i
+60	60
+SET sql_mode = 'STRICT_ALL_TABLES,NO_ZERO_DATE,NO_ZERO_IN_DATE,ERROR_FOR_DIVISION_BY_ZERO';
+# SELECT ts > 'lixo'
+# MooseDB
+COUNT(*)
+60
+Warnings:
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+Level	Code	Message
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+ROW_COUNT()
+-1
+# InnoDB
+COUNT(*)
+60
+Warnings:
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+Level	Code	Message
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+ROW_COUNT()
+-1
+rows_m	rows_i
+60	60
+# DELETE ts > 'lixo'
+# MooseDB
+Warnings:
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+Level	Code	Message
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+ROW_COUNT()
+-1
+# InnoDB
+Warnings:
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+Level	Code	Message
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+ROW_COUNT()
+-1
+rows_m	rows_i
+0	0
+# DELETE ts > 'lixo' AND host = 'h1'
+# MooseDB
+Warnings:
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+Level	Code	Message
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+ROW_COUNT()
+-1
+# InnoDB
+Warnings:
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+Level	Code	Message
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+ROW_COUNT()
+-1
+rows_m	rows_i
+40	40
+# SELECT ts > '2026-02-30'
+# MooseDB
+COUNT(*)
+60
+Level	Code	Message
+ROW_COUNT()
+-1
+# InnoDB
+COUNT(*)
+60
+Level	Code	Message
+ROW_COUNT()
+-1
+rows_m	rows_i
+60	60
+# DELETE ts > '2026-02-30'
+# MooseDB
+Level	Code	Message
+ROW_COUNT()
+-1
+# InnoDB
+Level	Code	Message
+ROW_COUNT()
+-1
+rows_m	rows_i
+60	0
+# DELETE ts > '2026-02-30' AND host = 'h1'
+# MooseDB
+Level	Code	Message
+ROW_COUNT()
+-1
+# InnoDB
+Level	Code	Message
+ROW_COUNT()
+-1
+rows_m	rows_i
+60	40
+# SELECT ts > '0000-00-00'
+# MooseDB
+COUNT(*)
+60
+Level	Code	Message
+ROW_COUNT()
+-1
+# InnoDB
+COUNT(*)
+60
+Level	Code	Message
+ROW_COUNT()
+-1
+rows_m	rows_i
+60	60
+# DELETE ts > '0000-00-00'
+# MooseDB
+Level	Code	Message
+ROW_COUNT()
+-1
+# InnoDB
+Level	Code	Message
+ROW_COUNT()
+-1
+rows_m	rows_i
+0	0
+# DELETE ts > '0000-00-00' AND host = 'h1'
+# MooseDB
+Level	Code	Message
+ROW_COUNT()
+-1
+# InnoDB
+Level	Code	Message
+ROW_COUNT()
+-1
+rows_m	rows_i
+40	40
+# SELECT ts > NULL
+# MooseDB
+COUNT(*)
+0
+Level	Code	Message
+ROW_COUNT()
+-1
+# InnoDB
+COUNT(*)
+0
+Level	Code	Message
+ROW_COUNT()
+-1
+rows_m	rows_i
+60	60
+# DELETE ts > NULL
+# MooseDB
+Level	Code	Message
+ROW_COUNT()
+-1
+# InnoDB
+Level	Code	Message
+ROW_COUNT()
+-1
+rows_m	rows_i
+60	60
+# DELETE ts > NULL AND host = 'h1'
+# MooseDB
+Level	Code	Message
+ROW_COUNT()
+-1
+# InnoDB
+Level	Code	Message
+ROW_COUNT()
+-1
+rows_m	rows_i
+60	60
+# SELECT ts BETWEEN 'lixo' AND '2026-03-01 00:10:00'
+# MooseDB
+COUNT(*)
+11
+Warnings:
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+Level	Code	Message
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+ROW_COUNT()
+-1
+# InnoDB
+COUNT(*)
+11
+Warnings:
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+Level	Code	Message
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+ROW_COUNT()
+-1
+rows_m	rows_i
+60	60
+# DELETE ts BETWEEN 'lixo' AND '2026-03-01 00:10:00'
+# MooseDB
+Warnings:
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+Level	Code	Message
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+ROW_COUNT()
+-1
+# InnoDB
+Warnings:
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+Level	Code	Message
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+ROW_COUNT()
+-1
+rows_m	rows_i
+49	49
+# DELETE ts BETWEEN 'lixo' AND '2026-03-01 00:10:00' AND host = 'h1'
+# MooseDB
+Warnings:
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+Level	Code	Message
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+ROW_COUNT()
+-1
+# InnoDB
+Warnings:
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+Level	Code	Message
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+ROW_COUNT()
+-1
+rows_m	rows_i
+56	56
+# SELECT ts < '2026-03-01 00:10:00.9999995'
+# MooseDB
+COUNT(*)
+11
+Warnings:
+Note	1292	Truncated incorrect datetime value: '2026-03-01 00:10:00.9999995'
+Level	Code	Message
+Note	1292	Truncated incorrect datetime value: '2026-03-01 00:10:00.9999995'
+ROW_COUNT()
+-1
+# InnoDB
+COUNT(*)
+11
+Warnings:
+Note	1292	Truncated incorrect datetime value: '2026-03-01 00:10:00.9999995'
+Level	Code	Message
+Note	1292	Truncated incorrect datetime value: '2026-03-01 00:10:00.9999995'
+ROW_COUNT()
+-1
+rows_m	rows_i
+60	60
+# DELETE ts < '2026-03-01 00:10:00.9999995'
+# MooseDB
+Warnings:
+Note	1292	Truncated incorrect datetime value: '2026-03-01 00:10:00.9999995'
+Level	Code	Message
+Note	1292	Truncated incorrect datetime value: '2026-03-01 00:10:00.9999995'
+ROW_COUNT()
+-1
+# InnoDB
+Warnings:
+Note	1292	Truncated incorrect datetime value: '2026-03-01 00:10:00.9999995'
+Level	Code	Message
+Note	1292	Truncated incorrect datetime value: '2026-03-01 00:10:00.9999995'
+ROW_COUNT()
+-1
+rows_m	rows_i
+49	49
+# DELETE ts < '2026-03-01 00:10:00.9999995' AND host = 'h1'
+# MooseDB
+Warnings:
+Note	1292	Truncated incorrect datetime value: '2026-03-01 00:10:00.9999995'
+Level	Code	Message
+Note	1292	Truncated incorrect datetime value: '2026-03-01 00:10:00.9999995'
+ROW_COUNT()
+-1
+# InnoDB
+Warnings:
+Note	1292	Truncated incorrect datetime value: '2026-03-01 00:10:00.9999995'
+Level	Code	Message
+Note	1292	Truncated incorrect datetime value: '2026-03-01 00:10:00.9999995'
+ROW_COUNT()
+-1
+rows_m	rows_i
+56	56
+# SELECT ts >= '2026-03-01 00:50:00' AND ts <= '2026-03-01 00:5x:00'
+# MooseDB
+COUNT(*)
+0
+Warnings:
+Warning	1292	Truncated incorrect datetime value: '2026-03-01 00:5x:00'
+Level	Code	Message
+Warning	1292	Truncated incorrect datetime value: '2026-03-01 00:5x:00'
+ROW_COUNT()
+-1
+# InnoDB
+COUNT(*)
+0
+Warnings:
+Warning	1292	Truncated incorrect datetime value: '2026-03-01 00:5x:00'
+Level	Code	Message
+Warning	1292	Truncated incorrect datetime value: '2026-03-01 00:5x:00'
+ROW_COUNT()
+-1
+rows_m	rows_i
+60	60
+# DELETE ts >= '2026-03-01 00:50:00' AND ts <= '2026-03-01 00:5x:00'
+# MooseDB
+Warnings:
+Warning	1292	Truncated incorrect datetime value: '2026-03-01 00:5x:00'
+Level	Code	Message
+Warning	1292	Truncated incorrect datetime value: '2026-03-01 00:5x:00'
+ROW_COUNT()
+-1
+# InnoDB
+Warnings:
+Warning	1292	Truncated incorrect datetime value: '2026-03-01 00:5x:00'
+Level	Code	Message
+Warning	1292	Truncated incorrect datetime value: '2026-03-01 00:5x:00'
+ROW_COUNT()
+-1
+rows_m	rows_i
+60	60
+# DELETE ts >= '2026-03-01 00:50:00' AND ts <= '2026-03-01 00:5x:00' AND host = 'h1'
+# MooseDB
+Warnings:
+Warning	1292	Truncated incorrect datetime value: '2026-03-01 00:5x:00'
+Level	Code	Message
+Warning	1292	Truncated incorrect datetime value: '2026-03-01 00:5x:00'
+ROW_COUNT()
+-1
+# InnoDB
+Warnings:
+Warning	1292	Truncated incorrect datetime value: '2026-03-01 00:5x:00'
+Level	Code	Message
+Warning	1292	Truncated incorrect datetime value: '2026-03-01 00:5x:00'
+ROW_COUNT()
+-1
+rows_m	rows_i
+60	60
+SET sql_mode = DEFAULT;
+# same with the GROUP BY pushdown off: only the scan path is involved
+SET SESSION moosedb_group_by_pushdown = OFF;
+# SELECT ts > 'lixo'
+# MooseDB
+COUNT(*)
+60
+Warnings:
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+Level	Code	Message
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+ROW_COUNT()
+-1
+# InnoDB
+COUNT(*)
+60
+Warnings:
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+Level	Code	Message
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+ROW_COUNT()
+-1
+rows_m	rows_i
+60	60
+# DELETE ts > 'lixo'
+# MooseDB
+Warnings:
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+Level	Code	Message
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+ROW_COUNT()
+-1
+# InnoDB
+Warnings:
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+Level	Code	Message
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+ROW_COUNT()
+-1
+rows_m	rows_i
+0	0
+# DELETE ts > 'lixo' AND host = 'h1'
+# MooseDB
+Warnings:
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+Level	Code	Message
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+ROW_COUNT()
+-1
+# InnoDB
+Warnings:
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+Level	Code	Message
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+ROW_COUNT()
+-1
+rows_m	rows_i
+40	40
+# SELECT ts > '2026-02-30'
+# MooseDB
+COUNT(*)
+60
+Level	Code	Message
+ROW_COUNT()
+-1
+# InnoDB
+COUNT(*)
+60
+Level	Code	Message
+ROW_COUNT()
+-1
+rows_m	rows_i
+60	60
+# DELETE ts > '2026-02-30'
+# MooseDB
+Level	Code	Message
+ROW_COUNT()
+-1
+# InnoDB
+Level	Code	Message
+ROW_COUNT()
+-1
+rows_m	rows_i
+60	0
+# DELETE ts > '2026-02-30' AND host = 'h1'
+# MooseDB
+Level	Code	Message
+ROW_COUNT()
+-1
+# InnoDB
+Level	Code	Message
+ROW_COUNT()
+-1
+rows_m	rows_i
+60	40
+# SELECT ts > '0000-00-00'
+# MooseDB
+COUNT(*)
+60
+Level	Code	Message
+ROW_COUNT()
+-1
+# InnoDB
+COUNT(*)
+60
+Level	Code	Message
+ROW_COUNT()
+-1
+rows_m	rows_i
+60	60
+# DELETE ts > '0000-00-00'
+# MooseDB
+Level	Code	Message
+ROW_COUNT()
+-1
+# InnoDB
+Level	Code	Message
+ROW_COUNT()
+-1
+rows_m	rows_i
+0	0
+# DELETE ts > '0000-00-00' AND host = 'h1'
+# MooseDB
+Level	Code	Message
+ROW_COUNT()
+-1
+# InnoDB
+Level	Code	Message
+ROW_COUNT()
+-1
+rows_m	rows_i
+40	40
+# SELECT ts > NULL
+# MooseDB
+COUNT(*)
+0
+Level	Code	Message
+ROW_COUNT()
+-1
+# InnoDB
+COUNT(*)
+0
+Level	Code	Message
+ROW_COUNT()
+-1
+rows_m	rows_i
+60	60
+# DELETE ts > NULL
+# MooseDB
+Level	Code	Message
+ROW_COUNT()
+-1
+# InnoDB
+Level	Code	Message
+ROW_COUNT()
+-1
+rows_m	rows_i
+60	60
+# DELETE ts > NULL AND host = 'h1'
+# MooseDB
+Level	Code	Message
+ROW_COUNT()
+-1
+# InnoDB
+Level	Code	Message
+ROW_COUNT()
+-1
+rows_m	rows_i
+60	60
+# SELECT ts BETWEEN 'lixo' AND '2026-03-01 00:10:00'
+# MooseDB
+COUNT(*)
+11
+Warnings:
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+Level	Code	Message
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+ROW_COUNT()
+-1
+# InnoDB
+COUNT(*)
+11
+Warnings:
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+Level	Code	Message
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+ROW_COUNT()
+-1
+rows_m	rows_i
+60	60
+# DELETE ts BETWEEN 'lixo' AND '2026-03-01 00:10:00'
+# MooseDB
+Warnings:
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+Level	Code	Message
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+ROW_COUNT()
+-1
+# InnoDB
+Warnings:
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+Level	Code	Message
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+ROW_COUNT()
+-1
+rows_m	rows_i
+49	49
+# DELETE ts BETWEEN 'lixo' AND '2026-03-01 00:10:00' AND host = 'h1'
+# MooseDB
+Warnings:
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+Level	Code	Message
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+ROW_COUNT()
+-1
+# InnoDB
+Warnings:
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+Level	Code	Message
+Warning	1292	Truncated incorrect datetime value: 'lixo'
+ROW_COUNT()
+-1
+rows_m	rows_i
+56	56
+# SELECT ts < '2026-03-01 00:10:00.9999995'
+# MooseDB
+COUNT(*)
+11
+Warnings:
+Note	1292	Truncated incorrect datetime value: '2026-03-01 00:10:00.9999995'
+Level	Code	Message
+Note	1292	Truncated incorrect datetime value: '2026-03-01 00:10:00.9999995'
+ROW_COUNT()
+-1
+# InnoDB
+COUNT(*)
+11
+Warnings:
+Note	1292	Truncated incorrect datetime value: '2026-03-01 00:10:00.9999995'
+Level	Code	Message
+Note	1292	Truncated incorrect datetime value: '2026-03-01 00:10:00.9999995'
+ROW_COUNT()
+-1
+rows_m	rows_i
+60	60
+# DELETE ts < '2026-03-01 00:10:00.9999995'
+# MooseDB
+Warnings:
+Note	1292	Truncated incorrect datetime value: '2026-03-01 00:10:00.9999995'
+Level	Code	Message
+Note	1292	Truncated incorrect datetime value: '2026-03-01 00:10:00.9999995'
+ROW_COUNT()
+-1
+# InnoDB
+Warnings:
+Note	1292	Truncated incorrect datetime value: '2026-03-01 00:10:00.9999995'
+Level	Code	Message
+Note	1292	Truncated incorrect datetime value: '2026-03-01 00:10:00.9999995'
+ROW_COUNT()
+-1
+rows_m	rows_i
+49	49
+# DELETE ts < '2026-03-01 00:10:00.9999995' AND host = 'h1'
+# MooseDB
+Warnings:
+Note	1292	Truncated incorrect datetime value: '2026-03-01 00:10:00.9999995'
+Level	Code	Message
+Note	1292	Truncated incorrect datetime value: '2026-03-01 00:10:00.9999995'
+ROW_COUNT()
+-1
+# InnoDB
+Warnings:
+Note	1292	Truncated incorrect datetime value: '2026-03-01 00:10:00.9999995'
+Level	Code	Message
+Note	1292	Truncated incorrect datetime value: '2026-03-01 00:10:00.9999995'
+ROW_COUNT()
+-1
+rows_m	rows_i
+56	56
+# SELECT ts >= '2026-03-01 00:50:00' AND ts <= '2026-03-01 00:5x:00'
+# MooseDB
+COUNT(*)
+0
+Warnings:
+Warning	1292	Truncated incorrect datetime value: '2026-03-01 00:5x:00'
+Level	Code	Message
+Warning	1292	Truncated incorrect datetime value: '2026-03-01 00:5x:00'
+ROW_COUNT()
+-1
+# InnoDB
+COUNT(*)
+0
+Warnings:
+Warning	1292	Truncated incorrect datetime value: '2026-03-01 00:5x:00'
+Level	Code	Message
+Warning	1292	Truncated incorrect datetime value: '2026-03-01 00:5x:00'
+ROW_COUNT()
+-1
+rows_m	rows_i
+60	60
+# DELETE ts >= '2026-03-01 00:50:00' AND ts <= '2026-03-01 00:5x:00'
+# MooseDB
+Warnings:
+Warning	1292	Truncated incorrect datetime value: '2026-03-01 00:5x:00'
+Level	Code	Message
+Warning	1292	Truncated incorrect datetime value: '2026-03-01 00:5x:00'
+ROW_COUNT()
+-1
+# InnoDB
+Warnings:
+Warning	1292	Truncated incorrect datetime value: '2026-03-01 00:5x:00'
+Level	Code	Message
+Warning	1292	Truncated incorrect datetime value: '2026-03-01 00:5x:00'
+ROW_COUNT()
+-1
+rows_m	rows_i
+60	60
+# DELETE ts >= '2026-03-01 00:50:00' AND ts <= '2026-03-01 00:5x:00' AND host = 'h1'
+# MooseDB
+Warnings:
+Warning	1292	Truncated incorrect datetime value: '2026-03-01 00:5x:00'
+Level	Code	Message
+Warning	1292	Truncated incorrect datetime value: '2026-03-01 00:5x:00'
+ROW_COUNT()
+-1
+# InnoDB
+Warnings:
+Warning	1292	Truncated incorrect datetime value: '2026-03-01 00:5x:00'
+Level	Code	Message
+Warning	1292	Truncated incorrect datetime value: '2026-03-01 00:5x:00'
+ROW_COUNT()
+-1
+rows_m	rows_i
+60	60
+SET SESSION moosedb_group_by_pushdown = DEFAULT;
+# UPDATE on MooseDB is refused by the engine (not a time range matter)
+INSERT INTO m SELECT '2026-03-01 00:00:00' + INTERVAL seq MINUTE, CONCAT('h', seq MOD 3), seq FROM seq_0_to_59;
+INSERT INTO i SELECT '2026-03-01 00:00:00' + INTERVAL seq MINUTE, CONCAT('h', seq MOD 3), seq FROM seq_0_to_59;
+UPDATE m SET v = v + 1 WHERE ts > '2026-03-01 00:30:00';
+ERROR HY000: Storage engine MooseDB of the table `test`.`m` doesn't have this option
+UPDATE m SET ts = ts + INTERVAL 1 DAY WHERE ts > '2026-03-01 00:30:00';
+ERROR HY000: Storage engine MooseDB of the table `test`.`m` doesn't have this option
+UPDATE m, s SET m.v = 0 WHERE m.host = s.host AND m.ts > '2026-03-01 00:30:00';
+ERROR HY000: Storage engine MooseDB of the table `test`.`m` doesn't have this option
+##################################################################
+# Lifecycle of the pushed range
+##################################################################
+# PREPARE ts > ? executed with different values
+SET @sm = 'SELECT COUNT(*), SUM(v), MIN(ts), MAX(ts) INTO @c1, @s1, @a1, @b1 FROM m IGNORE INDEX(ts) WHERE ts > ?';
+SET @si = 'SELECT COUNT(*), SUM(v), MIN(ts), MAX(ts) INTO @c2, @s2, @a2, @b2 FROM i IGNORE INDEX(ts) WHERE ts > ?';
+PREPARE pm FROM @sm;
+PREPARE pi FROM @si;
+bound	cnt	vs_innodb
+2026-03-01 00:30:00	58	SAME
+bound	cnt	vs_innodb
+2026-03-01 00:58:00	2	SAME
+bound	cnt	vs_innodb
+2020-01-01	120	SAME
+bound	cnt	vs_innodb
+2026-03-01 00:00:00	118	SAME
+bound	cnt	vs_innodb
+2027-01-01	0	SAME
+bound	cnt	vs_innodb
+2026-03-01 00:00:00.5	118	SAME
+bound	cnt	vs_innodb
+2026-03-01 00:59:00	0	SAME
+DEALLOCATE PREPARE pm;
+DEALLOCATE PREPARE pi;
+# stored procedure: loop with a variable in the bound
+CREATE PROCEDURE p_m(OUT r VARCHAR(500))
+BEGIN
+DECLARE n INT DEFAULT 0;
+DECLARE c INT;
+DECLARE b DATETIME;
+SET r = '';
+WHILE n < 6 DO
+SET b = '2026-03-01 00:00:00' + INTERVAL (n * 11) MINUTE;
+SELECT COUNT(*) INTO c FROM m IGNORE INDEX(ts) WHERE ts > b;
+SET r = CONCAT(r, c, ',');
+SET n = n + 1;
+END WHILE;
+END|
+CREATE PROCEDURE p_i(OUT r VARCHAR(500))
+BEGIN
+DECLARE n INT DEFAULT 0;
+DECLARE c INT;
+DECLARE b DATETIME;
+SET r = '';
+WHILE n < 6 DO
+SET b = '2026-03-01 00:00:00' + INTERVAL (n * 11) MINUTE;
+SELECT COUNT(*) INTO c FROM i IGNORE INDEX(ts) WHERE ts > b;
+SET r = CONCAT(r, c, ',');
+SET n = n + 1;
+END WHILE;
+END|
+CALL p_m(@r1);
+CALL p_i(@r2);
+CALL p_m(@r3);
+SELECT @r1 AS counts, IF(@r1 = @r2 AND @r1 = @r3, 'SAME', 'DIFFERENT') AS vs_innodb;
+counts	vs_innodb
+118,96,74,52,30,8,	SAME
+DROP PROCEDURE p_m;
+DROP PROCEDURE p_i;
+# inner side of a join rescanned per outer row, constant bound on the inner table
+# join, default
+result_rows	vs_innodb
+4	SAME
+SET SESSION join_cache_level = 0;
+# join, no join buffer (inner scan restarted for every outer row)
+result_rows	vs_innodb
+4	SAME
+SET SESSION join_cache_level = DEFAULT;
+# join, MooseDB table as the outer table
+result_rows	vs_innodb
+2	SAME
+# correlated subquery and IN (SELECT ...)
+# scalar subquery, bound is the outer column
+result_rows	vs_innodb
+4	SAME
+# EXISTS, outer bound plus constant bound
+result_rows	vs_innodb
+3	SAME
+# IN (SELECT ...)
+result_rows	vs_innodb
+1	SAME
+# IN (SELECT ...) with the MooseDB table inside
+result_rows	vs_innodb
+1	SAME
+# LEFT JOIN with the bound in ON, and in WHERE
+# LEFT JOIN ... ON b.ts > X
+result_rows	vs_innodb
+4	SAME
+# LEFT JOIN with the bound in WHERE (OR IS NULL)
+result_rows	vs_innodb
+4	SAME
+# LEFT JOIN, anti-join on the outer column
+result_rows	vs_innodb
+1	SAME
+##################################################################
+# Filesort in rowid mode: position()/rnd_pos over the pruned scan
+##################################################################
+SET SESSION max_length_for_sort_data = 4;
+# ORDER BY v over the range, rowid filesort
+result_rows	vs_innodb
+42	SAME
+# ORDER BY host, v LIMIT over an open range
+result_rows	vs_innodb
+7	SAME
+FLUSH STATUS;
+SELECT ts, host, v FROM m IGNORE INDEX(ts) WHERE ts > '2026-03-01 00:50:00' ORDER BY host, v;
+SELECT VARIABLE_VALUE > 0 AS rnd_pos_used FROM information_schema.SESSION_STATUS WHERE VARIABLE_NAME = 'Handler_read_rnd';
+rnd_pos_used
+1
+SET SESSION max_length_for_sort_data = DEFAULT;
+##################################################################
+# sql_mode corners: DATETIME(0) with .5, TIME_ROUND_FRACTIONAL, ALLOW_INVALID_DATES
+##################################################################
+SET sql_mode = CONCAT(@@sql_mode, ',TIME_ROUND_FRACTIONAL');
+# IGNORE INDEX(ts) WHERE tt.ts >= '2026-03-01 00:10:00.5'
+Variable_name	Value
+Handler_read_rnd_next	99
+a	b	c	vs_innodb
+98	3430	0	SAME
+# IGNORE INDEX(ts) WHERE tt.ts > '2026-03-01 00:10:00.5'
+Variable_name	Value
+Handler_read_rnd_next	99
+a	b	c	vs_innodb
+98	3430	0	SAME
+# IGNORE INDEX(ts) WHERE tt.ts <= '2026-03-01 00:10:00.5'
+Variable_name	Value
+Handler_read_rnd_next	23
+a	b	c	vs_innodb
+22	110	0	SAME
+# IGNORE INDEX(ts) WHERE tt.ts < '2026-03-01 00:10:00.5'
+Variable_name	Value
+Handler_read_rnd_next	23
+a	b	c	vs_innodb
+22	110	0	SAME
+# IGNORE INDEX(ts) WHERE tt.ts = '2026-03-01 00:10:00.5'
+Variable_name	Value
+Handler_read_rnd_next	121
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# IGNORE INDEX(ts) WHERE tt.ts BETWEEN '2026-03-01 00:10:00.5' AND '2026-03-01 00:20:00.4'
+Variable_name	Value
+Handler_read_rnd_next	21
+a	b	c	vs_innodb
+20	310	0	SAME
+SET sql_mode = DEFAULT;
+# IGNORE INDEX(ts) WHERE tt.ts >= '2026-03-01 00:10:00.5'
+Variable_name	Value
+Handler_read_rnd_next	99
+a	b	c	vs_innodb
+98	3430	0	SAME
+# IGNORE INDEX(ts) WHERE tt.ts < '2026-03-01 00:10:00.5'
+Variable_name	Value
+Handler_read_rnd_next	23
+a	b	c	vs_innodb
+22	110	0	SAME
+SET sql_mode = CONCAT(@@sql_mode, ',ALLOW_INVALID_DATES');
+# IGNORE INDEX(ts) WHERE tt.ts > '2026-02-30 00:00:00'
+Variable_name	Value
+Handler_read_rnd_next	121
+a	b	c	vs_innodb
+120	3540	0	SAME
+# IGNORE INDEX(ts) WHERE tt.ts < '2026-02-31'
+Variable_name	Value
+Handler_read_rnd_next	121
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# IGNORE INDEX(ts) WHERE tt.ts BETWEEN '2026-03-01 00:10:00' AND '2026-03-00'
+Variable_name	Value
+Handler_read_rnd_next	121
+a	b	c	vs_innodb
+0	NULL	0	SAME
+SET sql_mode = DEFAULT;
+##################################################################
+# TIMESTAMP column: not pruned by the engine, same answers
+##################################################################
+CREATE TABLE tm (ts TIMESTAMP NOT NULL, host VARCHAR(8) NOT NULL COMMENT 'TAG',
+v INT NOT NULL, INDEX(ts)) ENGINE=MooseDB CHUNK_INTERVAL='1 HOUR';
+CREATE TABLE ti (ts TIMESTAMP NOT NULL, host VARCHAR(8) NOT NULL,
+v INT NOT NULL, KEY(ts)) ENGINE=InnoDB;
+SET time_zone = '+05:30';
+INSERT INTO tm SELECT '2026-03-01 00:00:00' + INTERVAL seq MINUTE, CONCAT('h', seq MOD 3), seq FROM seq_0_to_59;
+INSERT INTO ti SELECT '2026-03-01 00:00:00' + INTERVAL seq MINUTE, CONCAT('h', seq MOD 3), seq FROM seq_0_to_59;
+# IGNORE INDEX(ts) WHERE tt.ts >= '2026-03-01 00:30:00'
+Variable_name	Value
+Handler_read_rnd_next	61
+a	b	c	vs_innodb
+30	1335	2563070888	SAME
+# IGNORE INDEX(ts) WHERE tt.ts BETWEEN '2026-03-01 00:10:00' AND '2026-03-01 00:20:00'
+Variable_name	Value
+Handler_read_rnd_next	61
+a	b	c	vs_innodb
+11	165	1230481940	SAME
+# IGNORE INDEX(ts) WHERE tt.ts < '2026-03-01 00:05:00.5'
+Variable_name	Value
+Handler_read_rnd_next	61
+a	b	c	vs_innodb
+6	15	1618748629	SAME
+SET time_zone = '-08:00';
+# IGNORE INDEX(ts) WHERE tt.ts >= '2026-03-01 00:30:00'
+Variable_name	Value
+Handler_read_rnd_next	61
+a	b	c	vs_innodb
+0	NULL	0	SAME
+SET time_zone = DEFAULT;
+DROP TABLE tm, ti;
+##################################################################
+# Multi-table DELETE and DELETE that reads through the pruned scan
+##################################################################
+TRUNCATE m;
+TRUNCATE i;
+INSERT INTO m SELECT '2026-03-01 00:00:00' + INTERVAL seq MINUTE, CONCAT('h', seq MOD 3), seq FROM seq_0_to_59;
+INSERT INTO i SELECT '2026-03-01 00:00:00' + INTERVAL seq MINUTE, CONCAT('h', seq MOD 3), seq FROM seq_0_to_59;
+DELETE m FROM m JOIN s ON m.host = s.host AND m.ts = s.ts WHERE m.ts > '2026-03-01 00:05:00';
+DELETE i FROM i JOIN s ON i.host = s.host AND i.ts = s.ts WHERE i.ts > '2026-03-01 00:05:00';
+DELETE m FROM m JOIN s ON m.host = s.host WHERE m.ts BETWEEN '2026-03-01 00:40:00' AND '2026-03-01 00:45:00' AND s.k = 1;
+DELETE i FROM i JOIN s ON i.host = s.host WHERE i.ts BETWEEN '2026-03-01 00:40:00' AND '2026-03-01 00:45:00' AND s.k = 1;
+DELETE FROM m WHERE ts < '2026-03-01 00:03:00' AND v MOD 2 = 0 ORDER BY ts LIMIT 2;
+DELETE FROM i WHERE ts < '2026-03-01 00:03:00' AND v MOD 2 = 0 ORDER BY ts LIMIT 2;
+# 
+Variable_name	Value
+Handler_read_rnd_next	57
+a	b	c	vs_innodb
+56	1681	1468956116	SAME
+# IGNORE INDEX(ts) WHERE tt.ts > '2026-03-01 00:00:00'
+Variable_name	Value
+Handler_read_rnd_next	57
+a	b	c	vs_innodb
+56	1681	1468956116	SAME
+DROP TABLE m, i, s;

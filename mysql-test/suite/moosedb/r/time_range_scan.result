@@ -1,0 +1,256 @@
+CREATE TABLE m (ts DATETIME NOT NULL, host VARCHAR(8) NOT NULL COMMENT 'TAG',
+v INT NOT NULL, INDEX(ts)) ENGINE=MooseDB CHUNK_INTERVAL='1 HOUR';
+CREATE TABLE i (ts DATETIME NOT NULL, host VARCHAR(8) NOT NULL,
+v INT NOT NULL, KEY(ts)) ENGINE=InnoDB;
+# 10 hosts x 240 minutes: 2 sealed batches (4 hourly chunks) and a MemTable tail
+INSERT INTO m SELECT '2026-03-01 00:00:00' + INTERVAL s.seq MINUTE, CONCAT('h', h.seq), s.seq * 10 + h.seq FROM seq_0_to_119 s JOIN seq_0_to_9 h;
+INSERT INTO i SELECT '2026-03-01 00:00:00' + INTERVAL s.seq MINUTE, CONCAT('h', h.seq), s.seq * 10 + h.seq FROM seq_0_to_119 s JOIN seq_0_to_9 h;
+FLUSH TABLES m;
+INSERT INTO m SELECT '2026-03-01 00:00:00' + INTERVAL s.seq MINUTE, CONCAT('h', h.seq), s.seq * 10 + h.seq FROM seq_120_to_199 s JOIN seq_0_to_9 h;
+INSERT INTO i SELECT '2026-03-01 00:00:00' + INTERVAL s.seq MINUTE, CONCAT('h', h.seq), s.seq * 10 + h.seq FROM seq_120_to_199 s JOIN seq_0_to_9 h;
+FLUSH TABLES m;
+INSERT INTO m SELECT '2026-03-01 00:00:00' + INTERVAL s.seq MINUTE, CONCAT('h', h.seq), s.seq * 10 + h.seq FROM seq_200_to_239 s JOIN seq_0_to_9 h;
+INSERT INTO i SELECT '2026-03-01 00:00:00' + INTERVAL s.seq MINUTE, CONCAT('h', h.seq), s.seq * 10 + h.seq FROM seq_200_to_239 s JOIN seq_0_to_9 h;
+SELECT COUNT(*) FROM m;
+COUNT(*)
+2400
+##################################################################
+# Table scan (IGNORE INDEX): bounds in every form the engine captures
+##################################################################
+# IGNORE INDEX(ts) WHERE tt.ts BETWEEN '2026-03-01 01:10:00' AND '2026-03-01 01:19:59'
+Variable_name	Value
+Handler_read_rnd_next	101
+a	b	c	vs_innodb
+100	74950	0	SAME
+# IGNORE INDEX(ts) WHERE tt.ts >= '2026-03-01 03:30:00'
+Variable_name	Value
+Handler_read_rnd_next	301
+a	b	c	vs_innodb
+300	674850	0	SAME
+# IGNORE INDEX(ts) WHERE tt.ts > '2026-03-01 03:30:00'
+Variable_name	Value
+Handler_read_rnd_next	291
+a	b	c	vs_innodb
+290	653805	3160138547	SAME
+# IGNORE INDEX(ts) WHERE tt.ts < '2026-03-01 00:05:00'
+Variable_name	Value
+Handler_read_rnd_next	51
+a	b	c	vs_innodb
+50	1225	1992645281	SAME
+# IGNORE INDEX(ts) WHERE tt.ts <= '2026-03-01 00:05:00'
+Variable_name	Value
+Handler_read_rnd_next	61
+a	b	c	vs_innodb
+60	1770	3112045906	SAME
+# IGNORE INDEX(ts) WHERE '2026-03-01 02:00:00' <= tt.ts AND tt.ts < '2026-03-01 02:03:00'
+Variable_name	Value
+Handler_read_rnd_next	31
+a	b	c	vs_innodb
+30	36435	3160138547	SAME
+# IGNORE INDEX(ts) WHERE tt.ts = '2026-03-01 02:00:00'
+Variable_name	Value
+Handler_read_rnd_next	2401
+a	b	c	vs_innodb
+10	12045	3160138547	SAME
+# empty range, range outside the data
+# IGNORE INDEX(ts) WHERE tt.ts > '2026-03-01 02:00:00' AND tt.ts < '2026-03-01 01:00:00'
+Variable_name	Value
+Handler_read_rnd_next	1
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# IGNORE INDEX(ts) WHERE tt.ts >= '2027-01-01 00:00:00'
+Variable_name	Value
+Handler_read_rnd_next	1
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# IGNORE INDEX(ts) WHERE tt.ts < '2020-01-01 00:00:00'
+Variable_name	Value
+Handler_read_rnd_next	1
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# constants with a fraction, DATE-only constants, other types of constant
+# IGNORE INDEX(ts) WHERE tt.ts >= '2026-03-01 02:00:00.5' AND tt.ts <= '2026-03-01 02:02:00.4'
+Variable_name	Value
+Handler_read_rnd_next	21
+a	b	c	vs_innodb
+20	24390	0	SAME
+# IGNORE INDEX(ts) WHERE tt.ts > '2026-03-01 03:58:59.999999'
+Variable_name	Value
+Handler_read_rnd_next	11
+a	b	c	vs_innodb
+10	23945	3160138547	SAME
+# IGNORE INDEX(ts) WHERE tt.ts < '2026-03-01' + INTERVAL 5 MINUTE
+Variable_name	Value
+Handler_read_rnd_next	2401
+a	b	c	vs_innodb
+50	1225	1992645281	SAME
+# IGNORE INDEX(ts) WHERE tt.ts > '2026-03-01' AND tt.ts < '2026-03-02'
+Variable_name	Value
+Handler_read_rnd_next	2391
+a	b	c	vs_innodb
+2390	2878755	3485161459	SAME
+# IGNORE INDEX(ts) WHERE tt.ts >= DATE('2026-03-01 03:00:00')
+Variable_name	Value
+Handler_read_rnd_next	2401
+a	b	c	vs_innodb
+2400	2878800	3112045906	SAME
+# IGNORE INDEX(ts) WHERE tt.ts >= 20260301035000
+Variable_name	Value
+Handler_read_rnd_next	2401
+a	b	c	vs_innodb
+100	234950	0	SAME
+# IGNORE INDEX(ts) WHERE tt.ts >= '2026-03-01 03:55:00' AND tt.ts >= '2026-03-01 03:57:00' AND tt.ts <= '2026-03-01 03:58:00' AND tt.ts <= '2026-03-01 03:59:00'
+Variable_name	Value
+Handler_read_rnd_next	21
+a	b	c	vs_innodb
+20	47590	0	SAME
+# range crossing the sealed/MemTable boundary, with a TAG pushdown, with a non-key conjunct
+# IGNORE INDEX(ts) WHERE tt.ts BETWEEN '2026-03-01 03:15:00' AND '2026-03-01 03:45:00'
+Variable_name	Value
+Handler_read_rnd_next	311
+a	b	c	vs_innodb
+310	652395	3160138547	SAME
+# IGNORE INDEX(ts) WHERE tt.ts BETWEEN '2026-03-01 00:30:00' AND '2026-03-01 02:30:00' AND tt.host IN ('h1', 'h7')
+Variable_name	Value
+Handler_read_rnd_next	243
+a	b	c	vs_innodb
+242	218768	1060783656	SAME
+# IGNORE INDEX(ts) WHERE tt.ts BETWEEN '2026-03-01 00:30:00' AND '2026-03-01 02:30:00' AND tt.v MOD 3 = 0
+Variable_name	Value
+Handler_read_rnd_next	1211
+a	b	c	vs_innodb
+404	365418	3979701690	SAME
+# not captured (OR, NOT BETWEEN, expression on ts): every row is read, answer unchanged
+# IGNORE INDEX(ts) WHERE tt.ts < '2026-03-01 00:10:00' OR tt.ts > '2026-03-01 03:50:00'
+Variable_name	Value
+Handler_read_rnd_next	2401
+a	b	c	vs_innodb
+190	216855	86371937	SAME
+# IGNORE INDEX(ts) WHERE tt.ts NOT BETWEEN '2026-03-01 00:10:00' AND '2026-03-01 03:50:00'
+Variable_name	Value
+Handler_read_rnd_next	2401
+a	b	c	vs_innodb
+190	216855	86371937	SAME
+# IGNORE INDEX(ts) WHERE tt.ts + INTERVAL 1 MINUTE > '2026-03-01 03:50:00'
+Variable_name	Value
+Handler_read_rnd_next	2401
+a	b	c	vs_innodb
+100	234950	0	SAME
+##################################################################
+# Optimizer's own choice (index range or table scan)
+##################################################################
+# WHERE tt.ts BETWEEN '2026-03-01 01:10:00' AND '2026-03-01 01:19:59'
+Variable_name	Value
+Handler_read_rnd_next	0
+a	b	c	vs_innodb
+100	74950	0	SAME
+# WHERE tt.ts >= '2026-03-01 00:00:00'
+Variable_name	Value
+Handler_read_rnd_next	2401
+a	b	c	vs_innodb
+2400	2878800	3112045906	SAME
+# WHERE tt.ts >= '2026-03-01 02:00:00' AND tt.host = 'h4'
+Variable_name	Value
+Handler_read_rnd_next	121
+a	b	c	vs_innodb
+120	215880	0	SAME
+##################################################################
+# Server-side GROUP BY / DISTINCT / ORDER BY / LIMIT over a range
+##################################################################
+# GROUP BY host on the table scan
+result_rows	vs_innodb
+10	SAME
+# GROUP BY expression
+result_rows	vs_innodb
+3	SAME
+# DISTINCT
+result_rows	vs_innodb
+10	SAME
+# ORDER BY ts DESC LIMIT (filesort over the table scan)
+result_rows	vs_innodb
+25	SAME
+# ORDER BY ts ASC LIMIT
+result_rows	vs_innodb
+15	SAME
+# ORDER BY ts LIMIT, optimizer's choice (index order must stay ascending)
+result_rows	vs_innodb
+15	SAME
+# ORDER BY ts DESC LIMIT, optimizer's choice
+result_rows	vs_innodb
+15	SAME
+# MIN/MAX on the time column
+result_rows	vs_innodb
+1	SAME
+# self-join, one time bound per side
+result_rows	vs_innodb
+1	SAME
+# subquery with its own bound
+result_rows	vs_innodb
+1	SAME
+##################################################################
+# Rows hidden by DELETE (tombstones) and MemTable rows
+##################################################################
+DELETE FROM m WHERE host = 'h3' AND ts BETWEEN '2026-03-01 01:00:00' AND '2026-03-01 01:29:59';
+DELETE FROM i WHERE host = 'h3' AND ts BETWEEN '2026-03-01 01:00:00' AND '2026-03-01 01:29:59';
+DELETE FROM m WHERE v MOD 7 = 0 AND ts >= '2026-03-01 03:20:00';
+DELETE FROM i WHERE v MOD 7 = 0 AND ts >= '2026-03-01 03:20:00';
+INSERT INTO m VALUES ('2026-03-01 01:15:00', 'h3', 1), ('2026-03-01 03:59:30', 'h99', 2);
+INSERT INTO i VALUES ('2026-03-01 01:15:00', 'h3', 1), ('2026-03-01 03:59:30', 'h99', 2);
+# IGNORE INDEX(ts) WHERE tt.ts BETWEEN '2026-03-01 00:50:00' AND '2026-03-01 01:40:00'
+Variable_name	Value
+Handler_read_rnd_next	482
+a	b	c	vs_innodb
+481	362356	3816320448	SAME
+# IGNORE INDEX(ts) WHERE tt.ts >= '2026-03-01 03:00:00'
+Variable_name	Value
+Handler_read_rnd_next	545
+a	b	c	vs_innodb
+544	1134416	511994858	SAME
+# IGNORE INDEX(ts) WHERE tt.ts BETWEEN '2026-03-01 01:00:00' AND '2026-03-01 01:29:59' AND tt.host = 'h3'
+Variable_name	Value
+Handler_read_rnd_next	2
+a	b	c	vs_innodb
+1	1	2276876402	SAME
+# DELETE by range (row by row: the server reads through the same scan)
+DELETE FROM m WHERE v MOD 2 = 0 AND ts BETWEEN '2026-03-01 02:00:00' AND '2026-03-01 02:09:59';
+DELETE FROM i WHERE v MOD 2 = 0 AND ts BETWEEN '2026-03-01 02:00:00' AND '2026-03-01 02:09:59';
+# WHERE tt.ts BETWEEN '2026-03-01 01:55:00' AND '2026-03-01 02:15:00'
+Variable_name	Value
+Handler_read_rnd_next	0
+a	b	c	vs_innodb
+160	200995	1055235613	SAME
+# 
+Variable_name	Value
+Handler_read_rnd_next	2266
+a	b	c	vs_innodb
+2265	2668627	2053608805	SAME
+DROP TABLE m, i;
+# Fractional stored values (DATETIME(3)) against constants with more or fewer digits
+CREATE TABLE m (ts DATETIME(3) NOT NULL, host VARCHAR(8) NOT NULL COMMENT 'TAG',
+v INT NOT NULL, INDEX(ts)) ENGINE=MooseDB CHUNK_INTERVAL='1 HOUR';
+CREATE TABLE i (ts DATETIME(3) NOT NULL, host VARCHAR(8) NOT NULL,
+v INT NOT NULL, KEY(ts)) ENGINE=InnoDB;
+INSERT INTO m SELECT '2026-03-01 00:00:00' + INTERVAL (seq * 250) MICROSECOND, CONCAT('h', seq MOD 3), seq FROM seq_0_to_399;
+INSERT INTO i SELECT '2026-03-01 00:00:00' + INTERVAL (seq * 250) MICROSECOND, CONCAT('h', seq MOD 3), seq FROM seq_0_to_399;
+FLUSH TABLES m;
+# IGNORE INDEX(ts) WHERE tt.ts >= '2026-03-01 00:00:00.0125' AND tt.ts < '2026-03-01 00:00:00.0505'
+Variable_name	Value
+Handler_read_rnd_next	153
+a	b	c	vs_innodb
+152	19380	1201699536	SAME
+# IGNORE INDEX(ts) WHERE tt.ts > '2026-03-01 00:00:00.5' AND tt.ts <= '2026-03-01 00:00:00.75'
+Variable_name	Value
+Handler_read_rnd_next	1
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# IGNORE INDEX(ts) WHERE tt.ts = '2026-03-01 00:00:00.25'
+Variable_name	Value
+Handler_read_rnd_next	401
+a	b	c	vs_innodb
+0	NULL	0	SAME
+# IGNORE INDEX(ts) WHERE tt.ts BETWEEN '2026-03-01 00:00:00' AND '2026-03-01 00:00:00.4999'
+Variable_name	Value
+Handler_read_rnd_next	401
+a	b	c	vs_innodb
+400	79800	38190681	SAME
+DROP TABLE m, i;

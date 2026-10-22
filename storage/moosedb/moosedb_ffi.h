@@ -35,6 +35,10 @@
 // value without them; a top-N breaks ties in that collation order.
 #define TF_AGG_KEY_COLUMN_PAD 2
 
+// A TIMESTAMP column cut in buckets of `TFAggKey::width_us` microseconds aligned to the epoch
+// (floor): the key value is the bucket start, in microseconds.
+#define TF_AGG_KEY_BUCKET 3
+
 // Function codes of `TFAggFunc::op`.
 #define TF_AGG_COUNT_STAR 0
 
@@ -310,11 +314,13 @@ typedef struct {
   const uint8_t *positions;
 } TFBatch;
 
-// One group-by key: the series (`col` ignored) or a column.
+// One group-by key: the series (`col` ignored) or a column (`width_us` only for `TF_AGG_KEY_BUCKET`).
 typedef struct {
-  // `TF_AGG_KEY_SERIES`, `TF_AGG_KEY_COLUMN` or `TF_AGG_KEY_COLUMN_PAD`.
+  // `TF_AGG_KEY_SERIES`, `TF_AGG_KEY_COLUMN`, `TF_AGG_KEY_COLUMN_PAD` or `TF_AGG_KEY_BUCKET`.
   uint8_t kind;
   uint32_t col;
+  // Bucket width in microseconds (> 0), `TF_AGG_KEY_BUCKET` only; 0 otherwise.
+  int64_t width_us;
 } TFAggKey;
 
 // One aggregate function (`col` ignored for `TF_AGG_COUNT_STAR`).

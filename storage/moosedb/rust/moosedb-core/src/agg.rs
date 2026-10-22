@@ -94,6 +94,11 @@ pub enum KeySpec {
     /// key returned is the shortest value of the group (the smallest by bytes).
     /// A top-N then breaks ties in that collation's order (see [`pad_cmp`]).
     ColumnPad(usize),
+    /// A TIMESTAMP column (microseconds since 1970, no time zone) cut in buckets of
+    /// `width` microseconds (`width > 0`) aligned to the epoch: the key is the START of the
+    /// bucket, `floor(v / width) * width` (floor, so instants before 1970 fall in the bucket
+    /// that contains them). NULL is its own group.
+    Bucket(usize, i64),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -572,12 +577,17 @@ impl<'a> Plan<'a> {
         for k in &spec.keys {
             match *k {
                 KeySpec::Series => kinds.push(Kind::Int),
-                KeySpec::Column(c) | KeySpec::ColumnPad(c) => {
+                KeySpec::Column(c) | KeySpec::ColumnPad(c) | KeySpec::Bucket(c, _) => {
                     let kind = key_kind(col(c)?.ty).ok_or_else(|| {
                         invalid(format!("column {c} cannot be a group key (use the series for TAGs)"))
                     })?;
                     if matches!(k, KeySpec::ColumnPad(_)) && !matches!(kind, Kind::Bytes) {
                         return Err(invalid(format!("column {c}: PAD SPACE needs a string key")));
+                    }
+                    if let KeySpec::Bucket(_, w) = *k {
+                        if w <= 0 || col(c)?.ty != ColumnType::Timestamp {
+                            return Err(invalid(format!("column {c}: a bucket needs a TIMESTAMP column and a positive width")));
+                        }
                     }
                     kinds.push(kind);
                     want[c] = true;
@@ -984,22 +994,23 @@ impl<'a> Col<'a> {
         }
     }
 
-    /// Whether rows `i` and `j` hold the same value (NULL equals NULL).
+    /// Whether rows `i` and `j` have the same key under `key` (NULL equals NULL).
     #[inline(always)]
-    fn same(&self, i: usize, j: usize) -> bool {
+    fn same(&self, key: &KeySpec, i: usize, j: usize) -> bool {
         match (self.is_null(i), self.is_null(j)) {
             (true, true) => true,
             (false, false) => match self {
                 Col::Bytes { .. } => matches!((self.bytes(i), self.bytes(j)), (Ok(x), Ok(y)) if x == y),
-                _ => self.int(i) == self.int(j),
+                _ => bucket_of(key, self.int(i)) == bucket_of(key, self.int(j)),
             },
             _ => false,
         }
     }
 
-    /// Appends the key image of row `i`.
-    /// With `pad`, a string drops its trailing 0x20 bytes ([`KeySpec::ColumnPad`]).
-    fn encode(&self, i: usize, pad: bool, out: &mut Vec<u8>) -> Result<()> {
+    /// Appends the key image of row `i` under `key`: a string drops its trailing 0x20 bytes
+    /// ([`KeySpec::ColumnPad`]), a timestamp becomes its bucket start ([`KeySpec::Bucket`]).
+    fn encode(&self, key: &KeySpec, i: usize, out: &mut Vec<u8>) -> Result<()> {
+        let pad = matches!(key, KeySpec::ColumnPad(_));
         if self.is_null(i) {
             out.push(0);
             return Ok(());
@@ -1012,9 +1023,19 @@ impl<'a> Col<'a> {
                 out.extend_from_slice(&(b.len() as u32).to_le_bytes());
                 out.extend_from_slice(b);
             }
-            _ => out.extend_from_slice(&self.int(i).to_le_bytes()),
+            _ => out.extend_from_slice(&bucket_of(key, self.int(i)).to_le_bytes()),
         }
         Ok(())
+    }
+}
+
+/// `v` itself, or the start of its bucket for a [`KeySpec::Bucket`] (floor division; the start
+/// lies within `width` below `v`, saturating at `i64::MIN`).
+#[inline(always)]
+fn bucket_of(key: &KeySpec, v: i64) -> i64 {
+    match *key {
+        KeySpec::Bucket(_, w) if w > 0 => v.saturating_sub(v.rem_euclid(w)),
+        _ => v,
     }
 }
 
@@ -1350,7 +1371,7 @@ impl Local {
         for (k, key) in p.keys.iter().enumerate() {
             match *key {
                 KeySpec::Series => self.scratch.extend_from_slice(&sid.to_le_bytes()),
-                KeySpec::Column(c) | KeySpec::ColumnPad(c) => cols.push((k, Col::of(win, c, b)?)),
+                KeySpec::Column(c) | KeySpec::ColumnPad(c) | KeySpec::Bucket(c, _) => cols.push((k, Col::of(win, c, b)?)),
             }
         }
         let mut gids = std::mem::take(&mut self.gids);
@@ -1411,7 +1432,7 @@ impl Local {
                     continue;
                 }
                 if let Some((pi, pr)) = prev {
-                    if cols.iter().all(|(_, c)| c.same(pi, i)) {
+                    if cols.iter().all(|(k, c)| c.same(&p.keys[*k], pi, i)) {
                         bt.rep_of.push(pr);
                         continue;
                     }
@@ -1421,8 +1442,9 @@ impl Local {
                 for spec in &p.keys {
                     match spec {
                         KeySpec::Series => bt.imgs.extend_from_slice(&sid.to_le_bytes()),
-                        KeySpec::Column(_) | KeySpec::ColumnPad(_) => {
-                            cols[at].1.encode(i, matches!(spec, KeySpec::ColumnPad(_)), &mut bt.imgs)?;
+                        KeySpec::Column(_) | KeySpec::ColumnPad(_) | KeySpec::Bucket(..) => {
+                            let Some((_, c)) = cols.get(at) else { return Err(corrupt("key column list")) };
+                            c.encode(spec, i, &mut bt.imgs)?;
                             at += 1;
                         }
                     }
@@ -1538,11 +1560,11 @@ impl Local {
             for key in &p.keys {
                 match *key {
                     KeySpec::Series => self.scratch.extend_from_slice(&m.series_id.to_le_bytes()),
-                    KeySpec::Column(c) | KeySpec::ColumnPad(c) => match cell(m, c)? {
+                    KeySpec::Column(c) | KeySpec::ColumnPad(c) | KeySpec::Bucket(c, _) => match cell(m, c)? {
                         Value::Null => self.scratch.push(0),
                         Value::Int(i) | Value::Timestamp(i) => {
                             self.scratch.push(1);
-                            self.scratch.extend_from_slice(&i.to_le_bytes());
+                            self.scratch.extend_from_slice(&bucket_of(key, *i).to_le_bytes());
                         }
                         Value::Bool(b) => {
                             self.scratch.push(1);

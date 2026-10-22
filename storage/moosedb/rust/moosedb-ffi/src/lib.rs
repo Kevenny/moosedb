@@ -1666,6 +1666,9 @@ pub const TF_AGG_KEY_COLUMN: u8 = 1;
 /// space is the byte 0x20): values differing only by trailing 0x20 bytes are one group, keyed by the
 /// value without them; a top-N breaks ties in that collation order.
 pub const TF_AGG_KEY_COLUMN_PAD: u8 = 2;
+/// A TIMESTAMP column cut in buckets of `TFAggKey::width_us` microseconds aligned to the epoch
+/// (floor): the key value is the bucket start, in microseconds.
+pub const TF_AGG_KEY_BUCKET: u8 = 3;
 /// Function codes of `TFAggFunc::op`.
 pub const TF_AGG_COUNT_STAR: u8 = 0;
 pub const TF_AGG_COUNT: u8 = 1;
@@ -1677,13 +1680,15 @@ pub const TF_AGG_KEYCOL_SERIES: u8 = 0;
 pub const TF_AGG_KEYCOL_INT: u8 = 1;
 pub const TF_AGG_KEYCOL_BYTES: u8 = 2;
 
-/// One group-by key: the series (`col` ignored) or a column.
+/// One group-by key: the series (`col` ignored) or a column (`width_us` only for `TF_AGG_KEY_BUCKET`).
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct TFAggKey {
-    /// `TF_AGG_KEY_SERIES`, `TF_AGG_KEY_COLUMN` or `TF_AGG_KEY_COLUMN_PAD`.
+    /// `TF_AGG_KEY_SERIES`, `TF_AGG_KEY_COLUMN`, `TF_AGG_KEY_COLUMN_PAD` or `TF_AGG_KEY_BUCKET`.
     pub kind: u8,
     pub col: u32,
+    /// Bucket width in microseconds (> 0), `TF_AGG_KEY_BUCKET` only; 0 otherwise.
+    pub width_us: i64,
 }
 
 /// One aggregate function (`col` ignored for `TF_AGG_COUNT_STAR`).
@@ -1909,6 +1914,7 @@ pub unsafe extern "C" fn moosedb_agg_run(
                 TF_AGG_KEY_SERIES => Ok(KeySpec::Series),
                 TF_AGG_KEY_COLUMN => Ok(KeySpec::Column(k.col as usize)),
                 TF_AGG_KEY_COLUMN_PAD => Ok(KeySpec::ColumnPad(k.col as usize)),
+                TF_AGG_KEY_BUCKET => Ok(KeySpec::Bucket(k.col as usize, k.width_us)),
                 other => Err(invalid(&format!("unknown key kind {other}"))),
             })
             .collect::<Result<Vec<_>, Error>>()?;

@@ -933,3 +933,55 @@ fn agg_throughput() {
         }
     }
 }
+
+/// `KeySpec::Bucket`: the key is the epoch-aligned bucket start (floor, also before 1970 and on
+/// the exact boundaries), over chunks and MemTable, on 1 and 4 threads; bad specs are refused.
+#[test]
+fn bucket_keys_floor_to_the_epoch_aligned_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_new(&dir.path().join("t"));
+    build(&t, 12);
+    let edge = |ts: i64| vec![Value::Timestamp(ts), Value::Bytes(b"h0".to_vec()), Value::Int(1), Value::Null, Value::Float64(0.0)];
+    let m = 60 * MICROS_PER_SEC;
+    put(&t, [-m - 1, -m, -1, 0, m - 1, m, 3_600 * MICROS_PER_SEC - 1, -86_400 * MICROS_PER_SEC].into_iter().map(edge));
+    let mut s = t.scan(&ScanFilter::range(i64::MIN, i64::MAX), false).unwrap();
+    let mut all = Vec::new();
+    while let Some((_, r)) = s.next_row().unwrap() {
+        let (Value::Timestamp(ts), n) = (&r[0], &r[2]) else { panic!() };
+        all.push((*ts, if let Value::Int(n) = n { Some(*n) } else { None }));
+    }
+    for w in [1, MICROS_PER_SEC, m, 60 * m, MICROS_PER_DAY, 7] {
+        let mut want: BTreeMap<i64, (u64, i128)> = BTreeMap::new();
+        for &(ts, n) in &all {
+            let e = want.entry(ts - ts.rem_euclid(w)).or_default();
+            e.0 += 1;
+            e.1 += i128::from(n.unwrap_or(0));
+        }
+        for threads in [1, 4] {
+            let mut agg = t.agg_open(i64::MIN, i64::MAX, None).unwrap();
+            agg.set_min_parallel_rows(0);
+            let sp = AggSpec {
+                keys: vec![KeySpec::Bucket(0, w)],
+                funcs: vec![FuncSpec::CountStar, FuncSpec::Sum(2)],
+                max_memory: 1 << 30,
+                threads,
+                ..AggSpec::default()
+            };
+            agg.run(&sp, None).unwrap();
+            let r = agg.result();
+            let KeyCol::Int { nulls, vals } = &r.keys[0] else { panic!() };
+            let got: BTreeMap<i64, (u64, i128)> = (0..r.groups)
+                .map(|g| {
+                    assert!(!nulls[g]);
+                    (vals[g], (r.funcs[0].count[g], (i128::from(r.funcs[1].sum_hi[g]) << 64) | i128::from(r.funcs[1].sum_lo[g])))
+                })
+                .collect();
+            assert_eq!(got, want, "width={w} threads={threads}");
+        }
+    }
+    let mut agg = t.agg_open(i64::MIN, i64::MAX, None).unwrap();
+    for k in [KeySpec::Bucket(0, 0), KeySpec::Bucket(0, -5), KeySpec::Bucket(2, 60), KeySpec::Bucket(1, 60)] {
+        let sp = AggSpec { keys: vec![k], funcs: funcs(), max_memory: 1 << 30, threads: 1, ..AggSpec::default() };
+        assert!(matches!(agg.run(&sp, None), Err(Error::InvalidArg(_))), "{k:?}");
+    }
+}

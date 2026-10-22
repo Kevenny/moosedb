@@ -940,7 +940,7 @@ inclusive `BIGINT UNSIGNED`; nunca TAG nem o eixo) só com constantes: `=`, `<=>
 conjuntos de uma coluna formam o predicado dela). HAVING, ORDER BY (chave ou
 agregado, ASC/DESC), LIMIT e OFFSET entram. Fora: DISTINCT, ROLLUP, window, WITH
 TIES, SQL_CALC_FOUND_ROWS, subconsulta/derivada/view/CTE/UNION, rotinas,
-expressões, `OR` entre colunas diferentes, conjunto com duas colunas, função da
+expressões (exceto o bucket de tempo, abaixo), `OR` entre colunas diferentes, conjunto com duas colunas, função da
 coluna (`UPPER(op)='X'`), função não constante/não determinística, `Item_param`
 não ligado, comparação string x número (o servidor converte e avisa linha a
 linha), predicado em TAG que não seja `=`/`IN`, eixo `TIMESTAMP`.
@@ -993,6 +993,26 @@ espaços, então `'a' < 'a' < 'a	'`), que NÃO é a ordem dos bytes quando o re
 tem byte < 0x20. Só charsets com espaço de 1 byte e `mbminlen = 1` (`cs_pad_bin`).
 Qual valor do grupo o servidor mostra (`'a'` ou `'a  '`) depende do plano dele; os
 testes comparam sem o `Max_length` do metadata nesses casos (`$nomaxlen`).
+
+**Bucket de tempo** (`TF_AGG_KEY_BUCKET` / `KeySpec::Bucket(col, width_us)`; `bucket_key_of`, `store_bucket`).
+`GROUP BY DATE(c)` ou `DATE_FORMAT(c, F)` com `c` coluna `DATETIME(n)` (eixo ou não) e `F` exatamente
+`'%Y-%m-%d'`, `'%Y-%m-%d %H'`, `'%Y-%m-%d %H:%i'` ou `'%Y-%m-%d %H:%i:%s'` (largura 1 dia/1 h/1 min/1 s a
+partir da época). O core devolve o **início do bucket** em µs (`v - v.rem_euclid(width)`: floor, então
+instantes antes de 1970 caem no bucket que os contém; fração é descartada pelo floor, igual ao servidor) e o
+handler formata o valor que a expressão produziria (`DATE` via `store_time_dec`, texto `%04u-%02u-%02u ...`
+via `micros_to_time`), no campo da tmp table do próprio Item. Os itens do SELECT/ORDER BY/HAVING são casados
+com a chave por ponteiro ou `Item::eq`; a coluna crua `c` NÃO casa com a chave bucket. A ordem do bucket
+(inteiro) coincide com a da expressão (largura fixa, ano de 4 dígitos), então ORDER BY/top-N usam o
+caminho de chave inteira. NULL é grupo próprio; `DATETIME` não admite data zero/parcial (a engine as
+recusa na escrita), então a conversão de volta é exata. **Recusado** (fica com o servidor): coluna
+`TIMESTAMP` (depende de `time_zone`), `UNIX_TIMESTAMP`/`FROM_UNIXTIME` (idem), `HOUR(ts)`/`%H` sozinho
+(funde dias: não é bucket contíguo), `%Y-%m`/`%S`/`%b`... e `DATE_FORMAT` com locale, `TIME_FORMAT`,
+`ts - INTERVAL SECOND(ts) SECOND` (preserva a fração), aritmética dentro de `DATE()`, e a chave usada em
+outra expressão no SELECT (`DATE(ts)+0`). `time_zone` da sessão não afeta as formas aceitas (DATETIME não
+tem fuso). Teste: `gbh_bucket` (OFF x ON x InnoDB, fronteiras, antes de 1970, 1000-01-01 e 9999-12-31,
+NULL, TAG + bucket, HAVING/ORDER BY/LIMIT, recusas) e `bucket_keys_floor_to_the_epoch_aligned_start`
+(modelo no core). Medido (20 M linhas, 8 threads, mediana de 7): série por minuto nos 7 dias
+8,8 s -> 0,065 s (`evento_moose_h`); por hora e host 10,8 s -> 0,086 s; `DATE(ts)` 3,3 s -> 0,026 s.
 
 **Agregação escalar (sem GROUP BY)**. O servidor chama `create_group_by` também
 para consultas com agregado e sem `group_list` (`JOIN::make_aggr_tables_info`,
@@ -1106,6 +1126,7 @@ scan não ordenado: só o commitado; o lote privado do statement é invisível).
 `load_window` do scan em stream; não há segunda cópia).
 
 - **Chaves**: `Series` (um estado por série, laço apertado na janela) e
+  `Bucket(i, largura_us)` (coluna Timestamp cortada em buckets de largura fixa alinhados à época; a chave é o início do bucket) e
   `Column(i)` (Int64/Timestamp/Bool como inteiro, Varchar/Decimal como bytes;
   NULL é valor próprio). Imagem da chave em bytes numa tabela própria
   (arena de chaves + índice de endereçamento aberto com `u32`), hash

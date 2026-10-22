@@ -1,0 +1,295 @@
+#
+# GROUP BY a time bucket done by the engine (KeySpec::Bucket): DATE(c) and
+# DATE_FORMAT(c, F) with F one of '%Y-%m-%d', '%Y-%m-%d %H', '%Y-%m-%d %H:%i',
+# '%Y-%m-%d %H:%i:%s' on a DATETIME column. Every query is compared with the
+# server without pushdown and with InnoDB; the refused forms must not be taken.
+#
+--source include/not_embedded.inc
+--source include/have_innodb.inc
+--source include/have_sequence.inc
+--source suite/moosedb/include/have_moosedb.inc
+
+--let $refused= 0
+--let $sorted= 0
+--let $show= 0
+--let $pre=
+
+CREATE TABLE b (
+  ts   DATETIME(6) NOT NULL,
+  host VARCHAR(16) NOT NULL COMMENT 'TAG',
+  v    BIGINT NOT NULL,
+  t2   DATETIME NULL,
+  tm   TIMESTAMP NULL DEFAULT NULL,
+  INDEX(ts)
+) ENGINE=MooseDB CHUNK_INTERVAL='1 DAY';
+
+--echo # 12000 rows over 1969-12-30 .. 1970-01-02, 12000 more from 2024-02-29, in chunks; the edges go to the MemTable
+INSERT INTO b SELECT '1969-12-30 00:00:00' + INTERVAL seq * 17 SECOND + INTERVAL (seq MOD 7) * 100000 MICROSECOND,
+    CONCAT('h', seq MOD 3), seq MOD 100,
+    IF(seq MOD 5 = 0, NULL, '1999-12-31 23:00:00' + INTERVAL seq * 31 SECOND),
+    '2020-06-01 00:00:00' + INTERVAL seq SECOND
+  FROM seq_0_to_11999;
+INSERT INTO b SELECT '2024-02-29 00:00:00' + INTERVAL seq * 11 SECOND + INTERVAL (seq MOD 5) * 250000 MICROSECOND,
+    CONCAT('h', seq MOD 3), seq MOD 100,
+    IF(seq MOD 5 = 0, NULL, '2024-02-29 23:00:00' + INTERVAL seq * 29 SECOND),
+    '2024-02-29 00:00:00' + INTERVAL seq SECOND
+  FROM seq_0_to_11999;
+FLUSH TABLES b;
+--echo # exactly on, just before and just after the bucket boundaries; the first and the last DATETIME
+INSERT INTO b VALUES
+  ('1000-01-01 00:00:00', 'e', 1, '1000-01-01 00:00:00', NULL),
+  ('1969-12-31 23:59:59.999999', 'e', 2, '1969-12-31 23:59:59', NULL),
+  ('1970-01-01 00:00:00', 'e', 3, '1970-01-01 00:00:00', NULL),
+  ('1970-01-01 00:00:00.000001', 'e', 4, NULL, NULL),
+  ('1969-12-31 23:59:00', 'e', 5, '1969-12-31 23:59:00', NULL),
+  ('1969-12-31 23:00:00', 'e', 6, '1969-12-31 23:00:00', NULL),
+  ('1969-12-31 22:59:59.999999', 'e', 7, '1969-12-31 22:59:59', NULL),
+  ('2024-02-29 23:59:59.999999', 'e', 8, '2024-02-29 23:59:59', NULL),
+  ('2024-03-01 00:00:00', 'e', 9, '2024-03-01 00:00:00', NULL),
+  ('2024-03-01 00:00:59.999999', 'e', 10, NULL, NULL),
+  ('2024-03-01 00:01:00', 'e', 11, '2024-03-01 00:01:00', NULL),
+  ('2024-03-01 00:59:59.999999', 'e', 12, '2024-03-01 00:59:59', NULL),
+  ('2024-03-01 01:00:00', 'e', 13, '2024-03-01 01:00:00', NULL),
+  ('2024-03-01 01:00:00.000001', 'e', 14, '2024-03-01 01:00:00', NULL),
+  ('9999-12-31 23:59:59.999999', 'e', 15, '9999-12-31 23:59:59', NULL),
+  ('9999-12-31 00:00:00', 'e', 16, '9999-12-31 00:00:00', NULL);
+CREATE TABLE s (
+  ts DATETIME NOT NULL,
+  host VARCHAR(16) NOT NULL COMMENT 'TAG',
+  v BIGINT NOT NULL,
+  INDEX(ts)
+) ENGINE=MooseDB CHUNK_INTERVAL='1 DAY';
+INSERT INTO s SELECT '2024-03-01 23:58:00' + INTERVAL seq * 13 SECOND, CONCAT('h', seq MOD 2), seq FROM seq_0_to_999;
+CREATE DATABASE mirror;
+CREATE TABLE mirror.b LIKE test.b;
+ALTER TABLE mirror.b ENGINE=InnoDB;
+INSERT INTO mirror.b SELECT * FROM test.b;
+CREATE TABLE mirror.s LIKE test.s;
+ALTER TABLE mirror.s ENGINE=InnoDB;
+INSERT INTO mirror.s SELECT * FROM test.s;
+
+--echo ##########################################################
+--echo # accepted forms (the engine must run them with pushdown ON)
+--echo ##########################################################
+--let $label= DATE(ts), before and after 1970
+--let $q= SELECT DATE(ts) d, COUNT(*) c, SUM(v) s FROM b GROUP BY d ORDER BY d
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= DATE_FORMAT per day, hour, minute, second
+--let $q= SELECT DATE_FORMAT(ts, '%Y-%m-%d') d, COUNT(*) c, SUM(v) s FROM b GROUP BY d ORDER BY d
+--source suite/moosedb/include/gbh_diff.inc
+--let $q= SELECT DATE_FORMAT(ts, '%Y-%m-%d %H') h, COUNT(*) c, MIN(v) a, MAX(v) z FROM b GROUP BY h ORDER BY h
+--source suite/moosedb/include/gbh_diff.inc
+--let $q= SELECT DATE_FORMAT(ts, '%Y-%m-%d %H:%i') m, COUNT(*) c, SUM(v) s FROM b GROUP BY m ORDER BY m
+--source suite/moosedb/include/gbh_diff.inc
+--let $q= SELECT DATE_FORMAT(ts, '%Y-%m-%d %H:%i:%s') x, COUNT(*) c, SUM(v) s FROM b GROUP BY x ORDER BY x
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= GROUP BY the expression (not the alias), ORDER BY the expression, DESC, key not in the select list
+--let $q= SELECT DATE_FORMAT(ts, '%Y-%m-%d %H') h, COUNT(*) c FROM b GROUP BY DATE_FORMAT(ts, '%Y-%m-%d %H') ORDER BY DATE_FORMAT(ts, '%Y-%m-%d %H') DESC
+--source suite/moosedb/include/gbh_diff.inc
+--let $q= SELECT COUNT(*) c, SUM(v) s FROM b GROUP BY DATE(ts) ORDER BY c, s
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= TAG + bucket, and two buckets in one GROUP BY
+--let $q= SELECT host, DATE_FORMAT(ts, '%Y-%m-%d %H') h, COUNT(*) c, SUM(v) s FROM b GROUP BY host, h ORDER BY host, h
+--source suite/moosedb/include/gbh_diff.inc
+--let $q= SELECT DATE(ts) d, DATE_FORMAT(ts, '%Y-%m-%d %H') h, COUNT(*) c FROM b GROUP BY d, h ORDER BY d, h
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= HAVING, ORDER BY aggregate, LIMIT, OFFSET stay on the server
+--let $q= SELECT DATE_FORMAT(ts, '%Y-%m-%d %H:%i') m, COUNT(*) c FROM b GROUP BY m HAVING c > 3 ORDER BY m LIMIT 7 OFFSET 2
+--source suite/moosedb/include/gbh_diff.inc
+--let $q= SELECT DATE(ts) d, COUNT(*) c FROM b GROUP BY d ORDER BY c DESC, d LIMIT 3
+--source suite/moosedb/include/gbh_diff.inc
+--let $q= SELECT DATE_FORMAT(ts, '%Y-%m-%d %H') h, SUM(v) s FROM b GROUP BY h HAVING s > 100 ORDER BY s, h LIMIT 5
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= WHERE on the time axis cutting buckets, on a TAG, and on a plain column
+--let $q= SELECT DATE_FORMAT(ts, '%Y-%m-%d %H:%i') m, COUNT(*) c, MIN(ts) a, MAX(ts) z FROM b WHERE ts >= '2024-03-01 00:00:59.999999' AND ts < '2024-03-01 01:00:00.000001' GROUP BY m ORDER BY m
+--source suite/moosedb/include/gbh_diff.inc
+--let $q= SELECT DATE(ts) d, COUNT(*) c FROM b WHERE host IN ('h1', 'e') AND v >= 50 GROUP BY d ORDER BY d
+--source suite/moosedb/include/gbh_diff.inc
+--let $q= SELECT DATE(ts) d, COUNT(*) c FROM b WHERE ts < '1970-01-01' GROUP BY d ORDER BY d
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= a DATETIME(0) axis, and a session time zone (DATETIME has none)
+--let $q= SELECT DATE_FORMAT(ts, '%Y-%m-%d %H:%i') m, COUNT(*) c, SUM(v) s FROM s GROUP BY m ORDER BY m
+--source suite/moosedb/include/gbh_diff.inc
+--let $pre= SET time_zone = '+05:00';
+--let $q= SELECT DATE(ts) d, COUNT(*) c FROM s GROUP BY d ORDER BY d
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= a nullable DATETIME column (NULL is its own group)
+--let $q= SELECT DATE(t2) d, COUNT(*) c, SUM(v) s FROM b GROUP BY d ORDER BY d
+--source suite/moosedb/include/gbh_diff.inc
+--let $q= SELECT DATE_FORMAT(t2, '%Y-%m-%d %H:%i') m, COUNT(*) c FROM b GROUP BY m ORDER BY m
+--source suite/moosedb/include/gbh_diff.inc
+--let $q= SELECT host, DATE_FORMAT(t2, '%Y-%m-%d %H') h, COUNT(*) c FROM b GROUP BY host, h ORDER BY host, h
+--source suite/moosedb/include/gbh_diff.inc
+
+--echo ##########################################################
+--echo # refused forms (the server does them)
+--echo ##########################################################
+--let $label= TIMESTAMP column (depends on time_zone)
+--let $refused= 1
+--let $q= SELECT DATE(tm) d, COUNT(*) c FROM b GROUP BY d ORDER BY d
+--source suite/moosedb/include/gbh_diff.inc
+--let $refused= 1
+--let $q= SELECT DATE_FORMAT(tm, '%Y-%m-%d %H') h, COUNT(*) c FROM b GROUP BY h ORDER BY h
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= formats other than the four fixed ones, a locale argument, TIME_FORMAT
+--let $refused= 1
+--let $q= SELECT DATE_FORMAT(ts, '%Y-%m') m, COUNT(*) c FROM b GROUP BY m ORDER BY m
+--source suite/moosedb/include/gbh_diff.inc
+--let $refused= 1
+--let $q= SELECT DATE_FORMAT(ts, '%H') h, COUNT(*) c FROM b GROUP BY h ORDER BY h
+--source suite/moosedb/include/gbh_diff.inc
+--let $refused= 1
+--let $q= SELECT DATE_FORMAT(ts, '%Y-%m-%d %H:%i:%S') x, COUNT(*) c FROM b GROUP BY x ORDER BY x
+--source suite/moosedb/include/gbh_diff.inc
+--let $refused= 1
+--let $q= SELECT DATE_FORMAT(ts, '%Y-%m-%d %H:%i', 'pt_BR') x, COUNT(*) c FROM b GROUP BY x ORDER BY x
+--source suite/moosedb/include/gbh_diff.inc
+--let $refused= 1
+--let $q= SELECT TIME_FORMAT(ts, '%H:%i') x, COUNT(*) c FROM b GROUP BY x ORDER BY x
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= other functions of the time column (time zone, modulus, arithmetic)
+--let $refused= 1
+--let $q= SELECT FLOOR(UNIX_TIMESTAMP(ts) / 60) m, COUNT(*) c FROM b GROUP BY m ORDER BY m
+--source suite/moosedb/include/gbh_diff.inc
+--let $refused= 1
+--let $q= SELECT HOUR(ts) h, COUNT(*) c FROM b GROUP BY h ORDER BY h
+--source suite/moosedb/include/gbh_diff.inc
+--let $refused= 1
+--let $q= SELECT ts - INTERVAL SECOND(ts) SECOND m, COUNT(*) c FROM s GROUP BY m ORDER BY m
+--source suite/moosedb/include/gbh_diff.inc
+--let $refused= 1
+--let $q= SELECT DATE(ts + INTERVAL 1 HOUR) d, COUNT(*) c FROM b GROUP BY d ORDER BY d
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= the select list uses the key in another expression
+--let $refused= 1
+--let $q= SELECT DATE(ts) + 0 d, COUNT(*) c FROM b GROUP BY DATE(ts) ORDER BY d
+--source suite/moosedb/include/gbh_diff.inc
+
+--echo ##########################################################
+--echo # a select-list format that differs from the GROUP BY one only by case (sql_mode='' lets the
+--echo # server run it; each select format is a function of the grouped bucket): never the same key
+--echo ##########################################################
+--let $label= %h/%H, %I/%i, %y/%Y, %D/%d, %M/%m
+--let $refused= 1
+--let $pre= SET sql_mode='';
+--let $q= SELECT DATE_FORMAT(ts, '%Y-%m-%d %h') x, COUNT(*) c FROM b GROUP BY DATE_FORMAT(ts, '%Y-%m-%d %H') ORDER BY x, c
+--source suite/moosedb/include/gbh_diff.inc
+--let $refused= 1
+--let $pre= SET sql_mode='';
+--let $q= SELECT DATE_FORMAT(ts, '%Y-%m-%d %H:%I') x, COUNT(*) c FROM b GROUP BY DATE_FORMAT(ts, '%Y-%m-%d %H:%i') ORDER BY x, c
+--source suite/moosedb/include/gbh_diff.inc
+--let $refused= 1
+--let $pre= SET sql_mode='';
+--let $q= SELECT DATE_FORMAT(ts, '%y-%m-%d') x, COUNT(*) c FROM b GROUP BY DATE_FORMAT(ts, '%Y-%m-%d') ORDER BY x, c
+--source suite/moosedb/include/gbh_diff.inc
+--let $refused= 1
+--let $pre= SET sql_mode='';
+--let $q= SELECT DATE_FORMAT(ts, '%Y-%m-%D') x, COUNT(*) c FROM b GROUP BY DATE_FORMAT(ts, '%Y-%m-%d') ORDER BY x, c
+--source suite/moosedb/include/gbh_diff.inc
+--let $refused= 1
+--let $pre= SET sql_mode='';
+--let $q= SELECT DATE_FORMAT(ts, '%Y-%M-%d') x, COUNT(*) c FROM b GROUP BY DATE_FORMAT(ts, '%Y-%m-%d') ORDER BY x, c
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= the same bucket asked as DATE(ts) in GROUP BY and CAST(ts AS DATE) in the select list
+--let $q= SELECT CAST(ts AS DATE) d, COUNT(*) c FROM b GROUP BY CAST(ts AS DATE) ORDER BY d
+--source suite/moosedb/include/gbh_diff.inc
+--let $either= 1
+--let $q= SELECT CAST(ts AS DATE) d, COUNT(*) c FROM b GROUP BY DATE(ts) ORDER BY d
+--source suite/moosedb/include/gbh_diff.inc
+
+--echo ##########################################################
+--echo # positions, character sets, collations, locale, old_mode, HAVING, top-N, prepared, DATETIME(3), threads
+--echo ##########################################################
+--let $label= GROUP BY by position
+--let $either= 1
+--let $q= SELECT DATE(ts) d, COUNT(*) c FROM b GROUP BY 1 ORDER BY 1
+--source suite/moosedb/include/gbh_diff.inc
+--let $either= 1
+--let $q= SELECT host, DATE_FORMAT(ts, '%Y-%m-%d %H') h, COUNT(*) c FROM b GROUP BY 1, 2 ORDER BY 1, 2
+--source suite/moosedb/include/gbh_diff.inc
+--let $either= 1
+--let $q= SELECT DATE_FORMAT(ts, '%Y-%m-%d %H') h, host, COUNT(*) c FROM b GROUP BY 2, 1 ORDER BY 2, 1
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= connection character set and collation
+--let $either= 1
+--let $pre= SET NAMES latin1;
+--let $q= SELECT DATE_FORMAT(ts, '%Y-%m-%d %H') h, COUNT(*) c FROM b GROUP BY h ORDER BY h
+--source suite/moosedb/include/gbh_diff.inc
+--let $either= 1
+--let $pre= SET NAMES utf8mb3;
+--let $q= SELECT DATE_FORMAT(ts, '%Y-%m-%d %H:%i') h, COUNT(*) c FROM b GROUP BY h ORDER BY h LIMIT 20
+--source suite/moosedb/include/gbh_diff.inc
+--let $either= 1
+--let $pre= SET NAMES binary;
+--let $q= SELECT DATE_FORMAT(ts, '%Y-%m-%d %H') h, COUNT(*) c FROM b GROUP BY h ORDER BY h
+--source suite/moosedb/include/gbh_diff.inc
+--let $either= 1
+--let $pre= SET NAMES utf8mb4 COLLATE utf8mb4_bin;
+--let $q= SELECT DATE_FORMAT(ts, '%Y-%m-%d %H') h, COUNT(*) c FROM b GROUP BY h ORDER BY h DESC
+--source suite/moosedb/include/gbh_diff.inc
+--let $either= 1
+--let $pre= SET lc_time_names = 'pt_BR';
+--let $q= SELECT DATE_FORMAT(ts, '%Y-%m-%d %H:%i') m, COUNT(*) c FROM b GROUP BY m ORDER BY m LIMIT 30
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= old_mode TIME_ROUND_FRACTIONAL with .999999 and .25 fractions
+--let $either= 1
+--let $pre= SET old_mode = 'TIME_ROUND_FRACTIONAL';
+--let $q= SELECT DATE(ts) d, COUNT(*) c FROM b GROUP BY d ORDER BY d
+--source suite/moosedb/include/gbh_diff.inc
+--let $either= 1
+--let $pre= SET old_mode = 'TIME_ROUND_FRACTIONAL';
+--let $q= SELECT DATE_FORMAT(ts, '%Y-%m-%d %H:%i:%s') x, COUNT(*) c FROM b GROUP BY x ORDER BY x
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= HAVING on the key, top-N with ties and by key
+--let $q= SELECT DATE(ts) d, COUNT(*) c FROM b GROUP BY d HAVING d > '2024-03-01' ORDER BY d
+--source suite/moosedb/include/gbh_diff.inc
+--let $q= SELECT DATE_FORMAT(ts, '%Y-%m-%d %H') h, COUNT(*) c FROM b GROUP BY h HAVING h = '1970-01-01 00'
+--source suite/moosedb/include/gbh_diff.inc
+--let $q= SELECT DATE(ts) d, COUNT(*) c FROM b GROUP BY d ORDER BY c DESC, d LIMIT 4
+--source suite/moosedb/include/gbh_diff.inc
+--let $q= SELECT DATE_FORMAT(ts, '%Y-%m-%d %H') h, COUNT(*) c FROM b GROUP BY h ORDER BY c DESC, h LIMIT 5
+--source suite/moosedb/include/gbh_diff.inc
+--let $q= SELECT DATE(ts) d, COUNT(*) c FROM b GROUP BY d ORDER BY d DESC LIMIT 3
+--source suite/moosedb/include/gbh_diff.inc
+--let $q= SELECT DATE_FORMAT(ts, '%Y-%m-%d %H:%i:%s') x, COUNT(*) c FROM b GROUP BY x ORDER BY c DESC, x DESC LIMIT 6
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= prepared statement with the format as a parameter
+--let $either= 1
+--let $q= SET @f = '%Y-%m-%d %H'; PREPARE st FROM 'SELECT DATE_FORMAT(ts, ?) x, COUNT(*) c FROM b GROUP BY x ORDER BY x'; EXECUTE st USING @f;
+--source suite/moosedb/include/gbh_diff.inc
+--let $either= 1
+--let $q= SET @f = '%Y-%m'; PREPARE st FROM 'SELECT DATE_FORMAT(ts, ?) x, COUNT(*) c FROM b GROUP BY x ORDER BY x'; EXECUTE st USING @f;
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= DATETIME(3), and MIN/MAX of the axis, COUNT(col), SUM with a bucket
+CREATE TABLE s3 (
+  ts DATETIME(3) NOT NULL,
+  host VARCHAR(16) NOT NULL COMMENT 'TAG',
+  v BIGINT NOT NULL,
+  INDEX(ts)
+) ENGINE=MooseDB CHUNK_INTERVAL='1 DAY';
+INSERT INTO s3 SELECT '2024-03-01 23:59:00.001' + INTERVAL seq * 997000 MICROSECOND, CONCAT('h', seq MOD 2), seq FROM seq_0_to_1999;
+CREATE TABLE mirror.s3 LIKE test.s3;
+ALTER TABLE mirror.s3 ENGINE=InnoDB;
+INSERT INTO mirror.s3 SELECT * FROM test.s3;
+--let $q= SELECT DATE_FORMAT(ts, '%Y-%m-%d %H:%i:%s') x, COUNT(*) c, MIN(ts) a, MAX(ts) z FROM s3 GROUP BY x ORDER BY x
+--source suite/moosedb/include/gbh_diff.inc
+--let $q= SELECT DATE(ts) d, COUNT(*) c, MIN(ts) a, MAX(ts) z FROM s3 GROUP BY d ORDER BY d
+--source suite/moosedb/include/gbh_diff.inc
+--let $q= SELECT DATE_FORMAT(ts, '%Y-%m-%d %H:%i') m, COUNT(t2) n, COUNT(*) c, MIN(ts) a, MAX(ts) z, SUM(v) s FROM b GROUP BY m ORDER BY m
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= moosedb_agg_threads = 1 and 4
+--let $thr= `SELECT @@global.moosedb_agg_threads`
+SET GLOBAL moosedb_agg_threads = 1;
+--let $q= SELECT DATE_FORMAT(ts, '%Y-%m-%d %H:%i') m, COUNT(*) c, SUM(v) s FROM b GROUP BY m ORDER BY m
+--source suite/moosedb/include/gbh_diff.inc
+SET GLOBAL moosedb_agg_threads = 4;
+--let $q= SELECT DATE_FORMAT(ts, '%Y-%m-%d %H:%i') m, COUNT(*) c, SUM(v) s FROM b GROUP BY m ORDER BY m
+--source suite/moosedb/include/gbh_diff.inc
+--let $q= SELECT host, DATE(ts) d, COUNT(*) c FROM b GROUP BY host, d ORDER BY host, d
+--source suite/moosedb/include/gbh_diff.inc
+--disable_query_log
+eval SET GLOBAL moosedb_agg_threads = $thr;
+--enable_query_log
+
+DROP DATABASE mirror;
+DROP TABLE b, s, s3;

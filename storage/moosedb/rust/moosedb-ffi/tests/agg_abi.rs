@@ -118,9 +118,9 @@ fn mask_filter(col: u32, mask: *const u8, mask_len: u64) -> TFAggFilter {
     }
 }
 
-const SERIES: TFAggKey = TFAggKey { kind: TF_AGG_KEY_SERIES, col: 0 };
+const SERIES: TFAggKey = TFAggKey { kind: TF_AGG_KEY_SERIES, col: 0, width_us: 0 };
 const fn column(col: u32) -> TFAggKey {
-    TFAggKey { kind: TF_AGG_KEY_COLUMN, col }
+    TFAggKey { kind: TF_AGG_KEY_COLUMN, col, width_us: 0 }
 }
 const fn func(op: u8, col: u32) -> TFAggFunc {
     TFAggFunc { op, col }
@@ -309,7 +309,7 @@ fn aggregation_lifecycle_results_dictionaries_and_errors_through_c_abi() {
     let star = [func(TF_AGG_COUNT_STAR, 0)];
     assert_eq!(bad(&[column(1)], &star, &[], 1 << 20), TFStatus::TF_ERR_INVALID_ARG, "TAG column key");
     assert_eq!(bad(&[column(77)], &star, &[], 1 << 20), TFStatus::TF_ERR_INVALID_ARG);
-    assert_eq!(bad(&[TFAggKey { kind: 9, col: 0 }], &star, &[], 1 << 20), TFStatus::TF_ERR_INVALID_ARG);
+    assert_eq!(bad(&[TFAggKey { kind: 9, col: 0, width_us: 0 }], &star, &[], 1 << 20), TFStatus::TF_ERR_INVALID_ARG);
     assert_eq!(bad(&[], &[func(42, 0)], &[], 1 << 20), TFStatus::TF_ERR_INVALID_ARG);
     assert_eq!(bad(&[], &[func(TF_AGG_SUM, 4)], &[], 1 << 20), TFStatus::TF_ERR_INVALID_ARG, "SUM of a double");
     let short = [mask_filter(3, mask.as_ptr(), 2)];

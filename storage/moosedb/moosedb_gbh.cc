@@ -26,6 +26,7 @@
 
 #define MYSQL_SERVER 1
 
+#include <type_traits>
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
@@ -128,6 +129,9 @@ bool is_constant(const Item *item)
 
 /* ── The plan ─────────────────────────────────────────────────────────── */
 
+/* The time-bucket expressions of a GROUP BY key: the value is the bucket start, the text/date it shows is made from it. */
+enum class bfmt : uint8_t { NONE, DATE, DAY, HOUR, MIN, SEC };
+
 struct gkey
 {
   Field *field= nullptr;
@@ -139,7 +143,13 @@ struct gkey
   bool is_unsigned= false;
   bool pad= false;                 /* non-TAG string, binary PAD SPACE: the core trims and groups it */
   int res= -1;                     /* key index in the core's result        */
+  bfmt bucket= bfmt::NONE;          /* a time bucket of the DATETIME column `field` (DATE() / DATE_FORMAT()) */
+  int64_t width= 0;                /* bucket: width in microseconds         */
+  Item *expr= nullptr;             /* bucket: the expression, to match select-list items */
 };
+
+static_assert(std::is_base_of<Item_result_field, Item_field>::value, "Item_field must be an Item_result_field");
+static_assert(std::is_base_of<Item_result_field, Item_func>::value, "Item_func must be an Item_result_field");
 
 enum class aggk : uint8_t { COUNT_STAR, COUNT, SUM, AVG, MIN, MAX };
 
@@ -158,7 +168,7 @@ struct gitem
 {
   ikind k= ikind::CONST;
   int idx= -1;
-  Item_field *field_item= nullptr;   /* KEY: the item whose result_field is its tmp field */
+  Item_result_field *field_item= nullptr;   /* KEY: the item whose result_field is its tmp field */
 };
 
 struct gorder
@@ -217,7 +227,15 @@ struct gplan
   int key_of(const Field *f) const
   {
     for (size_t i= 0; i < keys.size(); i++)
-      if (keys[i].field == f)
+      if (keys[i].field == f && keys[i].bucket == bfmt::NONE)
+        return (int) i;
+    return -1;
+  }
+  /* The bucket key with the same column, kind and width as `b` (not Item::eq: it ignores the case of the format), or -1. */
+  int key_of_bucket(const gkey &b) const
+  {
+    for (size_t i= 0; i < keys.size(); i++)
+      if (keys[i].bucket == b.bucket && keys[i].field == b.field && keys[i].width == b.width)
         return (int) i;
     return -1;
   }
@@ -246,12 +264,86 @@ struct gplan
   }
 };
 
+/*
+  GROUP BY DATE(ts) / DATE_FORMAT(ts, F) on a DATETIME column (no time zone, so the
+  stored microseconds ARE the civil time), F one of the fixed formats below: the
+  bucket is [floor(ts/width)*width, +width) from the epoch, and the value the
+  server would compute is a function of the bucket start only. TIMESTAMP columns
+  (session time zone), other formats (%b, %a, locale argument...), UNIX_TIMESTAMP,
+  HOUR(ts), arithmetic on ts: left to the server.
+*/
+bool bucket_key_of(gplan *p, Item *item, gkey *k)
+{
+  Item *real= item ? item->real_item() : nullptr;
+  if (!real || real->type() != Item::FUNC_ITEM || !p->handler)
+    return false;
+  Item_func *fn= static_cast<Item_func *>(real);
+  if (fn->argument_count() < 1)
+    return false;
+  Item **a= fn->arguments();
+  if (!a || !a[0])
+    return false;
+  bfmt b= bfmt::NONE;
+  int64_t w= 0;
+  if (fn->functype() == Item_func::DATE_FUNC && fn->argument_count() == 1 &&
+      !strcmp(fn->func_name_cstring().str, "cast_as_date"))
+  {
+    b= bfmt::DATE;
+    w= 86400LL * MICROS_PER_SEC_G;
+  }
+  else if (fn->argument_count() == 2 && a[1] && is_constant(a[1]) && !a[1]->is_expensive() && a[1]->cmp_type() == STRING_RESULT &&
+           !strcmp(fn->func_name_cstring().str, "date_format") &&
+           a[1]->collation.collation->mbminlen == 1)
+  {
+    String buf;
+    String *fs= a[1]->val_str(&buf);
+    if (!fs)
+      return false;
+    static const struct { const char *s; bfmt b; int64_t w; } fmts[]= {
+      {"%Y-%m-%d", bfmt::DAY, 86400LL * MICROS_PER_SEC_G},
+      {"%Y-%m-%d %H", bfmt::HOUR, 3600LL * MICROS_PER_SEC_G},
+      {"%Y-%m-%d %H:%i", bfmt::MIN, 60LL * MICROS_PER_SEC_G},
+      {"%Y-%m-%d %H:%i:%s", bfmt::SEC, MICROS_PER_SEC_G}};
+    for (const auto &f : fmts)
+      if (fs->length() == strlen(f.s) && !memcmp(fs->ptr(), f.s, fs->length()))
+      {
+        b= f.b;
+        w= f.w;
+      }
+  }
+  if (b == bfmt::NONE)
+    return false;
+  Field *f= column_of(a[0], p->table);
+  tf_conv c;
+  if (!f || f->type() != MYSQL_TYPE_DATETIME || !p->handler->moosedb_column_conv(f, &c) ||
+      c != tf_conv::DATETIME)
+    return false;
+  k->field= f;
+  k->bucket= b;
+  k->width= w;
+  k->expr= real;
+  return true;
+}
+
 const char *group_by_refusal(gplan *p, ORDER *group_by)
 {
   for (ORDER *o= group_by; o; o= o->next)
   {
     if (!o->item)
       return "GROUP BY: not a column";
+    {
+      gkey bk;
+      if (bucket_key_of(p, *o->item, &bk))
+      {
+        const int lc= p->layout_col(bk.field);
+        if (lc < 0)
+          return "GROUP BY: unsupported column type";
+        bk.col= (uint32_t) lc;
+        if (p->key_of_bucket(bk) < 0)
+          p->keys.push_back(bk);
+        continue;
+      }
+    }
     Field *f= column_of(*o->item, p->table);
     if (!f)
       return "GROUP BY: not a column";
@@ -434,9 +526,22 @@ const char *item_refusal(gplan *p, Item *item, const char *expr_reason,
       return "column not in GROUP BY";
     out->k= ikind::KEY;
     out->idx= k;
-    out->field_item= static_cast<Item_field *>(real);
+    out->field_item= static_cast<Item_result_field *>(real);
     return nullptr;
   }
+  case Item::FUNC_ITEM:
+  {
+    gkey probe;
+    const int k= bucket_key_of(p, real, &probe) ? p->key_of_bucket(probe) : -1;
+    if (k >= 0)
+    {
+      out->k= ikind::KEY;
+      out->idx= k;
+      out->field_item= static_cast<Item_result_field *>(real);
+      return nullptr;
+    }
+  }
+  [[fallthrough]];
   default:
     if (!is_constant(real))
       return expr_reason;
@@ -1239,10 +1344,10 @@ int moosedb_gbh::compute()
 
   std::vector<TFAggKey> keys;
   if (p_.has_series)
-    keys.push_back(TFAggKey{TF_AGG_KEY_SERIES, 0});
+    keys.push_back(TFAggKey{TF_AGG_KEY_SERIES, 0, 0});
   for (const gkey &k : p_.keys)
     if (!k.is_tag)
-      keys.push_back(TFAggKey{(uint8_t) (k.pad ? TF_AGG_KEY_COLUMN_PAD : TF_AGG_KEY_COLUMN), k.col});
+      keys.push_back(TFAggKey{(uint8_t) (k.bucket != bfmt::NONE ? TF_AGG_KEY_BUCKET : k.pad ? TF_AGG_KEY_COLUMN_PAD : TF_AGG_KEY_COLUMN), k.col, (int64_t) k.width});
 
   /*
     The series ids of a TAG filter and the aggregation snapshot are two calls:
@@ -1506,7 +1611,7 @@ int moosedb_gbh::build_mask(const gfilter &f, std::vector<uint8_t> *mask,
   if (!src || !src->record[0] || !src->s || !fld || !agg_ || !mask || !values ||
       f.conds.empty())
     return fail("internal: filter without a column");
-  TFAggKey key{TF_AGG_KEY_COLUMN, f.col};
+  TFAggKey key{TF_AGG_KEY_COLUMN, f.col, 0};
   TFAggSpec spec{};
   spec.keys= &key;
   spec.key_count= 1;
@@ -2088,6 +2193,33 @@ int moosedb_gbh::store_agg(Field *f, const gagg &a, uint32_t g)
   return 0;
 }
 
+/* The value of a time-bucket expression for the bucket starting at `us`. */
+int store_bucket(Field *f, bfmt b, longlong us)
+{
+  MYSQL_TIME lt;
+  moosedb_micros_to_time(us, &lt);
+  if (b == bfmt::DATE)
+  {
+    lt.hour= lt.minute= lt.second= 0;
+    lt.second_part= 0;
+    lt.time_type= MYSQL_TIMESTAMP_DATE;
+    return f->store_time_dec(&lt, 0) > 0;
+  }
+  char buf[32];
+  int n= 0;
+  const unsigned y= lt.year, mo= lt.month, d= lt.day, h= lt.hour, mi= lt.minute, s= lt.second;
+  switch (b)
+  {
+  case bfmt::DAY:  n= snprintf(buf, sizeof(buf), "%04u-%02u-%02u", y, mo, d); break;
+  case bfmt::HOUR: n= snprintf(buf, sizeof(buf), "%04u-%02u-%02u %02u", y, mo, d, h); break;
+  case bfmt::MIN:  n= snprintf(buf, sizeof(buf), "%04u-%02u-%02u %02u:%02u", y, mo, d, h, mi); break;
+  default:         n= snprintf(buf, sizeof(buf), "%04u-%02u-%02u %02u:%02u:%02u", y, mo, d, h, mi, s); break;
+  }
+  if (n <= 0 || (size_t) n >= sizeof(buf))
+    return 1;
+  return f->store(buf, (uint) n, &my_charset_latin1) > 0;
+}
+
 int moosedb_gbh::store_row(uint32_t g)
 {
   if (table->s->null_bytes && table->s->default_values)
@@ -2109,7 +2241,12 @@ int moosedb_gbh::store_row(uint32_t g)
       else
       {
         f->set_notnull();
-        if (k.is_str)
+        if (k.bucket != bfmt::NONE)
+        {
+          if (store_bucket(f, k.bucket, c.v))
+            r= fail("a time bucket does not fit its result column");
+        }
+        else if (k.is_str)
           f->store(kptr(c), c.len, k.cs);
         else
           f->store((longlong) c.v, k.is_unsigned);

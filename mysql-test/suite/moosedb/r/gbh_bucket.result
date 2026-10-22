@@ -1,0 +1,268 @@
+CREATE TABLE b (
+ts   DATETIME(6) NOT NULL,
+host VARCHAR(16) NOT NULL COMMENT 'TAG',
+v    BIGINT NOT NULL,
+t2   DATETIME NULL,
+tm   TIMESTAMP NULL DEFAULT NULL,
+INDEX(ts)
+) ENGINE=MooseDB CHUNK_INTERVAL='1 DAY';
+# 12000 rows over 1969-12-30 .. 1970-01-02, 12000 more from 2024-02-29, in chunks; the edges go to the MemTable
+INSERT INTO b SELECT '1969-12-30 00:00:00' + INTERVAL seq * 17 SECOND + INTERVAL (seq MOD 7) * 100000 MICROSECOND,
+CONCAT('h', seq MOD 3), seq MOD 100,
+IF(seq MOD 5 = 0, NULL, '1999-12-31 23:00:00' + INTERVAL seq * 31 SECOND),
+'2020-06-01 00:00:00' + INTERVAL seq SECOND
+FROM seq_0_to_11999;
+INSERT INTO b SELECT '2024-02-29 00:00:00' + INTERVAL seq * 11 SECOND + INTERVAL (seq MOD 5) * 250000 MICROSECOND,
+CONCAT('h', seq MOD 3), seq MOD 100,
+IF(seq MOD 5 = 0, NULL, '2024-02-29 23:00:00' + INTERVAL seq * 29 SECOND),
+'2024-02-29 00:00:00' + INTERVAL seq SECOND
+FROM seq_0_to_11999;
+FLUSH TABLES b;
+# exactly on, just before and just after the bucket boundaries; the first and the last DATETIME
+INSERT INTO b VALUES
+('1000-01-01 00:00:00', 'e', 1, '1000-01-01 00:00:00', NULL),
+('1969-12-31 23:59:59.999999', 'e', 2, '1969-12-31 23:59:59', NULL),
+('1970-01-01 00:00:00', 'e', 3, '1970-01-01 00:00:00', NULL),
+('1970-01-01 00:00:00.000001', 'e', 4, NULL, NULL),
+('1969-12-31 23:59:00', 'e', 5, '1969-12-31 23:59:00', NULL),
+('1969-12-31 23:00:00', 'e', 6, '1969-12-31 23:00:00', NULL),
+('1969-12-31 22:59:59.999999', 'e', 7, '1969-12-31 22:59:59', NULL),
+('2024-02-29 23:59:59.999999', 'e', 8, '2024-02-29 23:59:59', NULL),
+('2024-03-01 00:00:00', 'e', 9, '2024-03-01 00:00:00', NULL),
+('2024-03-01 00:00:59.999999', 'e', 10, NULL, NULL),
+('2024-03-01 00:01:00', 'e', 11, '2024-03-01 00:01:00', NULL),
+('2024-03-01 00:59:59.999999', 'e', 12, '2024-03-01 00:59:59', NULL),
+('2024-03-01 01:00:00', 'e', 13, '2024-03-01 01:00:00', NULL),
+('2024-03-01 01:00:00.000001', 'e', 14, '2024-03-01 01:00:00', NULL),
+('9999-12-31 23:59:59.999999', 'e', 15, '9999-12-31 23:59:59', NULL),
+('9999-12-31 00:00:00', 'e', 16, '9999-12-31 00:00:00', NULL);
+CREATE TABLE s (
+ts DATETIME NOT NULL,
+host VARCHAR(16) NOT NULL COMMENT 'TAG',
+v BIGINT NOT NULL,
+INDEX(ts)
+) ENGINE=MooseDB CHUNK_INTERVAL='1 DAY';
+INSERT INTO s SELECT '2024-03-01 23:58:00' + INTERVAL seq * 13 SECOND, CONCAT('h', seq MOD 2), seq FROM seq_0_to_999;
+CREATE DATABASE mirror;
+CREATE TABLE mirror.b LIKE test.b;
+ALTER TABLE mirror.b ENGINE=InnoDB;
+INSERT INTO mirror.b SELECT * FROM test.b;
+CREATE TABLE mirror.s LIKE test.s;
+ALTER TABLE mirror.s ENGINE=InnoDB;
+INSERT INTO mirror.s SELECT * FROM test.s;
+##########################################################
+# accepted forms (the engine must run them with pushdown ON)
+##########################################################
+# DATE(ts), before and after 1970
+# SELECT DATE(ts) d, COUNT(*) c, SUM(v) s FROM b GROUP BY d ORDER BY d
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# DATE_FORMAT per day, hour, minute, second
+# SELECT DATE_FORMAT(ts, '%Y-%m-%d') d, COUNT(*) c, SUM(v) s FROM b GROUP BY d ORDER BY d
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# DATE_FORMAT per day, hour, minute, second
+# SELECT DATE_FORMAT(ts, '%Y-%m-%d %H') h, COUNT(*) c, MIN(v) a, MAX(v) z FROM b GROUP BY h ORDER BY h
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# DATE_FORMAT per day, hour, minute, second
+# SELECT DATE_FORMAT(ts, '%Y-%m-%d %H:%i') m, COUNT(*) c, SUM(v) s FROM b GROUP BY m ORDER BY m
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# DATE_FORMAT per day, hour, minute, second
+# SELECT DATE_FORMAT(ts, '%Y-%m-%d %H:%i:%s') x, COUNT(*) c, SUM(v) s FROM b GROUP BY x ORDER BY x
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# GROUP BY the expression (not the alias), ORDER BY the expression, DESC, key not in the select list
+# SELECT DATE_FORMAT(ts, '%Y-%m-%d %H') h, COUNT(*) c FROM b GROUP BY DATE_FORMAT(ts, '%Y-%m-%d %H') ORDER BY DATE_FORMAT(ts, '%Y-%m-%d %H') DESC
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# GROUP BY the expression (not the alias), ORDER BY the expression, DESC, key not in the select list
+# SELECT COUNT(*) c, SUM(v) s FROM b GROUP BY DATE(ts) ORDER BY c, s
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# TAG + bucket, and two buckets in one GROUP BY
+# SELECT host, DATE_FORMAT(ts, '%Y-%m-%d %H') h, COUNT(*) c, SUM(v) s FROM b GROUP BY host, h ORDER BY host, h
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# TAG + bucket, and two buckets in one GROUP BY
+# SELECT DATE(ts) d, DATE_FORMAT(ts, '%Y-%m-%d %H') h, COUNT(*) c FROM b GROUP BY d, h ORDER BY d, h
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# HAVING, ORDER BY aggregate, LIMIT, OFFSET stay on the server
+# SELECT DATE_FORMAT(ts, '%Y-%m-%d %H:%i') m, COUNT(*) c FROM b GROUP BY m HAVING c > 3 ORDER BY m LIMIT 7 OFFSET 2
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# HAVING, ORDER BY aggregate, LIMIT, OFFSET stay on the server
+# SELECT DATE(ts) d, COUNT(*) c FROM b GROUP BY d ORDER BY c DESC, d LIMIT 3
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# HAVING, ORDER BY aggregate, LIMIT, OFFSET stay on the server
+# SELECT DATE_FORMAT(ts, '%Y-%m-%d %H') h, SUM(v) s FROM b GROUP BY h HAVING s > 100 ORDER BY s, h LIMIT 5
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# WHERE on the time axis cutting buckets, on a TAG, and on a plain column
+# SELECT DATE_FORMAT(ts, '%Y-%m-%d %H:%i') m, COUNT(*) c, MIN(ts) a, MAX(ts) z FROM b WHERE ts >= '2024-03-01 00:00:59.999999' AND ts < '2024-03-01 01:00:00.000001' GROUP BY m ORDER BY m
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# WHERE on the time axis cutting buckets, on a TAG, and on a plain column
+# SELECT DATE(ts) d, COUNT(*) c FROM b WHERE host IN ('h1', 'e') AND v >= 50 GROUP BY d ORDER BY d
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# WHERE on the time axis cutting buckets, on a TAG, and on a plain column
+# SELECT DATE(ts) d, COUNT(*) c FROM b WHERE ts < '1970-01-01' GROUP BY d ORDER BY d
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# a DATETIME(0) axis, and a session time zone (DATETIME has none)
+# SELECT DATE_FORMAT(ts, '%Y-%m-%d %H:%i') m, COUNT(*) c, SUM(v) s FROM s GROUP BY m ORDER BY m
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# a DATETIME(0) axis, and a session time zone (DATETIME has none)
+# SELECT DATE(ts) d, COUNT(*) c FROM s GROUP BY d ORDER BY d
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# a nullable DATETIME column (NULL is its own group)
+# SELECT DATE(t2) d, COUNT(*) c, SUM(v) s FROM b GROUP BY d ORDER BY d
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# a nullable DATETIME column (NULL is its own group)
+# SELECT DATE_FORMAT(t2, '%Y-%m-%d %H:%i') m, COUNT(*) c FROM b GROUP BY m ORDER BY m
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# a nullable DATETIME column (NULL is its own group)
+# SELECT host, DATE_FORMAT(t2, '%Y-%m-%d %H') h, COUNT(*) c FROM b GROUP BY host, h ORDER BY host, h
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+##########################################################
+# refused forms (the server does them)
+##########################################################
+# TIMESTAMP column (depends on time_zone)
+# SELECT DATE(tm) d, COUNT(*) c FROM b GROUP BY d ORDER BY d
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# TIMESTAMP column (depends on time_zone)
+# SELECT DATE_FORMAT(tm, '%Y-%m-%d %H') h, COUNT(*) c FROM b GROUP BY h ORDER BY h
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# formats other than the four fixed ones, a locale argument, TIME_FORMAT
+# SELECT DATE_FORMAT(ts, '%Y-%m') m, COUNT(*) c FROM b GROUP BY m ORDER BY m
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# formats other than the four fixed ones, a locale argument, TIME_FORMAT
+# SELECT DATE_FORMAT(ts, '%H') h, COUNT(*) c FROM b GROUP BY h ORDER BY h
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# formats other than the four fixed ones, a locale argument, TIME_FORMAT
+# SELECT DATE_FORMAT(ts, '%Y-%m-%d %H:%i:%S') x, COUNT(*) c FROM b GROUP BY x ORDER BY x
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# formats other than the four fixed ones, a locale argument, TIME_FORMAT
+# SELECT DATE_FORMAT(ts, '%Y-%m-%d %H:%i', 'pt_BR') x, COUNT(*) c FROM b GROUP BY x ORDER BY x
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# formats other than the four fixed ones, a locale argument, TIME_FORMAT
+# SELECT TIME_FORMAT(ts, '%H:%i') x, COUNT(*) c FROM b GROUP BY x ORDER BY x
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# other functions of the time column (time zone, modulus, arithmetic)
+# SELECT FLOOR(UNIX_TIMESTAMP(ts) / 60) m, COUNT(*) c FROM b GROUP BY m ORDER BY m
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# other functions of the time column (time zone, modulus, arithmetic)
+# SELECT HOUR(ts) h, COUNT(*) c FROM b GROUP BY h ORDER BY h
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# other functions of the time column (time zone, modulus, arithmetic)
+# SELECT ts - INTERVAL SECOND(ts) SECOND m, COUNT(*) c FROM s GROUP BY m ORDER BY m
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# other functions of the time column (time zone, modulus, arithmetic)
+# SELECT DATE(ts + INTERVAL 1 HOUR) d, COUNT(*) c FROM b GROUP BY d ORDER BY d
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# the select list uses the key in another expression
+# SELECT DATE(ts) + 0 d, COUNT(*) c FROM b GROUP BY DATE(ts) ORDER BY d
+# same output with and without pushdown and on InnoDB; the engine did not run it
+##########################################################
+# a select-list format that differs from the GROUP BY one only by case (sql_mode='' lets the
+# server run it; each select format is a function of the grouped bucket): never the same key
+##########################################################
+# %h/%H, %I/%i, %y/%Y, %D/%d, %M/%m
+# SELECT DATE_FORMAT(ts, '%Y-%m-%d %h') x, COUNT(*) c FROM b GROUP BY DATE_FORMAT(ts, '%Y-%m-%d %H') ORDER BY x, c
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# %h/%H, %I/%i, %y/%Y, %D/%d, %M/%m
+# SELECT DATE_FORMAT(ts, '%Y-%m-%d %H:%I') x, COUNT(*) c FROM b GROUP BY DATE_FORMAT(ts, '%Y-%m-%d %H:%i') ORDER BY x, c
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# %h/%H, %I/%i, %y/%Y, %D/%d, %M/%m
+# SELECT DATE_FORMAT(ts, '%y-%m-%d') x, COUNT(*) c FROM b GROUP BY DATE_FORMAT(ts, '%Y-%m-%d') ORDER BY x, c
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# %h/%H, %I/%i, %y/%Y, %D/%d, %M/%m
+# SELECT DATE_FORMAT(ts, '%Y-%m-%D') x, COUNT(*) c FROM b GROUP BY DATE_FORMAT(ts, '%Y-%m-%d') ORDER BY x, c
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# %h/%H, %I/%i, %y/%Y, %D/%d, %M/%m
+# SELECT DATE_FORMAT(ts, '%Y-%M-%d') x, COUNT(*) c FROM b GROUP BY DATE_FORMAT(ts, '%Y-%m-%d') ORDER BY x, c
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# the same bucket asked as DATE(ts) in GROUP BY and CAST(ts AS DATE) in the select list
+# SELECT CAST(ts AS DATE) d, COUNT(*) c FROM b GROUP BY CAST(ts AS DATE) ORDER BY d
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# the same bucket asked as DATE(ts) in GROUP BY and CAST(ts AS DATE) in the select list
+# SELECT CAST(ts AS DATE) d, COUNT(*) c FROM b GROUP BY DATE(ts) ORDER BY d
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+##########################################################
+# positions, character sets, collations, locale, old_mode, HAVING, top-N, prepared, DATETIME(3), threads
+##########################################################
+# GROUP BY by position
+# SELECT DATE(ts) d, COUNT(*) c FROM b GROUP BY 1 ORDER BY 1
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# GROUP BY by position
+# SELECT host, DATE_FORMAT(ts, '%Y-%m-%d %H') h, COUNT(*) c FROM b GROUP BY 1, 2 ORDER BY 1, 2
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# GROUP BY by position
+# SELECT DATE_FORMAT(ts, '%Y-%m-%d %H') h, host, COUNT(*) c FROM b GROUP BY 2, 1 ORDER BY 2, 1
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# connection character set and collation
+# SELECT DATE_FORMAT(ts, '%Y-%m-%d %H') h, COUNT(*) c FROM b GROUP BY h ORDER BY h
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# connection character set and collation
+# SELECT DATE_FORMAT(ts, '%Y-%m-%d %H:%i') h, COUNT(*) c FROM b GROUP BY h ORDER BY h LIMIT 20
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# connection character set and collation
+# SELECT DATE_FORMAT(ts, '%Y-%m-%d %H') h, COUNT(*) c FROM b GROUP BY h ORDER BY h
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# connection character set and collation
+# SELECT DATE_FORMAT(ts, '%Y-%m-%d %H') h, COUNT(*) c FROM b GROUP BY h ORDER BY h DESC
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# connection character set and collation
+# SELECT DATE_FORMAT(ts, '%Y-%m-%d %H:%i') m, COUNT(*) c FROM b GROUP BY m ORDER BY m LIMIT 30
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# old_mode TIME_ROUND_FRACTIONAL with .999999 and .25 fractions
+# SELECT DATE(ts) d, COUNT(*) c FROM b GROUP BY d ORDER BY d
+# same output with and without pushdown and on InnoDB; the server answered by itself (the engine did not run it)
+# old_mode TIME_ROUND_FRACTIONAL with .999999 and .25 fractions
+# SELECT DATE_FORMAT(ts, '%Y-%m-%d %H:%i:%s') x, COUNT(*) c FROM b GROUP BY x ORDER BY x
+# same output with and without pushdown and on InnoDB; the server answered by itself (the engine did not run it)
+# HAVING on the key, top-N with ties and by key
+# SELECT DATE(ts) d, COUNT(*) c FROM b GROUP BY d HAVING d > '2024-03-01' ORDER BY d
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# HAVING on the key, top-N with ties and by key
+# SELECT DATE_FORMAT(ts, '%Y-%m-%d %H') h, COUNT(*) c FROM b GROUP BY h HAVING h = '1970-01-01 00'
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# HAVING on the key, top-N with ties and by key
+# SELECT DATE(ts) d, COUNT(*) c FROM b GROUP BY d ORDER BY c DESC, d LIMIT 4
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# HAVING on the key, top-N with ties and by key
+# SELECT DATE_FORMAT(ts, '%Y-%m-%d %H') h, COUNT(*) c FROM b GROUP BY h ORDER BY c DESC, h LIMIT 5
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# HAVING on the key, top-N with ties and by key
+# SELECT DATE(ts) d, COUNT(*) c FROM b GROUP BY d ORDER BY d DESC LIMIT 3
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# HAVING on the key, top-N with ties and by key
+# SELECT DATE_FORMAT(ts, '%Y-%m-%d %H:%i:%s') x, COUNT(*) c FROM b GROUP BY x ORDER BY c DESC, x DESC LIMIT 6
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# prepared statement with the format as a parameter
+# SET @f = '%Y-%m-%d %H'; PREPARE st FROM 'SELECT DATE_FORMAT(ts, ?) x, COUNT(*) c FROM b GROUP BY x ORDER BY x'; EXECUTE st USING @f;
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# prepared statement with the format as a parameter
+# SET @f = '%Y-%m'; PREPARE st FROM 'SELECT DATE_FORMAT(ts, ?) x, COUNT(*) c FROM b GROUP BY x ORDER BY x'; EXECUTE st USING @f;
+# same output with and without pushdown and on InnoDB; the server answered by itself (the engine did not run it)
+CREATE TABLE s3 (
+ts DATETIME(3) NOT NULL,
+host VARCHAR(16) NOT NULL COMMENT 'TAG',
+v BIGINT NOT NULL,
+INDEX(ts)
+) ENGINE=MooseDB CHUNK_INTERVAL='1 DAY';
+INSERT INTO s3 SELECT '2024-03-01 23:59:00.001' + INTERVAL seq * 997000 MICROSECOND, CONCAT('h', seq MOD 2), seq FROM seq_0_to_1999;
+CREATE TABLE mirror.s3 LIKE test.s3;
+ALTER TABLE mirror.s3 ENGINE=InnoDB;
+INSERT INTO mirror.s3 SELECT * FROM test.s3;
+# DATETIME(3), and MIN/MAX of the axis, COUNT(col), SUM with a bucket
+# SELECT DATE_FORMAT(ts, '%Y-%m-%d %H:%i:%s') x, COUNT(*) c, MIN(ts) a, MAX(ts) z FROM s3 GROUP BY x ORDER BY x
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# DATETIME(3), and MIN/MAX of the axis, COUNT(col), SUM with a bucket
+# SELECT DATE(ts) d, COUNT(*) c, MIN(ts) a, MAX(ts) z FROM s3 GROUP BY d ORDER BY d
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# DATETIME(3), and MIN/MAX of the axis, COUNT(col), SUM with a bucket
+# SELECT DATE_FORMAT(ts, '%Y-%m-%d %H:%i') m, COUNT(t2) n, COUNT(*) c, MIN(ts) a, MAX(ts) z, SUM(v) s FROM b GROUP BY m ORDER BY m
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+SET GLOBAL moosedb_agg_threads = 1;
+# moosedb_agg_threads = 1 and 4
+# SELECT DATE_FORMAT(ts, '%Y-%m-%d %H:%i') m, COUNT(*) c, SUM(v) s FROM b GROUP BY m ORDER BY m
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+SET GLOBAL moosedb_agg_threads = 4;
+# moosedb_agg_threads = 1 and 4
+# SELECT DATE_FORMAT(ts, '%Y-%m-%d %H:%i') m, COUNT(*) c, SUM(v) s FROM b GROUP BY m ORDER BY m
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# moosedb_agg_threads = 1 and 4
+# SELECT host, DATE(ts) d, COUNT(*) c FROM b GROUP BY host, d ORDER BY host, d
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+DROP DATABASE mirror;
+DROP TABLE b, s, s3;

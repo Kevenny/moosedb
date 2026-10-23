@@ -5,7 +5,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use moosedb_core::fuzz_api::{seed_schema, seeds};
+use moosedb_core::fuzz_api::{chunk_has_zones, install_fuzz_key, seed_schema, seeds, unseal_chunk_index};
 use moosedb_core::{RawOptions, Table, TableConfig, Value};
 
 fn put(root: &Path, target: &str, name: &str, bytes: &[u8]) {
@@ -37,10 +37,11 @@ fn main() {
     for (target, name, bytes) in seeds() {
         put(&root, target, &name, &bytes);
     }
-    for (label, compression) in [("none", "NONE"), ("lz4", "LZ4"), ("zstd", "ZSTD")] {
+    install_fuzz_key();
+    for (label, compression, key) in [("none", "NONE", None), ("lz4", "LZ4", None), ("zstd", "ZSTD", None), ("encnone", "NONE", Some(5)), ("enczstd", "ZSTD", Some(5))] {
         let tmp = std::env::temp_dir().join(format!("moosedb-seeds-{}-{label}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
-        let opts = RawOptions { compression: Some(compression), ..Default::default() };
+        let opts = RawOptions { compression: Some(compression), encryption_key_id: key, ..Default::default() };
         let cfg = TableConfig::new(&tmp, seed_schema(), &opts).unwrap();
         Table::create(&cfg).unwrap();
         {
@@ -54,7 +55,15 @@ fn main() {
             }
             t.sync_wal(true).unwrap();
             for p in files(t.dir(), ".tfl") {
+                assert!(chunk_has_zones(&fs::read(&p).unwrap()), "seed chunk without ZONES section");
+            }
+            for p in files(t.dir(), ".tfl") {
                 put(&root, "chunk_file", &format!("{label}_{}", p.file_name().unwrap().to_string_lossy()), &fs::read(p).unwrap());
+            }
+            for p in files(t.dir(), ".tfl") {
+                if let Some(u) = unseal_chunk_index(&fs::read(&p).unwrap()) {
+                    put(&root, "chunk_file", &format!("{label}_enc_{}", p.file_name().unwrap().to_string_lossy()), &u);
+                }
             }
             for p in files(t.dir(), ".wal") {
                 put(&root, "wal_segment", &format!("{label}_{}", p.file_name().unwrap().to_string_lossy()), &fs::read(&p).unwrap());

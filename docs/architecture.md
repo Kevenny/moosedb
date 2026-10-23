@@ -293,8 +293,9 @@ não afeta o build do plugin nem o clippy). O core expõe, só com a feature
 | `column_block` | corpo de bloco por tipo (delta, delta-of-delta, Gorilla, RLE, simple8b, plain; `decode`, `decode_compact`, `decode_compact_prefix`) |
 | `block_envelope` | envelope do bloco (`unpack`, CRC) + wrapper LZ4/ZSTD (`decompress`) |
 | `codec_stream` | cada codec isolado (simple8b, delta, dod, Gorilla 32/64, RLE, varint) |
-| `chunk_file` | arquivo `.tfl` inteiro (CRC do header reparado): header, índice de séries, bloom, `decode_series`, `fetch_row`, `read_block` |
+| `chunk_file` | arquivo `.tfl` inteiro (CRC do header e da seção de resumos reparados; chunks cifrados AEAD trazem o índice em claro e são re-selados): header, índice, bloom, resumos, `decode_series`, `fetch_row`, `read_block`, `Pruner` |
 | `small_records` | entrada de série, valor/linha, bloom, tombstones, cabeçalho de cifra |
+| `zone_section` | seção de resumos por bloco (zone maps + Bloom) isolada, CRC reparado, mais o `Pruner` |
 | `manifest` | `MANIFEST` v1/v2/v3 (com e sem CRC reparado) |
 | `wal_segment` | segmento WAL (CRC das entradas reparado), replay em todos os modos |
 | `wal_payload` | corpo de entrada WAL (DELETE_RANGE/DELETE_ROWS/linha) |

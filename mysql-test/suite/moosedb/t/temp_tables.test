@@ -88,13 +88,15 @@ connect (con3,localhost,root,,test);
 CREATE TEMPORARY TABLE gone (ts DATETIME NOT NULL, v INT, INDEX(ts)) ENGINE=MooseDB;
 INSERT INTO gone SELECT '2026-01-01' + INTERVAL seq MINUTE, seq FROM seq_1_to_100;
 let $tmpdir= `SELECT @@tmpdir`;
+# the server's own tmpdir: with --parallel it is not $MYSQLTEST_VARDIR/tmp/mysqld.1
+let MOOSE_TMPDIR= $tmpdir;
 disconnect con3;
 connection default;
 --let $count_sessions= 1
 --source include/wait_until_count_sessions.inc
 --perl
 use strict;
-my $dir = $ENV{MYSQLTEST_VARDIR} . "/tmp/mysqld.1";
+my $dir = $ENV{MOOSE_TMPDIR};
 opendir(my $dh, $dir) or die "opendir $dir: $!";
 my @left = grep { !/^\./ } readdir($dh);
 closedir($dh);

@@ -666,6 +666,8 @@ fn compaction_flush_and_inserts_racing_with_deletes_keep_exactly_the_right_rows(
     assert_eq!(got.len(), 400);
     assert!(got.iter().all(|r| r.0 == "b"));
     assert_eq!(t.stats().unwrap().row_count, 400);
+    // the writer's last rows may still sit in the MemTable: compact() does not flush
+    t.flush().unwrap();
     t.compact(i64::MIN, i64::MAX, 2_000_000_000 * SEC).unwrap();
     assert_eq!(t.stats().unwrap().row_count, 400);
     let rows: u64 = t.chunks().unwrap().iter().map(|c| c.header.row_count).sum();

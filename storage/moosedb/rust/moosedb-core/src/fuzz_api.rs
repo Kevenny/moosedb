@@ -15,6 +15,7 @@ use crate::compression::{self, delta, gorilla, rle, simple8b};
 use crate::index::bloom::Bloom;
 use crate::manifest::Manifest;
 use crate::schema::{Column, ColumnType, Schema};
+use crate::zone::{ColPred, Pruner};
 use crate::tomb::{decode_range, decode_rows, decode_sel};
 use crate::wal::{self, ReplayLimits, TornTail};
 
@@ -101,13 +102,69 @@ pub fn codec_stream(data: &[u8]) {
     }
 }
 
-/// Whole `.tfl` file. Header CRC is repaired so mutations reach the index parser.
+/// Deterministic key provider (key = `[id ^ version; 32]`) so encrypted files can be built and read.
+pub fn install_fuzz_key() {
+    crate::crypto::set_key_provider(Some(std::sync::Arc::new(|id: u32, version: Option<u32>| {
+        let v = version.unwrap_or(2);
+        Ok((v, [(id ^ v) as u8; crate::crypto::KEY_LEN]))
+    })));
+}
+
+/// AEAD chunk: seals (`seal = true`) or opens the index+bloom unit in place, so the fuzzer mutates
+/// the plaintext index instead of ciphertext that GCM would reject. Returns false if not applicable.
+fn reseal_index(file: &mut [u8], seal: bool) -> bool {
+    use crate::crypto::{CipherParams, TAG_LEN};
+    let flen = crate::chunk::FOOTER_LEN;
+    if file.len() < HEADER_LEN + crate::chunk::ENC_HEADER_LEN + flen + TAG_LEN {
+        return false;
+    }
+    let Ok(h) = ChunkHeader::decode(&file[..HEADER_LEN]) else { return false };
+    if !h.is_encrypted() || !h.is_authenticated() {
+        return false;
+    }
+    let Ok(c) = CipherParams::decode(&file[HEADER_LEN..]) else { return false };
+    let c = c.authenticated(file[..HEADER_LEN].to_vec());
+    let end = file.len() - flen;
+    let ioff = u64::from_le_bytes(file[end..end + 8].try_into().unwrap());
+    let boff = u64::from_le_bytes(file[end + 8..end + 16].try_into().unwrap());
+    let ds = h.data_start();
+    let body_end = end - TAG_LEN;
+    if ioff < ds || ioff > body_end as u64 {
+        return false;
+    }
+    let (i, ctx) = (ioff as usize, crate::chunk::index_ctx(boff));
+    let (body, tag) = file[i..end].split_at_mut(body_end - i);
+    if seal {
+        match c.seal(body, ioff - ds, &ctx) {
+            Ok(t) => {
+                tag.copy_from_slice(&t);
+                true
+            }
+            Err(_) => false,
+        }
+    } else {
+        c.open(body, tag, ioff - ds, &ctx)
+    }
+}
+
+/// Seed helper: an AEAD chunk with its index+bloom unit in plaintext (what `chunk_file` re-seals).
+pub fn unseal_chunk_index(file: &[u8]) -> Option<Vec<u8>> {
+    install_fuzz_key();
+    let mut f = file.to_vec();
+    reseal_index(&mut f, false).then_some(f)
+}
+
+/// Whole `.tfl` file. Header CRC is repaired so mutations reach the index parser. Authenticated
+/// (encrypted) chunks carry the index in plaintext and are re-sealed here.
 pub fn chunk_file(data: &[u8]) {
+    install_fuzz_key();
     let mut file = data.to_vec();
     if file.len() >= HEADER_LEN {
         let crc = crc32fast::hash(&file[..60]).to_le_bytes();
         file[60..64].copy_from_slice(&crc);
     }
+    repair_zone_crc(&mut file);
+    reseal_index(&mut file, true);
     let id = if file.len() >= 48 { u64::from_le_bytes(file[40..48].try_into().unwrap()) } else { 0 };
     let path = scratch("chunk").join("chunk_x.tfl");
     if std::fs::write(&path, &file).is_err() {
@@ -124,6 +181,17 @@ pub fn chunk_file(data: &[u8]) {
             let _ = chunk_reader::read_block(&meta, *b);
         }
     }
+    // zone maps (when the section parsed) feed the pruner
+    let cols = [
+        ColPred::Int { col: 4, lo: -5, hi: 100 },
+        ColPred::Float { col: 3, lo: 19.0, hi: 21.0 },
+        ColPred::Bytes { col: 5, values: vec![b"n1".to_vec(), b"n7 ".to_vec()], pad_space: true },
+    ];
+    if let Ok(p) = Pruner::from_cols(&schema, &cols) {
+        for i in 0..meta.series.len().min(64) {
+            let _ = p.entry_pruned(&meta, i);
+        }
+    }
 }
 
 /// Series-index entries, tag values/rows, bloom filter, tombstone records: the small parsers.
@@ -131,6 +199,7 @@ pub fn small_records(data: &[u8]) {
     if data.is_empty() {
         return;
     }
+    install_fuzz_key(); // CipherParams::decode (case 7) resolves a key
     let mut r = ByteReader::new(&data[1..]);
     match data[0] % 9 {
         0 => drop(decode_series_entry(&mut r)),
@@ -176,6 +245,7 @@ pub fn manifest(data: &[u8]) {
 
 /// A WAL segment file, as-is and with every entry CRC repaired; replayed in each mode.
 pub fn wal_segment(data: &[u8]) {
+    install_fuzz_key();
     let dir = scratch("wal");
     let mut fixed = data.to_vec();
     let mut pos = 8usize;
@@ -317,6 +387,8 @@ pub fn seeds() -> Vec<(&'static str, String, Vec<u8>)> {
     let mut b = Vec::new();
     crate::zone::encode_section(&mut b, 2, &zones);
     rec(8, "zones", &b);
+    let mut zs = vec![1u8, 3, 10, 0];
+    zs.extend_from_slice(&b);
     let sel = Sel::from_ids(vec![1, 4, 9]);
     let mut b = Vec::new();
     encode_sel(&mut b, &sel);
@@ -329,6 +401,7 @@ pub fn seeds() -> Vec<(&'static str, String, Vec<u8>)> {
     let mut b = Vec::new();
     encode_rows(&mut b, &rows);
     rec(6, "rows", &b);
+    out.push(("zone_section", "zones".into(), zs));
 
     let row = [Value::Timestamp(5), Value::Bytes(b"h1".to_vec()), Value::Float64(1.5)];
     let mut p = Vec::new();
@@ -361,4 +434,100 @@ pub fn seeds() -> Vec<(&'static str, String, Vec<u8>)> {
     put_u32(&mut m, crc);
     out.push(("manifest", "v3".into(), m));
     out
+}
+
+/// Recomputes the zone-section CRC (it sits after the Bloom filter inside the index unit; for
+/// AEAD chunks the unit is still plaintext here) so mutated records reach `Zone::decode`.
+fn repair_zone_crc(file: &mut [u8]) {
+    let flen = crate::chunk::FOOTER_LEN;
+    if file.len() < HEADER_LEN + flen {
+        return;
+    }
+    let tag = match ChunkHeader::decode(&file[..HEADER_LEN]) {
+        Ok(h) if h.is_encrypted() => crate::crypto::TAG_LEN,
+        _ => 0,
+    };
+    let end = file.len() - flen;
+    let boff = u64::from_le_bytes(file[end + 8..end + 16].try_into().unwrap());
+    let Some(stop) = end.checked_sub(tag) else { return };
+    if boff as usize > stop || boff > end as u64 {
+        return;
+    }
+    let region = &mut file[boff as usize..stop];
+    let mut br = ByteReader::new(region);
+    if Bloom::decode(&mut br).is_err() {
+        return;
+    }
+    let at = br.position();
+    let sec = &mut region[at..];
+    if sec.len() < 12 {
+        return;
+    }
+    let len = u32::from_le_bytes(sec[4..8].try_into().unwrap()) as usize;
+    if let Some(e) = 8usize.checked_add(len).filter(|e| e + 4 <= sec.len()) {
+        let crc = crc32fast::hash(&sec[..e]).to_le_bytes();
+        sec[e..e + 4].copy_from_slice(&crc);
+    }
+}
+
+/// `[ndata:1][entries:1][rows:2][section..]`: the zone-map section on its own, CRC repaired,
+/// then used by the pruner. Entry `i` has `rows + i` rows and `ndata` blocks.
+pub fn zone_section(data: &[u8]) {
+    if data.len() < 4 {
+        return;
+    }
+    let (ndata, n, rows) = (usize::from(data[0]) % 5 + 1, usize::from(data[1]) % 9, u32::from(u16::from_le_bytes([data[2], data[3]])));
+    let entries: Vec<crate::chunk::SeriesEntry> = (0..n)
+        .map(|i| crate::chunk::SeriesEntry {
+            series_id: i as u64,
+            row_count: rows.wrapping_add(i as u32),
+            ts_min: 0,
+            ts_max: 0,
+            tags: Vec::new(),
+            blocks: vec![crate::chunk::BlockRef { offset: 0, len: 0 }; ndata],
+        })
+        .collect();
+    let mut sec = data[4..].to_vec();
+    let _ = crate::zone::decode_section(&sec, &entries);
+    if sec.len() >= 12 {
+        let len = u32::from_le_bytes(sec[4..8].try_into().unwrap()) as usize;
+        if let Some(e) = 8usize.checked_add(len).filter(|e| e + 4 <= sec.len()) {
+            let crc = crc32fast::hash(&sec[..e]).to_le_bytes();
+            sec[e..e + 4].copy_from_slice(&crc);
+            sec.truncate(e + 4);
+            let _ = crate::zone::decode_section(&sec, &entries);
+        }
+    }
+}
+
+/// Seed check: the chunk header announces a zone-map section.
+pub fn chunk_has_zones(file: &[u8]) -> bool {
+    file.len() >= HEADER_LEN && ChunkHeader::decode(&file[..HEADER_LEN]).is_ok_and(|h| h.flags & crate::chunk::flags::ZONES != 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The zone_section seed is a valid section for the entries `zone_section` builds from its prefix.
+    #[test]
+    fn zone_seed_decodes_and_crc_repair_reaches_records() {
+        let (_, _, seed) = seeds().into_iter().find(|(t, ..)| *t == "zone_section").unwrap();
+        let entries: Vec<_> = (0..3u32)
+            .map(|i| crate::chunk::SeriesEntry {
+                series_id: u64::from(i),
+                row_count: 10 + i,
+                ts_min: 0,
+                ts_max: 0,
+                tags: Vec::new(),
+                blocks: vec![crate::chunk::BlockRef { offset: 0, len: 0 }; 2],
+            })
+            .collect();
+        // row counts 10,11,12 vs. zones built for 10 rows: nulls are 0, so all still valid
+        assert!(crate::zone::decode_section(&seed[4..], &entries).is_some());
+        zone_section(&seed);
+        let mut bad = seed.clone();
+        bad[4 + 8] ^= 0xFF; // corrupt a record: CRC no longer matches, repair must not panic
+        zone_section(&bad);
+    }
 }

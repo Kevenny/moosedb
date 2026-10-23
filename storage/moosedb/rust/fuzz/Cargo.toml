@@ -79,3 +79,10 @@ path = "fuzz_targets/wal_payload.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "zone_section"
+path = "fuzz_targets/zone_section.rs"
+test = false
+doc = false
+bench = false

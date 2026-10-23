@@ -428,7 +428,8 @@ CREATE TABLE r (itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG', clock INT NOT NUL
   ENGINE=MooseDB TIMESTAMP_COLUMN='clock' CHUNK_INTERVAL='1 DAY' RETENTION_PERIOD='30 DAYS';
 --disable_query_log
 eval INSERT INTO r SELECT 1 + a.seq, UNIX_TIMESTAMP() - 40 * 86400 + b.seq * 60, b.seq FROM seq_0_to_2 a, seq_0_to_99 b;
-eval INSERT INTO r SELECT 1 + a.seq, UNIX_TIMESTAMP() - 3600 + b.seq * 20, b.seq FROM seq_0_to_2 a, seq_0_to_99 b;
+# yesterday 01:00-01:33 UTC: one daily chunk whatever the hour the test runs
+eval INSERT INTO r SELECT 1 + a.seq, UNIX_TIMESTAMP() DIV 86400 * 86400 - 86400 + 3600 + b.seq * 20, b.seq FROM seq_0_to_2 a, seq_0_to_99 b;
 --enable_query_log
 FLUSH TABLES r;
 DELETE FROM r WHERE itemid = 1 AND clock < UNIX_TIMESTAMP() - 20 * 86400;

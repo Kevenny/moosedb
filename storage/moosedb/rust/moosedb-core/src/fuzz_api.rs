@@ -228,9 +228,21 @@ fn zone_fuzz_entries() -> Vec<crate::chunk::SeriesEntry> {
         .collect()
 }
 
-/// MANIFEST bytes, as-is and with the trailing CRC repaired (so the body parser is reached).
+/// MANIFEST bytes, as-is, with the trailing CRC repaired (so the v1-v3 body parser is reached),
+/// and as the plaintext body of a sealed v4 MANIFEST (so the v4 parser is reached past the GCM tag).
 pub fn manifest(data: &[u8]) {
+    install_fuzz_key();
     let dir = scratch("manifest");
+    if let Ok(sealed) = crate::manifest::seal_body(1, data.to_vec()) {
+        let _ = std::fs::write(dir.join("MANIFEST"), &sealed);
+        let _ = Manifest::load(&dir);
+        // Any flip in a sealed file must be refused (the tag), never parsed.
+        let mut flipped = sealed;
+        let at = data.len() % flipped.len();
+        flipped[at] ^= 1;
+        let _ = std::fs::write(dir.join("MANIFEST"), &flipped);
+        assert!(Manifest::load(&dir).is_err(), "altered sealed MANIFEST accepted");
+    }
     let _ = std::fs::write(dir.join("MANIFEST"), data);
     let _ = Manifest::load(&dir);
     if data.len() >= 4 {
@@ -530,4 +542,10 @@ mod tests {
         bad[4 + 8] ^= 0xFF; // corrupt a record: CRC no longer matches, repair must not panic
         zone_section(&bad);
     }
+}
+
+/// Plaintext body of a sealed (v4) MANIFEST, for seeding the `manifest` target.
+pub fn unseal_manifest(file: &[u8]) -> Option<Vec<u8>> {
+    install_fuzz_key();
+    Manifest::open_body(file).ok().map(|(_, body)| body)
 }

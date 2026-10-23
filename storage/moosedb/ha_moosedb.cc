@@ -451,6 +451,7 @@ static ulonglong srv_chunk_cache_size= 128ULL << 20;
 static uint srv_max_open_chunks= 100;
 static ulonglong srv_batch_memory_budget= 1ULL << 30;
 static uint srv_unique_lock_wait_timeout= 50;
+static my_bool srv_recover_damaged_chunks= 0;
 
 /* Mirrors the current values into the Rust core. */
 static void push_globals()
@@ -462,6 +463,7 @@ static void push_globals()
   s.chunk_cache_bytes= srv_chunk_cache_size;
   s.max_open_chunks= srv_max_open_chunks;
   s.batch_memory_budget_bytes= srv_batch_memory_budget;
+  s.recover_damaged_chunks= srv_recover_damaged_chunks;
   if (moosedb_set_globals(&s) != TF_OK)
     sql_print_warning("MooseDB: cannot apply settings: %s",
                       take_last_error().c_str());
@@ -525,6 +527,15 @@ static MYSQL_SYSVAR_ULONGLONG(batch_memory_budget, srv_batch_memory_budget,
   "Bytes the row buffers of all open statement batches may hold together; "
   "above it, batches holding at least 1 MiB spill to disk early",
   NULL, update_global<ulonglong>, 1ULL << 30, 16ULL << 20, 1ULL << 40, 0);
+
+static MYSQL_SYSVAR_BOOL(recover_damaged_chunks, srv_recover_damaged_chunks,
+  PLUGIN_VAR_OPCMDARG,
+  "Recovery switch, OFF by default: when a chunk listed in the authenticated "
+  "MANIFEST of an encrypted table is damaged, open the table without that "
+  "chunk (set aside as .corrupt, logged loudly) instead of refusing. The data "
+  "of that chunk is lost; restoring the file from a backup is preferable. "
+  "Turn it OFF again afterwards",
+  NULL, update_global<my_bool>, 0);
 
 static MYSQL_SYSVAR_UINT(unique_lock_wait_timeout, srv_unique_lock_wait_timeout,
   PLUGIN_VAR_RQCMDARG,
@@ -664,6 +675,7 @@ static struct st_mysql_sys_var *moosedb_system_variables[]= {
   MYSQL_SYSVAR(chunk_cache_size),
   MYSQL_SYSVAR(max_open_chunks),
   MYSQL_SYSVAR(batch_memory_budget),
+  MYSQL_SYSVAR(recover_damaged_chunks),
   MYSQL_SYSVAR(unique_lock_wait_timeout),
   NULL
 };

@@ -78,6 +78,11 @@ pub mod flags {
     /// flag and the trailing bytes, so no version bump: a chunk without
     /// useful summaries does not set it.
     pub const ZONES: u16 = 1 << 3;
+    /// Written by a version whose MANIFEST for this table is authenticated
+    /// (encrypted chunks only). Part of the header the GCM tags are bound to,
+    /// so it cannot be stripped without invalidating the chunk: a plain
+    /// MANIFEST next to such a chunk is a downgrade (see `manifest`).
+    pub const AUTH_MANIFEST: u16 = 1 << 4;
     /// Bits 8-9: codec the chunk was written with (`compression::CODEC_*`).
     pub const CODEC_SHIFT: u16 = 8;
     pub const CODEC_MASK: u16 = 0b11 << CODEC_SHIFT;
@@ -188,7 +193,7 @@ pub(crate) fn chunk_flags(codec: Codec, encrypted: bool) -> u16 {
         f |= flags::COMPRESSED;
     }
     if encrypted {
-        f |= flags::ENCRYPTED;
+        f |= flags::ENCRYPTED | flags::AUTH_MANIFEST;
     }
     f
 }

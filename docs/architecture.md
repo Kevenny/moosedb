@@ -19,7 +19,7 @@ mysqld ──► ha_moosedb.so
 | `table` | estado da tabela, protocolo de durabilidade, recuperação |
 | `wal` | segmentos v2 (`ROW`/`COMMIT`/`ROW_COMMIT` com CRC), cifrados opcionalmente; v1 legível |
 | `batch` | lotes por statement: buffer privado, commit atômico, spill para chunks em estágio |
-| `manifest` | MANIFEST v2/v3 (`wal_seq`, `replay_seq`, chunks vivos com `born`, tombstones), troca atômica |
+| `manifest` | MANIFEST v2/v3 (`wal_seq`, `replay_seq`, chunks vivos com `born`, tombstones) e v4 selado (tabela cifrada: tudo autenticado + IV de cada chunk), troca atômica |
 | `tomb`, `delete` | tombstones (exclusão lógica por faixa ou por linhas), `DELETE` atômico e durável, replay |
 | `fsutil` | `write_atomic`, `sync_dir`, fsync que marca falha (poison) |
 | `memtable` | buffer em segmentos imutáveis (snapshot O(1)) |
@@ -49,7 +49,7 @@ Cada tabela é um diretório `<datadir>/<schema>/<tabela>/`:
 
 | Arquivo | Conteúdo |
 |---|---|
-| `MANIFEST` | lista de chunks vivos + checkpoint do WAL (`wal_seq`) + início do replay (`replay_seq`) (v2; v3 quando há ou houve `DELETE`: + `born` por chunk, `tseq` e os tombstones; CRC32, troca atômica) |
+| `MANIFEST` | lista de chunks vivos + checkpoint do WAL (`wal_seq`) + início do replay (`replay_seq`) (v2; v3 quando há ou houve `DELETE`: + `born` por chunk, `tseq` e os tombstones; CRC32, troca atômica; **v4 em tabela cifrada**: o conteúdo inteiro selado com AES-256-GCM, ver §Criptografia) |
 | `OPTIONS` | TABLE OPTIONS normalizadas (texto), lidas pelo INFORMATION_SCHEMA |
 | `wal_NNNNNN.tfl.wal` | segmentos do WAL |
 | `chunk_<início>_<fim>_<id>.tfl` | chunk selado (formato v2 ou v3 cifrado, `chunk.rs`) |
@@ -159,7 +159,7 @@ liberado** (`ChunkFile::drop`). Na recuperação:
 
 * arquivos fora do MANIFEST (órfãos de um crash) e `.tmp` são apagados;
 * chunks com header/rodapé em claro corrompidos vão para quarentena
-  (`.tfl.corrupt`) e saem do MANIFEST; o chunk mais novo tem o CRC completo
+  (`.tfl.corrupt`) e saem do MANIFEST — **exceto em tabela cifrada com MANIFEST v4**, onde esse dano é forjável sem chave e a abertura falha (`Crypto`), sem quarentena, salvo com a sysvar de recuperação `moosedb_recover_damaged_chunks=ON` (§Criptografia). Nada é apagado antes de **todas** as validações (presença, IV, dano, CRC do mais novo): órfãos e segmentos de WAL velhos só saem depois, para que um MANIFEST antigo autêntico restaurado sozinho não custe os chunks novos; o chunk mais novo tem o CRC completo
   verificado;
 * um chunk **listado no MANIFEST e ausente** faz a abertura falhar (nunca é
   descartado em silêncio), exceto quando existe o `.tfl.corrupt`
@@ -296,7 +296,7 @@ não afeta o build do plugin nem o clippy). O core expõe, só com a feature
 | `chunk_file` | arquivo `.tfl` inteiro (CRC do header e da seção de resumos reparados; chunks cifrados AEAD trazem o índice em claro e são re-selados): header, índice, bloom, resumos, `decode_series`, `fetch_row`, `read_block`, `Pruner` |
 | `small_records` | entrada de série, valor/linha, bloom, tombstones, cabeçalho de cifra |
 | `zone_section` | seção de resumos por bloco (zone maps + Bloom) isolada, CRC reparado, mais o `Pruner` |
-| `manifest` | `MANIFEST` v1/v2/v3 (com e sem CRC reparado) |
+| `manifest` | `MANIFEST` v1/v2/v3 (com e sem CRC reparado) e v4 selado (o dado vira o corpo de um v4 válido, para o parser passar da tag; um bit trocado no arquivo selado tem de ser recusado) |
 | `wal_segment` | segmento WAL (CRC das entradas reparado), replay em todos os modos |
 | `wal_payload` | corpo de entrada WAL (DELETE_RANGE/DELETE_ROWS/linha) |
 
@@ -574,7 +574,8 @@ só se as entradas ainda estiverem vivas.
 arquivo guarda id e versão da chave e um IV aleatório de 128 bits, então a
 rotação de chaves funciona (arquivos antigos seguem legíveis; novos usam a
 versão mais recente). A chave precisa ter 256 bits. Ficam em claro: os headers
-(contagens, intervalo de tempo, ids), o MANIFEST e o OPTIONS.
+(contagens, intervalo de tempo, ids) e o OPTIONS. O MANIFEST de tabela cifrada
+é autenticado e seu corpo (ids, tombstones) é cifrado; só o header de 40 B é em claro.
 
 **Desenho** (`crypto.rs`). Cada *unidade* é selada separadamente e portanto lida
 e verificada separadamente: um bloco de coluna do chunk, a seção
@@ -609,16 +610,17 @@ intervalo); segmentos de WAL antigos somem no próximo flush. Chunks e WAL em
 claro continuam v2 e legíveis por binários antigos; um binário antigo diante
 de arquivo v3 recusa explicitamente ("version 3 not supported").
 
-**Limites do modelo de ameaça**: a autenticação é por unidade, não por tabela:
-a detecção de troca, reordenação e truncamento vale **dentro de uma
-unidade/arquivo** (blocos de um chunk, entradas de um segmento WAL). Quem
-escreve no datadir ainda consegue (a) apagar um chunk ou um segmento WAL
-inteiro, ou cortar o fim do último segmento (tratado como torn tail; o CRC é
-recalculável sem a chave), (b) substituir um arquivo por uma cópia antiga
-válida do mesmo `chunk_id`/segmento (rollback), (c) copiar um chunk GCM de
-outra tabela com a mesma chave (o AAD não amarra a tabela), (d) alterar o MANIFEST
-(CRC32, em claro) — por exemplo trocar a lista de chunks vivos ou os
-tombstones. O `CHECK TABLE` continua sem chave e só confere CRC32. Salvaguardas:
+**MANIFEST autenticado (v4, só tabela cifrada)**. Layout: `TFLM` | versão=4 u16 | reservado u16 | `CipherParams` de 32 B (`key_id`, `key_version`, IV, reservado, CRC32) | corpo cifrado | tag de 16 B. O corpo é o layout do v3 (`wal_seq`, `next_chunk_id`, `replay_seq`, `tseq`, chunks com `born`, tombstones) com **16 B a mais por chunk: o IV do arquivo do chunk**. Selagem: AES-256-GCM; chave = versão **mais recente** do `key_id` da tabela (a mesma regra de qualquer arquivo novo; a leitura usa a versão gravada no header); nonce = **IV aleatório de 128 bits novo a cada gravação** (o MANIFEST é reescrito a cada commit; nenhum nonce se repete; posição fixa 0); AAD = os 40 B de header (magic, versão, reservado, `CipherParams`) + tipo de unidade `2` (blocos `0`, índice `1`). Falha de tag é `Error::Crypto` na abertura, nunca "MANIFEST vazio". A tabela sem criptografia segue em v2/v3 em claro. A tag entra no conteúdo antes do `fsync` do `.tmp`; o protocolo `.tmp` → fsync → rename → troca do MANIFEST não muda. Custo: ver o relatório da mudança (`manifest::cost`, teste `#[ignore]`): +84 B com 1 chunk, +2,5 KB com 100, +48 KB com 2000; o `encode` passa de 1 µs a 5 µs (1 chunk) e de 3 µs a 47 µs (2000), contra ~3,3 ms da troca inteira, dominada pelo fsync.
+
+**Amarração chunk ↔ MANIFEST**: ao abrir, o IV do header cifrado de cada chunk listado (já lido por `read_meta`; nenhum byte a mais) precisa ser igual ao IV gravado no MANIFEST; senão a abertura falha (`Crypto`). Um chunk de outra tabela com a mesma chave, ou uma cópia antiga do mesmo `chunk_id`, tem outro IV (aleatório por arquivo) e é recusado. Em MANIFEST v4, dano "provável sem chave" a um chunk listado (CRC do header/rodapé, que qualquer um recalcula), o chunk mais novo com CRC inválido, ou um `.corrupt` no lugar de chunk listado **não viram quarentena**: a abertura falha (`Crypto`; a mensagem ao cliente traz tabela e nome do arquivo, sem o caminho do datadir, que vai ao log, e diz como remediar). Antes isso tirava o chunk da lista em silêncio. Saídas: restaurar o arquivo do backup (ou devolver o nome original a um `.corrupt`); ou, como último recurso, um administrador liga `SET GLOBAL moosedb_recover_damaged_chunks=ON` (sysvar GLOBAL, OFF por padrão, exige privilégio de administração do servidor, logo quem só escreve no datadir não a liga): a abertura volta à quarentena do chunk danificado, registra `RECOVERY:` no log, e regrava o MANIFEST v4 autenticado sem ele (as linhas desse chunk se perdem; o resto fica íntegro). Depois, desligue a variável. O `key_id` do MANIFEST v4 precisa ser o da configuração da tabela; senão a abertura falha.
+
+**Migração e downgrade**. Um MANIFEST v1/v2/v3 de tabela cifrada (escrito antes do v4) é lido com aviso e regravado v4 pela mesma abertura. Aceitá-lo para sempre seria um downgrade trivial (o atacante grava um v3 com CRC válido e volta a poder remover chunks, voltar `replay_seq` e tombstones). Por isso o MANIFEST em claro de tabela cifrada só é aceito se **não existir arquivo escrito por uma versão com MANIFEST autenticado**: chunks cifrados novos levam a flag `AUTH_MANIFEST` (bit 4 de `flags`) e segmentos WAL cifrados novos a flag 2 do header; as duas estão em bytes que entram no AAD das tags, então a flag não sai sem invalidar o arquivo, só o arquivo inteiro sai. Depois da primeira abertura sempre existe ao menos um segmento WAL com a flag (a abertura cria um). Um arquivo que não pode ser inspecionado (chunk com header ilegível ou truncado, erro de I/O) conta como evidência e recusa o MANIFEST em claro. **Janela conhecida**: a migração grava o v4 e só depois cria o segmento WAL com a flag; criar o WAL antes deixaria uma falha entre os dois passos (ou um crash) com WAL marcado e MANIFEST em claro, e a tabela legítima passaria a ser recusada. Escolhi não travar a tabela: se o processo morre entre os dois passos, e um atacante grava o MANIFEST antigo antes da abertura seguinte, ele é aceito. O teste de fault-injection (`an_fsync_failure_anywhere_in_the_migration_open...`) garante que a tabela sempre reabre com todas as linhas e que, depois de uma abertura limpa, o MANIFEST antigo não volta. Limite que fica: quem destrói **tudo** o que foi escrito desde a migração (todos os chunks novos e os segmentos WAL) consegue rebaixar; equivale a voltar o diretório a antes da migração (fora de escopo, abaixo).
+
+**Rotação/aposentadoria de chave**: o MANIFEST declara a versão da chave com que foi selado, então aposentar uma versão exige que ele tenha sido regravado depois da rotação. Recomendação: depois de rotacionar, rode `OPTIMIZE TABLE` (reescreve chunks e MANIFEST na versão nova) e confira (`CHECK TABLE` limpo, a tabela abre numa réplica de teste sem a versão antiga) antes de aposentar a versão. A reabertura de tabela ociosa também regrava o MANIFEST, mas não é garantia: com a MemTable não vazia o checkpoint da abertura não é gravado. Com a versão antiga já aposentada e sem essa regravação a abertura falha fechada (`Crypto`), como para um chunk.
+
+**WAL**: registrar no MANIFEST o último segmento/seq durável só detectaria a remoção de segmento inteiro ou o corte do fim se fosse atualizado a cada `sync` do WAL, isto é, um MANIFEST autenticado por commit de statement, no caminho quente do append. Não foi feito. A cauda do WAL posterior ao último checkpoint pode ser removida ou cortada sem detecção (perde-se no máximo o que a MemTable ainda não virou chunk). O que é detectado: alteração de entrada, troca de segmento (o AAD tem o número), segmento em claro em tabela cifrada.
+
+**Limites do modelo de ameaça**: a autenticação de chunk e WAL é por unidade; o MANIFEST v4 é autenticado como um todo e amarra os chunks pelo IV. Quem escreve no datadir **ainda** consegue: (a) apagar um segmento WAL ou cortar o fim do último (acima; o CRC de entrada é recalculável sem a chave); (b) voltar o **diretório inteiro** a uma cópia antiga consistente (exigiria estado fora do datadir, p.ex. um contador monotônico; fora de escopo); (c) restaurar **só o arquivo MANIFEST** por uma cópia antiga *dele mesmo* (a tag é válida): se a cópia lista um chunk que já não existe (compactação ou retenção posterior) a abertura falha, mas se todos os chunks listados ainda existem os chunks posteriores viram órfãos e são apagados, e `replay_seq` e tombstones voltam; detectar isso pede um número de geração fora do MANIFEST; (d) nas tabelas **sem** criptografia nada disso é protegido (CRC32). O `CHECK TABLE` continua sem chave e só confere CRC32. Salvaguardas:
 
 * abertura **fail-closed**: falha de decriptação/autenticação do índice
   recusa a abertura sem quarentena e sem reescrever o MANIFEST; para descartar
@@ -664,10 +666,11 @@ comuns a todos os arquivos:
 | `MANIFEST` | `TFLM` | **1** | sem `replay_seq` (só leitura) | v0.x e v1.0 |
 | | | **2** | `wal_seq`, `replay_seq`, `next_chunk_id`, chunks vivos, CRC32 | v0.x e v1.0 |
 | | | **3** | + `born` por chunk, `tseq`, tombstones; gravado a partir do primeiro `DELETE` | v0.x com DELETE e v1.0 |
+| | | **4** | só tabela cifrada, desde a criação: `CipherParams` + corpo (layout do v3 + IV de cada chunk) selado com AES-256-GCM + tag. Em tabela cifrada o v1–v3 só é aceito enquanto não houver arquivo com a flag `AUTH_MANIFEST` (chunk) ou a flag 2 (WAL); ver §Criptografia | v1.0 com MANIFEST autenticado |
 | `OPTIONS` | — | sem versão | `chave=valor` em texto; chaves desconhecidas são ignoradas | todos |
 | `*.tmp`, `*.tfl.corrupt` | — | — | temporário de escrita atômica (apagado na abertura) / chunk em quarentena | — |
 
-O MANIFEST **não** é cifrado nem autenticado (CRC32). O header de criptografia
+O MANIFEST v1–v3 não é cifrado nem autenticado (CRC32); o v4 (tabela cifrada) é selado por inteiro. O header de criptografia
 (32 B: `key_id`, `key_version`, IV, reservado, CRC32) é igual em chunk e WAL,
 v2 e v3; é a *versão do contêiner* que decide se há tags.
 
@@ -680,7 +683,8 @@ em `moosedb-tests/fixtures/`, cada uma um diretório de tabela pequeno):
 | `ctr_v2` | idem | chunk v2 e WAL v2 AES-256-CTR (chave 7, versão 1); migração por `OPTIMIZE` |
 | `wal_v1` | idem, WAL reescrito no layout v1 | WAL v1 |
 | `deleted_v3` | idem | MANIFEST v3 com tombstone |
-| `aead_v3` | v1.0 | chunk v3 e WAL v3 (trava o formato novo) |
+| `aead_v3` | v1.0 | chunk v3 e WAL v3 (trava o formato novo); MANIFEST v2 em claro, o legado de tabela cifrada que a abertura migra para v4 |
+| (criadas nos testes) | MANIFEST v4 | `sealed_table`: bit-flip em cada byte, truncamento, MANIFEST em claro forjado por cima, chunk de outra tabela, `ctr_v2`/`aead_v3` migrados e não rebaixáveis |
 | `zones_v2`, `zones_v3` | v1.0 + zone maps | chunk com a flag `ZONES`, em claro (v2) e selado (v3); `gen_fixture_zones` |
 
 Cada teste copia a fixture, abre com o código atual e exige as mesmas linhas e
@@ -737,6 +741,7 @@ Cada teste copia a fixture, abre com o código atual e exige as mesmas linhas e
 | 30 | Índices só não-UNIQUE ("linhas não são únicas por tag+tempo") | **Uma** `PRIMARY KEY`/`UNIQUE (todas as TAGs em qualquer ordem, tempo[, 1-2 colunas INT NOT NULL])`, com unicidade verificada de verdade (`ER_DUP_ENTRY`, `INSERT IGNORE`, errkey = a chave). Sem TAGs: só `UNIQUE(tempo)`. TAG de texto na chave exige collation binária NO PAD (ou inteira); `REPLACE`/`ODKU` sobre chave existente → `ER_ILLEGAL_HA` (sem UPDATE; depois de um `DELETE` da chave inserem normalmente); `unique_checks=0` pula a checagem. Detalhes em §Chave única | O Zabbix 7.0 declara `PRIMARY KEY (itemid,clock,ns)`; antes só rodava com a PK removida. Subconjunto de TAGs foi recusado: unicidade sobre parte da identidade da série exigiria checar várias séries a cada INSERT. Collation `_ci`/PAD SPACE foi recusada porque duas séries (bytes diferentes) seriam a mesma chave. O índice de tempo isolado deixa de ser obrigatório quando existe a chave única (ela contém o tempo). |
 | 31 | Engine append-only: sem `DELETE` (a retenção por chunk era a única remoção) | `DELETE` suportado por **tombstones** duráveis (faixa de tempo × séries, ou linhas exatas), com a atomicidade e a visibilidade do `INSERT` e remoção física na compactação. MANIFEST v3 (`born` por chunk, `tseq`, tombstones) só depois do primeiro `DELETE`; entradas WAL 4 e 5. `UPDATE` segue recusado. `DELETE` com `WHERE` roda concorrente com `INSERT`. Detalhes em §DELETE | O housekeeper e `history.clear` do Zabbix apagam por item/intervalo. Reescrever chunks a cada `DELETE` custaria O(chunk) por statement (5.000 por dia); o tombstone custa O(1) e o espaço volta na compactação. |
 | 32 | AES-256-CTR sem MAC (§14 da spec) | AES-256-**GCM** (crate `aes-gcm` 0.10 da RustCrypto, mesma família de `aes`/`ctr`); arquivos CTR antigos continuam legíveis, sem autenticação | CTR não detecta adulteração (o CRC32 é linear e recomputável por quem escreve no datadir). GCM é um AEAD pronto, com AAD; CTR+HMAC exigiria duas crates novas (`hmac`+`sha2`) e composição manual. Formato novo: chunk v3 / WAL v3 (§Formato em disco v1.0). Resolve a limitação "criptografia sem integridade autenticada". |
+| 33 | O MANIFEST não é citado como alvo de adulteração (a spec só fala em cifrar chunk e WAL) | MANIFEST **v4 autenticado** em tabela cifrada (AES-256-GCM, IV aleatório por gravação, IV de cada chunk dentro do corpo); MANIFEST em claro de tabela cifrada só é aceito se não houver arquivo escrito por versão com MANIFEST autenticado; dano a chunk listado deixa de ser quarentena nessas tabelas, salvo com a sysvar opt-in `moosedb_recover_damaged_chunks` (divergência: sysvar a mais) | Sem isso, quem escreve no datadir remove chunks da lista, volta `replay_seq`/tombstones ou troca um chunk por cópia de outra tabela sem a chave. Não detecta: restaurar só o MANIFEST por uma cópia antiga dele, apagar a cauda do WAL, voltar o diretório inteiro (§Criptografia). |
 
 ## DELETE (tombstones)
 
@@ -1289,7 +1294,7 @@ scan não ordenado: só o commitado; o lote privado do statement é invisível).
 * 1 MiB ≤ `MEMTABLE_SIZE` ≤ 96 MiB (garante blocos de flush < 256 MiB); tabelas antigas
   com valor maior abrem com o valor limitado.
 * O plugin se declara `EXPERIMENTAL`: requer `plugin_maturity=experimental`.
-* Autenticação da criptografia é por unidade (bloco/entrada), não da tabela: apagar ou truncar arquivos, restaurar cópia antiga válida e alterar o MANIFEST não são detectados (ver §Criptografia).
+* Autenticação da criptografia: chunk e WAL por unidade; o MANIFEST de tabela cifrada é autenticado e amarra os chunks pelo IV. Seguem sem detecção: apagar ou cortar a cauda do WAL, restaurar só o MANIFEST por uma cópia antiga dele e voltar o diretório inteiro (ver §Criptografia, Limites do modelo de ameaça).
 * **`mariadb-backup` não copia tabelas MooseDB**: ele pula subdiretórios do
   banco (`extra/mariabackup/backup_copy.cc:379`) e só copia extensões fixas
   (`backup_copy.cc:926-943`, `common_engine.cc:352-361`). Os hooks

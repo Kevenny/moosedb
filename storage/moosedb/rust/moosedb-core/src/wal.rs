@@ -62,6 +62,9 @@ const K_ROW_COMMIT: u8 = 3;
 const K_DELETE_RANGE: u8 = 4;
 const K_DELETE_ROWS: u8 = 5;
 const FLAG_ENCRYPTED: u16 = 1;
+/// Set on encrypted segments written by a version with an authenticated
+/// MANIFEST (header is bound to the entry tags; see `manifest`).
+const FLAG_AUTH_MANIFEST: u16 = 2;
 const BASE_HEADER: usize = 8;
 const ENTRY_HEADER: usize = 8;
 /// Sanity bound on a single entry; anything larger is treated as corruption.
@@ -339,7 +342,7 @@ impl Wal {
         let mut header = Vec::with_capacity(BASE_HEADER + PARAMS_LEN);
         header.extend_from_slice(MAGIC);
         header.extend_from_slice(&version.to_le_bytes());
-        header.extend_from_slice(&(if cipher.is_some() { FLAG_ENCRYPTED } else { 0 }).to_le_bytes());
+        header.extend_from_slice(&(if cipher.is_some() { FLAG_ENCRYPTED | FLAG_AUTH_MANIFEST } else { 0 }).to_le_bytes());
         if let Some(c) = &cipher {
             header.extend_from_slice(&c.encode());
         }
@@ -734,6 +737,23 @@ impl RowReader<'_> {
             _ => Err(changed()),
         }
     }
+}
+
+/// Whether any of the segments was written by a version with an authenticated
+/// MANIFEST. An I/O error is an error (the caller refuses); a header too short
+/// or without the magic is a segment that never held anything: not marked.
+pub(crate) fn any_marks_authenticated_manifest(dir: &Path, segs: &[u64]) -> Result<bool> {
+    for &seq in segs {
+        let mut prefix = Vec::with_capacity(BASE_HEADER);
+        File::open(segment_path(dir, seq))?.take(BASE_HEADER as u64).read_to_end(&mut prefix)?;
+        if prefix.len() == BASE_HEADER
+            && &prefix[..4] == MAGIC
+            && u16::from_le_bytes([prefix[6], prefix[7]]) & FLAG_AUTH_MANIFEST != 0
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// True if segment `seq` never received an entry: its header was never

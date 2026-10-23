@@ -216,6 +216,8 @@ pub struct TFGlobalSettings {
     /// (`moosedb_batch_memory_budget`). Above it, the batches that hold at
     /// least 1 MiB spill to disk early. 0 = default (1 GiB).
     pub batch_memory_budget_bytes: u64,
+    /// `moosedb_recover_damaged_chunks`: see `Settings::recover_damaged_chunks`.
+    pub recover_damaged_chunks: bool,
 }
 
 /// Fetches an encryption key from the server. `version == 0` asks for the
@@ -582,6 +584,7 @@ pub unsafe extern "C" fn moosedb_set_globals(s: *const TFGlobalSettings) -> TFSt
         g.set_chunk_cache_bytes(s.chunk_cache_bytes);
         g.set_max_open_chunks(s.max_open_chunks);
         g.set_batch_memory_budget_bytes(s.batch_memory_budget_bytes);
+        g.set_recover_damaged_chunks(s.recover_damaged_chunks);
         Ok(())
     })
 }

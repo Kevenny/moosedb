@@ -82,6 +82,11 @@ impl CipherParams {
         Ok(CipherParams { key_id, key_version, iv, key, auth: None })
     }
 
+    /// The file's random IV (identifies the file; the MANIFEST records it).
+    pub(crate) fn iv(&self) -> [u8; IV_LEN] {
+        self.iv
+    }
+
     pub(crate) fn encode(&self) -> [u8; PARAMS_LEN] {
         let mut b = Vec::with_capacity(PARAMS_LEN);
         put_u32(&mut b, self.key_id);
@@ -209,7 +214,9 @@ pub(crate) mod test_keys {
                 return Err(Error::NotFound(format!("key {id}")));
             }
             let v = version.unwrap_or(2);
-            Ok((v, [(id ^ v) as u8; KEY_LEN]))
+            // Key 7 is the one the moosedb-tests fixtures were written with.
+            let b = if id == 7 { (7u8.wrapping_mul(31)) ^ v as u8 } else { (id ^ v) as u8 };
+            Ok((v, [b; KEY_LEN]))
         })));
     }
 }

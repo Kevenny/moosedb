@@ -247,7 +247,10 @@ impl Inner {
     /// rename reached the disk, so the table is poisoned; reopening resolves
     /// the ambiguity through recovery.
     pub(crate) fn commit_manifest(&mut self, dir: &Path, manifest: Manifest) -> Result<()> {
-        if let Err(e) = manifest.store(dir) {
+        // Sealing can fail (key provider) before anything touches the disk: that
+        // is an ordinary error, not an ambiguous commit, so it does not poison.
+        let bytes = manifest.encode()?;
+        if let Err(e) = write_atomic(&dir.join(crate::manifest::MANIFEST_FILE), &bytes) {
             self.poison(format!("MANIFEST update failed: {e}"));
             return Err(e);
         }
@@ -341,6 +344,12 @@ pub(crate) fn build_manifest(base: &Manifest, chunks: &[Arc<ChunkMeta>], tombs: 
     m.tseq = tseq;
     m.ranges = tombs.ranges().iter().map(|t| (**t).clone()).collect();
     m.rows = tombs.rows_tombs().iter().map(|t| (**t).clone()).collect();
+    // A sealed MANIFEST names each chunk file by its IV (see `manifest`).
+    m.ivs = if m.key.is_some() {
+        sorted.iter().map(|c| c.cipher.as_ref().map_or([0; crate::crypto::IV_LEN], |k| k.iv())).collect()
+    } else {
+        Vec::new()
+    };
     m
 }
 
@@ -411,7 +420,7 @@ impl Table {
             Err(e) => return Err(e.into()),
         }
         write_atomic(&dir.join(OPTIONS_FILE), config.opts.to_text().as_bytes())?;
-        Manifest::empty().store(dir)?;
+        Manifest { key: config.opts.encryption_key_id, ..Manifest::empty() }.store(dir)?;
         if let Some(parent) = dir.parent() {
             sync_dir(parent)?;
         }
@@ -486,19 +495,69 @@ impl Table {
         }
         wal_segs.sort_unstable();
 
-        let live: HashSet<u64> = manifest.chunks.iter().copied().collect();
-        for (id, path) in &chunk_files {
-            if !live.contains(id) {
-                remove_if_exists(path)?;
+        // Authenticated MANIFEST (encrypted tables). One written before it
+        // existed is accepted once and rewritten sealed below, unless a file
+        // written by an authenticating version is present: then someone put
+        // an old-format MANIFEST back on purpose. Checked before the unlisted
+        // chunks are deleted.
+        let key = config.opts.encryption_key_id;
+        // Client-visible messages name the table and the file; the datadir path goes to the log.
+        let tname = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let legacy_encrypted = key.is_some() && manifest.key.is_none();
+        match (key, manifest.key) {
+            (None, Some(_)) => {
+                return Err(invalid(format!("table {tname} has an encrypted MANIFEST but is configured without encryption")));
             }
+            (Some(k), Some(m)) if k != m => {
+                return Err(Error::Crypto(format!(
+                    "table {tname}: the authenticated MANIFEST was sealed with key id {m} but the table is configured with key id {k}; refusing to open"
+                )));
+            }
+            (Some(_), None) => {
+                // A file that cannot be inspected counts as evidence (fail closed).
+                let marked = (|| -> Result<bool> {
+                    if wal::any_marks_authenticated_manifest(&dir, &wal_segs)? {
+                        return Ok(true);
+                    }
+                    for p in chunk_files.values() {
+                        if crate::chunk_reader::marks_authenticated_manifest(p)? {
+                            return Ok(true);
+                        }
+                    }
+                    Ok(false)
+                })();
+                if !matches!(marked, Ok(false)) {
+                    warn(&format!("{}: unauthenticated MANIFEST next to authenticated files ({marked:?})", dir.display()));
+                    return Err(Error::Crypto(format!(
+                        "table {tname} has an unauthenticated MANIFEST but files written with an authenticated one, \
+                         or files that cannot be inspected: the MANIFEST was replaced (downgrade); refusing to open"
+                    )));
+                }
+                warn(&format!(
+                    "{} has an unauthenticated MANIFEST (written before MANIFEST authentication); it is rewritten authenticated now",
+                    dir.display()
+                ));
+            }
+            _ => {}
         }
+        manifest.key = key;
 
         let born_of: HashMap<u64, u64> = manifest.chunks.iter().copied().zip(manifest.born.iter().copied()).collect();
         let mut chunks = Vec::with_capacity(manifest.chunks.len());
         let mut dropped = false;
-        for &id in &manifest.chunks {
+        // Whether the MANIFEST read was authenticated: then nothing may drop
+        // a listed chunk, and each file must be the one the MANIFEST names.
+        let sealed = key.is_some() && !legacy_encrypted;
+        // Opt-in recovery (`moosedb_recover_damaged_chunks`, admin only): a damaged
+        // listed chunk is set aside as in an unauthenticated table.
+        let recover = crate::settings::get().recover_damaged_chunks();
+        let fname = |p: &Path| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let remedy = "restore that file from a backup, or give a file renamed to .corrupt its original name back; \
+                      as a last resort an administrator can SET GLOBAL moosedb_recover_damaged_chunks=ON to drop the \
+                      chunk (its rows are lost) and reopen, then set it OFF again";
+        for (idx, &id) in manifest.chunks.iter().enumerate() {
             let Some(path) = chunk_files.get(&id) else {
-                if quarantined.contains(&id) {
+                if quarantined.contains(&id) && (!sealed || recover) {
                     // An earlier recovery quarantined it but crashed before
                     // rewriting the MANIFEST: finish that step.
                     dropped = true;
@@ -506,9 +565,9 @@ impl Table {
                 }
                 // A listed chunk is committed data. Dropping it silently
                 // would turn a lost file into permanent data loss.
+                warn(&format!("{}: chunk {id} listed in the MANIFEST is missing", dir.display()));
                 return Err(corrupt(format!(
-                    "chunk {id} listed in the MANIFEST is missing from {}; refusing to open",
-                    dir.display()
+                    "chunk {id} listed in the MANIFEST of table {tname} is missing; refusing to open ({remedy})"
                 )));
             };
             match read_meta(path, id) {
@@ -516,13 +575,21 @@ impl Table {
                     if meta.header.is_encrypted() != config.opts.encryption_key_id.is_some() {
                         return Err(invalid(format!(
                             "{} is {} but the table is configured {}",
-                            meta.path().display(),
+                            fname(meta.path()),
                             if meta.header.is_encrypted() { "encrypted" } else { "not encrypted" },
                             if config.opts.encryption_key_id.is_some() {
                                 "with encryption"
                             } else {
                                 "without encryption"
                             },
+                        )));
+                    }
+                    if sealed && meta.cipher.as_ref().map(|c| c.iv()) != manifest.ivs.get(idx).copied() {
+                        warn(&format!("{}: not the chunk the authenticated MANIFEST lists", meta.path().display()));
+                        return Err(Error::Crypto(format!(
+                            "{} of table {tname} is not the chunk {id} the authenticated MANIFEST lists (replaced, copied from \
+                             another table or restored from an older copy); refusing to open ({remedy})",
+                            fname(meta.path())
                         )));
                     }
                     let mut meta = meta;
@@ -532,9 +599,25 @@ impl Table {
                 // Only damage provable without a key (header/footer CRC,
                 // structure) reaches this arm; a failure inside the encrypted
                 // index is `Error::Crypto` and fails the open instead.
-                Err(Error::Corrupt(why)) => {
+                Err(Error::Corrupt(why)) if !sealed || recover => {
+                    if sealed {
+                        warn(&format!(
+                            "RECOVERY: {} is listed in the authenticated MANIFEST and damaged ({why}); \
+                             dropped because moosedb_recover_damaged_chunks=ON, its rows are lost",
+                            path.display()
+                        ));
+                    }
                     quarantine(path, &why)?;
                     dropped = true;
+                }
+                // Damage anyone can fake (the CRCs are not keyed) must not be
+                // a way to drop a chunk from an authenticated MANIFEST.
+                Err(Error::Corrupt(why)) => {
+                    warn(&format!("{}: damaged ({why})", path.display()));
+                    return Err(Error::Crypto(format!(
+                        "{} of table {tname} is damaged ({why}) and the authenticated MANIFEST lists it; refusing to open ({remedy})",
+                        fname(path)
+                    )));
                 }
                 Err(e) => return Err(e),
             }
@@ -543,6 +626,13 @@ impl Table {
         if let Some(newest) = chunks.last() {
             match verify_file(newest.path()) {
                 Ok(()) => {}
+                Err(Error::Corrupt(why)) if sealed && !recover => {
+                    warn(&format!("{}: damaged ({why})", newest.path().display()));
+                    return Err(Error::Crypto(format!(
+                        "{} of table {tname} is damaged ({why}) and the authenticated MANIFEST lists it; refusing to open ({remedy})",
+                        fname(newest.path())
+                    )));
+                }
                 Err(Error::Corrupt(why)) => {
                     let path = newest.path().to_path_buf();
                     chunks.pop();
@@ -569,14 +659,19 @@ impl Table {
             let missing: HashSet<u64> = manifest.chunks.iter().copied().filter(|id| !live.contains(id)).collect();
             tombs.forget_chunks(&missing);
         }
-        if dropped {
-            manifest.chunks = chunks.iter().map(|c| c.id).collect();
-            manifest.born = chunks.iter().map(|c| c.born).collect();
-            manifest.ranges = tombs.ranges().iter().map(|t| (**t).clone()).collect();
-            manifest.rows = tombs.rows_tombs().iter().map(|t| (**t).clone()).collect();
-            manifest.store(&dir)?;
+        // Nothing is deleted before every listed chunk has been validated: a
+        // stale (but authentic) MANIFEST must not cost the chunks it does not list.
+        let listed: HashSet<u64> = manifest.chunks.iter().copied().collect();
+        for (id, path) in &chunk_files {
+            if !listed.contains(id) {
+                remove_if_exists(path)?;
+            }
         }
         let chunks: Vec<Arc<ChunkMeta>> = chunks.into_iter().map(Arc::new).collect();
+        if dropped || legacy_encrypted {
+            manifest = build_manifest(&manifest, &chunks, &tombs, manifest.tseq);
+            manifest.store(&dir)?;
+        }
         let mut tseq = manifest.tseq.max(tombs.max_seq());
 
         let mut series = SeriesIndex::default();
@@ -1186,6 +1281,10 @@ mod tests {
     use crate::schema::{Column, ColumnType};
 
     fn config(dir: &Path) -> TableConfig {
+        config_with(dir, &RawOptions::default())
+    }
+
+    fn config_with(dir: &Path, raw: &RawOptions<'_>) -> TableConfig {
         let schema = Schema::new(
             vec![
                 Column { name: "ts".into(), ty: ColumnType::Timestamp },
@@ -1195,7 +1294,7 @@ mod tests {
             0,
         )
         .unwrap();
-        TableConfig::new(dir, schema, &RawOptions::default()).unwrap()
+        TableConfig::new(dir, schema, raw).unwrap()
     }
 
     fn row(i: i64, host: &str) -> Row {
@@ -1275,6 +1374,87 @@ mod tests {
         drop(t);
         let t = Table::open(config(&path)).unwrap();
         assert_eq!(rows(&t), 5, "rows are recovered from the WAL");
+    }
+
+    /// Crash during the MANIFEST switch of an encrypted table: whichever fsync
+    /// fails (the chunk's, the MANIFEST's temp file, the directory), the table
+    /// reopens with every row, the MANIFEST on disk is authentic (old or new)
+    /// and no temp file is left.
+    #[cfg(feature = "encryption")]
+    #[test]
+    fn a_failed_fsync_anywhere_in_a_flush_leaves_an_authentic_manifest() {
+        crate::crypto::test_keys::install();
+        let raw = RawOptions { encryption_key_id: Some(1), ..Default::default() };
+        for ok in 0..12u32 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("t");
+            let cfg = config_with(&path, &raw);
+            Table::create(&cfg).unwrap();
+            let t = Table::open(cfg).unwrap();
+            for i in 0..5 {
+                t.write(row(i, "a")).unwrap();
+            }
+            fail_fsync_after(ok);
+            let _ = t.flush();
+            restore_fsync();
+            drop(t);
+            let m = Manifest::load(&path).unwrap_or_else(|e| panic!("ok={ok}: MANIFEST not authentic: {e}"));
+            assert_eq!(m.key, Some(1));
+            let t = Table::open(config_with(&path, &raw)).unwrap_or_else(|e| panic!("ok={ok}: {e}"));
+            assert_eq!(rows(&t), 5, "ok={ok}");
+            assert!(tmp_files(&path).is_empty(), "ok={ok}");
+            t.flush().unwrap();
+            drop(t);
+            assert_eq!(rows(&Table::open(config_with(&path, &raw)).unwrap()), 5, "ok={ok}");
+        }
+    }
+
+    /// Migration of an encrypted table written before the authenticated MANIFEST:
+    /// an fsync failing at any point of the first `open` leaves a table that
+    /// reopens with all its rows, and once it has opened cleanly the old MANIFEST
+    /// can no longer be put back. (Between a failed open that already stored the v4
+    /// MANIFEST and the next open there is a window; see architecture.md.)
+    #[cfg(feature = "encryption")]
+    #[test]
+    fn an_fsync_failure_anywhere_in_the_migration_open_loses_nothing_and_shuts_the_downgrade() {
+        crate::crypto::test_keys::install();
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../moosedb-tests/fixtures");
+        let schema = Schema::new(
+            vec![
+                Column { name: "ts".into(), ty: ColumnType::Timestamp },
+                Column { name: "host".into(), ty: ColumnType::Tag },
+                Column { name: "metric".into(), ty: ColumnType::Tag },
+                Column { name: "value".into(), ty: ColumnType::Float64 },
+                Column { name: "value_int".into(), ty: ColumnType::Int64 },
+                Column { name: "note".into(), ty: ColumnType::Varchar },
+            ],
+            0,
+        )
+        .unwrap();
+        let cfg = |p: &Path| {
+            TableConfig::new(p, schema.clone(), &RawOptions { encryption_key_id: Some(7), ..Default::default() }).unwrap()
+        };
+        for case in ["aead_v3", "ctr_v2"] {
+            let legacy = fs::read(fixtures.join(case).join("MANIFEST")).unwrap();
+            for ok in 0..14u32 {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("t");
+                fs::create_dir(&path).unwrap();
+                for e in fs::read_dir(fixtures.join(case)).unwrap() {
+                    let e = e.unwrap();
+                    fs::copy(e.path(), path.join(e.file_name())).unwrap();
+                }
+                fail_fsync_after(ok);
+                let first = Table::open(cfg(&path));
+                restore_fsync();
+                drop(first);
+                let t = Table::open(cfg(&path)).unwrap_or_else(|e| panic!("{case}/{ok}: {e}"));
+                assert_eq!(rows(&t), 35, "{case}/{ok}");
+                drop(t);
+                fs::write(path.join("MANIFEST"), &legacy).unwrap();
+                assert!(matches!(Table::open(cfg(&path)), Err(Error::Crypto(_))), "{case}/{ok}: downgrade accepted");
+            }
+        }
     }
 
     #[test]

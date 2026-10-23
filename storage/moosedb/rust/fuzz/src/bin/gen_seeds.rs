@@ -5,7 +5,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use moosedb_core::fuzz_api::{chunk_has_zones, install_fuzz_key, seed_schema, seeds, unseal_chunk_index};
+use moosedb_core::fuzz_api::{chunk_has_zones, install_fuzz_key, seed_schema, seeds, unseal_chunk_index, unseal_manifest};
 use moosedb_core::{RawOptions, Table, TableConfig, Value};
 
 fn put(root: &Path, target: &str, name: &str, bytes: &[u8]) {
@@ -70,6 +70,9 @@ fn main() {
             }
             if let Ok(m) = fs::read(t.dir().join("MANIFEST")) {
                 put(&root, "manifest", &format!("{label}_v2"), &m);
+                if let Some(body) = unseal_manifest(&m) {
+                    put(&root, "manifest", &format!("{label}_v4body"), &body);
+                }
             }
         }
         let _ = fs::remove_dir_all(&tmp);

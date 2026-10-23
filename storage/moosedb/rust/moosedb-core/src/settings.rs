@@ -1,7 +1,7 @@
 //! Process-wide tunables, mirrored from the `moosedb_*` system variables.
 //! Every value is an atomic so the server can change them at runtime.
 
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
 
 /// Default of `moosedb_batch_memory_budget`: 1 GiB for the buffers of every
 /// open statement batch of the process together.
@@ -15,6 +15,7 @@ pub struct Settings {
     max_open_chunks: AtomicU32,
     batch_memory_budget_bytes: AtomicU64,
     unique_state_bytes: AtomicU64,
+    recover_damaged_chunks: AtomicBool,
 }
 
 static SETTINGS: Settings = Settings {
@@ -25,6 +26,7 @@ static SETTINGS: Settings = Settings {
     max_open_chunks: AtomicU32::new(100),
     batch_memory_budget_bytes: AtomicU64::new(DEFAULT_BATCH_MEMORY_BUDGET),
     unique_state_bytes: AtomicU64::new(0),
+    recover_damaged_chunks: AtomicBool::new(false),
 };
 
 pub fn get() -> &'static Settings {
@@ -97,6 +99,15 @@ impl Settings {
     }
     pub fn set_unique_state_bytes(&self, v: u64) {
         self.unique_state_bytes.store(v, Relaxed);
+    }
+
+    /// `moosedb_recover_damaged_chunks`: lets the open of a table with an
+    /// authenticated MANIFEST set a damaged listed chunk aside (default off).
+    pub fn recover_damaged_chunks(&self) -> bool {
+        self.recover_damaged_chunks.load(Relaxed)
+    }
+    pub fn set_recover_damaged_chunks(&self, v: bool) {
+        self.recover_damaged_chunks.store(v, Relaxed);
     }
 }
 

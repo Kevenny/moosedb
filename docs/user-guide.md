@@ -368,9 +368,28 @@ authentication"); `OPTIMIZE TABLE` reescreve os chunks antigos já autenticados
 e o WAL antigo some no próximo flush. Depois da migração, um binário anterior
 não abre mais a tabela (recusa a versão do formato).
 
-A autenticação não cobre apagar ou truncar arquivos, restaurar uma cópia antiga
-válida nem alterar o `MANIFEST`; proteja o datadir com permissões do sistema
-de arquivos. Se a chave configurada não decifra a tabela, ela não abre
+O `MANIFEST` de tabela cifrada também é autenticado (a primeira abertura com
+esta versão regrava o antigo, e o log avisa), e cada chunk listado é amarrado a
+ele: remover chunk da lista, voltar o checkpoint ou trocar um chunk por cópia de
+outra tabela ou de outra época impede a abertura. A autenticação não cobre
+apagar ou cortar o fim do WAL, restaurar só o `MANIFEST` por uma cópia antiga
+dele nem voltar o diretório inteiro; proteja o datadir com permissões do
+sistema de arquivos. Para aposentar uma versão antiga de chave, depois de
+rotacionar rode `OPTIMIZE TABLE` (ele reescreve chunks e `MANIFEST` na versão
+nova) e confira o resultado antes de aposentar a versão; reabrir a tabela não é
+garantia.
+
+**Chunk danificado em tabela cifrada.** Se um chunk listado no `MANIFEST` estiver
+corrompido (ou for substituído), a tabela não abre e o erro nomeia o arquivo.
+Nada é apagado nem renomeado. Procedimento: (1) restaure esse arquivo do backup
+(ou, se ele foi renomeado para `.corrupt`, devolva o nome original) e reabra;
+(2) só se não houver backup, um administrador executa
+`SET GLOBAL moosedb_recover_damaged_chunks = ON`, abre a tabela (o chunk vai
+para `.corrupt`, o log registra `RECOVERY:` e o `MANIFEST` é regravado sem ele;
+as linhas desse chunk se perdem) e executa `SET GLOBAL
+moosedb_recover_damaged_chunks = OFF`. A variável vale para o processo todo e
+exige privilégio de administração; quem só escreve no diretório de dados não
+consegue ligá-la. Se a chave configurada não decifra a tabela, ela não abre
 (`Got error 192 ... from MooseDB`, erro de decriptação) — nada é descartado;
 corrija a configuração de chaves e reabra. Adulteração e chave errada não se
 distinguem.

@@ -380,6 +380,7 @@ fn global_settings_carry_the_batch_budget() {
         chunk_cache_bytes: 128 << 20,
         max_open_chunks: 100,
         batch_memory_budget_bytes: 64 << 20,
+        recover_damaged_chunks: false,
     };
     check(unsafe { moosedb_set_globals(&s) }).unwrap();
     assert_eq!(moosedb_core::settings::get().batch_memory_budget_bytes(), 64 << 20);

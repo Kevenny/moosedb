@@ -170,6 +170,15 @@ pub(crate) fn read_meta(path: &Path, id: u64) -> Result<ChunkMeta> {
     })
 }
 
+/// Whether the chunk file was written by a version with an authenticated
+/// MANIFEST (flag in the header the GCM tags are bound to). A file whose header
+/// cannot be read or decoded is an error: the caller must not read it as "no".
+pub(crate) fn marks_authenticated_manifest(path: &Path) -> Result<bool> {
+    let mut hb = [0u8; HEADER_LEN];
+    File::open(path)?.read_exact(&mut hb)?;
+    Ok(ChunkHeader::decode(&hb)?.flags & crate::chunk::flags::AUTH_MANIFEST != 0)
+}
+
 /// Full-file CRC32 verification (CHECK TABLE, recovery of the newest chunk).
 /// Works on the stored bytes, so it needs no encryption key.
 pub(crate) fn verify_file(path: &Path) -> Result<()> {

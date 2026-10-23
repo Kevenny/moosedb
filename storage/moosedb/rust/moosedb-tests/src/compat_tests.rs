@@ -374,6 +374,311 @@ fn a_plaintext_wal_segment_in_an_encrypted_table_is_refused() {
     assert!(Table::open(config(&plain, opts(false))).is_err());
 }
 
+// --- Authenticated MANIFEST (v4, encrypted tables) --------------------------
+
+fn manifest_path(dir: &Path) -> PathBuf {
+    dir.join("MANIFEST")
+}
+
+fn sealed_table(tmp: &Path, name: &str) -> PathBuf {
+    crate::encryption_tests::install();
+    let path = tmp.join(name);
+    let t = create_open(&path, opts(true));
+    populate(&t);
+    drop(t);
+    path
+}
+
+/// A MANIFEST in the plain formats (what an attacker without the key can
+/// write, checksum included): v2 without tombstones, or v3 with none.
+fn plain_manifest(version: u16, wal_seq: u64, next: u64, replay: u64, chunks: &[u64]) -> Vec<u8> {
+    let mut b = b"TFLM".to_vec();
+    b.extend_from_slice(&version.to_le_bytes());
+    b.extend_from_slice(&0u16.to_le_bytes());
+    for v in [wal_seq, next, replay] {
+        b.extend_from_slice(&v.to_le_bytes());
+    }
+    if version == 3 {
+        b.extend_from_slice(&0u64.to_le_bytes()); // tseq
+    }
+    b.extend_from_slice(&(chunks.len() as u32).to_le_bytes());
+    for id in chunks {
+        b.extend_from_slice(&id.to_le_bytes());
+        if version == 3 {
+            b.extend_from_slice(&0u64.to_le_bytes());
+        }
+    }
+    if version == 3 {
+        b.extend_from_slice(&[0u8; 8]); // no range, no row tombstones
+    }
+    let c = crc(&b);
+    b.extend_from_slice(&c);
+    b
+}
+
+fn is_refusal(r: &Result<Vec<Row>, moosedb_core::Error>) -> bool {
+    matches!(r, Err(moosedb_core::Error::Crypto(_) | moosedb_core::Error::Corrupt(_)))
+}
+
+#[test]
+fn an_encrypted_table_writes_a_sealed_manifest_and_a_plain_one_stays_plain() {
+    let tmp = tempfile::tempdir().unwrap();
+    let enc = sealed_table(tmp.path(), "enc");
+    let m = std::fs::read(manifest_path(&enc)).unwrap();
+    assert_eq!(u16::from_le_bytes([m[4], m[5]]), 4);
+    assert_eq!(outcome(&enc).unwrap().len(), 35);
+    let plain = tmp.path().join("plain");
+    drop(create_open(&plain, opts(false)));
+    assert_eq!(u16::from_le_bytes(std::fs::read(manifest_path(&plain)).unwrap()[4..6].try_into().unwrap()), 2);
+}
+
+#[test]
+fn any_bit_flip_in_the_sealed_manifest_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = sealed_table(tmp.path(), "base");
+    let size = std::fs::metadata(manifest_path(&base)).unwrap().len() as usize;
+    for pos in 0..size {
+        let copy = tmp.path().join(format!("flip{pos}"));
+        copy_dir(&base, &copy);
+        let mut b = std::fs::read(manifest_path(&copy)).unwrap();
+        b[pos] ^= 1 << (pos % 8);
+        std::fs::write(manifest_path(&copy), b).unwrap();
+        let r = outcome(&copy);
+        assert!(is_refusal(&r), "MANIFEST byte {pos}: {:?}", r.map(|r| r.len()));
+        assert!(chunk_path(&copy).exists(), "MANIFEST byte {pos}: a chunk was deleted");
+    }
+    // Truncation and an empty file are errors too, never an empty table.
+    for n in [0, 8, size / 2, size - 1] {
+        let copy = tmp.path().join(format!("cut{n}"));
+        copy_dir(&base, &copy);
+        let b = std::fs::read(manifest_path(&copy)).unwrap();
+        std::fs::write(manifest_path(&copy), &b[..n]).unwrap();
+        assert!(is_refusal(&outcome(&copy)), "MANIFEST cut to {n}");
+        assert!(chunk_path(&copy).exists());
+    }
+}
+
+#[test]
+fn a_plain_manifest_forged_over_a_sealed_table_is_refused_and_deletes_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = sealed_table(tmp.path(), "base");
+    let forged = [
+        ("chunk removed from the list", plain_manifest(2, 1, 2, 2, &[])),
+        ("replay_seq and flush point rolled back", plain_manifest(2, 0, 1, 1, &[1])),
+        ("tombstones dropped (v3)", plain_manifest(3, 1, 2, 2, &[1])),
+    ];
+    for (what, bytes) in forged {
+        let copy = tmp.path().join("forged");
+        let _ = std::fs::remove_dir_all(&copy);
+        copy_dir(&base, &copy);
+        std::fs::write(manifest_path(&copy), &bytes).unwrap();
+        let r = outcome(&copy);
+        assert!(matches!(r, Err(moosedb_core::Error::Crypto(_))), "{what}: {:?}", r.map(|r| r.len()));
+        assert_eq!(std::fs::read(manifest_path(&copy)).unwrap(), bytes, "{what}: the MANIFEST was rewritten");
+        assert!(chunk_path(&copy).exists(), "{what}: the chunk was deleted as an orphan");
+    }
+}
+
+#[test]
+fn a_chunk_copied_from_another_table_or_generation_with_the_same_key_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = sealed_table(tmp.path(), "a");
+    let b = sealed_table(tmp.path(), "b"); // same rows, same chunk id and file name, other IV
+    let (ca, cb) = (chunk_path(&a), chunk_path(&b));
+    assert_eq!(ca.file_name(), cb.file_name());
+    let (own, foreign) = (std::fs::read(&ca).unwrap(), std::fs::read(&cb).unwrap());
+    assert_ne!(own, foreign);
+    std::fs::write(&ca, foreign).unwrap();
+    let r = outcome(&a);
+    assert!(matches!(r, Err(moosedb_core::Error::Crypto(_))), "{:?}", r.map(|r| r.len()));
+    // The right file is accepted again.
+    std::fs::write(&ca, own).unwrap();
+    assert_eq!(outcome(&a).unwrap().len(), 35);
+}
+
+#[test]
+fn a_chunk_damaged_in_an_authenticated_table_is_not_quarantined() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = sealed_table(tmp.path(), "base");
+    let c = chunk_path(&base);
+    let mut b = std::fs::read(&c).unwrap();
+    let n = b.len();
+    b[n - 1] ^= 1; // footer magic: damage provable without the key (the old quarantine case)
+    std::fs::write(&c, &b).unwrap();
+    assert!(is_refusal(&outcome(&base)));
+    assert!(c.exists(), "the chunk must stay where it is");
+    assert!(!std::fs::read_dir(&base).unwrap().any(|e| e.unwrap().file_name().to_string_lossy().ends_with(".corrupt")));
+    // Renaming it to .corrupt is not a way to drop it from the list either.
+    let mut aside = c.as_os_str().to_owned();
+    aside.push(".corrupt");
+    std::fs::rename(&c, &aside).unwrap();
+    assert!(is_refusal(&outcome(&base)));
+    damaged_chunk_recovery(tmp.path());
+}
+
+/// The opt-in `moosedb_recover_damaged_chunks` switch (process-wide, so this runs inside the
+/// one test above, never in parallel with another that damages a chunk).
+fn damaged_chunk_recovery(root: &Path) {
+    let two = root.join("two");
+    let t = create_open(&two, opts(true));
+    for (from, to) in [(0, 10), (20, 30)] {
+        for i in from..to {
+            t.write(row(i, "a", i as f64)).unwrap();
+        }
+        t.flush().unwrap();
+    }
+    let mut files: Vec<PathBuf> = std::fs::read_dir(&two).unwrap().map(|e| e.unwrap().path()).filter(|p| p.extension().is_some_and(|x| x == "tfl")).collect();
+    files.sort();
+    assert_eq!(files.len(), 2);
+    drop(t);
+    let mut b = std::fs::read(&files[0]).unwrap();
+    let n = b.len();
+    b[n - 1] ^= 1;
+    std::fs::write(&files[0], &b).unwrap();
+    let before = std::fs::read(manifest_path(&two)).unwrap();
+
+    // OFF (default): refuses, tells what to do, names no datadir path, deletes and rewrites nothing.
+    let err = outcome(&two).unwrap_err();
+    assert!(matches!(err, moosedb_core::Error::Crypto(_)), "{err}");
+    let msg = err.to_string();
+    assert!(msg.contains("moosedb_recover_damaged_chunks") && msg.contains("backup"), "{msg}");
+    assert!(!msg.contains(root.to_str().unwrap()), "{msg}");
+    assert_eq!(std::fs::read(manifest_path(&two)).unwrap(), before);
+    assert!(files.iter().all(|f| f.exists()));
+
+    // ON: the table opens without that chunk; the other one is intact and the MANIFEST sealed again.
+    moosedb_core::settings::get().set_recover_damaged_chunks(true);
+    let r = outcome(&two);
+    moosedb_core::settings::get().set_recover_damaged_chunks(false);
+    assert_eq!(sorted(r.unwrap()), sorted((20..30).map(|i| row(i, "a", i as f64)).collect()));
+    let after = std::fs::read(manifest_path(&two)).unwrap();
+    assert_ne!(after, before);
+    assert_eq!(u16::from_le_bytes([after[4], after[5]]), 4);
+    assert!(!files[0].exists() && files[1].exists());
+    // OFF again: the repaired table opens normally.
+    assert_eq!(outcome(&two).unwrap().len(), 10);
+}
+
+#[test]
+fn a_stale_but_authentic_manifest_does_not_cost_the_newer_chunks() {
+    crate::encryption_tests::install();
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("t");
+    let t = create_open(&path, opts(true));
+    for i in 0..10 {
+        t.write(row(i, "a", i as f64)).unwrap();
+    }
+    t.flush().unwrap();
+    let stale = std::fs::read(manifest_path(&path)).unwrap(); // lists chunk 1 only
+    for i in 10..20 {
+        t.write(row(i, "a", i as f64)).unwrap();
+    }
+    t.flush().unwrap();
+    t.compact(i64::MIN, i64::MAX, base_ts()).unwrap(); // chunk 1 is gone, a merged chunk replaces it
+    drop(t);
+    let chunks = |p: &Path| {
+        let mut v: Vec<String> = std::fs::read_dir(p).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).filter(|n| n.ends_with(".tfl")).collect();
+        v.sort();
+        v
+    };
+    let before = chunks(&path);
+    assert!(!before.is_empty());
+    std::fs::write(manifest_path(&path), stale).unwrap();
+    assert!(outcome(&path).is_err(), "the stale MANIFEST lists a chunk that no longer exists");
+    assert_eq!(chunks(&path), before, "a refused open must not delete the chunks the stale MANIFEST does not list");
+}
+
+#[test]
+fn an_uninspectable_file_blocks_the_plain_manifest_instead_of_counting_as_unmarked() {
+    // ctr_v2 is a legacy table that migrates; a chunk-named file whose header cannot be read must stop it.
+    for bad in ["short", "dir"] {
+        let (_k, path) = tampered_copy_of("ctr_v2", |p| {
+            let f = p.join("chunk_20261001T000000_20261002T000000_000009.tfl");
+            if bad == "short" {
+                std::fs::write(f, b"too short").unwrap();
+            } else {
+                std::fs::create_dir(f).unwrap();
+            }
+        });
+        let before = std::fs::read(manifest_path(&path)).unwrap();
+        let r = outcome(&path);
+        assert!(matches!(r, Err(moosedb_core::Error::Crypto(_))), "{bad}: {:?}", r.map(|r| r.len()));
+        assert_eq!(std::fs::read(manifest_path(&path)).unwrap(), before, "{bad}");
+    }
+}
+
+#[test]
+fn a_key_provider_failure_while_sealing_the_manifest_is_an_error_not_a_poisoned_table() {
+    crate::encryption_tests::install();
+    // Key lookups of one operation, in order: [compaction: rekey check,] new chunk, MANIFEST seal.
+    // The WAL rotation after a flush is not swept: its failure poisons the table by design.
+    for (op, k) in [("flush", 0), ("flush", 1), ("delete+flush", 0), ("delete+flush", 1), ("compact", 0), ("compact", 1), ("compact", 2)] {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("t");
+        let o = RawOptions { encryption_key_id: Some(77), ..Default::default() };
+        let t = create_open(&path, o);
+        for i in 0..10 {
+            t.write(row(i, "a", i as f64)).unwrap();
+        }
+        if op == "compact" {
+            t.flush().unwrap();
+            for i in 10..20 {
+                t.write(row(i, "a", i as f64)).unwrap();
+            }
+            t.flush().unwrap();
+        }
+        if op == "delete+flush" {
+            t.delete_range(None, base_ts(), base_ts() + 3 * MICROS_PER_SEC - 1, None, true).unwrap();
+        }
+        let run = |t: &Table| match op {
+            "compact" => t.compact(i64::MIN, i64::MAX, base_ts()).map(|_| ()),
+            _ => t.flush(),
+        };
+        crate::encryption_tests::fail_key_77_at(k);
+        let failed = run(&t);
+        crate::encryption_tests::fail_key_77_at(-1);
+        let Err(err) = failed else { continue }; // fewer lookups than k
+        assert!(!matches!(err, moosedb_core::Error::ReadOnly(_)), "{op}/{k}: {err}");
+        t.write(row(500, "a", 1.0)).unwrap_or_else(|e| panic!("{op}/{k}: table poisoned: {e}"));
+        run(&t).unwrap_or_else(|e| panic!("{op}/{k}: retry failed: {e}"));
+        let n = all_rows(&t).len();
+        drop(t);
+        let o = RawOptions { encryption_key_id: Some(77), ..Default::default() };
+        assert_eq!(all_rows(&Table::open(config(&path, o)).unwrap()).len(), n, "{op}/{k}");
+    }
+}
+
+/// Writes `legacy` over the MANIFEST of a fixture copy, opens (migrating),
+/// and checks the downgrade door is shut afterwards.
+fn migrates_and_cannot_be_downgraded(case: &str, legacy: Option<Vec<u8>>) {
+    let (_keep, path) = tampered_copy_of(case, |p| {
+        if let Some(b) = &legacy {
+            std::fs::write(manifest_path(p), b).unwrap();
+        }
+    });
+    let old = std::fs::read(manifest_path(&path)).unwrap();
+    assert!(matches!(u16::from_le_bytes([old[4], old[5]]), 1..=3), "fixture MANIFEST must be a plain one");
+    assert_eq!(sorted(outcome(&path).unwrap()), sorted(expected(case)));
+    let sealed = std::fs::read(manifest_path(&path)).unwrap();
+    assert_eq!(u16::from_le_bytes([sealed[4], sealed[5]]), 4, "{case}: migrated by the first open");
+    assert_eq!(sorted(outcome(&path).unwrap()), sorted(expected(case)), "{case}: reopen");
+    // An attacker puts the old MANIFEST back (with a valid checksum): refused.
+    std::fs::write(manifest_path(&path), &old).unwrap();
+    assert!(matches!(outcome(&path), Err(moosedb_core::Error::Crypto(_))), "{case}: downgrade accepted");
+    assert_eq!(std::fs::read(manifest_path(&path)).unwrap(), old, "{case}: refusal must not rewrite");
+}
+
+#[test]
+fn legacy_encrypted_manifests_are_read_migrated_and_cannot_be_put_back() {
+    // v2 written by the format 1.0 code, with CTR chunks / with GCM chunks.
+    migrates_and_cannot_be_downgraded("ctr_v2", None);
+    migrates_and_cannot_be_downgraded("aead_v3", None);
+    // An encrypted MANIFEST v3 (tombstone layout) from the 1.0 code: same chunk as ctr_v2.
+    let m = std::fs::read(fixtures().join("ctr_v2").join("MANIFEST")).unwrap();
+    let u = |at: usize| u64::from_le_bytes(m[at..at + 8].try_into().unwrap());
+    migrates_and_cannot_be_downgraded("ctr_v2", Some(plain_manifest(3, u(8), u(16), u(24), &[1])));
+}
+
 // --- Zone maps (a section inside the index+Bloom unit, flag ZONES) -----------
 
 #[test]

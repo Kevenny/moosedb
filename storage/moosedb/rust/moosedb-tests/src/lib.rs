@@ -798,7 +798,7 @@ mod merge_tests {
 
 #[cfg(test)]
 mod encryption_tests {
-    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
     use std::sync::{Arc, Once};
 
     use super::helpers::*;
@@ -812,6 +812,14 @@ mod encryption_tests {
     static RETIRED_66: AtomicU32 = AtomicU32::new(0);
     /// While set, key id 55 resolves to different key bytes ("wrong key").
     static WRONG_KEY_55: AtomicBool = AtomicBool::new(false);
+    /// Key 77: the provider fails its `FAIL_77_AT`-th "latest version" lookup since the last reset (-1 = never).
+    static FAIL_77_AT: AtomicI64 = AtomicI64::new(-1);
+    static CALLS_77: AtomicI64 = AtomicI64::new(0);
+
+    pub(crate) fn fail_key_77_at(n: i64) {
+        CALLS_77.store(0, Ordering::SeqCst);
+        FAIL_77_AT.store(n, Ordering::SeqCst);
+    }
 
     pub(crate) fn install() {
         static ONCE: Once = Once::new();
@@ -819,6 +827,9 @@ mod encryption_tests {
             set_key_provider(Some(Arc::new(|id: u32, version: Option<u32>| {
                 if id == 404 {
                     return Err(Error::NotFound("no such key".into()));
+                }
+                if id == 77 && version.is_none() && CALLS_77.fetch_add(1, Ordering::SeqCst) == FAIL_77_AT.load(Ordering::SeqCst) {
+                    return Err(Error::Crypto("key server unavailable".into()));
                 }
                 if id == 66 {
                     let v = version.unwrap_or_else(|| LATEST_66.load(Ordering::SeqCst));
@@ -971,6 +982,10 @@ mod encryption_tests {
         }
         assert_eq!(wal_key_versions(&path).len(), 1);
         LATEST_66.store(2, Ordering::SeqCst);
+        // The sealed MANIFEST names the key version it was written with: the
+        // first open after the rotation rewrites it under version 2 (so does
+        // any commit); only then can version 1 go.
+        drop(Table::open(config(&path, enc(66))).unwrap());
         RETIRED_66.store(2, Ordering::SeqCst);
         let t = Table::open(config(&path, enc(66))).expect("an idle table must not depend on the retired version");
         assert!(wal_key_versions(&path).iter().all(|&v| v == 2));

@@ -15,6 +15,7 @@ moosedb_gbh_debug	OFF
 moosedb_group_by_pushdown	OFF
 moosedb_max_open_chunks	100
 moosedb_memtable_flush_threshold	67108864
+moosedb_recover_damaged_chunks	OFF
 moosedb_retention_check_interval	3600
 moosedb_unique_lock_wait_timeout	50
 moosedb_wal_sync_mode	fsync

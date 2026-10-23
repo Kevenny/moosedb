@@ -150,6 +150,8 @@ typedef struct {
   // (`moosedb_batch_memory_budget`). Above it, the batches that hold at
   // least 1 MiB spill to disk early. 0 = default (1 GiB).
   uint64_t batch_memory_budget_bytes;
+  // `moosedb_recover_damaged_chunks`: see `Settings::recover_damaged_chunks`.
+  bool recover_damaged_chunks;
 } TFGlobalSettings;
 
 // Fetches an encryption key from the server. `version == 0` asks for the

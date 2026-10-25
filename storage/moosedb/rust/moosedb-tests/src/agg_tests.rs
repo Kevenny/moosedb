@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use moosedb_core::agg::{Agg, AggSpec, ColFilter, FuncSpec, KeyCol, KeySpec, TopN, ValueFilter};
+use moosedb_core::agg::{Agg, AggSpec, ColFilter, FloatFilter, FuncSpec, KeyCol, KeySpec, TopN, ValueFilter};
 use moosedb_core::time::{days_from_civil, MICROS_PER_DAY, MICROS_PER_SEC};
 use moosedb_core::{Column, ColumnType, Error, RawOptions, Row, ScanFilter, Schema, Table, TableConfig, Value};
 
@@ -983,5 +983,123 @@ fn bucket_keys_floor_to_the_epoch_aligned_start() {
     for k in [KeySpec::Bucket(0, 0), KeySpec::Bucket(0, -5), KeySpec::Bucket(2, 60), KeySpec::Bucket(1, 60)] {
         let sp = AggSpec { keys: vec![k], funcs: funcs(), max_memory: 1 << 30, threads: 1, ..AggSpec::default() };
         assert!(matches!(agg.run(&sp, None), Err(Error::InvalidArg(_))), "{k:?}");
+    }
+}
+
+#[test]
+fn float_filters_match_the_ieee_model_on_chunks_and_memtable() {
+    let schema = Schema::new(
+        vec![
+            Column { name: "ts".into(), ty: ColumnType::Timestamp },
+            Column { name: "host".into(), ty: ColumnType::Tag },
+            Column { name: "d".into(), ty: ColumnType::Float64 },
+            Column { name: "f".into(), ty: ColumnType::Float32 },
+        ],
+        0,
+    )
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = TableConfig::new(dir.path().join("t"), schema, &RawOptions::default()).unwrap();
+    Table::create(&cfg).unwrap();
+    let t = Arc::new(Table::open(cfg).unwrap());
+    // NULL, both zeros, a value whose f32 differs from its f64, NaN and the extremes
+    let pool: [Option<f64>; 14] = [
+        None,
+        Some(-0.0),
+        Some(0.0),
+        Some(1.5),
+        Some(-1.5),
+        Some(1.1),
+        Some(f64::NAN),
+        Some(1e300),
+        Some(-1e300),
+        Some(2.0),
+        Some(f64::INFINITY),
+        Some(f64::NEG_INFINITY),
+        Some(0.1),
+        Some(1.1f32 as f64),
+    ];
+    let mk = |i: i64| -> Row {
+        let v = pool[(i as usize) % pool.len()];
+        vec![
+            Value::Timestamp(base() + i * MICROS_PER_SEC),
+            Value::Bytes(format!("h{}", i % 3).into_bytes()),
+            v.map_or(Value::Null, Value::Float64),
+            v.map_or(Value::Null, |x| Value::Float32(x as f32)),
+        ]
+    };
+    put(&t, (0..700).map(mk));
+    t.flush().unwrap();
+    put(&t, (700..1400).map(mk)); // MemTable too
+    let ff = |col: usize, lo: f64, hi: f64, lo_open: bool, hi_open: bool, points: Option<Vec<f64>>| FloatFilter {
+        col,
+        lo,
+        hi,
+        lo_open,
+        hi_open,
+        points,
+    };
+    let (ninf, inf) = (f64::NEG_INFINITY, f64::INFINITY);
+    let mut cases = Vec::new();
+    for col in [2usize, 3] {
+        cases.push(ff(col, 1.5, inf, true, false, None)); // > 1.5
+        cases.push(ff(col, 1.5, inf, false, false, None)); // >= 1.5
+        cases.push(ff(col, ninf, 1.5, false, true, None)); // < 1.5
+        cases.push(ff(col, ninf, inf, false, false, None)); // no bound: every non-NULL, non-NaN
+        cases.push(ff(col, 1.1, 1.1, false, false, None)); // = 1.1 (a FLOAT holds 1.1f32)
+        cases.push(ff(col, -0.0, 0.0, false, false, None)); // both zeros
+        cases.push(ff(col, 0.0, inf, true, false, None)); // > 0 keeps neither zero
+        cases.push(ff(col, -1.5, 2.0, false, false, None)); // BETWEEN
+        cases.push(ff(col, 2.0, -1.5, false, false, None)); // empty interval
+        cases.push(ff(col, ninf, inf, false, false, Some(vec![0.0, 1.5, 7.0, 1.5]))); // IN
+        cases.push(ff(col, -1.0, inf, false, false, Some(vec![-1.5, 1.5, 2.0]))); // IN within a range
+        cases.push(ff(col, ninf, inf, false, false, Some(vec![]))); // keeps nothing
+        cases.push(ff(col, ninf, inf, false, false, Some(vec![1.1f32 as f64, 1.1]))); // widened FLOAT vs DOUBLE constant
+    }
+    let model = |c: &FloatFilter, i: i64| -> bool {
+        let Some(v) = pool[(i as usize) % pool.len()] else { return false };
+        let x = if c.col == 3 { f64::from(v as f32) } else { v };
+        !x.is_nan()
+            && (if c.lo_open { x > c.lo } else { x >= c.lo })
+            && (if c.hi_open { x < c.hi } else { x <= c.hi })
+            && c.points.as_ref().map_or(true, |p| p.contains(&x))
+    };
+    let mut nonzero = 0;
+    for c in &cases {
+        let want = (0..1400).filter(|&i| model(c, i)).count() as u64;
+        nonzero += usize::from(want > 0);
+        for threads in [1, 3] {
+            for hint in [false, true] {
+                let mut agg = parallel_agg(&t);
+                let mut sp = AggSpec { funcs: vec![FuncSpec::CountStar], threads, ..AggSpec::default() };
+                sp.float_filters = vec![c.clone()];
+                if hint {
+                    sp.preds = vec![moosedb_core::ColPred::Float { col: c.col, lo: c.lo, hi: c.hi }];
+                }
+                agg.run(&sp, None).unwrap();
+                let r = agg.result();
+                let got = if r.groups == 0 { 0 } else { r.funcs[0].count[0] };
+                assert_eq!(got, want, "{c:?} threads={threads} hint={hint}");
+            }
+        }
+    }
+    assert!(nonzero >= 12, "the cases must match something");
+    // a float filter ANDed with a series restriction and a key
+    let mut agg = parallel_agg(&t);
+    let mut sp = AggSpec { keys: vec![KeySpec::Series], funcs: vec![FuncSpec::CountStar], threads: 2, ..AggSpec::default() };
+    sp.float_filters = vec![ff(2, 1.5, inf, true, false, None)];
+    agg.run(&sp, None).unwrap();
+    let want = (0..1400).filter(|&i| model(&sp.float_filters[0], i)).count() as u64;
+    assert_eq!(agg.result().funcs[0].count.iter().sum::<u64>(), want);
+    // rejected: NaN bound, infinite point, not a float column, out of range
+    for bad in [
+        ff(2, f64::NAN, inf, false, false, None),
+        ff(2, ninf, inf, false, false, Some(vec![inf])),
+        ff(0, ninf, inf, false, false, None),
+        ff(9, ninf, inf, false, false, None),
+    ] {
+        let mut sp = AggSpec { funcs: vec![FuncSpec::CountStar], ..AggSpec::default() };
+        sp.float_filters = vec![bad];
+        assert!(matches!(agg.run(&sp, None), Err(Error::InvalidArg(_))));
     }
 }

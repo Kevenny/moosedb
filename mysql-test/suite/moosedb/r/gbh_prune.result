@@ -126,10 +126,10 @@ INSERT INTO mirror.g SELECT * FROM test.g;
 # SELECT host, COUNT(*) c FROM g WHERE vc = 'd3-1' GROUP BY host ORDER BY host
 # same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
 # pruned=1 expected=1: as expected
-# ---- DOUBLE: outside the pushdown (the normal path runs and prunes) ----
+# ---- DOUBLE: the engine aggregates and prunes (plain DOUBLE only) ----
 # d >= 45
 # SELECT host, COUNT(*) c FROM g WHERE d >= 45 GROUP BY host ORDER BY host
-# same output with and without pushdown and on InnoDB; the engine did not run it
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
 # pruned=1 expected=1: as expected
 # DOUBLE(10,2) compares with an epsilon: never pushed
 # SELECT host, COUNT(*) c FROM g WHERE df >= 45 GROUP BY host ORDER BY host

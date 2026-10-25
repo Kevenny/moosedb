@@ -97,6 +97,8 @@ fn spec(keys: &[TFAggKey], funcs: &[TFAggFunc], filters: &[TFAggFilter], max_mem
         top_limit: 0,
         preds: ptr::null(),
         pred_count: 0,
+        float_filters: ptr::null(),
+        float_filter_count: 0,
     }
 }
 
@@ -276,6 +278,38 @@ fn aggregation_lifecycle_results_dictionaries_and_errors_through_c_abi() {
     int_filter.int_values = ints.as_ptr();
     int_filter.int_count = 3;
     assert_eq!(run_count(int_filter).unwrap(), 2);
+
+    // float filter: f (col 4) is 1.0 in every row
+    let total = {
+        let fns = [func(TF_AGG_COUNT_STAR, 0)];
+        let s = spec(&[], &fns, &[], 1 << 28, 3);
+        check(unsafe { moosedb_agg_run(agg, &s, None, ptr::null_mut()) }).unwrap();
+        check(unsafe { moosedb_agg_result(agg, 0, 10, &mut batch) }).unwrap();
+        unsafe { *(*batch.funcs).count }
+    };
+    assert!(total > 0);
+    let mut run_float = |col: u32, lo: f64, hi: f64, flags: u8, points: &[f64]| {
+        let fns = [func(TF_AGG_COUNT_STAR, 0)];
+        let ffs = [TFAggFloatFilter { col, lo, hi, flags, points: points.as_ptr(), point_count: points.len() as u64 }];
+        let mut s = spec(&[], &fns, &[], 1 << 28, 3);
+        s.float_filters = ffs.as_ptr();
+        s.float_filter_count = 1;
+        check(unsafe { moosedb_agg_run(agg, &s, None, ptr::null_mut()) }).map(|()| {
+            check(unsafe { moosedb_agg_result(agg, 0, 10, &mut batch) }).unwrap();
+            if batch.row_count == 0 { 0 } else { unsafe { *(*batch.funcs).count } }
+        })
+    };
+    let (ninf, inf) = (f64::NEG_INFINITY, f64::INFINITY);
+    assert_eq!(run_float(4, 1.0, inf, 0, &[]).unwrap(), total, "f >= 1.0");
+    assert_eq!(run_float(4, 1.0, inf, TF_FLOAT_LO_OPEN, &[]).unwrap(), 0, "f > 1.0");
+    assert_eq!(run_float(4, ninf, 1.0, TF_FLOAT_HI_OPEN, &[]).unwrap(), 0, "f < 1.0");
+    assert_eq!(run_float(4, ninf, inf, TF_FLOAT_POINTS, &[2.0, 1.0]).unwrap(), total, "f IN (2, 1)");
+    assert_eq!(run_float(4, ninf, inf, TF_FLOAT_POINTS, &[]).unwrap(), 0, "empty IN keeps nothing");
+    for (col, lo, pts) in [(2, 0.0, vec![]), (4, f64::NAN, vec![]), (4, 0.0, vec![f64::INFINITY])] {
+        let flags = if pts.is_empty() { 0 } else { TF_FLOAT_POINTS };
+        let st = status(run_float(col, lo, inf, flags, &pts).map(|_| ()));
+        assert_eq!(st, TFStatus::TF_ERR_INVALID_ARG, "col {col} lo {lo} pts {pts:?}");
+    }
 
     // top-N through the ABI: series by COUNT(*) is 40 each, so ties come by id
     let top_funcs = [func(TF_AGG_COUNT_STAR, 0), func(TF_AGG_SUM, 2)];

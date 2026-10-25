@@ -72,6 +72,16 @@
 // `TFAggSpec::top_mode`: the `top_limit` largest groups by `funcs[top_func]`.
 #define TF_AGG_TOP_DESC 2
 
+// `TFAggFloatFilter::flags`: the lower bound is exclusive (`v > lo`).
+#define TF_FLOAT_LO_OPEN 1
+
+// `TFAggFloatFilter::flags`: the upper bound is exclusive (`v < hi`).
+#define TF_FLOAT_HI_OPEN 2
+
+// `TFAggFloatFilter::flags`: the value must also equal one of `points[0..point_count]`
+// (an empty list then keeps nothing).
+#define TF_FLOAT_POINTS 4
+
 typedef enum {
   TF_OK = 0,
   TF_ERR_IO = 1,
@@ -376,6 +386,22 @@ typedef struct {
   uint8_t pad_space;
 } TFAggFilter;
 
+// Exact filter on a FLOAT64 / FLOAT32 column, ANDed with the others: a row is
+// kept iff its value is non-NULL, not NaN, within `lo..hi` (`-INFINITY` /
+// `INFINITY` = unbounded; ends closed unless `flags` says open) and, with
+// `TF_FLOAT_POINTS`, equal to one of the points (IEEE equality: `-0.0 == 0.0`).
+// A FLOAT32 value is widened to double first. NaN bounds and non-finite
+// points are `TF_ERR_INVALID_ARG`. **The caller may use this only for a plain
+// `FLOAT`/`DOUBLE` column** (not `(M,D)`, which the server compares with an epsilon).
+typedef struct {
+  uint32_t col;
+  double lo;
+  double hi;
+  uint8_t flags;
+  const double *points;
+  uint64_t point_count;
+} TFAggFloatFilter;
+
 typedef struct {
   const TFAggKey *keys;
   uint32_t key_count;
@@ -407,6 +433,9 @@ typedef struct {
   // them are skipped, on top of the filters. `preds` may be NULL with 0.
   const TFColPred *preds;
   uint32_t pred_count;
+  // Exact float filters (`TFAggFloatFilter`), ANDed with `filters`. May be NULL with 0.
+  const TFAggFloatFilter *float_filters;
+  uint32_t float_filter_count;
 } TFAggSpec;
 
 // Polled about every 10 ms on the calling thread; a non-zero return cancels

@@ -23,7 +23,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 use std::sync::Arc;
 
-use moosedb_core::agg::{Agg, AggSpec, ColFilter, FuncSpec, KeyCol, KeySpec, TopN, ValueFilter};
+use moosedb_core::agg::{Agg, AggSpec, ColFilter, FloatFilter, FuncSpec, KeyCol, KeySpec, TopN, ValueFilter};
 use moosedb_core::delete::RangeDelete;
 use moosedb_core::DeleteBatch;
 use moosedb_core::compression::Codec;
@@ -1760,6 +1760,32 @@ pub struct TFAggFilter {
     pub pad_space: u8,
 }
 
+/// `TFAggFloatFilter::flags`: the lower bound is exclusive (`v > lo`).
+pub const TF_FLOAT_LO_OPEN: u8 = 1;
+/// `TFAggFloatFilter::flags`: the upper bound is exclusive (`v < hi`).
+pub const TF_FLOAT_HI_OPEN: u8 = 2;
+/// `TFAggFloatFilter::flags`: the value must also equal one of `points[0..point_count]`
+/// (an empty list then keeps nothing).
+pub const TF_FLOAT_POINTS: u8 = 4;
+
+/// Exact filter on a FLOAT64 / FLOAT32 column, ANDed with the others: a row is
+/// kept iff its value is non-NULL, not NaN, within `lo..hi` (`-INFINITY` /
+/// `INFINITY` = unbounded; ends closed unless `flags` says open) and, with
+/// `TF_FLOAT_POINTS`, equal to one of the points (IEEE equality: `-0.0 == 0.0`).
+/// A FLOAT32 value is widened to double first. NaN bounds and non-finite
+/// points are `TF_ERR_INVALID_ARG`. **The caller may use this only for a plain
+/// `FLOAT`/`DOUBLE` column** (not `(M,D)`, which the server compares with an epsilon).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TFAggFloatFilter {
+    pub col: u32,
+    pub lo: f64,
+    pub hi: f64,
+    pub flags: u8,
+    pub points: *const f64,
+    pub point_count: u64,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct TFAggSpec {
@@ -1793,6 +1819,9 @@ pub struct TFAggSpec {
     /// them are skipped, on top of the filters. `preds` may be NULL with 0.
     pub preds: *const TFColPred,
     pub pred_count: u32,
+    /// Exact float filters (`TFAggFloatFilter`), ANDed with `filters`. May be NULL with 0.
+    pub float_filters: *const TFAggFloatFilter,
+    pub float_filter_count: u32,
 }
 
 /// Polled about every 10 ms on the calling thread; a non-zero return cancels
@@ -1904,13 +1933,32 @@ pub unsafe extern "C" fn moosedb_agg_run(
         a.keys_out.clear();
         a.funcs_out.clear();
         // SAFETY: caller contract for every array.
-        let (keys, funcs, filters) = unsafe {
+        let (keys, funcs, filters, float_filters) = unsafe {
             (
                 slice(s.keys, s.key_count as usize, "spec.keys")?,
                 slice(s.funcs, s.func_count as usize, "spec.funcs")?,
                 slice(s.filters, s.filter_count as usize, "spec.filters")?,
+                slice(s.float_filters, s.float_filter_count as usize, "spec.float_filters")?,
             )
         };
+        let mut ffs = Vec::new();
+        for f in float_filters {
+            let points = if f.flags & TF_FLOAT_POINTS != 0 {
+                let n = usize::try_from(f.point_count).map_err(|_| invalid("float filter points too long"))?;
+                // SAFETY: caller contract.
+                Some(unsafe { slice(f.points, n, "float_filter.points") }?.to_vec())
+            } else {
+                None
+            };
+            ffs.push(FloatFilter {
+                col: f.col as usize,
+                lo: f.lo,
+                hi: f.hi,
+                lo_open: f.flags & TF_FLOAT_LO_OPEN != 0,
+                hi_open: f.flags & TF_FLOAT_HI_OPEN != 0,
+                points,
+            });
+        }
         let keys = keys
             .iter()
             .map(|k| match k.kind {
@@ -1989,6 +2037,7 @@ pub unsafe extern "C" fn moosedb_agg_run(
             funcs,
             filters: fs,
             value_filters: vfs,
+            float_filters: ffs,
             // SAFETY: caller contract for `preds`.
             preds: unsafe { col_preds(s.preds, s.pred_count) }?,
             top,

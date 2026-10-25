@@ -137,6 +137,23 @@ pub struct ValueFilter {
     pub pad_space: bool,
 }
 
+/// Exact test of a FLOAT64 / FLOAT32 column: a row is kept iff its value (never
+/// NULL, never NaN) lies in the interval `lo..hi` (each end closed unless the
+/// `_open` flag is set; `-inf`/`+inf` leave an end unbounded) and, when `points`
+/// is `Some`, equals one of them (IEEE equality, so `-0.0 == 0.0`; an empty
+/// list keeps nothing). A FLOAT32 value is widened to `f64` first, as the SQL
+/// comparison does. The caller may use this only for a plain `FLOAT`/`DOUBLE`
+/// (no `(M,D)`: those compare with an epsilon).
+#[derive(Clone, Debug)]
+pub struct FloatFilter {
+    pub col: usize,
+    pub lo: f64,
+    pub hi: f64,
+    pub lo_open: bool,
+    pub hi_open: bool,
+    pub points: Option<Vec<f64>>,
+}
+
 /// Keep only the `limit` best groups by function `func` (an index into
 /// `funcs`): the result then holds at most `limit` groups, best first. Needs
 /// exactly one key. Order: the function's value (`COUNT` as a number; `SUM`,
@@ -157,6 +174,7 @@ pub struct AggSpec {
     pub funcs: Vec<FuncSpec>,
     pub filters: Vec<ColFilter>,
     pub value_filters: Vec<ValueFilter>,
+    pub float_filters: Vec<FloatFilter>,
     /// Extra zone-map tests (hints, ANDed with the filters): entries that cannot
     /// hold a row inside them are not read. Never change the result as long as
     /// each predicate is implied by the caller's WHERE (NULL never matches);
@@ -176,6 +194,7 @@ impl Default for AggSpec {
             funcs: Vec::new(),
             filters: Vec::new(),
             value_filters: Vec::new(),
+            float_filters: Vec::new(),
             preds: Vec::new(),
             top: None,
             max_memory: 1 << 30,
@@ -356,7 +375,7 @@ impl Agg {
         let result = plan.reduce(locals, threads, reborrow(&mut cancel))?;
         plan.check_stop()?;
         // The distinct values of a column, in result order, are its dictionary.
-        let plain = spec.filters.is_empty() && spec.value_filters.is_empty();
+        let plain = spec.filters.is_empty() && spec.value_filters.is_empty() && spec.float_filters.is_empty();
         if let ([KeySpec::Column(c)], true, true, true) = (&spec.keys[..], plain, spec.funcs.is_empty(), spec.top.is_none()) {
             plan.charge(result.keys[0].heap_bytes())?;
             self.dicts.insert(*c, result.keys[0].clone());
@@ -366,7 +385,7 @@ impl Agg {
     }
 
     fn compile_filters(&self, spec: &AggSpec) -> Result<Vec<(usize, FilterSet)>> {
-        if spec.filters.len() + spec.value_filters.len() > MAX_FILTERS {
+        if spec.filters.len() + spec.value_filters.len() + spec.float_filters.len() > MAX_FILTERS {
             return Err(invalid(format!("at most {MAX_FILTERS} filters")));
         }
         let cols = self.snap.schema.columns();
@@ -438,6 +457,23 @@ impl Agg {
             count(&set)?;
             out.push((f.col, set));
         }
+        for f in &spec.float_filters {
+            let ty = cols.get(f.col).ok_or_else(|| invalid(format!("column {} out of range", f.col)))?.ty;
+            if !matches!(ty, ColumnType::Float64 | ColumnType::Float32) {
+                return Err(invalid(format!("float filter on column {}, which is {ty:?}", f.col)));
+            }
+            let mut points = f.points.clone();
+            if f.lo.is_nan() || f.hi.is_nan() || points.iter().flatten().any(|p| !p.is_finite()) {
+                return Err(invalid("float filter: NaN bound or non-finite point"));
+            }
+            if let Some(p) = &mut points {
+                p.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Cmp::Equal));
+            }
+            let float = FloatSet { lo: f.lo, hi: f.hi, lo_open: f.lo_open, hi_open: f.hi_open, points };
+            let set = FilterSet { float: Some(float), ..FilterSet::default() };
+            count(&set)?;
+            out.push((f.col, set));
+        }
         Ok(out)
     }
 }
@@ -460,6 +496,28 @@ struct FilterSet {
     null_ok: bool,
     /// Trailing 0x20 bytes are ignored (`bytes` then holds trimmed values).
     pad_space: bool,
+    /// A float column test (see [`FloatFilter`]); the other sets are then empty.
+    float: Option<FloatSet>,
+}
+
+/// [`FloatFilter`] with `points` sorted.
+struct FloatSet {
+    lo: f64,
+    hi: f64,
+    lo_open: bool,
+    hi_open: bool,
+    points: Option<Vec<f64>>,
+}
+
+impl FloatSet {
+    #[inline(always)]
+    fn accepts(&self, v: f64) -> bool {
+        // NaN fails the comparisons anyway; it is excluded first for the point search.
+        !v.is_nan()
+            && (if self.lo_open { v > self.lo } else { v >= self.lo })
+            && (if self.hi_open { v < self.hi } else { v <= self.hi })
+            && self.points.as_ref().map_or(true, |p| p.binary_search_by(|x| x.partial_cmp(&v).unwrap_or(Cmp::Equal)).is_ok())
+    }
 }
 
 /// `v` without its trailing 0x20 bytes.
@@ -631,6 +689,11 @@ impl<'a> Plan<'a> {
         }
         let mut prune = Pruner::from_cols(&snap.schema, &spec.preds)?;
         for (c, set) in &filters {
+            if set.float.is_some() {
+                // no float test of its own here: the caller's `preds` hints prune
+                want[*c] = true;
+                continue;
+            }
             match key_kind(col(*c)?.ty) {
                 None => return Err(invalid(format!("column {c} cannot be filtered"))),
                 Some(Kind::Int) => prune.add_ints(&snap.schema, *c, set.ints.iter().copied(), set.null_ok),
@@ -943,8 +1006,9 @@ enum Col<'a> {
         data: &'a [u8],
         nulls: &'a [bool],
     },
-    /// Floats: only their NULLs matter (COUNT).
-    Other(&'a [bool]),
+    /// Floats: bit patterns (f64 / f32) for the float filters; COUNT needs only the NULLs.
+    F64(&'a [u64], &'a [bool]),
+    F32(&'a [u32], &'a [bool]),
 }
 
 impl<'a> Col<'a> {
@@ -960,13 +1024,14 @@ impl<'a> Col<'a> {
             DenseRef::Ints(v) => Col::Ints(v, nulls),
             DenseRef::Bools(v) => Col::Bools(v, nulls),
             DenseRef::Bytes { offsets, data } => Col::Bytes { off: offsets, data, nulls },
-            DenseRef::Bits64(_) | DenseRef::Bits32(_) => Col::Other(nulls),
+            DenseRef::Bits64(v) => Col::F64(v, nulls),
+            DenseRef::Bits32(v) => Col::F32(v, nulls),
         })
     }
 
     fn nulls(&self) -> &'a [bool] {
         match self {
-            Col::Ints(_, n) | Col::Bools(_, n) | Col::Other(n) | Col::Bytes { nulls: n, .. } => n,
+            Col::Ints(_, n) | Col::Bools(_, n) | Col::F64(_, n) | Col::F32(_, n) | Col::Bytes { nulls: n, .. } => n,
         }
     }
 
@@ -1044,6 +1109,14 @@ impl FilterSet {
         if col.is_null(i) {
             return Ok(self.null_ok);
         }
+        if let Some(fs) = &self.float {
+            let short = || corrupt("float column shorter than its window");
+            return Ok(match col {
+                Col::F64(v, _) => fs.accepts(f64::from_bits(*v.get(i).ok_or_else(short)?)),
+                Col::F32(v, _) => fs.accepts(f64::from(f32::from_bits(*v.get(i).ok_or_else(short)?))),
+                _ => false,
+            });
+        }
         if let Col::Bytes { .. } = col {
             let v = col.bytes(i)?;
             let v = if self.pad_space { trim_spaces(v) } else { v };
@@ -1064,6 +1137,13 @@ impl FilterSet {
     }
 
     fn accepts_value(&self, v: &Value) -> bool {
+        if let Some(fs) = &self.float {
+            return match v {
+                Value::Float64(f) => fs.accepts(*f),
+                Value::Float32(f) => fs.accepts(f64::from(*f)),
+                _ => false,
+            };
+        }
         match v {
             Value::Null => self.null_ok,
             Value::Int(i) | Value::Timestamp(i) => self.ints.contains(i),

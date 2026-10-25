@@ -724,6 +724,26 @@ fn chunks_without_zone_maps_are_read_and_never_pruned() {
 }
 
 #[test]
+fn optimize_gives_old_chunks_zone_maps_once() {
+    for (case, enc, version) in [("plain_v2", false, 2), ("ctr_v2", true, 2), ("aead_v3", true, 3)] {
+        let (_d, t) = check_case(case, enc);
+        assert!(t.chunks().unwrap().iter().all(|c| c.zones.is_none()), "{case}");
+        // the background pass leaves them alone (I/O for no urgency)
+        assert!(!t.compact_auto(base_ts()).is_ok_and(|r| r.groups > 0), "{case}: background rewrote");
+        assert!(t.chunks().unwrap().iter().all(|c| c.zones.is_none()), "{case}");
+        assert_eq!(t.compact(i64::MIN, i64::MAX, base_ts()).unwrap().groups, 1, "{case}");
+        assert_eq!(sorted(all_rows(&t)), sorted(expected(case)), "{case}");
+        assert!(t.chunks().unwrap().iter().all(|c| c.zones.is_some()), "{case}");
+        assert!(chunk_versions(&t).iter().all(|&v| v == version.max(if enc { 3 } else { 2 })), "{case}");
+        assert!(pruned_equals_unpruned(&t, case) >= 2, "{case}: pruning works");
+        // idempotent: the chunk now has summaries, a second OPTIMIZE rewrites nothing
+        let ids: Vec<u64> = t.chunks().unwrap().iter().map(|c| c.id).collect();
+        assert_eq!(t.compact(i64::MIN, i64::MAX, base_ts()).unwrap().groups, 0, "{case}");
+        assert_eq!(t.chunks().unwrap().iter().map(|c| c.id).collect::<Vec<_>>(), ids, "{case}");
+    }
+}
+
+#[test]
 fn chunks_with_zone_maps_are_read_and_pruned() {
     for (case, enc, version) in [("zones_v2", false, 2), ("zones_v3", true, 3)] {
         let (_d, t) = check_case(case, enc);

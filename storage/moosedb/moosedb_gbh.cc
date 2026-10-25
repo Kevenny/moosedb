@@ -31,6 +31,7 @@
 #include <cerrno>
 #include <chrono>
 #include <climits>
+#include <cmath>
 #include <cstring>
 #include <memory>
 #include <numeric>
@@ -194,6 +195,16 @@ struct gfilter
   bool exact= false;
   bool pad= false;                 /* exact: PAD SPACE binary collation (trailing 0x20 ignored) */
   std::vector<Item *> consts;
+  /*
+    Plain DOUBLE / FLOAT column: no dictionary (floats are nearly all
+    distinct); the conjuncts (<, <=, >, >=, =, BETWEEN, IN of constants) are
+    folded into one interval plus an optional point set (see float_shape).
+  */
+  bool is_float= false;
+  double flo= -HUGE_VAL, fhi= HUGE_VAL;
+  bool flo_open= false, fhi_open= false;
+  bool has_points= false;
+  std::vector<double> points;
 };
 
 struct gplan
@@ -666,8 +677,9 @@ const char *pred_refusal(const gplan *p, Item *it, Field **col, int depth= 0)
   if (mine)
   {
     const Item_result ct= mine->cmp_type();
-    if (ct != STRING_RESULT && ct != INT_RESULT)
+    if (ct != STRING_RESULT && ct != INT_RESULT && ct != REAL_RESULT)
       return "WHERE: predicate on an unsupported column type";
+    /* a REAL column's shape and constants (temporal ones included) are checked by float_shape */
     if (ct == STRING_RESULT ? other_const : string_const)
       return "WHERE: comparison across string and number";
     /* a DECIMAL/TIME constant against an integer column: the server converts per row (and warns per row) */
@@ -690,7 +702,15 @@ const char *filter_column_refusal(const gplan *p, Field *f, gfilter *out)
   const int col= p->layout_col(f);
   if (col < 0)
     return "WHERE: predicate on a column that is not stored";
-  if (c == tf_conv::INT && is_int_field(f))
+  if ((c == tf_conv::DOUBLE || c == tf_conv::FLOAT) &&
+      (f->type() == MYSQL_TYPE_DOUBLE || f->type() == MYSQL_TYPE_FLOAT))
+  {
+    /* FLOAT(M,D) / DOUBLE(M,D): the server compares with an epsilon (compare_real_fixed) */
+    if (f->decimals() != NOT_FIXED_DEC)
+      return "WHERE: predicate on a FLOAT/DOUBLE column with (M,D)";
+    out->is_float= true;
+  }
+  else if (c == tf_conv::INT && is_int_field(f))
     out->is_str= false;
   else if (c == tf_conv::STRING &&
            (f->real_type() == MYSQL_TYPE_VARCHAR || f->real_type() == MYSQL_TYPE_STRING))
@@ -789,6 +809,102 @@ void exact_shape(const gplan *p, gfilter *g)
 }
 
 /*
+  Folds the conjuncts of a DOUBLE/FLOAT filter into one interval plus an
+  optional point set (the core's exact FloatFilter), or refuses. Accepted, on
+  a plain FLOAT/DOUBLE column against non-NULL finite INT/DECIMAL/REAL
+  constants (the server then compares as double, widening a FLOAT value, with
+  no epsilon): `<`, `<=`, `>`, `>=`, `=` (either operand order), BETWEEN, IN
+  (one list per column; NOT, NOT IN, <>, <=>, IS NULL, LIKE, OR are refused).
+  NULL never matches; -0.0 == 0.0; NaN cannot be stored by the server and
+  never matches here.
+*/
+const char *float_shape(const gplan *p, gfilter *g)
+{
+  static const char *const bad=
+      "WHERE: FLOAT/DOUBLE predicate other than a range, = or IN of constants";
+  auto cst= [](Item *x, double *d) {
+    return ha_moosedb::moosedb_gbh_const_double(x, d) && std::isfinite(*d);
+  };
+  auto tighten_lo= [g](double d, bool open) {
+    if (d > g->flo || (d == g->flo && open))
+    {
+      g->flo= d;
+      g->flo_open= open;
+    }
+  };
+  auto tighten_hi= [g](double d, bool open) {
+    if (d < g->fhi || (d == g->fhi && open))
+    {
+      g->fhi= d;
+      g->fhi_open= open;
+    }
+  };
+  for (Item *c : g->conds)
+  {
+    if (!c || c->type() != Item::FUNC_ITEM)
+      return bad;
+    Item_func *f= static_cast<Item_func *>(c);
+    Item **a= f->arguments();
+    const uint n= f->argument_count();
+    if (!a || !g->field)
+      return bad;
+    double d= 0, e= 0;
+    switch (f->functype())
+    {
+    case Item_func::EQ_FUNC:
+    case Item_func::LT_FUNC:
+    case Item_func::LE_FUNC:
+    case Item_func::GT_FUNC:
+    case Item_func::GE_FUNC:
+    {
+      if (n != 2)
+        return bad;
+      const bool left= column_of(a[0], p->table) == g->field;
+      const bool right= column_of(a[1], p->table) == g->field;
+      if (left == right)
+        return bad;
+      const Type_handler *th= static_cast<Item_bool_func2 *>(f)->compare_type_handler();
+      if (!th || th->cmp_type() != REAL_RESULT || !cst(a[left ? 1 : 0], &d))
+        return bad;
+      Item_func::Functype op= f->functype();
+      if (!left)                                  /* `K op col` mirrors the operator */
+        op= op == Item_func::LT_FUNC ? Item_func::GT_FUNC
+          : op == Item_func::LE_FUNC ? Item_func::GE_FUNC
+          : op == Item_func::GT_FUNC ? Item_func::LT_FUNC
+          : op == Item_func::GE_FUNC ? Item_func::LE_FUNC : op;
+      if (op == Item_func::EQ_FUNC || op == Item_func::GE_FUNC || op == Item_func::GT_FUNC)
+        tighten_lo(d, op == Item_func::GT_FUNC);
+      if (op == Item_func::EQ_FUNC || op == Item_func::LE_FUNC || op == Item_func::LT_FUNC)
+        tighten_hi(d, op == Item_func::LT_FUNC);
+      break;
+    }
+    case Item_func::BETWEEN:
+      if (n != 3 || static_cast<Item_func_opt_neg *>(f)->negated ||
+          column_of(a[0], p->table) != g->field || !cst(a[1], &d) || !cst(a[2], &e))
+        return bad;
+      tighten_lo(d, false);
+      tighten_hi(e, false);
+      break;
+    case Item_func::IN_FUNC:
+      if (n < 2 || static_cast<Item_func_opt_neg *>(f)->negated ||
+          column_of(a[0], p->table) != g->field || g->has_points)
+        return bad;
+      g->has_points= true;
+      for (uint i= 1; i < n; i++)
+      {
+        if (!cst(a[i], &d))
+          return bad;
+        g->points.push_back(d);
+      }
+      break;
+    default:
+      return bad;
+    }
+  }
+  return nullptr;
+}
+
+/*
   The WHERE is a conjunction. TAG =/IN and bounds on the time axis go to the
   engine's own series/time selection (exact capture, as for DELETE); every other
   conjunct must touch exactly one stored non-TAG column and is grouped with the
@@ -829,7 +945,12 @@ const char *where_refusal(gplan *p, Item *cond)
     g->conds.push_back(c);
   }
   for (gfilter &g : p->filters)
-    exact_shape(p, &g);
+  {
+    if (!g.is_float)
+      exact_shape(p, &g);
+    else if (const char *r= float_shape(p, &g))
+      return r;
+  }
   return nullptr;
 }
 
@@ -1425,9 +1546,23 @@ int moosedb_gbh::compute()
   std::vector<std::vector<uint8_t>> masks(p_.filters.size());
   std::vector<exact_set> sets(p_.filters.size());     /* never resized: the filters point into them */
   std::vector<TFAggFilter> tfs;
+  std::vector<TFAggFloatFilter> ffs;                  /* float columns: no dictionary, the core tests the values (points live in p_.filters) */
   for (size_t i= 0; i < p_.filters.size(); i++)
   {
     const gfilter &gf= p_.filters[i];
+    if (gf.is_float)
+    {
+      TFAggFloatFilter ft{};
+      ft.col= gf.col;
+      ft.lo= gf.flo;
+      ft.hi= gf.fhi;
+      ft.flags= (uint8_t) ((gf.flo_open ? TF_FLOAT_LO_OPEN : 0) | (gf.fhi_open ? TF_FLOAT_HI_OPEN : 0) |
+                           (gf.has_points ? TF_FLOAT_POINTS : 0));
+      ft.points= gf.points.empty() ? nullptr : gf.points.data();
+      ft.point_count= gf.points.size();
+      ffs.push_back(ft);
+      continue;
+    }
     TFAggFilter t{};
     t.col= gf.col;
     if (gf.exact)
@@ -1482,6 +1617,8 @@ int moosedb_gbh::compute()
   spec.func_count= (uint32_t) p_.funcs.size();
   spec.filters= tfs.empty() ? nullptr : tfs.data();
   spec.filter_count= (uint32_t) tfs.size();
+  spec.float_filters= ffs.empty() ? nullptr : ffs.data();
+  spec.float_filter_count= (uint32_t) ffs.size();
   spec.preds= hints_.empty() ? nullptr : hints_.data();
   spec.pred_count= (uint32_t) hints_.size();
   if (used_ >= max_memory_)

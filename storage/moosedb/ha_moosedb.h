@@ -321,6 +321,8 @@ public:
                          longlong *lo, longlong *hi);
   /* Zone-map hints (TF_PRED_INT / TF_PRED_FLOAT only) implied by the AND-ed conjuncts of `where`. */
   void moosedb_gbh_value_preds(Item *where, std::vector<tf_val_pred> *out);
+  /* A non-NULL INT/DECIMAL/REAL constant as the double the server compares a DOUBLE column with (the extraction the zone-map hints use). */
+  static bool moosedb_gbh_const_double(Item *c, double *out);
   /* Series (sorted ids) satisfying every predicate; false = not resolvable. */
   bool moosedb_gbh_series(const std::vector<tf_tag_predicate> &preds,
                           std::vector<uint64_t> *out);

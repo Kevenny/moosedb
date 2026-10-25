@@ -1,0 +1,279 @@
+CREATE TABLE g (
+ts   DATETIME NOT NULL,
+host VARCHAR(8) NOT NULL COMMENT 'TAG',
+i    INT,
+d    DOUBLE,
+f    FLOAT,
+p    DOUBLE,
+df   DOUBLE(10,2),
+ff   FLOAT(8,3),
+INDEX(ts)
+) ENGINE=MooseDB CHUNK_INTERVAL='1 DAY';
+# d: steps of 0.25 in [-5, 4.75] (exact), NULLs, +0 and -0; f: tenths (0.1 is not representable: a FLOAT holds 0.100000001490116...)
+# p: day k holds [k*10, k*10+9.9] (zone maps); 6 days = 6 chunks, day 6 stays in the MemTable
+INSERT INTO g
+SELECT '2024-03-07' + INTERVAL seq MINUTE, CONCAT('h', seq MOD 2), seq MOD 10,
+(CAST((seq * 7) MOD 40 AS SIGNED) - 20) / 4, (CAST((seq * 3) MOD 41 AS SIGNED) - 20) / 10, 25 + (seq MOD 100) / 10,
+(CAST((seq * 7) MOD 40 AS SIGNED) - 20) / 4, (CAST((seq * 3) MOD 41 AS SIGNED) - 20) / 10
+FROM seq_0_to_99;
+DELETE FROM g WHERE ts >= '2024-03-03' AND ts < '2024-03-03 00:30:00';
+CREATE DATABASE mirror;
+CREATE TABLE mirror.g LIKE test.g;
+ALTER TABLE mirror.g ENGINE=InnoDB;
+INSERT INTO mirror.g SELECT * FROM test.g;
+# ---- DOUBLE: ranges, =, BETWEEN, IN (the engine runs them) ----
+# d > 1.5
+# SELECT host, COUNT(*) c, SUM(i) s FROM g WHERE d > 1.5 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# d >= 1.5
+# SELECT host, COUNT(*) c, SUM(i) s FROM g WHERE d >= 1.5 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# d < -1.5
+# SELECT host, COUNT(*) c FROM g WHERE d < -1.5 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# d <= -1.5
+# SELECT host, COUNT(*) c FROM g WHERE d <= -1.5 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# d = 0.25
+# SELECT host, COUNT(*) c FROM g WHERE d = 0.25 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# constant on the left: 1.5 < d
+# SELECT host, COUNT(*) c FROM g WHERE 1.5 < d GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# constant on the left: 1.5 >= d
+# SELECT host, COUNT(*) c FROM g WHERE 1.5 >= d GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# 0.25 = d
+# SELECT host, COUNT(*) c FROM g WHERE 0.25 = d GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# BETWEEN
+# SELECT host, COUNT(*) c, SUM(i) s FROM g WHERE d BETWEEN -1 AND 1 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# BETWEEN with swapped bounds is empty
+# SELECT host, COUNT(*) c FROM g WHERE d BETWEEN 1 AND -1 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# IN with INT, DECIMAL and a value that is nowhere
+# SELECT host, COUNT(*) c FROM g WHERE d IN (0.25, -0.75, 3, 99) GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# IN with a single value
+# SELECT host, COUNT(*) c FROM g WHERE d IN (0.25) GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# two bounds, strict
+# SELECT host, COUNT(*) c FROM g WHERE d > 1 AND d < 3 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# bounds on the same value, one strict
+# SELECT host, COUNT(*) c FROM g WHERE d >= 1.25 AND d > 1.25 AND d <= 2.5 AND d < 2.5 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# range AND IN
+# SELECT host, COUNT(*) c FROM g WHERE d > 1 AND d IN (0.25, 1.25, 2.5, -3) GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# integer and large constants
+# SELECT host, COUNT(*) c FROM g WHERE d >= -2 AND d < 9223372036854775807 AND d > -1e30 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# zero: +0 and -0 are equal (d = 0)
+# SELECT host, COUNT(*) c FROM g WHERE d = 0 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# zero: d = -0e0
+# SELECT host, COUNT(*) c FROM g WHERE d = -0e0 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# zero: d <= 0 AND d >= 0
+# SELECT host, COUNT(*) c FROM g WHERE d <= 0 AND d >= 0 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# zero: d > 0 leaves both zeros out
+# SELECT host, COUNT(*) c FROM g WHERE d > 0 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# zero: IN (0, -0e0)
+# SELECT host, COUNT(*) c FROM g WHERE d IN (0, -0e0) GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# NULL rows never match (d <= 100 counts only the non-NULL ones)
+# SELECT COUNT(*), COUNT(d), SUM(i) FROM g WHERE d <= 100
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# ---- FLOAT: the stored value is widened to double before comparing ----
+# f > 0.1: the FLOAT 0.1 is above the DOUBLE 0.1
+# SELECT host, COUNT(*) c FROM g WHERE f > 0.1 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# f = 0.1: nothing
+# SELECT host, COUNT(*) c FROM g WHERE f = 0.1 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# f >= 0.1
+# SELECT host, COUNT(*) c FROM g WHERE f >= 0.1 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# f <= 0.1
+# SELECT host, COUNT(*) c FROM g WHERE f <= 0.1 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# f = the exact double of the FLOAT 0.1
+# SELECT host, COUNT(*) c FROM g WHERE f = 0.100000001490116119384765625 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# f = 0.10000000149011612 (a DOUBLE with many digits)
+# SELECT host, COUNT(*) c FROM g WHERE f = 0.10000000149011612e0 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# f > 0.10000000149011611 (one digit below the FLOAT)
+# SELECT host, COUNT(*) c FROM g WHERE f > 0.10000000149011611 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# f IN
+# SELECT host, COUNT(*) c FROM g WHERE f IN (0.1, 0.2, 0.5, 0.20000000298023224) GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# f BETWEEN
+# SELECT host, COUNT(*) c FROM g WHERE f BETWEEN 0.1 AND 0.3 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# f < 0.3 AND f > -0.3
+# SELECT host, COUNT(*) c FROM g WHERE f < 0.3 AND f > -0.3 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# f > 1 (INT constant)
+# SELECT host, COUNT(*) c FROM g WHERE f > 1 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# f against a 1.0000000000000000001 constant
+# SELECT host, COUNT(*) c FROM g WHERE f >= 1.0000000000000000001 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# both columns in one WHERE
+# SELECT host, COUNT(*) c FROM g WHERE f > 0.1 AND d < 1 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# ---- with TAG, INT filter, key, bucket, top-N, scalar ----
+# TAG = and a DOUBLE range
+# SELECT i, COUNT(*) c FROM g WHERE host = 'h1' AND d > 1.5 GROUP BY i ORDER BY i
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# TAG IN and BETWEEN and a time bound
+# SELECT host, COUNT(*) c FROM g WHERE host IN ('h0', 'h9') AND d BETWEEN 0 AND 2 AND ts >= '2024-03-02' GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# INT filter (dictionary mask) and a DOUBLE range
+# SELECT host, COUNT(*) c FROM g WHERE i < 5 AND i <> 3 AND d > 1 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# INT = (value set) and a DOUBLE IN
+# SELECT host, COUNT(*) c FROM g WHERE i = 4 AND d IN (0.25, 1.25) GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# bucket of time: DATE(ts)
+# SELECT DATE(ts) dia, COUNT(*) c FROM g WHERE d > 1.5 GROUP BY DATE(ts) ORDER BY dia
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# bucket of time: DATE_FORMAT per hour with TAG
+# SELECT host, DATE_FORMAT(ts, '%Y-%m-%d %H') h, COUNT(*) c FROM g WHERE d <= -3 AND f < 0 GROUP BY host, DATE_FORMAT(ts, '%Y-%m-%d %H') ORDER BY host, h
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# top-N on an INT key
+# SELECT i, COUNT(*) c FROM g WHERE d > 1.5 GROUP BY i ORDER BY c DESC, i LIMIT 3
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# top-N on a TAG key
+# SELECT host, SUM(i) s FROM g WHERE d >= 0.5 GROUP BY host ORDER BY s DESC LIMIT 1
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# HAVING and LIMIT
+# SELECT i, COUNT(*) c FROM g WHERE f > 0.1 GROUP BY i HAVING c > 20 ORDER BY i LIMIT 4
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# scalar
+# SELECT COUNT(*), SUM(i), MIN(i), MAX(i), COUNT(d) FROM g WHERE d > 1.5
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# scalar over no rows
+# SELECT COUNT(*), SUM(i), MIN(i), MAX(i) FROM g WHERE d > 100
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# scalar, FLOAT IN with no match
+# SELECT COUNT(*), SUM(i) FROM g WHERE f IN (0.1)
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# COUNT of the filtered column
+# SELECT host, COUNT(d) c, COUNT(*) n FROM g WHERE d > 4 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# prepared statement parameters
+# DEALLOCATE PREPARE s
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=2)
+# ---- refused: the server answers (same output; the engine does not run it) ----
+# OR
+# SELECT host, COUNT(*) c FROM g WHERE d > 3 OR d < -3 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# NOT d > 1.5 (the server rewrites it as d <= 1.5, so it is a plain range)
+# SELECT host, COUNT(*) c FROM g WHERE NOT d > 1.5 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# d <> 1.5
+# SELECT host, COUNT(*) c FROM g WHERE d <> 1.5 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# NOT IN
+# SELECT host, COUNT(*) c FROM g WHERE d NOT IN (1.5, 2) GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# NOT BETWEEN
+# SELECT host, COUNT(*) c FROM g WHERE d NOT BETWEEN -1 AND 1 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# d <=> 1.5
+# SELECT host, COUNT(*) c FROM g WHERE d <=> 1.5 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# IS NULL
+# SELECT host, COUNT(*) c FROM g WHERE d IS NULL GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# IS NOT NULL
+# SELECT host, COUNT(*) c FROM g WHERE d IS NOT NULL GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# NULL constant
+# SELECT host, COUNT(*) c FROM g WHERE d > NULL GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# IN with a NULL
+# SELECT host, COUNT(*) c FROM g WHERE d IN (0.25, NULL) GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# function of the column
+# SELECT host, COUNT(*) c FROM g WHERE ABS(d) > 3 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# arithmetic on the column
+# SELECT host, COUNT(*) c FROM g WHERE d + 1 > 2 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# column x column
+# SELECT host, COUNT(*) c FROM g WHERE d > f GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# DOUBLE x INT column
+# SELECT host, COUNT(*) c FROM g WHERE d > i GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# string constant
+# SELECT host, COUNT(*) c FROM g WHERE d > '1.5' GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# temporal constant
+# SELECT host, COUNT(*) c FROM g WHERE d > TIMESTAMP'2000-01-01 00:00:00' GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# non-constant function
+# SELECT host, COUNT(*) c FROM g WHERE d > RAND() * 0 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# two IN lists on one column
+# SELECT host, COUNT(*) c FROM g WHERE d IN (0.25, 1.25) AND d IN (1.25, 2.5) GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# LIKE
+# SELECT host, COUNT(*) c FROM g WHERE d LIKE '1%' GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# DOUBLE(10,2): the server compares with an epsilon
+# SELECT host, COUNT(*) c FROM g WHERE df > 1.5 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# FLOAT(8,3)
+# SELECT host, COUNT(*) c FROM g WHERE ff >= 0.1 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# a refused float conjunct next to an accepted one
+# SELECT host, COUNT(*) c FROM g WHERE d > 1 AND f <> 0.5 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# ---- zone maps: the bounds of the WHERE prune chunks (Moosedb_prune_*) ----
+# p >= 45 (days 4 and 5 only)
+# SELECT host, COUNT(*) c FROM g WHERE p >= 45 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# pruned=1 expected=1: as expected
+# p > 49.9, scalar
+# SELECT COUNT(*), SUM(i) FROM g WHERE p > 49.9
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# pruned=1 expected=1: as expected
+# p < 5
+# SELECT host, COUNT(*) c FROM g WHERE p < 5 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# pruned=1 expected=1: as expected
+# p BETWEEN
+# SELECT host, COUNT(*) c, SUM(i) s FROM g WHERE p BETWEEN 20.5 AND 21.5 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# pruned=1 expected=1: as expected
+# p = 31.5
+# SELECT host, COUNT(*) c FROM g WHERE p = 31.5 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# pruned=1 expected=1: as expected
+# p IN (hull of the list)
+# SELECT host, COUNT(*) c FROM g WHERE p IN (1.5, 2.5) GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# pruned=1 expected=1: as expected
+# p with an INT filter
+# SELECT i, COUNT(*) c FROM g WHERE p >= 45 AND i < 3 GROUP BY i ORDER BY i
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# pruned=1 expected=1: as expected
+# whole range: nothing to prune
+# SELECT host, COUNT(*) c FROM g WHERE p > -1 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# pruned=0 expected=0: as expected
+# DOUBLE(10,2) never prunes
+# SELECT host, COUNT(*) c FROM g WHERE df >= 45 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# pruned=0 expected=0: as expected
+DROP DATABASE mirror;
+DROP TABLE g;

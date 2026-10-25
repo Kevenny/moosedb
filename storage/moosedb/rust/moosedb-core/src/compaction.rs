@@ -27,7 +27,7 @@ use crate::crypto::CipherParams;
 use crate::error::{Error, Result};
 use crate::fsutil::sync_dir;
 use crate::log::warn;
-use crate::schema::Row;
+use crate::schema::{ColumnType, Row};
 use crate::table::Table;
 use crate::tomb::{Sel, TombSet};
 
@@ -170,6 +170,16 @@ impl Table {
         // Thousands of pending tombstones cost every read of their series and every
         // MANIFEST write: past this many, chunks with dead rows are rewritten at once.
         let many_tombs = tombs.ranges().len() > MAX_PENDING_TOMBS;
+        // Only numeric/time/bool data columns always get a zone (VARCHAR/DECIMAL may be
+        // over the Bloom cap): without one, a rewrite can stay unzoned and OPTIMIZE
+        // would redo it every time.
+        let can_zone = self.schema.data_indices().iter().any(|&i| {
+            i != self.schema.ts_index()
+                && matches!(
+                    self.schema.columns()[i].ty,
+                    ColumnType::Int64 | ColumnType::Timestamp | ColumnType::Bool | ColumnType::Float32 | ColumnType::Float64
+                )
+        });
         let mut by_bucket: BTreeMap<(i64, i64), Vec<Arc<ChunkMeta>>> = BTreeMap::new();
         for c in chunks.iter().filter(|c| in_scope(c.bucket)) {
             by_bucket.entry(c.bucket).or_default().push(c.clone());
@@ -192,13 +202,18 @@ impl Table {
                 // OPTIMIZE also upgrades chunks of the unauthenticated CTR format
                 // (format v2 with the ENCRYPTED flag) to authenticated ones.
                 let legacy = force && group.iter().any(|c| c.cipher.as_ref().is_some_and(|k| !k.is_authenticated()));
+                // OPTIMIZE gives chunks written before zone maps existed their summaries.
+                // Not in background: it would be I/O for no urgency.
+                // shortcut: a bucket whose zonable columns are all NULL stays unzoned and is
+                // rewritten by every OPTIMIZE; track "rewritten, still unzoned" if that matters.
+                let unzoned = force && can_zone && group.iter().any(|c| c.zones.is_none()); // also heals an unreadable summary
                 // Rows a DELETE hid are only removed by rewriting: when a quarter of
                 // a chunk is dead (or at OPTIMIZE), not for a handful of rows.
                 let dirty = group.iter().any(|c| {
                     let d = tombs.dead_rows(c.id);
                     d > 0 && (force || d.saturating_mul(4) >= c.header.row_count || many_tombs)
                 });
-                group.len() >= trigger || (force && group.len() > 1) || recode || rekey || legacy || dirty
+                group.len() >= trigger || (force && group.len() > 1) || recode || rekey || legacy || unzoned || dirty
             })
             .map(|(_, g)| g)
             .collect()
@@ -511,6 +526,38 @@ mod tests {
             out.push(r);
         }
         out
+    }
+
+    #[test]
+    fn optimize_does_not_rewrite_a_chunk_that_can_never_get_zone_maps() {
+        // ts + TAG + a VARCHAR over the Bloom cap: no column gets a zone, so the
+        // chunk stays unzoned and a rewrite would be pure I/O, every OPTIMIZE.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t");
+        let schema = Schema::new(
+            vec![
+                Column { name: "ts".into(), ty: ColumnType::Timestamp },
+                Column { name: "host".into(), ty: ColumnType::Tag },
+                Column { name: "msg".into(), ty: ColumnType::Varchar },
+            ],
+            0,
+        )
+        .unwrap();
+        let cfg = TableConfig::new(&path, schema, &RawOptions::default()).unwrap();
+        Table::create(&cfg).unwrap();
+        let t = Table::open(cfg).unwrap();
+        for i in 0..70_000i64 {
+            t.write(vec![
+                Value::Timestamp(1_700_000_000_000_000 + i),
+                Value::Bytes(b"a".to_vec()),
+                Value::Bytes(format!("m{i}").into_bytes()),
+            ])
+            .unwrap();
+        }
+        t.flush().unwrap();
+        assert!(t.chunks().unwrap().iter().all(|c| c.zones.is_none()));
+        let report = t.compact(i64::MIN, i64::MAX, 2_000_000_000_000_000).unwrap();
+        assert_eq!(report.groups, 0);
     }
 
     #[test]

@@ -17,7 +17,8 @@
 //! | BOOL             | RLE                              |
 //! | VARCHAR / DECIMAL| length-prefixed bytes            |
 //!
-//! The codec (LZ4/ZSTD) is applied only when it makes the block smaller.
+//! The codec (LZ4/ZSTD) is applied only when it saves at least 1/`MIN_GAIN_DIV`
+//! of the block (see `encode`).
 
 use crate::bytes::{put_bytes, put_u16, put_u32, put_u8, put_varint, ByteReader};
 use crate::cache::BlockPayload;
@@ -26,6 +27,9 @@ use crate::error::{corrupt, invalid, Result};
 use crate::schema::{ColumnType, Value};
 
 pub(crate) const HEADER_LEN: usize = 12;
+
+/// Minimum saving (1/32, ~3 %) for a block to be stored compressed.
+const MIN_GAIN_DIV: usize = 32;
 
 const ENC_PLAIN: u8 = 0;
 const ENC_DELTA_OF_DELTA: u8 = 1;
@@ -128,7 +132,10 @@ pub(crate) fn encode(ty: ColumnType, values: &[&Value], codec: Codec) -> Result<
         Codec::None => (CODEC_NONE, payload),
         c => {
             let compressed = compression::compress(c, &payload)?;
-            if compressed.len() < payload.len() {
+            // Keep the codec only for a real gain: a block that shrinks by a few
+            // percent (already-compressed blobs) would make every read pay the
+            // decompression for nothing. CODEC_NONE is per block, so readers are unaffected.
+            if compressed.len() + payload.len() / MIN_GAIN_DIV < payload.len() {
                 (c.id(), compressed)
             } else {
                 (CODEC_NONE, payload)
@@ -530,6 +537,103 @@ mod tests {
         let v = rt(ColumnType::Float64, vals, Codec::Zstd(3));
         assert!(t.bytes.len() * 100 < t.plain_len, "timestamps: {} of {}", t.bytes.len(), t.plain_len);
         assert!(v.bytes.len() * 10 < v.plain_len, "values: {} of {}", v.bytes.len(), v.plain_len);
+    }
+
+    fn xorshift(s: &mut u64) -> u64 {
+        *s ^= *s << 13;
+        *s ^= *s >> 7;
+        *s ^= *s << 17;
+        *s
+    }
+
+    /// `n` blobs of `len` bytes: random, except that a fraction `zero_pct`/1000 of the bytes is 0.
+    fn blobs(n: usize, len: usize, zero_pct: u64) -> Vec<Value> {
+        let mut s = 0x9E37_79B9_7F4A_7C15u64;
+        (0..n)
+            .map(|_| {
+                Value::Bytes(
+                    (0..len)
+                        .map(|_| {
+                            let r = xorshift(&mut s);
+                            if (r >> 40) % 1000 < zero_pct { 0 } else { r as u8 }
+                        })
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
+    fn codec_of(b: &EncodedBlock) -> u8 {
+        b.bytes[1]
+    }
+
+    #[test]
+    fn a_block_that_barely_shrinks_is_stored_uncompressed_and_normal_data_still_compresses() {
+        let random = rt(ColumnType::Varchar, blobs(64, 1024, 0), Codec::Zstd(3));
+        assert_eq!(codec_of(&random), CODEC_NONE, "incompressible");
+        let text: Vec<Value> = (0..2000).map(|i| Value::Bytes(format!("host-{} status ok", i % 17).into_bytes())).collect();
+        assert_eq!(codec_of(&rt(ColumnType::Varchar, text, Codec::Zstd(3))), compression::CODEC_ZSTD);
+        let ints: Vec<Value> = (0..5000).map(|i| Value::Int(i * 3 + i % 5)).collect();
+        assert_eq!(codec_of(&rt(ColumnType::Int64, ints, Codec::Zstd(3))), compression::CODEC_ZSTD);
+        // 12 % zero bytes: ~10 % saving, above the threshold
+        assert_eq!(codec_of(&rt(ColumnType::Varchar, blobs(64, 1024, 120), Codec::Zstd(3))), compression::CODEC_ZSTD);
+    }
+
+    /// `cargo test -p moosedb-core --release block::tests::bench_min_gain -- --ignored --nocapture`
+    /// "before" = keep the codec whenever it shrinks the block; "after" = the 1/32 rule.
+    #[test]
+    #[ignore = "benchmark"]
+    fn bench_min_gain() {
+        use std::time::Instant;
+        let n = 200;
+        let reps = 20;
+        let sensor: Vec<Value> = (0..20_000).map(|i| Value::Float64(50.0 + ((i * 7919) % 1000) as f64 * 0.013)).collect();
+        let ints: Vec<Value> = (0..20_000).map(|i| Value::Int(i * 3 + (i * 31) % 7)).collect();
+        let text: Vec<Value> =
+            (0..20_000).map(|i| Value::Bytes(format!("GET /api/v1/item/{} 200 {}ms", i % 900, i % 37).into_bytes())).collect();
+        let mut cases: Vec<(String, ColumnType, Vec<Value>)> = [0u64, 5, 15, 30, 60, 120]
+            .iter()
+            .map(|&z| (format!("blob 4KiB x{n}, {:.1}% zero bytes", z as f64 / 10.0), ColumnType::Varchar, blobs(n, 4096, z)))
+            .collect();
+        cases.push(("float64 sensor 20k".into(), ColumnType::Float64, sensor));
+        cases.push(("int64 20k".into(), ColumnType::Int64, ints));
+        cases.push(("varchar text 20k".into(), ColumnType::Varchar, text));
+        println!("{:<34} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}", "case", "raw", "before", "after", "enc ms", "dec b ms", "dec a ms");
+        for (name, ty, vals) in cases {
+            let refs: Vec<&Value> = vals.iter().collect();
+            let raw = encode(ty, &refs, Codec::None).unwrap();
+            let payload = &raw.bytes[HEADER_LEN..];
+            let t = Instant::now();
+            let mut after = None;
+            for _ in 0..reps {
+                after = Some(encode(ty, &refs, Codec::Zstd(3)).unwrap());
+            }
+            let enc_ms = t.elapsed().as_secs_f64() * 1e3 / reps as f64;
+            let after = after.unwrap();
+            let z = compression::compress(Codec::Zstd(3), payload).unwrap();
+            let before = if z.len() < payload.len() {
+                forge(compression::CODEC_ZSTD, payload.len() as u32, &z)
+            } else {
+                forge(CODEC_NONE, payload.len() as u32, payload)
+            };
+            let time = |b: &[u8]| {
+                let t = Instant::now();
+                for _ in 0..reps {
+                    std::hint::black_box(unpack(b).unwrap());
+                }
+                t.elapsed().as_secs_f64() * 1e3 / reps as f64
+            };
+            println!(
+                "{:<34} {:>10} {:>10} {:>10} {:>10.2} {:>10.2} {:>10.2}",
+                name,
+                payload.len(),
+                before.len() - HEADER_LEN,
+                after.bytes.len() - HEADER_LEN,
+                enc_ms,
+                time(&before),
+                time(&after.bytes)
+            );
+        }
     }
 
     /// Builds a block with a valid CRC around arbitrary header fields.

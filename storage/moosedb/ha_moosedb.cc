@@ -2574,6 +2574,11 @@ bool double_value(Item *c, double *out)
 
 } // namespace
 
+bool ha_moosedb::moosedb_gbh_const_double(Item *c, double *out)
+{
+  return double_value(c, out);
+}
+
 void ha_moosedb::collect_value_predicates(const Item *cond,
                                           std::vector<tf_val_pred> *out)
 {

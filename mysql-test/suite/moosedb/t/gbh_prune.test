@@ -6,7 +6,7 @@
 # pushdown and InnoDB; the Moosedb_prune_* counters show whether the ON run
 # pruned. What the hints must not cover (OR, IS NULL, <=>, NOT BETWEEN,
 # _ci strings, DOUBLE(M,D), BIGINT UNSIGNED, string constants) must not
-# prune. DOUBLE columns are outside the pushdown's scope: the query runs on the
+# prune. A plain DOUBLE is pushed too (gbh_float); DOUBLE(M,D) stays on the
 # normal path, which prunes by itself. MemTable rows are never pruned; DELETEd
 # rows stay deleted.
 #
@@ -154,8 +154,8 @@ INSERT INTO mirror.g SELECT * FROM test.g;
 --let $q= SELECT host, COUNT(*) c FROM g WHERE vc = 'd3-1' GROUP BY host ORDER BY host
 --source suite/moosedb/include/gbh_prune_case.inc
 
---echo # ---- DOUBLE: outside the pushdown (the normal path runs and prunes) ----
---let $refused= 1
+--echo # ---- DOUBLE: the engine aggregates and prunes (plain DOUBLE only) ----
+--let $refused= 0
 --let $expect= 1
 --let $label= d >= 45
 --let $q= SELECT host, COUNT(*) c FROM g WHERE d >= 45 GROUP BY host ORDER BY host

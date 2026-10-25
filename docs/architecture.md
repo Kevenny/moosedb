@@ -60,7 +60,10 @@ Cada tabela é um diretório `<datadir>/<schema>/<tabela>/`:
 Header de 64 bytes (texto claro) → header de criptografia de 32 bytes (se
 cifrado) → blocos de coluna → índice de séries → Bloom filter → footer de 24
 bytes. Cada **bloco de coluna** tem codificação por tipo, codec (LZ4/ZSTD,
-aplicado só se reduzir o tamanho) e CRC próprio; o arquivo inteiro tem um CRC
+aplicado só se economizar ≥ 1/32 ≈ 3 % do bloco, `MIN_GAIN_DIV` em `block.rs`;
+senão `CODEC_NONE`, sem mudança de formato: blobs já comprimidos não pagam
+descompressão por 1-3 %; medido: com 1,7 % de ganho o decode custava 0,43 ms contra 0,02 ms
+em 820 KB) e CRC próprio; o arquivo inteiro tem um CRC
 sobre os bytes armazenados (o `CHECK TABLE` funciona sem a chave). No v3
 (cifrado) cada bloco e a seção índice+Bloom são selados com AES-256-GCM e
 seguidos de uma tag de 16 bytes (ver §Criptografia).
@@ -109,7 +112,11 @@ podados; `OPTIMIZE`/compactação regrava com resumos (tudo passa por
 residente para todo chunk vivo e não entra em nenhum orçamento (medido no lab
 fileaccess, 20 M linhas: +75 MB de RSS com 14 mil séries×dia, +332 MB com 485
 mil; disco +6% e +10%). Chunks gravados antes da seção (ou já compactados) só
-ganham resumos quando regravados — `OPTIMIZE` não reescreve chunk já compactado.
+ganham resumos quando regravados: o `OPTIMIZE`/`moosedb_compact` regrava todo
+grupo que tenha chunk sem resumos (`compaction.rs`, `unzoned`; idempotente, pois todo
+schema tem a coluna timestamp e a regravação sempre grava ZONES; também cura seção
+ilegível). A manutenção em background **não** faz isso (I/O sem urgência): chunks
+antigos só ganham poda após um `OPTIMIZE`.
 
 Poda (sempre conservadora; `Pruner::entry_pruned`):
 
@@ -134,7 +141,7 @@ reavalia o WHERE); C ABI `moosedb_scan_open_pruned`. (2) **agregação** — os
 `null_ok`) viram `Pruner` em `Plan::new`, aplicado em `Plan::units`; sem mudança
 de ABI. Além deles, `AggSpec::preds` / `TFAggSpec::preds` (`TFColPred`, mesma
 semântica do scan: dica, NULL nunca casa) entram no mesmo `Pruner`; o gbh passa
-os limites de faixa do WHERE (`INT`/`BIGINT`; para `FLOAT`/`DOUBLE` sem `(M,D)` a dica `TF_PRED_FLOAT` também é gerada, mas hoje o gbh recusa colunas DOUBLE como filtro, então não chega ao core por ele) (`col > K`, `BETWEEN`, ...) extraídos
+os limites de faixa do WHERE (`INT`/`BIGINT`; para `FLOAT`/`DOUBLE` sem `(M,D)` a dica `TF_PRED_FLOAT` também é gerada e chega ao core, pois o gbh aceita esse filtro; ver §Predicado em FLOAT/DOUBLE) (`col > K`, `BETWEEN`, ...) extraídos
 por `collect_value_predicates` (a mesma extração do scan normal: `FLOAT(M,D)`/
 `DOUBLE(M,D)`, `BIGINT UNSIGNED`, `YEAR`, `BIT`, string e `OR`/`NOT`/`IS NULL`
 não geram dica) tanto na **fase de dicionário** quanto na execução final. É na
@@ -943,7 +950,8 @@ comparador é datetime). Os demais conjuntos do WHERE entram se cada um referenc
 inclusive `BIGINT UNSIGNED`; nunca TAG nem o eixo) só com constantes: `=`, `<=>`,
 `<>`, `<`, `<=`, `>`, `>=`, `BETWEEN`, `IN`, `NOT IN`, `LIKE`/`NOT LIKE`,
 `IS [NOT] NULL`, e `OR`/`NOT`/`AND` aninhados desses sobre a MESMA coluna (os
-conjuntos de uma coluna formam o predicado dela). HAVING, ORDER BY (chave ou
+conjuntos de uma coluna formam o predicado dela). Uma coluna `FLOAT`/`DOUBLE` simples entra só com faixa/`=`/`IN`
+de constantes (§Predicado em FLOAT/DOUBLE). HAVING, ORDER BY (chave ou
 agregado, ASC/DESC), LIMIT e OFFSET entram. Fora: DISTINCT, ROLLUP, window, WITH
 TIES, SQL_CALC_FOUND_ROWS, subconsulta/derivada/view/CTE/UNION, rotinas,
 expressões (exceto o bucket de tempo, abaixo), `OR` entre colunas diferentes, conjunto com duas colunas, função da
@@ -966,6 +974,26 @@ core). Custo: uma avaliação de `Item` por valor DISTINTO (colunas com milhões
 valores distintos pagam isso; `=`/`IN` byte-exatos nem passam por aqui, ver atalhos abaixo). Limites do core (16 chaves, 64 funções, 16 filtros) e `moosedb_agg_max_memory` esgotado antes de uma execução: recusa no planejamento / erro de orçamento. O `parallel_sort` do pós-processamento não checa KILL (≈1 s por milhão de grupos string). Medição do
 tempo (status cumulativos `Moosedb_gbh_dict_us`, `_agg_us`, `_dict_values`,
 `_eval_us`, `_post_us` = pós-processamento em C++).
+
+**Predicado em FLOAT/DOUBLE** (`float_shape`, `TFAggFloatFilter` / `FloatFilter`). Sem dicionário nem
+máscara (em float quase todo valor é distinto): o WHERE da coluna vira um **filtro exato de faixa** no
+core, um intervalo (extremos abertos ou fechados) mais um conjunto opcional de pontos, avaliado por
+linha (chunks e MemTable) em `FilterSet::accepts_row/accepts_value`. Aceito: coluna `FLOAT`/`DOUBLE`
+**sem `(M,D)`** contra constantes INT/DECIMAL/REAL não NULL e finitas (extração `double_value`, a mesma
+do scan e das dicas de poda), com `<`, `<=`, `>`, `>=`, `=` (constante dos dois lados), `BETWEEN` e `IN`
+(uma lista por coluna); os conjuntos AND se fundem (interseção de intervalos; `NOT d > K` o servidor já
+reescreve como `d <= K`). Recusado: `OR`, `NOT IN`, `NOT BETWEEN`, `<>`, `<=>`, `IS [NOT] NULL`, `LIKE`,
+função ou aritmética da coluna, coluna x coluna, constante string/temporal/NULL/não constante, duas
+listas `IN` na mesma coluna e `FLOAT(M,D)`/`DOUBLE(M,D)` (o servidor compara com épsilon,
+`compare_real_fixed`, só quando os DOIS lados têm `decimals < NOT_FIXED_DEC`; coluna simples tem
+`NOT_FIXED_DEC`, então a comparação é `<`/`==` puro). Semântica = servidor: NULL nunca casa; `-0.0 == 0.0`;
+`FLOAT` é alargado a `double` antes de comparar (`f > 0.1` casa o `0.1f`, `f = 0.1` não; `f = 0.100000001490116119384765625`
+casa); NaN não existe em coluna SQL e no core nunca casa (nem `>`, que no servidor seria "maior" para NaN
+em `compare_real`); constante infinita é recusada. As dicas de poda (`TF_PRED_FLOAT`, inclusivas, hull do `IN`)
+seguem sendo geradas por `collect_value_predicates` e podam chunks; o filtro exato não poda por conta própria.
+O filtro conta no limite de 16 filtros e impede que a execução seja a "plain" que grava dicionário.
+Testes: `gbh_float` (OFF x ON x InnoDB, poda `Moosedb_prune_*`), `float_filters_match_the_ieee_model_on_chunks_and_memtable`,
+ABI em `agg_abi`.
 
 **Atalhos para o core.** (1) *Conjunto de valores*: um filtro cujo predicado é
 exatamente `col = const` / `col IN (consts)` (sem NOT/OR/NULL na lista) vai ao core

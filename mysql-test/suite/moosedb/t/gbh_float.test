@@ -1,0 +1,342 @@
+#
+# GROUP BY done by the engine with a WHERE on a DOUBLE / FLOAT column
+# (moosedb_group_by_pushdown). Floats have no dictionary phase: the engine
+# tests the values itself with an exact interval (+ point set) built from
+# `<`, `<=`, `>`, `>=`, `=`, BETWEEN and IN of constants on a plain
+# DOUBLE/FLOAT. Everything else (OR, NOT, <>, <=>, IS [NOT] NULL, functions,
+# column x column, string constants, DOUBLE(M,D)/FLOAT(M,D), two IN lists) is
+# refused and stays with the server. Differential test (OFF / ON / InnoDB must
+# print the same, include/gbh_diff.inc) plus the zone-map pruning counters.
+#
+--source include/not_embedded.inc
+--source include/have_innodb.inc
+--source include/have_sequence.inc
+--source suite/moosedb/include/have_moosedb.inc
+
+--let $refused= 0
+--let $sorted= 0
+--let $show= 0
+--let $pre=
+
+CREATE TABLE g (
+  ts   DATETIME NOT NULL,
+  host VARCHAR(8) NOT NULL COMMENT 'TAG',
+  i    INT,
+  d    DOUBLE,
+  f    FLOAT,
+  p    DOUBLE,
+  df   DOUBLE(10,2),
+  ff   FLOAT(8,3),
+  INDEX(ts)
+) ENGINE=MooseDB CHUNK_INTERVAL='1 DAY';
+
+--echo # d: steps of 0.25 in [-5, 4.75] (exact), NULLs, +0 and -0; f: tenths (0.1 is not representable: a FLOAT holds 0.100000001490116...)
+--echo # p: day k holds [k*10, k*10+9.9] (zone maps); 6 days = 6 chunks, day 6 stays in the MemTable
+--disable_query_log
+let $day= 0;
+while ($day < 6)
+{
+  eval INSERT INTO g
+    SELECT '2024-03-01' + INTERVAL $day DAY + INTERVAL seq MINUTE,
+           CONCAT('h', seq MOD 2),
+           seq MOD 10,
+           IF(seq MOD 19 = 0, NULL, IF(seq MOD 29 = 1, -1 * 0e0, (CAST((seq * 7) MOD 40 AS SIGNED) - 20) / 4)),
+           IF(seq MOD 23 = 0, NULL, (CAST((seq * 3) MOD 41 AS SIGNED) - 20) / 10),
+           IF(seq MOD 17 = 0, NULL, $day * 10 + (seq MOD 100) / 10),
+           (CAST((seq * 7) MOD 40 AS SIGNED) - 20) / 4,
+           (CAST((seq * 3) MOD 41 AS SIGNED) - 20) / 10
+    FROM seq_0_to_199;
+  FLUSH TABLES g;
+  inc $day;
+}
+--enable_query_log
+INSERT INTO g
+  SELECT '2024-03-07' + INTERVAL seq MINUTE, CONCAT('h', seq MOD 2), seq MOD 10,
+         (CAST((seq * 7) MOD 40 AS SIGNED) - 20) / 4, (CAST((seq * 3) MOD 41 AS SIGNED) - 20) / 10, 25 + (seq MOD 100) / 10,
+         (CAST((seq * 7) MOD 40 AS SIGNED) - 20) / 4, (CAST((seq * 3) MOD 41 AS SIGNED) - 20) / 10
+  FROM seq_0_to_99;
+DELETE FROM g WHERE ts >= '2024-03-03' AND ts < '2024-03-03 00:30:00';
+
+CREATE DATABASE mirror;
+CREATE TABLE mirror.g LIKE test.g;
+ALTER TABLE mirror.g ENGINE=InnoDB;
+INSERT INTO mirror.g SELECT * FROM test.g;
+
+--echo # ---- DOUBLE: ranges, =, BETWEEN, IN (the engine runs them) ----
+--let $label= d > 1.5
+--let $q= SELECT host, COUNT(*) c, SUM(i) s FROM g WHERE d > 1.5 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= d >= 1.5
+--let $q= SELECT host, COUNT(*) c, SUM(i) s FROM g WHERE d >= 1.5 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= d < -1.5
+--let $q= SELECT host, COUNT(*) c FROM g WHERE d < -1.5 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= d <= -1.5
+--let $q= SELECT host, COUNT(*) c FROM g WHERE d <= -1.5 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= d = 0.25
+--let $q= SELECT host, COUNT(*) c FROM g WHERE d = 0.25 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= constant on the left: 1.5 < d
+--let $q= SELECT host, COUNT(*) c FROM g WHERE 1.5 < d GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= constant on the left: 1.5 >= d
+--let $q= SELECT host, COUNT(*) c FROM g WHERE 1.5 >= d GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= 0.25 = d
+--let $q= SELECT host, COUNT(*) c FROM g WHERE 0.25 = d GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= BETWEEN
+--let $q= SELECT host, COUNT(*) c, SUM(i) s FROM g WHERE d BETWEEN -1 AND 1 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= BETWEEN with swapped bounds is empty
+--let $q= SELECT host, COUNT(*) c FROM g WHERE d BETWEEN 1 AND -1 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= IN with INT, DECIMAL and a value that is nowhere
+--let $q= SELECT host, COUNT(*) c FROM g WHERE d IN (0.25, -0.75, 3, 99) GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= IN with a single value
+--let $q= SELECT host, COUNT(*) c FROM g WHERE d IN (0.25) GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= two bounds, strict
+--let $q= SELECT host, COUNT(*) c FROM g WHERE d > 1 AND d < 3 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= bounds on the same value, one strict
+--let $q= SELECT host, COUNT(*) c FROM g WHERE d >= 1.25 AND d > 1.25 AND d <= 2.5 AND d < 2.5 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= range AND IN
+--let $q= SELECT host, COUNT(*) c FROM g WHERE d > 1 AND d IN (0.25, 1.25, 2.5, -3) GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= integer and large constants
+--let $q= SELECT host, COUNT(*) c FROM g WHERE d >= -2 AND d < 9223372036854775807 AND d > -1e30 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= zero: +0 and -0 are equal (d = 0)
+--let $q= SELECT host, COUNT(*) c FROM g WHERE d = 0 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= zero: d = -0e0
+--let $q= SELECT host, COUNT(*) c FROM g WHERE d = -0e0 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= zero: d <= 0 AND d >= 0
+--let $q= SELECT host, COUNT(*) c FROM g WHERE d <= 0 AND d >= 0 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= zero: d > 0 leaves both zeros out
+--let $q= SELECT host, COUNT(*) c FROM g WHERE d > 0 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= zero: IN (0, -0e0)
+--let $q= SELECT host, COUNT(*) c FROM g WHERE d IN (0, -0e0) GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= NULL rows never match (d <= 100 counts only the non-NULL ones)
+--let $q= SELECT COUNT(*), COUNT(d), SUM(i) FROM g WHERE d <= 100
+--source suite/moosedb/include/gbh_diff.inc
+
+--echo # ---- FLOAT: the stored value is widened to double before comparing ----
+--let $label= f > 0.1: the FLOAT 0.1 is above the DOUBLE 0.1
+--let $q= SELECT host, COUNT(*) c FROM g WHERE f > 0.1 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= f = 0.1: nothing
+--let $q= SELECT host, COUNT(*) c FROM g WHERE f = 0.1 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= f >= 0.1
+--let $q= SELECT host, COUNT(*) c FROM g WHERE f >= 0.1 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= f <= 0.1
+--let $q= SELECT host, COUNT(*) c FROM g WHERE f <= 0.1 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= f = the exact double of the FLOAT 0.1
+--let $q= SELECT host, COUNT(*) c FROM g WHERE f = 0.100000001490116119384765625 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= f = 0.10000000149011612 (a DOUBLE with many digits)
+--let $q= SELECT host, COUNT(*) c FROM g WHERE f = 0.10000000149011612e0 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= f > 0.10000000149011611 (one digit below the FLOAT)
+--let $q= SELECT host, COUNT(*) c FROM g WHERE f > 0.10000000149011611 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= f IN
+--let $q= SELECT host, COUNT(*) c FROM g WHERE f IN (0.1, 0.2, 0.5, 0.20000000298023224) GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= f BETWEEN
+--let $q= SELECT host, COUNT(*) c FROM g WHERE f BETWEEN 0.1 AND 0.3 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= f < 0.3 AND f > -0.3
+--let $q= SELECT host, COUNT(*) c FROM g WHERE f < 0.3 AND f > -0.3 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= f > 1 (INT constant)
+--let $q= SELECT host, COUNT(*) c FROM g WHERE f > 1 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= f against a 1.0000000000000000001 constant
+--let $q= SELECT host, COUNT(*) c FROM g WHERE f >= 1.0000000000000000001 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= both columns in one WHERE
+--let $q= SELECT host, COUNT(*) c FROM g WHERE f > 0.1 AND d < 1 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+
+--echo # ---- with TAG, INT filter, key, bucket, top-N, scalar ----
+--let $label= TAG = and a DOUBLE range
+--let $q= SELECT i, COUNT(*) c FROM g WHERE host = 'h1' AND d > 1.5 GROUP BY i ORDER BY i
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= TAG IN and BETWEEN and a time bound
+--let $q= SELECT host, COUNT(*) c FROM g WHERE host IN ('h0', 'h9') AND d BETWEEN 0 AND 2 AND ts >= '2024-03-02' GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= INT filter (dictionary mask) and a DOUBLE range
+--let $q= SELECT host, COUNT(*) c FROM g WHERE i < 5 AND i <> 3 AND d > 1 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= INT = (value set) and a DOUBLE IN
+--let $q= SELECT host, COUNT(*) c FROM g WHERE i = 4 AND d IN (0.25, 1.25) GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= bucket of time: DATE(ts)
+--let $q= SELECT DATE(ts) dia, COUNT(*) c FROM g WHERE d > 1.5 GROUP BY DATE(ts) ORDER BY dia
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= bucket of time: DATE_FORMAT per hour with TAG
+--let $q= SELECT host, DATE_FORMAT(ts, '%Y-%m-%d %H') h, COUNT(*) c FROM g WHERE d <= -3 AND f < 0 GROUP BY host, DATE_FORMAT(ts, '%Y-%m-%d %H') ORDER BY host, h
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= top-N on an INT key
+--let $q= SELECT i, COUNT(*) c FROM g WHERE d > 1.5 GROUP BY i ORDER BY c DESC, i LIMIT 3
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= top-N on a TAG key
+--let $q= SELECT host, SUM(i) s FROM g WHERE d >= 0.5 GROUP BY host ORDER BY s DESC LIMIT 1
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= HAVING and LIMIT
+--let $q= SELECT i, COUNT(*) c FROM g WHERE f > 0.1 GROUP BY i HAVING c > 20 ORDER BY i LIMIT 4
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= scalar
+--let $q= SELECT COUNT(*), SUM(i), MIN(i), MAX(i), COUNT(d) FROM g WHERE d > 1.5
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= scalar over no rows
+--let $q= SELECT COUNT(*), SUM(i), MIN(i), MAX(i) FROM g WHERE d > 100
+--source suite/moosedb/include/gbh_diff.inc
+--let $either= 1
+--let $label= scalar, FLOAT IN with no match
+--let $q= SELECT COUNT(*), SUM(i) FROM g WHERE f IN (0.1)
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= COUNT of the filtered column
+--let $q= SELECT host, COUNT(d) c, COUNT(*) n FROM g WHERE d > 4 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= prepared statement parameters
+--let $pre= PREPARE s FROM 'SELECT host, COUNT(*) c FROM g WHERE d > ? AND f < ? GROUP BY host ORDER BY host'; SET @a= 1.5, @b= 0.5; EXECUTE s USING @a, @b; SET @a= -2, @b= 3; EXECUTE s USING @a, @b;
+--let $q= DEALLOCATE PREPARE s
+--source suite/moosedb/include/gbh_diff.inc
+
+--echo # ---- refused: the server answers (same output; the engine does not run it) ----
+--let $refused= 1
+--let $label= OR
+--let $q= SELECT host, COUNT(*) c FROM g WHERE d > 3 OR d < -3 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $label= NOT d > 1.5 (the server rewrites it as d <= 1.5, so it is a plain range)
+--let $q= SELECT host, COUNT(*) c FROM g WHERE NOT d > 1.5 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $refused= 1
+--let $label= d <> 1.5
+--let $q= SELECT host, COUNT(*) c FROM g WHERE d <> 1.5 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $refused= 1
+--let $label= NOT IN
+--let $q= SELECT host, COUNT(*) c FROM g WHERE d NOT IN (1.5, 2) GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $refused= 1
+--let $label= NOT BETWEEN
+--let $q= SELECT host, COUNT(*) c FROM g WHERE d NOT BETWEEN -1 AND 1 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $refused= 1
+--let $label= d <=> 1.5
+--let $q= SELECT host, COUNT(*) c FROM g WHERE d <=> 1.5 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $refused= 1
+--let $label= IS NULL
+--let $q= SELECT host, COUNT(*) c FROM g WHERE d IS NULL GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $refused= 1
+--let $label= IS NOT NULL
+--let $q= SELECT host, COUNT(*) c FROM g WHERE d IS NOT NULL GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $refused= 1
+--let $label= NULL constant
+--let $q= SELECT host, COUNT(*) c FROM g WHERE d > NULL GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $refused= 1
+--let $label= IN with a NULL
+--let $q= SELECT host, COUNT(*) c FROM g WHERE d IN (0.25, NULL) GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $refused= 1
+--let $label= function of the column
+--let $q= SELECT host, COUNT(*) c FROM g WHERE ABS(d) > 3 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $refused= 1
+--let $label= arithmetic on the column
+--let $q= SELECT host, COUNT(*) c FROM g WHERE d + 1 > 2 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $refused= 1
+--let $label= column x column
+--let $q= SELECT host, COUNT(*) c FROM g WHERE d > f GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $refused= 1
+--let $label= DOUBLE x INT column
+--let $q= SELECT host, COUNT(*) c FROM g WHERE d > i GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $refused= 1
+--let $label= string constant
+--let $q= SELECT host, COUNT(*) c FROM g WHERE d > '1.5' GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $refused= 1
+--let $label= temporal constant
+--let $q= SELECT host, COUNT(*) c FROM g WHERE d > TIMESTAMP'2000-01-01 00:00:00' GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $refused= 1
+--let $label= non-constant function
+--let $q= SELECT host, COUNT(*) c FROM g WHERE d > RAND() * 0 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $refused= 1
+--let $label= two IN lists on one column
+--let $q= SELECT host, COUNT(*) c FROM g WHERE d IN (0.25, 1.25) AND d IN (1.25, 2.5) GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $refused= 1
+--let $label= LIKE
+--let $q= SELECT host, COUNT(*) c FROM g WHERE d LIKE '1%' GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $refused= 1
+--let $label= DOUBLE(10,2): the server compares with an epsilon
+--let $q= SELECT host, COUNT(*) c FROM g WHERE df > 1.5 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $refused= 1
+--let $label= FLOAT(8,3)
+--let $q= SELECT host, COUNT(*) c FROM g WHERE ff >= 0.1 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+--let $refused= 1
+--let $label= a refused float conjunct next to an accepted one
+--let $q= SELECT host, COUNT(*) c FROM g WHERE d > 1 AND f <> 0.5 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_diff.inc
+
+--echo # ---- zone maps: the bounds of the WHERE prune chunks (Moosedb_prune_*) ----
+--let $expect= 1
+--let $label= p >= 45 (days 4 and 5 only)
+--let $q= SELECT host, COUNT(*) c FROM g WHERE p >= 45 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_prune_case.inc
+--let $label= p > 49.9, scalar
+--let $q= SELECT COUNT(*), SUM(i) FROM g WHERE p > 49.9
+--source suite/moosedb/include/gbh_prune_case.inc
+--let $label= p < 5
+--let $q= SELECT host, COUNT(*) c FROM g WHERE p < 5 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_prune_case.inc
+--let $label= p BETWEEN
+--let $q= SELECT host, COUNT(*) c, SUM(i) s FROM g WHERE p BETWEEN 20.5 AND 21.5 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_prune_case.inc
+--let $label= p = 31.5
+--let $q= SELECT host, COUNT(*) c FROM g WHERE p = 31.5 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_prune_case.inc
+--let $label= p IN (hull of the list)
+--let $q= SELECT host, COUNT(*) c FROM g WHERE p IN (1.5, 2.5) GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_prune_case.inc
+--let $label= p with an INT filter
+--let $q= SELECT i, COUNT(*) c FROM g WHERE p >= 45 AND i < 3 GROUP BY i ORDER BY i
+--source suite/moosedb/include/gbh_prune_case.inc
+--let $expect= 0
+--let $label= whole range: nothing to prune
+--let $q= SELECT host, COUNT(*) c FROM g WHERE p > -1 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_prune_case.inc
+--let $refused= 1
+--let $label= DOUBLE(10,2) never prunes
+--let $q= SELECT host, COUNT(*) c FROM g WHERE df >= 45 GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_prune_case.inc
+
+DROP DATABASE mirror;
+DROP TABLE g;

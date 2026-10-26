@@ -11,3 +11,6 @@ PsPadBK/
 
 # Graphify: grafo local, refeito por `graphify update .` (não versionar)
 graphify-out/
+
+# Labs locais (dumps, dados, resultados): não versionar arquivos novos
+lab/

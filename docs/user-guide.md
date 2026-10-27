@@ -99,7 +99,7 @@ Regras:
 | `COMPRESSION` | `ZSTD`, `LZ4`, `NONE` (codec dos chunks frios) | `ZSTD` |
 | `COMPRESSION_LEVEL` | 1–19 | 3 |
 | `HOT_THRESHOLD` | período; mais novos = LZ4 | `7 DAYS` |
-| `MEMTABLE_SIZE` | bytes (4096 – 96 MiB) | `moosedb_memtable_flush_threshold` |
+| `MEMTABLE_SIZE` | bytes (1 MiB – 96 MiB) | `moosedb_memtable_flush_threshold` |
 | `TIMESTAMP_COLUMN` | nome da coluna (`DATETIME`/`TIMESTAMP`/`INT`/`BIGINT`) | coluna `DATETIME`/`TIMESTAMP` do índice temporal |
 | `ENCRYPTION` | `YES`/`NO` | `NO` |
 | `ENCRYPTION_KEY_ID` | id no key management | 1 |

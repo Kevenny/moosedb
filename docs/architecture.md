@@ -178,9 +178,20 @@ liberado** (`ChunkFile::drop`). Na recuperação:
   inválida seguida de entradas reais continua sendo corrupção; o restante do
   WAL não coberto pelo checkpoint é reaplicado.
 * durabilidade validada com perda de energia simulada (LazyFS: descarta tudo
-  que não teve fsync): 76 ciclos com 6–10 clientes, 4.341 statements
-  confirmados, nenhum perdido, parcial ou duplicado. Com `wal_sync_mode=write`
-  statements confirmados podem sumir (≈20% no teste), mas sempre inteiros.
+  que não teve fsync), harness em `docs/docker/powerloss/` (README lá).
+  Rodada de 2026-10-27 (6 seeds, 150 ciclos, 4 clientes, 3 tabelas: sem
+  cifra, `ENCRYPTION='YES'` com MANIFEST v4, `PRIMARY KEY (TAG, clock)`):
+  39.005 statements confirmados (INSERT de 1, multi-row e de 3–8 mil linhas,
+  DELETE direto e linha a linha, FLUSH, OPTIMIZE, `moosedb_compact`). Quedas
+  durante cada tipo de statement e, via crash do próprio LazyFS, no `rename`
+  do MANIFEST, no `fsync` de chunk, no `unlink` de chunk compactado e no
+  `fsync` do WAL. Resultado: nenhum statement confirmado perdido, nenhuma
+  linha ressuscitada, duplicada ou nunca enviada, nenhum statement em voo
+  parcial, nenhum `.tmp` sobrando, nenhuma quarentena, nenhuma falha de
+  autenticação na abertura da tabela cifrada. Controle com
+  `wal_sync_mode=write`: 9 de 10 ciclos perdem linhas confirmadas (1.662) e
+  ressuscitam apagadas (416), o que mostra que o oráculo detecta perda. A
+  rodada antiga (76 ciclos, 4.341 statements) não tinha script versionado.
 
 Se uma falha deixa memória e disco possivelmente divergentes — inclusive
 **qualquer erro de fsync** (WAL, chunk, MANIFEST, diretório) — a tabela entra

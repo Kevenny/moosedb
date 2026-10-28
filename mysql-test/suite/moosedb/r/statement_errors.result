@@ -1,29 +1,66 @@
 CREATE TABLE e (ts DATETIME(6) NOT NULL, v INT NOT NULL, INDEX(ts)) ENGINE=MooseDB;
-# Error in the middle of a multi-row INSERT: the earlier rows stay
+# Error in the middle of a multi-row INSERT: nothing stays
 INSERT INTO e VALUES ('2026-01-01', 1), ('2026-01-02', 2), ('0000-00-00', 3), ('2026-01-04', 4);
 ERROR HY000: Got error 1205 'column 'ts': zero or partial dates cannot be stored' from MooseDB
 SELECT v FROM e ORDER BY ts;
 v
-1
-2
-# Zero date rejected by the engine in INSERT...SELECT: earlier rows stay
+# Zero date rejected by the engine in INSERT...SELECT: nothing stays
 INSERT INTO e SELECT IF(seq = 3, '0000-00-00', '2026-02-01' + INTERVAL seq SECOND), seq FROM seq_1_to_5;
 ERROR HY000: Got error 1205 'column 'ts': zero or partial dates cannot be stored' from MooseDB
 SELECT COUNT(*) FROM e;
 COUNT(*)
-4
+0
 # Same state after kill -9
 # Kill the server
 # restart
 SELECT COUNT(*) FROM e;
 COUNT(*)
-4
+0
 SELECT v FROM e WHERE v < 10 ORDER BY ts, v;
 v
+# Duplicate key in the middle of a multi-row INSERT: nothing stays
+CREATE TABLE k (id INT NOT NULL COMMENT 'TAG', clock INT NOT NULL, PRIMARY KEY (id, clock))
+ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+INSERT INTO k VALUES (1, 100);
+INSERT INTO k VALUES (2, 100), (3, 100), (1, 100);
+ERROR 23000: Duplicate entry '1-100' for key 'PRIMARY'
+SELECT id FROM k ORDER BY id;
+id
+1
+# the rolled-back keys can be inserted again
+INSERT INTO k VALUES (2, 100), (3, 100);
+# BEGIN ... ROLLBACK: statements already ended stay (with a warning)
+BEGIN;
+INSERT INTO k VALUES (4, 100);
+INSERT INTO k VALUES (5, 100), (4, 100);
+ERROR 23000: Duplicate entry '4-100' for key 'PRIMARY'
+ROLLBACK;
+Warnings:
+Warning	1196	Some non-transactional changed tables couldn't be rolled back
+SELECT id FROM k ORDER BY id;
+id
 1
 2
-1
-2
+3
+4
+# Trigger rows are undone with the outer statement that fails later
+CREATE TABLE i (a INT PRIMARY KEY) ENGINE=InnoDB;
+CREATE TRIGGER ti AFTER INSERT ON i FOR EACH ROW INSERT INTO k VALUES (10 + NEW.a, 100);
+INSERT INTO i VALUES (1), (2), (1);
+ERROR 23000: Duplicate entry '1' for key 'PRIMARY'
+SELECT COUNT(*) FROM i;
+COUNT(*)
+0
+SELECT COUNT(*) FROM k WHERE id > 10;
+COUNT(*)
+0
+INSERT INTO i VALUES (1), (2);
+SELECT id FROM k WHERE id > 10 ORDER BY id;
+id
+11
+12
+DROP TABLE i;
+DROP TABLE k;
 # LOCK TABLES: single-row and multi-row INSERTs visible and durable
 LOCK TABLES e WRITE, e AS e2 READ;
 INSERT INTO e VALUES ('2026-03-01', 100);

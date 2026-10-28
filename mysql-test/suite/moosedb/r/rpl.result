@@ -48,6 +48,29 @@ connection slave;
 SELECT COUNT(*) FROM r;
 COUNT(*)
 0
+# A failed statement leaves nothing on either side; ROLLBACK of an
+# explicit transaction keeps its already-ended statement on both
+connection master;
+INSERT INTO r VALUES ('2026-01-03', 'h1', 1), ('0000-00-00', 'h1', 2);
+ERROR HY000: Got error 1205 'column 'ts': zero or partial dates cannot be stored' from MooseDB
+BEGIN;
+INSERT INTO r VALUES ('2026-01-03 00:00:01', 'h1', 3);
+ROLLBACK;
+Warnings:
+Warning	1196	Some non-transactional changed tables couldn't be rolled back
+BEGIN;
+INSERT INTO r VALUES ('2026-01-03 00:00:02', 'h1', 4);
+DELETE FROM r WHERE v = 3;
+ROLLBACK;
+Warnings:
+Warning	1196	Some non-transactional changed tables couldn't be rolled back
+SELECT COUNT(*), SUM(v) FROM r;
+COUNT(*)	SUM(v)
+1	4
+connection slave;
+SELECT COUNT(*), SUM(v) FROM r;
+COUNT(*)	SUM(v)
+1	4
 connection master;
 DROP TABLE r;
 include/rpl_end.inc

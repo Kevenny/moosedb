@@ -354,7 +354,7 @@ CREATE TABLE big_i (itemid BIGINT UNSIGNED NOT NULL, clock INT NOT NULL, value D
                     PRIMARY KEY (itemid, clock, ns)) ENGINE=InnoDB;
 --error ER_DUP_ENTRY
 INSERT INTO big SELECT 1 + seq MOD 7, 1700000000 + seq DIV 7, seq, 1 FROM seq_1_to_40000 UNION ALL SELECT 2, 1700000000, 0, 1;
-SELECT COUNT(*) AS kept_rows_before_the_duplicate FROM big;
+SELECT COUNT(*) AS rows_after_the_failed_statement FROM big;
 TRUNCATE TABLE big;
 INSERT INTO big SELECT 1 + seq MOD 7, 1700000000 + seq DIV 7, seq, 1 FROM seq_1_to_150000;
 INSERT INTO big_i SELECT 1 + seq MOD 7, 1700000000 + seq DIV 7, seq, 1 FROM seq_1_to_150000;

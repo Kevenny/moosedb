@@ -42,7 +42,10 @@ result_rows	vs_innodb
 2	SAME
 DROP TABLE k1, k2, i1, i2;
 ##################################################################
-# The same routine deletes, then reads and inserts the same key
+# The same routine deletes, then reads and inserts the same key.
+# Like its INSERTs, a statement's DELETE (also in a function/trigger)
+# takes effect when the statement ends: re-inserting the key in the same
+# statement is a duplicate, and the whole statement is undone.
 ##################################################################
 CREATE TABLE t (itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG', clock INT NOT NULL, value DOUBLE NOT NULL, ns INT NOT NULL, PRIMARY KEY (itemid, clock, ns))
 ENGINE=MooseDB TIMESTAMP_COLUMN='clock' CHUNK_INTERVAL='1 DAY';
@@ -67,19 +70,17 @@ INSERT INTO t VALUES (1, 1700000000 + NEW.v, NEW.v + 200, 0);
 INSERT INTO res VALUES (NEW.v, c);
 END|
 SELECT swap(2);
-swap(2)
-1009
+ERROR 23000: Duplicate entry '1-1700000002-0' for key 'PRIMARY'
 SELECT value FROM t WHERE clock = 1700000002;
 value
-102
-# function: 10 rows before, 9 after the delete (the delete is visible in the same routine)
+2
 INSERT INTO ctl VALUES (3);
+ERROR 23000: Duplicate entry '1-1700000003-0' for key 'PRIMARY'
 SELECT n FROM res WHERE v = 3;
 n
-0
 SELECT value FROM t WHERE clock = 1700000003;
 value
-203
+3
 SELECT COUNT(*) FROM t;
 COUNT(*)
 10

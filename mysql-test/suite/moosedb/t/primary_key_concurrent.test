@@ -136,7 +136,7 @@ connection waiter;
 reap;
 --enable_result_log
 connection default;
---echo # (each statement wrote its first row; the one that closed the cycle lost its second row)
+--echo # (the statement that closed the cycle is rolled back whole; the other wrote both rows)
 SELECT COUNT(*) AS rows_written FROM t WHERE itemid IN (40, 41);
 
 --echo ##################################################################

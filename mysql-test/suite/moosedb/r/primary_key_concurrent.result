@@ -91,10 +91,10 @@ connection default;
 connection holder;
 connection waiter;
 connection default;
-# (each statement wrote its first row; the one that closed the cycle lost its second row)
+# (the statement that closed the cycle is rolled back whole; the other wrote both rows)
 SELECT COUNT(*) AS rows_written FROM t WHERE itemid IN (40, 41);
 rows_written
-3
+2
 ##################################################################
 # unique_checks = 0 does not wait for anybody
 ##################################################################

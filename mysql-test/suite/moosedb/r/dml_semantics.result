@@ -1,10 +1,10 @@
 CREATE TABLE t (ts DATETIME NOT NULL, host VARCHAR(8) NOT NULL COMMENT 'TAG', v INT NOT NULL, INDEX(ts))
 ENGINE=MooseDB MEMTABLE_SIZE=1048576;
 CREATE TABLE c (ts DATETIME NOT NULL, host VARCHAR(8) NOT NULL, v INT NOT NULL, INDEX(ts)) ENGINE=MyISAM;
-# ---- Transactions: the engine is not transactional ----
+# ---- Transactions: each statement commits when it ends (ROLLBACK cannot undo it) ----
 SELECT ENGINE, TRANSACTIONS, XA, SAVEPOINTS FROM information_schema.ENGINES WHERE ENGINE IN ('MooseDB', 'MyISAM') ORDER BY ENGINE;
 ENGINE	TRANSACTIONS	XA	SAVEPOINTS
-MooseDB	NO	NO	NO
+MooseDB	YES	YES	YES
 MyISAM	NO	NO	NO
 BEGIN;
 INSERT INTO t VALUES ('2026-01-01', 'a', 1);
@@ -124,13 +124,13 @@ SELECT COUNT(*) FROM t WHERE ts = '2026-03-01';
 COUNT(*)
 6
 # ---- Multi-row statements failing in the middle ----
-# Rows before the failing one stay (no statement rollback), as in MyISAM
+# Nothing of the failing statement stays (statement rollback), as in InnoDB
 INSERT INTO t VALUES ('2026-05-01', 'a', 1), ('0000-00-00', 'a', 2), ('2026-05-03', 'a', 3);
 ERROR HY000: Got error 1205 'column 'ts': zero or partial dates cannot be stored' from MooseDB
 INSERT INTO t VALUES ('2026-05-04', 'a', 4), ('2026-05-05', 'a', 5), ('2026-05-06', 'a', 6);
 SELECT COUNT(*) FROM t WHERE ts >= '2026-05-01';
 COUNT(*)
-4
+3
 SET sql_mode = '';
 INSERT INTO t VALUES ('2026-05-10', 'a', 1), ('0000-00-00', 'a', 2), ('2026-05-12', 'a', 3);
 ERROR HY000: Got error 1205 'column 'ts': zero or partial dates cannot be stored' from MooseDB
@@ -140,8 +140,6 @@ ERROR HY000: Got error 1205 'column 'ts': zero or partial dates cannot be stored
 SET sql_mode = DEFAULT;
 SELECT ts FROM t WHERE ts >= '2026-05-10' ORDER BY ts;
 ts
-2026-05-10 00:00:00
-2026-05-20 00:00:00
 # Data too long / NULL / bad numeric values are caught by the server
 INSERT INTO t VALUES ('2026-06-01', 'toolongvalue', 1);
 ERROR 22001: Data too long for column 'host' at row 1
@@ -166,14 +164,14 @@ ok	5
 # ---- INSERT ... SELECT ----
 TRUNCATE TABLE t;
 TRUNCATE TABLE c;
-# Error half way: the rows produced so far are kept, as in the control
+# Error half way: nothing stays (strict mode aborts as for InnoDB); the MyISAM control keeps the rows so far
 INSERT INTO t SELECT '2026-07-01' + INTERVAL seq DAY, 'a', 10 DIV (5 - seq) FROM seq_0_to_9;
-ERROR 22003: BIGINT UNSIGNED value is out of range in '5 - `test`.`seq_0_to_9`.`seq`'
+ERROR 22012: Division by 0
 INSERT INTO c SELECT '2026-07-01' + INTERVAL seq DAY, 'a', 10 DIV (5 - seq) FROM seq_0_to_9;
 ERROR 22003: BIGINT UNSIGNED value is out of range in '5 - `test`.`seq_0_to_9`.`seq`'
 SELECT COUNT(*), SUM(v) FROM t;
 COUNT(*)	SUM(v)
-6	22
+0	NULL
 SELECT COUNT(*), SUM(v) FROM c;
 COUNT(*)	SUM(v)
 6	22
@@ -225,21 +223,17 @@ SELECT COUNT(*), SUM(v) FROM t;
 COUNT(*)	SUM(v)
 30000	149985000
 TRUNCATE TABLE t;
-# Bad lines: rejected rows stop the load in strict mode, the good ones before stay
+# Bad lines: rejected rows stop the load in strict mode, and nothing of it stays
 LOAD DATA INFILE 'VARDIR/tmp/tf_bad.txt' INTO TABLE t;
 ERROR HY000: Got error 1205 'column 'ts': zero or partial dates cannot be stored' from MooseDB
 SELECT host FROM t ORDER BY ts;
 host
-a
-b
 TRUNCATE TABLE t;
-# IGNORE does not skip the row either; the rows before it stay
+# IGNORE does not skip the row either (engine error); nothing stays
 LOAD DATA INFILE 'VARDIR/tmp/tf_bad.txt' IGNORE INTO TABLE t;
 ERROR HY000: Got error 1205 'column 'ts': zero or partial dates cannot be stored' from MooseDB
 SELECT host FROM t ORDER BY ts;
 host
-a
-b
 DROP TABLE src;
 TRUNCATE TABLE t;
 # ---- UPDATE / DELETE / multi-table statements ----

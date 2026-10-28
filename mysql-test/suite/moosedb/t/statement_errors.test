@@ -1,20 +1,21 @@
 #
-# Statement end commits also when the statement fails (non-transactional
-# engine: rows inserted before the error stay, as in the binlog), and
-# LOCK TABLES inserts are visible and durable before UNLOCK.
+# A failed statement leaves nothing, as in InnoDB (statement transaction:
+# the binlog drops its rows too); ROLLBACK cannot undo a statement that
+# already ended; LOCK TABLES inserts are visible and durable before UNLOCK.
 #
 --source include/not_embedded.inc
 --source include/have_sequence.inc
+--source include/have_innodb.inc
 --source suite/moosedb/include/have_moosedb.inc
 
 CREATE TABLE e (ts DATETIME(6) NOT NULL, v INT NOT NULL, INDEX(ts)) ENGINE=MooseDB;
 
---echo # Error in the middle of a multi-row INSERT: the earlier rows stay
+--echo # Error in the middle of a multi-row INSERT: nothing stays
 --error ER_GET_ERRMSG
 INSERT INTO e VALUES ('2026-01-01', 1), ('2026-01-02', 2), ('0000-00-00', 3), ('2026-01-04', 4);
 SELECT v FROM e ORDER BY ts;
 
---echo # Zero date rejected by the engine in INSERT...SELECT: earlier rows stay
+--echo # Zero date rejected by the engine in INSERT...SELECT: nothing stays
 --error ER_GET_ERRMSG
 INSERT INTO e SELECT IF(seq = 3, '0000-00-00', '2026-02-01' + INTERVAL seq SECOND), seq FROM seq_1_to_5;
 SELECT COUNT(*) FROM e;
@@ -24,6 +25,34 @@ SELECT COUNT(*) FROM e;
 --source include/start_mysqld.inc
 SELECT COUNT(*) FROM e;
 SELECT v FROM e WHERE v < 10 ORDER BY ts, v;
+
+--echo # Duplicate key in the middle of a multi-row INSERT: nothing stays
+CREATE TABLE k (id INT NOT NULL COMMENT 'TAG', clock INT NOT NULL, PRIMARY KEY (id, clock))
+  ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+INSERT INTO k VALUES (1, 100);
+--error ER_DUP_ENTRY
+INSERT INTO k VALUES (2, 100), (3, 100), (1, 100);
+SELECT id FROM k ORDER BY id;
+--echo # the rolled-back keys can be inserted again
+INSERT INTO k VALUES (2, 100), (3, 100);
+--echo # BEGIN ... ROLLBACK: statements already ended stay (with a warning)
+BEGIN;
+INSERT INTO k VALUES (4, 100);
+--error ER_DUP_ENTRY
+INSERT INTO k VALUES (5, 100), (4, 100);
+ROLLBACK;
+SELECT id FROM k ORDER BY id;
+--echo # Trigger rows are undone with the outer statement that fails later
+CREATE TABLE i (a INT PRIMARY KEY) ENGINE=InnoDB;
+CREATE TRIGGER ti AFTER INSERT ON i FOR EACH ROW INSERT INTO k VALUES (10 + NEW.a, 100);
+--error ER_DUP_ENTRY
+INSERT INTO i VALUES (1), (2), (1);
+SELECT COUNT(*) FROM i;
+SELECT COUNT(*) FROM k WHERE id > 10;
+INSERT INTO i VALUES (1), (2);
+SELECT id FROM k WHERE id > 10 ORDER BY id;
+DROP TABLE i;
+DROP TABLE k;
 
 --echo # LOCK TABLES: single-row and multi-row INSERTs visible and durable
 LOCK TABLES e WRITE, e AS e2 READ;

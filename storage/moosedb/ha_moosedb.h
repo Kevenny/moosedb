@@ -292,13 +292,15 @@ public:
 
   /* ── Locking ──────────────────────────────────────────────────────── */
   int external_lock(THD *thd, int lock_type) override;
+  int start_stmt(THD *thd, thr_lock_type lock_type) override;
   THR_LOCK_DATA **store_lock(THD *thd, THR_LOCK_DATA **to,
                              enum thr_lock_type lock_type) override;
 
   /* ── Capabilities ─────────────────────────────────────────────────── */
   ulonglong table_flags() const override
   {
-    return HA_NO_TRANSACTIONS | HA_REC_NOT_IN_SEQ |
+    /* statement-transactional: see moosedb_stmt_end() */
+    return HA_REC_NOT_IN_SEQ |
            HA_STATS_RECORDS_IS_EXACT | HA_NO_AUTO_INCREMENT |
            HA_BINLOG_ROW_CAPABLE | HA_BINLOG_STMT_CAPABLE |
            HA_CAN_TABLE_CONDITION_PUSHDOWN | HA_PARTIAL_COLUMN_READ |
@@ -333,6 +335,9 @@ public:
   /* The pending Rust error of this thread, with host paths removed. */
   std::string moosedb_gbh_error() const;
   int moosedb_force_flush();
+  /* Server statement end (moosedb_commit/moosedb_rollback): commit or discard the open batch. */
+  int moosedb_stmt_end(bool commit, bool *wrote);
+  void moosedb_stmt_forget() { stmt_thd_= nullptr; }
   int moosedb_compact_chunks(longlong from_us, longlong to_us);
 
 private:
@@ -351,6 +356,9 @@ private:
   int map_status(TFStatus status, const char *name= nullptr);
   int commit_batch();   /* publish + sync the open statement batch, if any */
   int commit_delete();  /* apply the rows collected by delete_row(), if any */
+  void abort_batch();   /* discard the open batch and DELETE, if any */
+  void join_stmt_trx(THD *thd);  /* register in the server's statement transaction */
+  void leave_stmt_trx();
   int record_to_row(const uchar *buf, TFRow *out);   /* record -> values_ */
   bool capture_delete_cond(Item *item, std::vector<tf_tag_predicate> *preds,
                            longlong *lo, longlong *hi);
@@ -398,6 +406,7 @@ private:
   std::vector<tf_snapshot_ptr> snapshots_;  /* resolve positions in rnd_pos */
   tf_batch_ptr batch_;         /* open statement batch (lazy, per stmt)  */
   tf_delete_ptr del_;          /* rows of the open DELETE statement       */
+  THD *stmt_thd_= nullptr;     /* THD whose statement list holds this handler */
   /* Plan of a direct delete, made by direct_delete_rows_init(). */
   bool ddel_ready_= false;
   bool ddel_all_series_= true;

@@ -195,8 +195,8 @@ Semântica:
   for key 'PRIMARY'`); `INSERT IGNORE` pula a linha com um warning; duplicata
   dentro do mesmo statement, contra a MemTable, chunks selados (quentes, frios,
   compactados, cifrados), após restart e após `kill -9` + replay do WAL: todos
-  detectados. Como a engine não é transacional, um `INSERT` de várias linhas que
-  falha **mantém as linhas anteriores à duplicata** (o InnoDB desfaz o statement);
+  detectados. Como no InnoDB, um `INSERT` de várias linhas que falha **não deixa
+  nenhuma linha** (o statement é desfeito inteiro);
 * `REPLACE` e `INSERT … ON DUPLICATE KEY UPDATE` funcionam quando a chave **não**
   existe (inclusive depois de um `DELETE` dela); quando existe, falham com
   `ER_ILLEGAL_HA` (a engine não tem `UPDATE`) — nunca com semântica errada;
@@ -215,13 +215,12 @@ Semântica:
 * `ALTER TABLE … ADD PRIMARY KEY` numa tabela com duplicata falha com
   `ER_DUP_ENTRY`; `DROP PRIMARY KEY` exige que exista (ou seja adicionado no
   mesmo `ALTER`) um `INDEX` sobre a coluna de tempo;
-* **Falhas da reserva deixam as linhas anteriores do statement.** `ER_LOCK_DEADLOCK`
-  e `ER_LOCK_WAIT_TIMEOUT` (e `KILL`) da espera por uma série saem, como qualquer erro
-  de um statement, **com as linhas já aceitas mantidas** (a engine não desfaz;
-  contrato de atomicidade por statement). O InnoDB desfaria o statement todo. Um
-  cliente (ou réplica) que re-executa o mesmo `INSERT` recebe `ER_DUP_ENTRY` nas
-  linhas que já entraram: no retry use `INSERT IGNORE`, ou escreva cada statement
-  numa só série / numa ordem de séries consistente (o que o Zabbix já faz);
+* **Deadlock e timeout seguem o InnoDB.** `ER_LOCK_DEADLOCK`, `ER_LOCK_WAIT_TIMEOUT`
+  e `KILL` da espera por uma série desfazem o statement inteiro (nenhuma linha dele
+  fica, nem no binlog), e o cliente pode simplesmente repeti-lo. No deadlock, como
+  no InnoDB, a transação toda é marcada para rollback; statements anteriores da
+  mesma transação em tabelas MooseDB já terminaram e ficam (ver
+  [Escrevendo e lendo](#escrevendo-e-lendo));
 * **Memória e desempate.** O estado de unicidade (~70 B por série) fica em memória,
   fora do `moosedb_batch_memory_budget`. Em varreduras ordenadas por tempo de uma
   tabela inteira com PK, o desempate por `ns` custa um passo extra por instante
@@ -256,8 +255,15 @@ SELECT * FROM metricas WHERE host = 'srv01' ORDER BY ts DESC LIMIT 10;
   é suportado — ver [DELETE](#delete).
 * Cada statement é **atômico para leitura e para crash**: outras sessões veem
   todas as linhas de um INSERT de uma vez, e um crash no meio dele não deixa
-  nada. Não há transações (`BEGIN`/`ROLLBACK` não desfazem) e, se o statement
-  falhar no meio, as linhas inseridas antes do erro permanecem (como no MyISAM).
+  nada. Se o statement falhar (erro de valor, duplicata, deadlock, `KILL`), nada
+  dele fica, como no InnoDB — o binlog também o descarta. Não há transações
+  multi-statement: dentro de `BEGIN … COMMIT` cada statement é confirmado ao
+  terminar, e `ROLLBACK` não o desfaz (o servidor avisa com o warning 1196, como
+  numa tabela MyISAM). Pelo mesmo motivo a engine não participa de XA de verdade
+  (`XA ROLLBACK` não desfaz statements já terminados).
+* Escritas de um statement (`INSERT` e `DELETE`, inclusive de triggers e funções
+  chamadas por ele) só ficam visíveis quando ele termina: uma rotina que apaga uma
+  chave e a insere de novo no mesmo statement recebe `ER_DUP_ENTRY`.
 * Uma linha está durável quando o statement retorna OK
   (`moosedb_wal_sync_mode=fsync`). Com `write`, sobrevive a um crash do
   `mysqld`, mas não a uma queda do sistema operacional.
@@ -282,8 +288,9 @@ descartado. Existem dois caminhos:
 * **Atomicidade e crash**: igual ao `INSERT`. O statement vira *uma* entrada do
   WAL sincronizada antes de as linhas sumirem; um `kill -9` deixa a tabela como
   antes ou como depois, nunca no meio. Um `DELETE` linha a linha que apague mais de
-  ~32 MiB de linhas é aplicado em etapas (cada uma atômica e durável); uma falha no
-  meio mantém as etapas já aplicadas, como um `INSERT` que falha no meio.
+  ~32 MiB de linhas é aplicado em etapas (cada uma atômica e durável) ao fim do
+  statement; uma falha *durante essa aplicação* mantém as etapas já aplicadas. Um
+  `DELETE` que falha antes disso não apaga nada.
 * **Concorrência**: um `DELETE` com `WHERE` roda ao lado de `INSERT`s da mesma
   tabela e da mesma série (o *syncer* não espera o *housekeeper*); só afeta linhas
   que já estavam gravadas quando ele terminou. Dois `DELETE`s da mesma tabela se
@@ -444,7 +451,8 @@ Valide com `CHECK TABLE`. O snapshot precisa cobrir o datadir inteiro num
 único instante: snapshots separados por arquivo ou por disco não servem.
 
 Não use `mariadb-dump --single-transaction` nem `--skip-lock-tables`: a
-engine não é transacional, e tabelas diferentes saem de instantes diferentes.
+engine não tem snapshot de transação, e tabelas diferentes saem de instantes
+diferentes.
 `FLUSH TABLES ... FOR EXPORT` não é suportado.
 
 Cópia física manual (testada com carga concorrente, inclusive cifrada):

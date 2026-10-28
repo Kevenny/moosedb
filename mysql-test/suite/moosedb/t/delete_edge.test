@@ -59,7 +59,10 @@ INSERT INTO i2 SELECT * FROM k2 WHERE clock >= 1700000020;
 DROP TABLE k1, k2, i1, i2;
 
 --echo ##################################################################
---echo # The same routine deletes, then reads and inserts the same key
+--echo # The same routine deletes, then reads and inserts the same key.
+--echo # Like its INSERTs, a statement's DELETE (also in a function/trigger)
+--echo # takes effect when the statement ends: re-inserting the key in the same
+--echo # statement is a duplicate, and the whole statement is undone.
 --echo ##################################################################
 CREATE TABLE t (itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG', clock INT NOT NULL, value DOUBLE NOT NULL, ns INT NOT NULL, PRIMARY KEY (itemid, clock, ns))
   ENGINE=MooseDB TIMESTAMP_COLUMN='clock' CHUNK_INTERVAL='1 DAY';
@@ -85,9 +88,10 @@ BEGIN
   INSERT INTO res VALUES (NEW.v, c);
 END|
 DELIMITER ;|
+--error ER_DUP_ENTRY
 SELECT swap(2);
 SELECT value FROM t WHERE clock = 1700000002;
---echo # function: 10 rows before, 9 after the delete (the delete is visible in the same routine)
+--error ER_DUP_ENTRY
 INSERT INTO ctl VALUES (3);
 SELECT n FROM res WHERE v = 3;
 SELECT value FROM t WHERE clock = 1700000003;

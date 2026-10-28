@@ -380,9 +380,10 @@ INSERT INTO zs VALUES (9223372036854775807, 14);
 ERROR HY000: Got error 1205 'column 'clock': time value outside the supported range (+/-9223372036854 seconds since 1970)' from MooseDB
 INSERT INTO zs VALUES (-9223372036854775808, 15);
 ERROR HY000: Got error 1205 'column 'clock': time value outside the supported range (+/-9223372036854 seconds since 1970)' from MooseDB
-# A failing statement keeps the rows before the bad one, like any non-transactional engine error
+# A failing statement leaves nothing, as in InnoDB
 INSERT INTO zs VALUES (100, 16), (9223372036855, 17), (200, 18);
 ERROR HY000: Got error 1205 'column 'clock': time value outside the supported range (+/-9223372036854 seconds since 1970)' from MooseDB
+INSERT INTO zs VALUES (100, 16);
 INSERT INTO zsi VALUES (100, 16);
 SELECT COUNT(*), MIN(clock), MAX(clock) FROM zs;
 COUNT(*)	MIN(clock)	MAX(clock)

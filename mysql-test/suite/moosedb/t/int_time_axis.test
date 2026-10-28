@@ -231,9 +231,10 @@ INSERT INTO zs VALUES (-9223372036855, 13);
 INSERT INTO zs VALUES (9223372036854775807, 14);
 --error ER_GET_ERRMSG
 INSERT INTO zs VALUES (-9223372036854775808, 15);
---echo # A failing statement keeps the rows before the bad one, like any non-transactional engine error
+--echo # A failing statement leaves nothing, as in InnoDB
 --error ER_GET_ERRMSG
 INSERT INTO zs VALUES (100, 16), (9223372036855, 17), (200, 18);
+INSERT INTO zs VALUES (100, 16);
 INSERT INTO zsi VALUES (100, 16);
 SELECT COUNT(*), MIN(clock), MAX(clock) FROM zs;
 SELECT COUNT(*), MIN(clock), MAX(clock) FROM zsi;

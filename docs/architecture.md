@@ -204,27 +204,60 @@ o statement.
 
 Cada statement escreve num **lote** (`batch.rs`): as linhas ficam num buffer
 privado e entram na MemTable **de uma vez**, sob o mutex, no commit — um
-snapshot nunca vê parte de um statement. O handler faz commit no fim de todo
-statement (`external_lock(F_UNLCK)`, `end_bulk_insert`, e `reset()`/`close()`
-como rede de segurança; INSERT de uma linha sob `LOCK TABLES` usa a escrita
-de linha única — atômica — seguida de sync do WAL), **inclusive
-quando o statement falha**: a engine é não transacional para o servidor e o
-binlog já registra as linhas inseridas; descartá-las divergiria a réplica.
+snapshot nunca vê parte de um statement. A engine é **transacional no nível
+do statement**, como o InnoDB: não declara `HA_NO_TRANSACTIONS`, e o handler que
+abre um lote (ou um `DELETE` linha a linha) entra na transação de statement do
+servidor (registro em `external_lock(F_WRLCK)`/`start_stmt`, antes de o servidor
+marcar a engine como read-write; lista de handlers por THD em `thd_ha_data`).
+O servidor encerra o statement com `hton->commit` (sucesso → commit do lote) ou
+`hton->rollback` (erro: valor inválido, duplicata, deadlock, timeout, `KILL` →
+lote descartado). O binlog toma a mesma decisão (com tabela transacional os
+eventos de linha vão para o *trx cache*, truncado no rollback do statement), então
+primário e réplica nunca divergem por um statement que falhou.
+Com binlog, o commit durável do lote acontece no `hton->prepare` (o servidor
+prepara as engines, grava o binlog e só então chama `commit`): a ordem continua
+engine → binlog, como antes — um crash entre os dois perde o evento do binlog,
+nunca deixa no binlog linhas que a engine não tem — e o 2PC do InnoDB num mesmo
+statement é preservado. `external_lock(F_UNLCK)`, `reset()` (fora de
+sub-statement: em trigger/função quem decide é o statement externo), `close()` e o
+destrutor continuam como rede de segurança. Escritas aplicadas na hora (`DELETE`
+direto, truncate) marcam `modified_non_trans_table`, como uma tabela MyISAM.
+
+Só o nível do statement: dentro de `BEGIN … COMMIT` cada statement é confirmado ao
+terminar. Numa transação multi-statement a engine também se registra no nível da
+transação (como o InnoDB; senão o servidor trata cada commit de statement como fim
+da transação e descarta os savepoints), com callbacks e savepoints vazios. Ao
+confirmar um statement nela, o handler marca `all.modified_non_trans_table`
+(warning 1196 em `ROLLBACK`/`ROLLBACK TO SAVEPOINT`) e `OPTION_BINLOG_THIS_TRX`
+(o que o servidor faz para tabela temporária criada na transação): o binlog grava o
+*trx cache* seguido do `ROLLBACK` em vez de descartá-lo, e a réplica fica com as
+mesmas linhas. No deadlock a transação inteira é marcada para
+rollback (`mark_transaction_to_rollback(true)`, como o InnoDB).
+
+Limites conhecidos: (1) o commit no `prepare` é durável antes do binlog e das
+outras engines; se o binlog ou o `prepare` de outra engine falhar depois, as
+linhas ficam sem evento (o mesmo que o MyISAM); (2) a engine não participa de XA
+(`XA PREPARE` é vazio; `XA ROLLBACK` não desfaz statements já terminados); (3) a
+replicação paralela que refaz um grupo após deadlock/timeout reaplica statements
+MooseDB já confirmados do grupo (duplicata em tabela sem PK — não testado);
+(4) `DELETE` em trigger/função espera o fim do statement externo (o caminho
+direto é recusado em sub-statement), então não é visível às instruções seguintes
+da mesma rotina.
 
 Casos específicos:
 
 * **Triggers, funções e `CALL`** (modos *prelocked*): o servidor não chama
-  `start_bulk_insert`, mas a escrita continua em lote; o commit ocorre no
-  `external_lock(F_UNLCK)` do statement externo ou, dentro de `CALL`/`LOCK
-  TABLES`, no `reset()` ao fim da sub-instrução que usou a tabela.
+  `start_bulk_insert`, mas a escrita continua em lote; o commit (ou rollback)
+  vem com o do statement externo; dentro de `CALL`, com o de cada instrução da
+  rotina.
 * **Ler as próprias escritas**: linhas do statement corrente são invisíveis
   também para a própria sessão até o commit — um trigger ou rotina não vê as
   linhas que o statement externo acabou de inserir.
 * **Réplica (RBR)**: o servidor aplica um statement em vários eventos de
-  linhas; o commit é adiado até `STMT_END_F` (fim do statement, antes de a
-  posição do relay log avançar) — um commit e um fsync por statement.
-* **`LOCK TABLES`**: INSERT de uma linha fora de lote é gravado e sincronizado
-  na hora; multi-linha commita em `end_bulk_insert`.
+  linhas; o commit vem do `trans_commit_stmt` em `STMT_END_F` (fim do statement,
+  antes de a posição do relay log avançar) — um commit e um fsync por statement.
+* **`LOCK TABLES`**: cada statement continua em lote, confirmado (ou desfeito)
+  no fim do statement (`start_stmt` registra a engine).
 * Erro de commit em `reset()` é reportado ao cliente (`print_error`); em
   `close()`/destrutor (caminhos anormais) só vai para o log.
 
@@ -738,7 +771,7 @@ Cada teste copia a fixture, abre com o código atual e exige as mesmas linhas e
 | 9 | TFValue com `bool`/enum/união anônima | `uint8_t bool_val`, `uint8_t kind`, união `data` | Ler `bool`/enum inválido vindo do C é UB no Rust; cbindgen não gera união anônima. |
 | 10 | — | `TF_ERR_INTERNAL`, `TF_ERR_UNSUPPORTED`, `TF_ERR_CRYPTO` (10) | Panic capturado / recurso indisponível / falha de decriptação ou chave indisponível (vira `HA_ERR_DECRYPTION_FAILED`). |
 | 11 | API FFI mínima | + sync do WAL, truncate, scans filtrados/bidirecionais, snapshots, séries, check, estimativa, inspeção, manutenção, chaves, settings | Necessárias para a Handler API completa e os recursos acima. |
-| 12 | fsync por `write_row` | commit do **lote** no fim do statement (`external_lock(F_UNLCK)`, `end_bulk_insert`; sob `LOCK TABLES`, cada INSERT de uma linha) com fsync conforme `wal_sync_mode` | Linha confirmada = statement retornou OK; fsync por linha inviabiliza 1M linhas em 30 s. Ver §Atomicidade por statement. |
+| 12 | fsync por `write_row` | commit do **lote** no fim do statement (transação de statement do servidor: `hton->prepare`/`commit`; erro → descartado) com fsync conforme `wal_sync_mode` | Linha confirmada = statement retornou OK; fsync por linha inviabiliza 1M linhas em 30 s. Ver §Atomicidade por statement. |
 | 13 | Entrada do WAL `[CRC][len][ts][series_id][valores]` | header de segmento + `[CRC][len][linha]` | Header guarda os parâmetros de criptografia; `series_id` é reconstruído no replay. |
 | 14 | Header de 64 bytes com os campos listados | mesmos campos + `column_count`, `chunk_id`, `wal_seq`, `schema_fingerprint`; codec nas flags | Os campos listados somam 40 bytes; o resto valida schema e ajuda diagnóstico. |
 | 15 | Checkpoint implícito | `MANIFEST` explícito | Um flush gera vários chunks; sem commit único, um crash duplicaria ou perderia linhas. |
@@ -750,7 +783,7 @@ Cada teste copia a fixture, abre com o código atual e exige as mesmas linhas e
 | 21 | — (particionamento não mencionado) | `HTON_NO_PARTITION`: `PARTITION BY` é recusado | `ha_partition` reorganiza partições com `delete_row`, que a engine append-only não suporta: `ADD`/`COALESCE PARTITION` duplicavam e perdiam linhas. O tempo já é particionado por chunks. |
 | 22 | Procedures sem modelo de privilégio | UDFs exigem `DELETE` (retenção) e `ALTER` (compactação) na tabela; tabela inexistente e sem privilégio dão o mesmo erro | MariaDB não aplica ACL a UDFs; sem a checagem, qualquer usuário podia expirar dados alheios. |
 | 23 | `RETENTION_PERIOD` / `HOT_THRESHOLD` sem limite | ≤ 10 000 anos; cálculo de cutoff saturante | Períodos absurdos estouravam a aritmética e geravam cutoff no futuro (retenção apagaria tudo). |
-| 24 | — (isolamento não especificado) | atomicidade por statement: linhas de um statement aparecem todas de uma vez; crash no meio não deixa nada; sem MVCC nem transações multi-statement | Leituras nunca veem statements parciais; MVCC completo não se justifica com dados imutáveis. Erro no meio do statement mantém as linhas já inseridas (coerente com o binlog de engine não transacional). |
+| 24 | — (isolamento não especificado) | atomicidade por statement: linhas de um statement aparecem todas de uma vez; crash no meio não deixa nada; sem MVCC nem transações multi-statement | Leituras nunca veem statements parciais; MVCC completo não se justifica com dados imutáveis. Erro no meio do statement desfaz o statement inteiro (transação de statement registrada no servidor; o binlog descarta junto), como no InnoDB. |
 | 25 | Entrada do WAL única | WAL v2 com `ROW`/`COMMIT`/`ROW_COMMIT`; MANIFEST v2 com `replay_seq` | Necessário para a atomicidade por statement com escritores concorrentes. v1 continua legível. |
 | 26 | Leitura linha a linha | leitura colunar projetada e em lote pela FFI (`TFBatch`), poda por ts dentro da série | O custo dominante era montar linhas (4 mallocs/linha), não decodificar. |
 | 27 | Eixo de tempo só `DATETIME`/`TIMESTAMP` | + `INT`/`BIGINT` (signed/unsigned, `NOT NULL`, armazenada) **somente** via `TIMESTAMP_COLUMN='col'`, lido como segundos epoch UTC (`ts_us = secs × 10⁶`); índice simples sobre a coluna continua obrigatório; `ns` não é dobrado no eixo | Zabbix guarda `clock INT` + `ns INT`. Exigir `TIMESTAMP_COLUMN` evita que um índice qualquer sobre um inteiro mude o significado de tabelas existentes. Produto que estoura `i64` (ou `BIGINT UNSIGNED` > 2⁶³) é erro explícito, não truncamento; limites de range vindos do índice saturam. O core não mudou (mesmo `TF_COL_TIMESTAMP`, sem mudança de FFI); o IS exibe o eixo como DATETIME (clampa em 0000/9999 nos extremos). |
@@ -919,8 +952,8 @@ com três peças em memória (`unique.rs`, estado sob o mutex da tabela):
 
 Durabilidade/atomicidade: nada muda (a checagem acontece antes de gravar a linha no
 WAL/buffer; a linha recusada não entra no lote, que continua utilizável). Um erro
-no meio do statement mantém as linhas já aceitas (§Atomicidade, #24): ao contrário
-do InnoDB, `INSERT (a),(b),(a)` deixa `a` e `b`.
+no meio do statement desfaz o statement inteiro (§Atomicidade, #24): como no
+InnoDB, `INSERT (a),(b),(a)` não deixa nada; deadlock e timeout da reserva também.
 
 **Leitura pela chave.** A PK é um índice composto `(TAGs, tempo, extras)`: as
 partes extras só aceitam igualdade (sem `HA_READ_RANGE`); o `index_read_map` com a

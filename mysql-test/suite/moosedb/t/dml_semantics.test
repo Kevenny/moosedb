@@ -16,7 +16,7 @@ CREATE TABLE t (ts DATETIME NOT NULL, host VARCHAR(8) NOT NULL COMMENT 'TAG', v 
   ENGINE=MooseDB MEMTABLE_SIZE=1048576;
 CREATE TABLE c (ts DATETIME NOT NULL, host VARCHAR(8) NOT NULL, v INT NOT NULL, INDEX(ts)) ENGINE=MyISAM;
 
---echo # ---- Transactions: the engine is not transactional ----
+--echo # ---- Transactions: each statement commits when it ends (ROLLBACK cannot undo it) ----
 SELECT ENGINE, TRANSACTIONS, XA, SAVEPOINTS FROM information_schema.ENGINES WHERE ENGINE IN ('MooseDB', 'MyISAM') ORDER BY ENGINE;
 BEGIN;
 INSERT INTO t VALUES ('2026-01-01', 'a', 1);
@@ -91,7 +91,7 @@ REPLACE INTO t SELECT ts, host, v FROM t WHERE ts = '2026-03-01';
 SELECT COUNT(*) FROM t WHERE ts = '2026-03-01';
 
 --echo # ---- Multi-row statements failing in the middle ----
---echo # Rows before the failing one stay (no statement rollback), as in MyISAM
+--echo # Nothing of the failing statement stays (statement rollback), as in InnoDB
 --error ER_GET_ERRMSG
 INSERT INTO t VALUES ('2026-05-01', 'a', 1), ('0000-00-00', 'a', 2), ('2026-05-03', 'a', 3);
 INSERT INTO t VALUES ('2026-05-04', 'a', 4), ('2026-05-05', 'a', 5), ('2026-05-06', 'a', 6);
@@ -125,8 +125,8 @@ SELECT host, v FROM t WHERE ts >= '2026-06-01';
 --echo # ---- INSERT ... SELECT ----
 TRUNCATE TABLE t;
 TRUNCATE TABLE c;
---echo # Error half way: the rows produced so far are kept, as in the control
---error ER_DATA_OUT_OF_RANGE
+--echo # Error half way: nothing stays (strict mode aborts as for InnoDB); the MyISAM control keeps the rows so far
+--error ER_DIVISION_BY_ZERO
 INSERT INTO t SELECT '2026-07-01' + INTERVAL seq DAY, 'a', 10 DIV (5 - seq) FROM seq_0_to_9;
 --error ER_DATA_OUT_OF_RANGE
 INSERT INTO c SELECT '2026-07-01' + INTERVAL seq DAY, 'a', 10 DIV (5 - seq) FROM seq_0_to_9;
@@ -167,7 +167,7 @@ SELECT COUNT(*) FROM t;
 FLUSH TABLES t;
 SELECT COUNT(*), SUM(v) FROM t;
 TRUNCATE TABLE t;
---echo # Bad lines: rejected rows stop the load in strict mode, the good ones before stay
+--echo # Bad lines: rejected rows stop the load in strict mode, and nothing of it stays
 --write_file $MYSQLD_TMP/tf_bad.txt
 2026-01-01 00:00:00	a	1
 2026-01-01 00:00:01	b	2
@@ -179,7 +179,7 @@ EOF
 eval LOAD DATA INFILE '$MYSQLD_TMP/tf_bad.txt' INTO TABLE t;
 SELECT host FROM t ORDER BY ts;
 TRUNCATE TABLE t;
---echo # IGNORE does not skip the row either; the rows before it stay
+--echo # IGNORE does not skip the row either (engine error); nothing stays
 --replace_result $MYSQLTEST_VARDIR VARDIR
 --error ER_GET_ERRMSG
 eval LOAD DATA INFILE '$MYSQLD_TMP/tf_bad.txt' IGNORE INTO TABLE t;

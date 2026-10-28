@@ -1143,7 +1143,10 @@ void tf_batch_closer::operator()(MooseDBBatch *b) const noexcept
   }
 }
 
-ha_moosedb::~ha_moosedb()= default;
+ha_moosedb::~ha_moosedb()
+{
+  leave_stmt_trx();
+}
 
 int ha_moosedb::map_status(TFStatus status, const char *name)
 {
@@ -1366,6 +1369,7 @@ int ha_moosedb::close()
                       "committing it");
     error= commit_batch();
   }
+  leave_stmt_trx();
   DBUG_RETURN(error);
 }
 
@@ -1507,15 +1511,9 @@ int ha_moosedb::write_row(const uchar *buf)
   /*
     Rows of one statement go into a batch: invisible to other sessions until
     the statement ends, and lost as a whole if the server crashes before.
-    The batch is committed by end_bulk_insert(), external_lock(F_UNLCK) or
-    reset(), whichever comes first (none of them discards rows).
-
-    Only under plain LOCK TABLES is there no per-statement external_lock, and
-    the server calls start_bulk_insert() for multi-row statements there. So a
-    row written outside bulk insert with no open batch is a lone single-row
-    INSERT: write it directly and sync it right away (moosedb_write_row alone
-    does not sync the WAL). In prelocked modes (triggers, stored functions,
-    CALL) the server never calls start_bulk_insert(), so always use a batch.
+    The batch joins the server's statement transaction: committed when the
+    statement succeeds, discarded when it fails (moosedb_stmt_end) -- also
+    under LOCK TABLES and in prelocked modes (triggers, functions, CALL).
   */
   THD *thd= ha_thd();
   if (!thd)
@@ -1524,15 +1522,6 @@ int ha_moosedb::write_row(const uchar *buf)
   if (in_bulk_insert_ && bulk_query_id_ != thd->query_id)
     in_bulk_insert_= false;
   const bool unique= share_->layout.unique_key != MAX_KEY;
-  const bool lone= !batch_ && !in_bulk_insert_ &&
-                   thd->locked_tables_mode == LTM_LOCK_TABLES;
-  if (lone && !unique)
-  {
-    if (!(error= map_status(moosedb_write_row(share_->table.get(), &row))))
-      error= map_status(moosedb_sync_wal(share_->table.get(),
-                                         srv_wal_sync_mode == WAL_SYNC_FSYNC));
-    DBUG_RETURN(error);
-  }
   if (!batch_)
   {
     MooseDBBatch *b= nullptr;
@@ -1546,16 +1535,13 @@ int ha_moosedb::write_row(const uchar *buf)
         moosedb_batch_set_unique_checks(batch_.get(), false) != TF_OK)
       take_last_error();
   }
+  join_stmt_trx(thd);
   error= write_batch_row(row);
   if (error == HA_ERR_FOUND_DUPP_KEY)
     dup_key_= share_->layout.unique_key;
-  if (lone)
-  {
-    /* UNIQUE table under LOCK TABLES: a one-row statement, committed now */
-    const int ce= commit_batch();
-    if (!error)
-      error= ce;
-  }
+  /* as InnoDB: a deadlock ends the whole transaction, not just the statement */
+  if (error == HA_ERR_LOCK_DEADLOCK)
+    thd->mark_transaction_to_rollback(true);
   DBUG_RETURN(error);
 }
 
@@ -1847,9 +1833,8 @@ void tf_delete_closer::operator()(MooseDBDelete *d) const noexcept
 
 /*
   Applies the rows collected by delete_row(). The handle is released also on
-  error. Like an INSERT batch this runs at the end of the statement, whether
-  it succeeded or not: rows the server already counted (and binlogged) as
-  deleted must really go.
+  error. Like an INSERT batch this runs when the statement succeeds; a failed
+  statement discards it (abort_batch).
 */
 int ha_moosedb::commit_delete()
 {
@@ -1893,10 +1878,174 @@ int ha_moosedb::delete_row(const uchar *buf)
       DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
     del_.reset(d);
   }
+  if (THD *thd= ha_thd())
+    join_stmt_trx(thd);
   error= map_status(moosedb_delete_add(del_.get(), &row));
   if (!error)
     del_rows_++;
   DBUG_RETURN(error);
+}
+
+/*
+  A write applied at once (direct DELETE, truncate) cannot be rolled back:
+  tell the server, as for a non-transactional table, so the binlog keeps it
+  if the statement or transaction is rolled back.
+*/
+static void mark_not_undoable(THD *thd)
+{
+  if (!thd)
+    return;
+  thd->transaction->stmt.modified_non_trans_table= TRUE;
+  thd->transaction->all.modified_non_trans_table= TRUE;
+  /* cleared by the next command in autocommit mode */
+  thd->variables.option_bits|= OPTION_BINLOG_THIS_TRX;
+}
+
+void ha_moosedb::abort_batch()
+{
+  if (batch_ && moosedb_batch_abort(batch_.release()) != TF_OK)
+    take_last_error();
+  if (del_ && moosedb_delete_abort(del_.release()) != TF_OK)
+    take_last_error();
+  del_rows_= 0;
+}
+
+/*
+  Statement transaction, as InnoDB: a handler that opens a batch registers
+  in the server's statement transaction, and the server ends it with
+  moosedb_commit() (statement succeeded) or moosedb_rollback() (it failed:
+  deadlock, lock wait timeout, duplicate key, KILL...). The binlog keeps or
+  drops the statement's row events the same way, so a failed statement
+  leaves nothing, on the primary and on replicas. Only the statement level:
+  each statement is committed when it ends, also inside BEGIN ... COMMIT.
+  Inside a multi-statement transaction the engine also registers at the
+  transaction level (as InnoDB does), so the server does not take each
+  statement commit for the end of the transaction; the transaction-level
+  callbacks and savepoints have nothing to do.
+*/
+static void register_trx(THD *thd)
+{
+  trans_register_ha(thd, false, moosedb_hton, 0);
+  if (thd->in_multi_stmt_transaction_mode())
+    trans_register_ha(thd, true, moosedb_hton, 0);
+}
+
+struct tf_stmt_handlers
+{
+  std::vector<ha_moosedb *> open;
+};
+
+static tf_stmt_handlers *stmt_handlers(const THD *thd)
+{
+  return static_cast<tf_stmt_handlers *>(thd_get_ha_data(thd, moosedb_hton));
+}
+
+void ha_moosedb::join_stmt_trx(THD *thd)
+{
+  register_trx(thd);
+  if (stmt_thd_ == thd)
+    return;
+  leave_stmt_trx();
+  tf_stmt_handlers *h= stmt_handlers(thd);
+  if (!h)
+  {
+    auto fresh= std::make_unique<tf_stmt_handlers>();
+    h= fresh.get();
+    thd_set_ha_data(thd, moosedb_hton, fresh.release());
+  }
+  h->open.push_back(this);
+  stmt_thd_= thd;
+}
+
+void ha_moosedb::leave_stmt_trx()
+{
+  if (!stmt_thd_)
+    return;
+  if (tf_stmt_handlers *h= stmt_handlers(stmt_thd_))
+    h->open.erase(std::remove(h->open.begin(), h->open.end(), this),
+                  h->open.end());
+  stmt_thd_= nullptr;
+}
+
+int ha_moosedb::moosedb_stmt_end(bool commit, bool *wrote)
+{
+  stmt_thd_= nullptr;
+  if (!commit)
+  {
+    abort_batch();
+    return 0;
+  }
+  if (batch_ || del_)
+    *wrote= true;
+  return commit_batch();
+}
+
+static int moosedb_stmt_finish(THD *thd, bool commit)
+{
+  tf_stmt_handlers *h= stmt_handlers(thd);
+  if (!h)
+    return 0;
+  std::vector<ha_moosedb *> open;
+  open.swap(h->open);
+  int error= 0;
+  bool wrote= false;
+  for (ha_moosedb *f : open)
+  {
+    const int e= f->moosedb_stmt_end(commit, &wrote);
+    if (e && !error)
+      error= e;
+  }
+  /*
+    ROLLBACK (or ROLLBACK TO SAVEPOINT) of an explicit transaction cannot undo
+    a committed statement: warn as for a non-transactional table, and make the
+    binlog keep the events followed by the ROLLBACK (OPTION_BINLOG_THIS_TRX,
+    what the server does for a temporary table created in a transaction;
+    without it a ROW-format ROLLBACK drops them and the replica diverges).
+  */
+  if (wrote && thd->in_multi_stmt_transaction_mode())
+  {
+    thd->transaction->all.modified_non_trans_table= TRUE;
+    thd->variables.option_bits|= OPTION_BINLOG_THIS_TRX;
+  }
+  return error;
+}
+
+/*
+  With the binlog on, the server prepares every read-write engine, writes the
+  binlog, then commits. Committing (durably) in prepare keeps the order of a
+  non-transactional engine -- engine first, then binlog: a crash in between
+  loses the binlog event, never rows the binlog already has -- and keeps
+  2PC for InnoDB in the same statement. moosedb_commit then finds nothing.
+*/
+static int moosedb_prepare(handlerton *, THD *thd, bool all)
+{
+  return all ? 0 : moosedb_stmt_finish(thd, true);
+}
+
+static int moosedb_commit(handlerton *, THD *thd, bool all)
+{
+  return all ? 0 : moosedb_stmt_finish(thd, true);
+}
+
+static int moosedb_rollback(handlerton *, THD *thd, bool all)
+{
+  return all ? 0 : moosedb_stmt_finish(thd, false);
+}
+
+/* statements are committed as they end: a savepoint has nothing to keep */
+static int moosedb_savepoint(handlerton *, THD *, void *)
+{
+  return 0;
+}
+
+static int moosedb_close_connection(handlerton *, THD *thd)
+{
+  std::unique_ptr<tf_stmt_handlers> h(stmt_handlers(thd));
+  thd_set_ha_data(thd, moosedb_hton, nullptr);
+  if (h)
+    for (ha_moosedb *f : h->open)
+      f->moosedb_stmt_forget();
+  return 0;
 }
 
 int ha_moosedb::commit_batch()
@@ -1925,35 +2074,39 @@ void ha_moosedb::start_bulk_insert(ha_rows, uint)
 
 int ha_moosedb::end_bulk_insert()
 {
-  in_bulk_insert_= false;
   /*
-    Replication applier: Write_rows_log_event calls start/end_bulk_insert once
-    per row EVENT. Keep the batch open across the events of one statement; it
-    is committed (and synced) by external_lock(F_UNLCK) at STMT_END_F, which
-    runs (slave_close_thread_tables) before the relay log position is advanced.
+    Nothing to commit here: the statement may still fail. The batch stays
+    open until the server ends the statement (moosedb_commit/rollback) --
+    for the replication applier at STMT_END_F, across the row events.
   */
-  THD *thd= ha_thd();
-  if (thd && thd->slave_thread)
-    return 0;
-  int error= commit_batch();
-  /* the server ignores our return value here and reads my_errno */
-  if (error)
-    my_errno= error;
-  return error;
+  in_bulk_insert_= false;
+  return 0;
 }
 
-int ha_moosedb::external_lock(THD *, int lock_type)
+/* LOCK TABLES: no external_lock per statement */
+int ha_moosedb::start_stmt(THD *thd, thr_lock_type lock_type)
+{
+  if (thd && lock_type >= TL_FIRST_WRITE)
+    register_trx(thd);
+  return 0;
+}
+
+int ha_moosedb::external_lock(THD *thd, int lock_type)
 {
   DBUG_ENTER("ha_moosedb::external_lock");
   /*
-    F_UNLCK = statement end. MooseDB is non-transactional, so this is the
-    point where the client's OK is about to be sent: commit the statement
-    batch (also when the statement failed: already-inserted rows are
-    binlogged and stay).
+    Write lock: register in the statement transaction now, before the
+    server's ha_write_row() marks the engine read-write (so prepare runs).
+    F_UNLCK = statement end. The server already committed or rolled back
+    the statement (moosedb_stmt_end); a batch still open here belongs to a
+    path that did not end it and is committed.
   */
+  if (lock_type == F_WRLCK && thd)
+    register_trx(thd);
   if (lock_type == F_UNLCK)
     in_bulk_insert_= false;
-  DBUG_RETURN(lock_type == F_UNLCK ? commit_batch() : 0);
+  const bool server_ends= stmt_thd_ && stmt_thd_ == thd;
+  DBUG_RETURN(lock_type == F_UNLCK && !server_ends ? commit_batch() : 0);
 }
 
 /*
@@ -2016,7 +2169,10 @@ int ha_moosedb::delete_all_rows()
       DBUG_RETURN(HA_ERR_WRONG_COMMAND);
   }
   scan_.reset();
-  DBUG_RETURN(map_status(moosedb_truncate(share_->table.get())));
+  const int error= map_status(moosedb_truncate(share_->table.get()));
+  if (!error)
+    mark_not_undoable(ha_thd());
+  DBUG_RETURN(error);
 }
 
 int ha_moosedb::truncate()
@@ -2909,13 +3065,21 @@ int ha_moosedb::reset()
   THD *thd= ha_thd();
   if (in_bulk_insert_ && thd && bulk_query_id_ != thd->query_id)
     in_bulk_insert_= false;   /* stale: end_bulk_insert() was never called */
-  if (!in_bulk_insert_ && (batch_ || del_))
+  /*
+    Registered in this THD's statement: the server will end the batch
+    (moosedb_stmt_end) -- also when reset() runs before that, as in a
+    failing INSERT ... SELECT or a trigger/function sub-statement.
+  */
+  const bool server_ends= stmt_thd_ && stmt_thd_ == thd;
+  if (!in_bulk_insert_ && !server_ends && (batch_ || del_))
   {
     error= commit_batch();
     /* ha_reset()'s return value is ignored by the server: report it here */
     if (error)
       print_error(error, MYF(0));
   }
+  if (!batch_ && !del_)
+    leave_stmt_trx();   /* the table may go to another THD next */
   ddel_cap_valid_= false;
   ddel_cap_item_= nullptr;
   pushed_.clear();
@@ -3477,6 +3641,9 @@ int ha_moosedb::direct_delete_rows_init()
   THD *thd= ha_thd();
   if (!thd || !table || !share_ || !share_->table || !thd->lex)
     DBUG_RETURN(HA_ERR_WRONG_COMMAND);
+  /* in a trigger/function it would apply before the outer statement ends */
+  if (thd->in_sub_stmt)
+    DBUG_RETURN(HA_ERR_WRONG_COMMAND);
   SELECT_LEX *sl= thd->lex->first_select_lex();
   if (!sl || sl->order_list.elements)
     DBUG_RETURN(HA_ERR_WRONG_COMMAND);
@@ -3574,6 +3741,7 @@ int ha_moosedb::direct_delete_rows(ha_rows *deleted)
     DBUG_RETURN(error);
   }
   *deleted= (ha_rows) rows;
+  mark_not_undoable(ha_thd());
   DBUG_RETURN(0);
 }
 
@@ -5933,6 +6101,14 @@ static int moosedb_init_func(void *p)
   moosedb_hton->end_backup= moosedb_end_backup;
   moosedb_hton->flush_logs= moosedb_flush_logs;
   moosedb_hton->create_group_by= moosedb_create_group_by;
+  moosedb_hton->prepare= moosedb_prepare;
+  moosedb_hton->commit= moosedb_commit;
+  moosedb_hton->rollback= moosedb_rollback;
+  moosedb_hton->close_connection= moosedb_close_connection;
+  moosedb_hton->savepoint_offset= 0;
+  moosedb_hton->savepoint_set= moosedb_savepoint;
+  moosedb_hton->savepoint_rollback= moosedb_savepoint;
+  moosedb_hton->savepoint_release= moosedb_savepoint;
   push_globals();
   if (moosedb_set_key_callback(moosedb_key_callback) != TF_OK)
   {

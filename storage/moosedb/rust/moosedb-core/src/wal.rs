@@ -42,6 +42,7 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::bytes::{put_i64, put_u32, put_u64, ByteReader};
 use crate::codec::{decode_row, encode_row};
@@ -323,8 +324,15 @@ pub(crate) struct Wal {
     offset: u64,
     /// Size of the segment header: `offset == header_len` means no entries.
     header_len: u64,
-    /// Whether bytes were appended since the last `sync`.
-    dirty: bool,
+    /// Logical offset up to which bytes were handed to the OS (flushed from
+    /// the buffer); `offset - os_offset` bytes still sit in the buffer.
+    os_offset: u64,
+    /// Whether bytes were appended since the last fsync done under `&mut self`.
+    /// (`sync(false)` flushes but does not clear it.)
+    unsynced: bool,
+    /// Second handle to the same inode, so a group commit can fsync without
+    /// holding the table mutex.
+    sync_handle: Arc<File>,
     /// Set by the first failed write/flush/fsync. The buffered data may be
     /// lost or half-written and a later fsync could report success without
     /// the data being durable, so the segment never accepts or confirms
@@ -355,13 +363,16 @@ impl Wal {
             return Err(e);
         }
         sync_dir(dir)?;
+        let sync_handle = Arc::new(file.try_clone()?);
         Ok(Wal {
             seq,
             out: BufWriter::with_capacity(1 << 20, file),
             cipher,
             offset: header.len() as u64,
             header_len: header.len() as u64,
-            dirty: false,
+            os_offset: header.len() as u64,
+            unsynced: false,
+            sync_handle,
             failed: false,
         })
     }
@@ -406,17 +417,19 @@ impl Wal {
             return Err(e.into());
         }
         self.offset += (ENTRY_HEADER + body.len()) as u64;
-        self.dirty = true;
+        self.unsynced = true;
         Ok(())
     }
 
     /// Pushes buffered entries to the OS and, if `durable`, to stable storage.
     pub(crate) fn sync(&mut self, durable: bool) -> Result<()> {
         self.check_usable()?;
-        if !self.dirty {
+        let unflushed = self.os_offset < self.offset;
+        if !unflushed && !(durable && self.unsynced) {
             return Ok(());
         }
         let synced = self.out.flush().map_err(Error::from).and_then(|()| {
+            self.os_offset = self.offset;
             if durable {
                 fsutil::sync_data(self.out.get_ref())
             } else {
@@ -427,8 +440,29 @@ impl Wal {
             self.failed = true;
             return Err(e);
         }
-        self.dirty = false;
+        if durable {
+            self.unsynced = false;
+        }
         Ok(())
+    }
+
+    /// For a group commit: `(seq, bytes handed to the OS, handle to fsync)`.
+    /// The bytes up to the offset are covered by an fsync of the handle that
+    /// starts after this call.
+    pub(crate) fn sync_point(&self) -> Result<(u64, u64, Arc<File>)> {
+        self.check_usable()?;
+        Ok((self.seq, self.os_offset, self.sync_handle.clone()))
+    }
+
+    /// Where the entries appended so far end, once flushed to the OS.
+    pub(crate) fn flush_for_commit(&mut self) -> Result<(u64, u64)> {
+        self.sync(false)?;
+        Ok((self.seq, self.os_offset))
+    }
+
+    /// An fsync outside the table lock failed: the segment confirms nothing more.
+    pub(crate) fn mark_failed(&mut self) {
+        self.failed = true;
     }
 
     fn check_usable(&self) -> Result<()> {

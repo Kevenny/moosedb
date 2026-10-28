@@ -200,6 +200,34 @@ em modo **read-only** até ser reaberta; um fsync nunca é "tentado de novo"
 pela recuperação. Erros de validação (linha acima de 1 GiB no WAL) só falham
 o statement.
 
+**Group commit do WAL** (commit de lote com `wal_sync_mode=fsync`, como no
+InnoDB). O lote grava o COMMIT no WAL e **publica as linhas** sob o mutex da
+tabela. Antes de publicar, entrega os bytes ao SO (`flush`, sem fsync). Depois
+solta o mutex e espera a durabilidade em `Table::wait_durable(seq, offset)`:
+
+* a primeira sessão que encontra o alvo ainda não durável vira líder e faz um
+  único `fdatasync`;
+* o líder trabalha num handle clonado do segmento atual, sob um mutex próprio
+  (`group`, ordem `group` → tabela), sem segurar o mutex da tabela;
+* esse fsync cobre tudo o que já estava no SO, e os outros commits que
+  esperavam na fila recebem OK sem fazer fsync próprio.
+
+Garantias e escolhas:
+
+* **Visível antes de durável.** Outra sessão pode ler as linhas antes do
+  fsync, mas o cliente que commitou só recebe OK depois dele, o mesmo contrato
+  do InnoDB.
+* **Falha de fsync.** Se o fsync falha, o grupo e a tabela são envenenados
+  (read-only, sticky). O statement e todos os seguintes recebem erro, e as
+  linhas podem ficar visíveis até a reabertura, que reconstrói a partir do
+  disco.
+* **Troca de segmento.** Antes de trocar de segmento, toda rotação
+  (flush/checkpoint) faz fsync do segmento antigo sob o mutex da tabela, então
+  um alvo de segmento antigo está coberto. `truncate` descarta as linhas pelo
+  MANIFEST.
+* **O que fica de fora.** O DELETE continua fazendo fsync sob o mutex: o
+  delete só é aplicado em memória depois do fsync. O modo `write` não muda.
+
 ### Atomicidade por statement (lotes)
 
 Cada statement escreve num **lote** (`batch.rs`): as linhas ficam num buffer

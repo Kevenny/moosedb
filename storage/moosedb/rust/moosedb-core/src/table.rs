@@ -377,6 +377,19 @@ pub struct Table {
     /// Deletes of this table run one at a time (see `delete`); held outside
     /// the table mutex.
     pub(crate) del_gate: Mutex<()>,
+    /// Group commit: who is already durable. Lock order is `group` then
+    /// `inner`, never the reverse.
+    group: Mutex<GroupSync>,
+}
+
+#[derive(Default)]
+struct GroupSync {
+    /// Everything up to `(segment, offset)` is on stable storage.
+    durable: (u64, u64),
+    /// An fsync failed: nothing is ever confirmed again.
+    failed: bool,
+    /// fsyncs issued by `wait_durable` (tests count them).
+    fsyncs: u64,
 }
 
 /// Deletes WAL segments `<= upto`, logging (not failing) on errors: leftover
@@ -839,6 +852,7 @@ impl Table {
             claims_cv: Condvar::new(),
             batch_hint: AtomicU64::new(0),
             del_gate: Mutex::new(()),
+            group: Mutex::new(GroupSync::default()),
         })
     }
 
@@ -923,6 +937,45 @@ impl Table {
             return Err(e);
         }
         Ok(())
+    }
+
+    /// Blocks until the WAL is on stable storage up to `target` (segment,
+    /// offset), as returned by `Wal::flush_for_commit`. One fsync serves every
+    /// caller queued on `group`: the first becomes the leader and syncs all
+    /// the bytes handed to the OS so far, the others find `durable` advanced.
+    /// The fsync runs outside the table mutex.
+    pub(crate) fn wait_durable(&self, target: (u64, u64)) -> Result<()> {
+        let mut g = self.group.lock().unwrap_or_else(|p| p.into_inner());
+        if g.failed {
+            return Err(Error::ReadOnly("WAL fsync failed earlier; the table must be reopened".into()));
+        }
+        if g.durable >= target {
+            return Ok(());
+        }
+        let (seq, os_offset, handle) = {
+            let guard = self.lock()?;
+            guard.check_writable()?;
+            guard.wal.sync_point()?
+        };
+        // If the segment of `target` was rotated meanwhile, every rotation
+        // fsyncs it first (or a TRUNCATE made its rows irrelevant); syncing the
+        // current segment is merely redundant then.
+        g.fsyncs += 1;
+        if let Err(e) = crate::fsutil::sync_data(&handle) {
+            g.failed = true;
+            if let Ok(mut guard) = self.lock() {
+                guard.wal.mark_failed();
+                guard.poison(format!("WAL sync failed: {e}"));
+            }
+            return Err(e);
+        }
+        g.durable = g.durable.max((seq, os_offset));
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn group_fsyncs(&self) -> u64 {
+        self.group.lock().unwrap().fsyncs
     }
 
     /// Seals the MemTable into chunks (one per time bucket).

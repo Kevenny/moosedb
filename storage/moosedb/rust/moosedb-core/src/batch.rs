@@ -596,13 +596,20 @@ impl Batch {
                 }
                 return Err(e);
             }
-            // The COMMIT is in the log buffer. Make it reach the OS/disk before
-            // publishing, all under the table mutex (no flush can slip in between):
-            // if the sync fails the statement errors and no reader ever sees the rows.
-            if let Err(e) = inner.wal.sync(sync) {
-                inner.poison(format!("WAL sync failed: {e}"));
-                return Err(e);
-            }
+            // The COMMIT is in the log buffer. Hand it to the OS under the mutex;
+            // the fsync (if `sync`) happens after the mutex is released and is
+            // shared with concurrent commits (`wait_durable`). Rows are visible
+            // before they are durable: if that fsync fails the table is poisoned
+            // (read-only), the statement errors, and the rows may have been
+            // visible until the table is reopened; recovery rebuilds from what
+            // is on disk.
+            let target = match inner.wal.flush_for_commit() {
+                Ok(t) => t,
+                Err(e) => {
+                    inner.poison(format!("WAL sync failed: {e}"));
+                    return Err(e);
+                }
+            };
             self.finished = true;
             inner.open_batches.remove(&self.id);
             // Global id of each local series. A UNIQUE table already resolved
@@ -642,6 +649,10 @@ impl Batch {
                 if let Err(e) = table.flush_locked(inner) {
                     warn(&format!("MemTable flush failed, will retry: {e}"));
                 }
+            }
+            drop(guard);
+            if sync {
+                table.wait_durable(target)?;
             }
             return Ok(());
         }
@@ -942,8 +953,53 @@ mod tests {
         let r = b.commit(true);
         restore_fsync();
         assert!(r.is_err());
-        assert_eq!(t.stats().unwrap().row_count, 0, "rows of a failed commit are never visible");
+        // Rows are published before the fsync, so they may be visible here.
         assert!(matches!(t.begin_batch(), Err(Error::ReadOnly(_))));
+        assert!(matches!(t.write(row(2)), Err(Error::ReadOnly(_))));
+    }
+
+    #[test]
+    fn concurrent_synced_commits_share_fsyncs_and_survive_a_reopen() {
+        const THREADS: i64 = 8;
+        const EACH: i64 = 50;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t");
+        let t = open(&path);
+        let handles: Vec<_> = (0..THREADS)
+            .map(|th| {
+                let t = t.clone();
+                std::thread::spawn(move || {
+                    for i in 0..EACH {
+                        let mut b = t.begin_batch().unwrap();
+                        b.write(row(th * 1000 + i)).unwrap();
+                        b.commit(true).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let n = (THREADS * EACH) as u64;
+        assert_eq!(t.stats().unwrap().row_count, n);
+        let fsyncs = t.group_fsyncs();
+        assert!(fsyncs <= n, "never more than one fsync per commit: {fsyncs}");
+        eprintln!("group commit: {fsyncs} fsyncs for {n} commits");
+        drop(t);
+        assert_eq!(Table::open(config(&path)).unwrap().stats().unwrap().row_count, n);
+    }
+
+    #[test]
+    fn group_fsync_failure_is_sticky_for_later_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = open(&dir.path().join("t"));
+        let mut b = t.begin_batch().unwrap();
+        b.write(row(1)).unwrap();
+        fail_fsync_after(0);
+        assert!(b.commit(true).is_err());
+        restore_fsync(); // the disk "recovers"; the table must not believe it
+        assert!(matches!(t.begin_batch(), Err(Error::ReadOnly(_))));
+        assert!(matches!(t.wait_durable((0, 0)), Err(Error::ReadOnly(_))));
         assert!(matches!(t.write(row(2)), Err(Error::ReadOnly(_))));
     }
 

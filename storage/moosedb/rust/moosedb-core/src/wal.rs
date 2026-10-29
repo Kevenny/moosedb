@@ -68,6 +68,49 @@ const FLAG_ENCRYPTED: u16 = 1;
 const FLAG_AUTH_MANIFEST: u16 = 2;
 const BASE_HEADER: usize = 8;
 const ENTRY_HEADER: usize = 8;
+/// How far ahead of the append point the segment is kept physically zeroed, so
+/// the usual fdatasync does not have to change the file size (an extending
+/// fdatasync also commits the file system journal and costs about twice as much).
+const PREALLOC_STEP: u64 = 1 << 20;
+static ZEROS: [u8; 1 << 16] = [0; 1 << 16];
+
+/// Writes `n` real zero bytes at the current position (fallocate would leave
+/// unwritten extents, whose conversion on the first write is what we avoid).
+fn write_zeros(f: &mut File, mut n: u64) -> std::io::Result<()> {
+    while n > 0 {
+        let k = n.min(ZEROS.len() as u64) as usize;
+        f.write_all(&ZEROS[..k])?;
+        n -= k as u64;
+    }
+    Ok(())
+}
+
+/// Whether bytes `from..to` of `file` are all zero (the normal end of a
+/// segment: see `Wal::append`). Streams; stops at the first non-zero byte.
+fn zeros_between(file: &mut File, from: u64, to: u64) -> Result<bool> {
+    file.seek(SeekFrom::Start(from))?;
+    let mut left = to.saturating_sub(from);
+    let mut buf = vec![0u8; ZEROS.len()];
+    while left > 0 {
+        let k = left.min(buf.len() as u64) as usize;
+        file.read_exact(&mut buf[..k])?;
+        if buf[..k] != ZEROS[..k] {
+            return Ok(false);
+        }
+        left -= k as u64;
+    }
+    Ok(true)
+}
+
+/// Whether a file whose header is not valid never got one written: what it
+/// holds is a (possibly empty) prefix of the magic and then only zeros. That
+/// is a crash inside `Wal::create` (the size and name persisted, the data did
+/// not), at any size; any other content is a damaged header.
+fn header_never_written(file: &mut File, prefix: &[u8], len: u64) -> Result<bool> {
+    let k = prefix.iter().zip(MAGIC.iter()).take_while(|(a, b)| a == b).count().min(prefix.len());
+    Ok(len < BASE_HEADER as u64 || zeros_between(file, k as u64, len)?)
+}
+
 /// Sanity bound on a single entry; anything larger is treated as corruption.
 pub(crate) const MAX_ENTRY: usize = 1 << 30;
 
@@ -324,6 +367,9 @@ pub(crate) struct Wal {
     offset: u64,
     /// Size of the segment header: `offset == header_len` means no entries.
     header_len: u64,
+    /// Physical end of the zeroed area: bytes in `offset..alloc_end` are zero
+    /// on disk. The file size is never a logical offset.
+    alloc_end: u64,
     /// Logical offset up to which bytes were handed to the OS (flushed from
     /// the buffer); `offset - os_offset` bytes still sit in the buffer.
     os_offset: u64,
@@ -355,7 +401,14 @@ impl Wal {
             header.extend_from_slice(&c.encode());
         }
         let cipher = cipher.map(|c| c.authenticated(bind(&header, seq)));
-        let written = file.write_all(&header).map_err(Error::from).and_then(|()| fsutil::sync_all(&file));
+        // One fsync for header and zeros: the new size is paid here, not by the first commit.
+        let alloc_end = header.len() as u64 + PREALLOC_STEP;
+        let written = file
+            .write_all(&header)
+            .and_then(|()| write_zeros(&mut file, PREALLOC_STEP))
+            .and_then(|()| file.seek(SeekFrom::Start(header.len() as u64)).map(|_| ()))
+            .map_err(Error::from)
+            .and_then(|()| fsutil::sync_all(&file));
         if let Err(e) = written {
             // A segment with a partial header is useless; do not leave it behind.
             drop(file);
@@ -370,6 +423,7 @@ impl Wal {
             cipher,
             offset: header.len() as u64,
             header_len: header.len() as u64,
+            alloc_end,
             os_offset: header.len() as u64,
             unsynced: false,
             sync_handle,
@@ -407,6 +461,13 @@ impl Wal {
         let mut h = crc32fast::Hasher::new();
         h.update(&len_bytes);
         h.update(body);
+        let total = (ENTRY_HEADER + body.len()) as u64;
+        if self.offset + total > self.alloc_end {
+            if let Err(e) = self.extend(total) {
+                self.failed = true;
+                return Err(e.into());
+            }
+        }
         let written = self
             .out
             .write_all(&h.finalize().to_le_bytes())
@@ -418,6 +479,31 @@ impl Wal {
         }
         self.offset += (ENTRY_HEADER + body.len()) as u64;
         self.unsynced = true;
+        Ok(())
+    }
+
+    /// Zeroes the file ahead until an entry of `total` bytes plus one step fits.
+    /// No fsync: the next fdatasync pays the new size, once per step.
+    ///
+    /// Only the step after the entry is zeroed (the entry fills its own span).
+    /// Failing to zero (ENOSPC...) is not fatal: the cursor goes back to
+    /// `offset` and the append grows the file as before; zeros written beyond
+    /// the offset are a harmless tail and `alloc_end` stays what was written
+    /// before. Only a failed flush or seek poisons the segment.
+    fn extend(&mut self, total: u64) -> std::io::Result<()> {
+        self.out.flush()?;
+        self.os_offset = self.offset;
+        let start = self.alloc_end.max(self.offset + total);
+        let target = self.offset + total + PREALLOC_STEP;
+        let offset = self.offset;
+        let f = self.out.get_mut();
+        let zeroed = f.seek(SeekFrom::Start(start)).and_then(|_| write_zeros(f, target - start));
+        f.seek(SeekFrom::Start(offset))?;
+        if zeroed.is_ok() {
+            self.alloc_end = target;
+        } else {
+            warn("WAL: could not preallocate ahead; appending without it");
+        }
         Ok(())
     }
 
@@ -541,9 +627,9 @@ pub(crate) fn replay_at(
     // file systems, zero-filled) file. Nothing was ever appended to it, in any
     // position among the segments: it is empty, never corruption.
     let never_used = |n: u64| ReplayOutcome { unused: true, entries: 0, torn_bytes: n, valid_len: 0 };
-    let header_ok = prefix.len() >= BASE_HEADER && &prefix[..4] == MAGIC;
+    let header_ok = prefix.len() >= BASE_HEADER && &prefix[..4] == MAGIC && prefix[4..BASE_HEADER] != [0; 4];
     if !header_ok {
-        if file_len < BASE_HEADER as u64 || (file_len <= max_header && prefix.iter().all(|&b| b == 0)) {
+        if header_never_written(&mut file, &prefix, file_len)? {
             return Ok(never_used(file_len));
         }
         return Err(corrupt(format!("{} has an invalid header", path.display())));
@@ -572,7 +658,7 @@ pub(crate) fn replay_at(
         if file_len < max_header {
             return Ok(never_used(file_len));
         }
-        if file_len == max_header {
+        if file_len == max_header || zeros_between(&mut file, max_header, file_len)? {
             return Ok(never_used(0));
         }
         Some(segment_cipher(&prefix[..header_len as usize], version, seq)?)
@@ -621,7 +707,12 @@ pub(crate) fn replay_at(
     }
     drop(input);
 
-    let torn_bytes = file_len - pos;
+    // Zeros to the end are the preallocated area, not damage (also in a
+    // segment with successors: a crash may leave it there after a rotation).
+    let mut torn_bytes = file_len - pos;
+    if torn_bytes > 0 && zeros_between(&mut File::open(&path)?, pos, file_len)? {
+        torn_bytes = 0;
+    }
     if torn_bytes > 0 {
         if torn == TornTail::Error {
             return Err(corrupt(format!(
@@ -800,11 +891,12 @@ fn segment_has_no_entries(dir: &Path, seq: u64) -> Result<bool> {
     let max_header = (BASE_HEADER + PARAMS_LEN) as u64;
     let mut prefix = Vec::with_capacity(max_header as usize);
     Read::by_ref(&mut file).take(max_header).read_to_end(&mut prefix)?;
-    if prefix.len() < BASE_HEADER || &prefix[..4] != MAGIC {
-        return Ok(len < BASE_HEADER as u64 || (len <= max_header && prefix.iter().all(|&b| b == 0)));
+    if prefix.len() < BASE_HEADER || &prefix[..4] != MAGIC || prefix[4..BASE_HEADER] == [0; 4] {
+        return header_never_written(&mut file, &prefix, len);
     }
     let flags = u16::from_le_bytes([prefix[6], prefix[7]]);
-    Ok(if flags & FLAG_ENCRYPTED != 0 { len <= max_header } else { len <= BASE_HEADER as u64 })
+    let header = if flags & FLAG_ENCRYPTED != 0 { max_header } else { BASE_HEADER as u64 };
+    Ok(len <= header || zeros_between(&mut file, header, len)?)
 }
 
 /// Fails if segment `seq` has entries and its ENCRYPTED flag differs from the
@@ -1108,7 +1200,7 @@ mod tests {
         w.sync(true).unwrap();
         drop(w);
         let path = segment_path(dir.path(), 3);
-        let full = fs::metadata(&path).unwrap().len();
+        let full = logical_end(dir.path(), 3); // drop the zero tail: the tear is at the end of the file
         OpenOptions::new().write(true).open(&path).unwrap().set_len(full - 2).unwrap();
 
         assert!(collect(dir.path(), 3, false).is_err(), "torn data in a non-final segment is corruption");
@@ -1116,6 +1208,124 @@ mod tests {
         assert_eq!(got, vec![b"one".to_vec()]);
         assert_eq!(out.torn_bytes, 9);
         assert_eq!(fs::metadata(&path).unwrap().len(), (BASE_HEADER + 11) as u64);
+    }
+
+    /// Sealed length of a segment of plain entries: header + entries only.
+    fn logical_end(dir: &Path, seq: u64) -> u64 {
+        replay(dir, seq, TornTail::Ignore, None, |_, _| Ok(())).unwrap().valid_len
+    }
+
+    #[test]
+    fn appends_cross_the_preallocated_area_and_replay_in_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = Wal::create(dir.path(), 1, None).unwrap();
+        let path = segment_path(dir.path(), 1);
+        assert_eq!(fs::metadata(&path).unwrap().len(), BASE_HEADER as u64 + PREALLOC_STEP);
+        let big = vec![7u8; 100_000];
+        let n = 25; // 2.5 MB: crosses the 1 MiB mark twice
+        for i in 0..n {
+            let mut p = big.clone();
+            p[0] = i as u8;
+            w.append(&p).unwrap();
+            w.sync(true).unwrap();
+        }
+        w.append(&vec![1u8; 3 << 20]).unwrap(); // bigger than a step
+        w.sync(true).unwrap();
+        drop(w);
+        let (got, out) = collect(dir.path(), 1, false).unwrap();
+        assert_eq!(got.len(), n + 1);
+        assert!((0..n).all(|i| got[i][0] == i as u8 && got[i].len() == big.len()));
+        assert_eq!(out.torn_bytes, 0, "the zero tail is not damage");
+        assert!(fs::metadata(&path).unwrap().len() > out.valid_len);
+    }
+
+    #[test]
+    fn a_zero_tail_is_clean_in_every_position_but_other_garbage_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        for seq in [1, 2] {
+            let mut w = Wal::create(dir.path(), seq, None).unwrap();
+            w.append(b"one").unwrap();
+            w.sync(true).unwrap();
+        }
+        // A sealed segment with a zero tail followed by another segment.
+        let (got, out) = collect(dir.path(), 1, false).unwrap();
+        assert_eq!((got.len(), out.torn_bytes), (1, 0));
+        // Non-zero byte far into the tail: error with successors, truncate otherwise.
+        let p1 = segment_path(dir.path(), 1);
+        let mut data = fs::read(&p1).unwrap();
+        let end = logical_end(dir.path(), 1) as usize;
+        data[end + 5000] = 1;
+        fs::write(&p1, &data).unwrap();
+        assert!(collect(dir.path(), 1, false).is_err());
+        let (got, out) = collect(dir.path(), 1, true).unwrap();
+        assert_eq!(got.len(), 1);
+        assert!(out.torn_bytes > 0);
+        assert_eq!(fs::metadata(&p1).unwrap().len(), end as u64);
+    }
+
+    #[test]
+    fn a_torn_entry_followed_by_zeros_is_truncated() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = Wal::create(dir.path(), 1, None).unwrap();
+        w.append(b"one").unwrap();
+        w.append(b"two").unwrap();
+        w.sync(true).unwrap();
+        drop(w);
+        let path = segment_path(dir.path(), 1);
+        let mut data = fs::read(&path).unwrap();
+        let end = logical_end(dir.path(), 1) as usize;
+        data[end - 1] ^= 0xff; // damages the last entry; zeros follow
+        fs::write(&path, &data).unwrap();
+        assert!(collect(dir.path(), 1, false).is_err());
+        let (got, out) = collect(dir.path(), 1, true).unwrap();
+        assert_eq!(got, vec![b"one".to_vec()]);
+        assert!(out.torn_bytes > 0);
+        assert_eq!(fs::metadata(&path).unwrap().len(), (BASE_HEADER + 11) as u64);
+    }
+
+    #[test]
+    fn a_valid_header_followed_only_by_zeros_has_no_entries_and_no_damage() {
+        crate::crypto::test_keys::install();
+        for key in [None, Some(5)] {
+            let dir = tempfile::tempdir().unwrap();
+            drop(Wal::create(dir.path(), 1, key).unwrap());
+            let out = replay(dir.path(), 1, TornTail::Error, None, |_, _| panic!("no entries")).unwrap();
+            assert_eq!(out.entries, 0);
+            assert_eq!(out.torn_bytes, 0, "key {key:?}");
+            assert!(!segment_has_no_entries(dir.path(), 1).map(|b| !b).unwrap(), "key {key:?}");
+        }
+    }
+
+    #[test]
+    fn a_segment_that_is_all_zeros_or_a_zeroed_header_prefix_is_removed_at_any_size() {
+        crate::crypto::test_keys::install();
+        let stubs: [&[u8]; 3] = [b"", b"TFW", b"TFWL"];
+        for key in [None, Some(5)] {
+            for stub in stubs {
+                for later in [false, true] {
+                    let dir = tempfile::tempdir().unwrap();
+                    let mut bad = stub.to_vec();
+                    bad.resize(PREALLOC_STEP as usize + 40, 0);
+                    fs::write(segment_path(dir.path(), 1), &bad).unwrap();
+                    let mut w = Wal::create(dir.path(), 2, key).unwrap();
+                    if later {
+                        w.append(&row_commit_entry(&r(1))).unwrap();
+                        w.sync(true).unwrap();
+                    }
+                    drop(w);
+                    let segs = if later { vec![1, 2] } else { vec![1] };
+                    let (got, _) = committed(dir.path(), &segs, 0);
+                    assert_eq!(got.len(), usize::from(later), "key {key:?} stub {stub:?}");
+                    assert!(!segment_path(dir.path(), 1).exists(), "removed: key {key:?} stub {stub:?} later {later}");
+                }
+            }
+        }
+        // Bytes that are not a prefix of the magic stay corruption.
+        let dir = tempfile::tempdir().unwrap();
+        let mut bad = vec![0u8; 5000];
+        bad[3000] = 1;
+        fs::write(segment_path(dir.path(), 1), &bad).unwrap();
+        assert!(replay(dir.path(), 1, TornTail::Truncate, None, |_, _| Ok(())).is_err());
     }
 
     #[test]
@@ -1517,7 +1727,10 @@ mod tests {
         drop(w);
         // An entry header that claims 900 MiB, followed by almost nothing.
         let path = segment_path(dir.path(), 1);
-        let mut f = OpenOptions::new().append(true).open(&path).unwrap();
+        let end = logical_end(dir.path(), 1);
+        let mut f = OpenOptions::new().write(true).open(&path).unwrap();
+        f.set_len(end).unwrap();
+        f.seek(SeekFrom::End(0)).unwrap();
         f.write_all(&0u32.to_le_bytes()).unwrap();
         f.write_all(&(900u32 << 20).to_le_bytes()).unwrap();
         f.write_all(&[7u8; 100]).unwrap();

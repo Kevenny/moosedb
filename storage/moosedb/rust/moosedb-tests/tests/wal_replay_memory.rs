@@ -47,7 +47,13 @@ fn real_segment(dir: &Path) -> Vec<u8> {
         .unwrap();
     }
     b.commit(true).unwrap();
-    let bytes = fs::read(dir.join("wal_000001.tfl.wal")).unwrap();
+    let mut bytes = fs::read(dir.join("wal_000001.tfl.wal")).unwrap();
+    // The segment ends in preallocated zeros: walk the entries (crc, len, payload) to find the end.
+    let mut end = HEADER_LEN;
+    while u32::from_le_bytes(bytes[end..end + 4].try_into().unwrap()) != 0 {
+        end += 8 + u32::from_le_bytes(bytes[end + 4..end + 8].try_into().unwrap()) as usize;
+    }
+    bytes.truncate(end);
     // The last entry must be the COMMIT: crc, len = 9, kind 2, batch id.
     assert_eq!(bytes[bytes.len() - COMMIT_ENTRY_LEN + 4], 9);
     bytes

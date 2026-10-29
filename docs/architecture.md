@@ -228,6 +228,33 @@ Garantias e escolhas:
 * **O que fica de fora.** O DELETE continua fazendo fsync sob o mutex: o
   delete só é aplicado em memória depois do fsync. O modo `write` não muda.
 
+**Segmento de WAL pré-zerado.** No ext4, um `fdatasync` de append num arquivo
+que cresce custa ~1,6 ms, porque grava o novo tamanho e faz o commit do
+journal. Numa área já escrita custa ~0,69 ms (medido no lab, 2026-10-28).
+
+* O segmento nasce com 1 MiB de **zeros de verdade** depois do header, com um
+  `sync_all` na criação. `fallocate` não serve: um extent não escrito paga a
+  conversão.
+* O append estende mais 1 MiB à frente quando chega ao fim. Sem fsync próprio:
+  o próximo commit paga o tamanho novo uma vez por MiB.
+* Na leitura, uma cauda **toda zero** depois da última entrada válida é o fim
+  normal do segmento, em qualquer segmento, e não conta como cauda rasgada. Um
+  cabeçalho de entrada todo zero nunca é válido (CRC).
+* Bytes diferentes de zero depois do ponto inválido continuam como antes:
+  truncados no último segmento, corrupção num segmento que tem sucessores.
+* Um segmento cujo header nunca chegou ao disco é tratado como **nunca usado**
+  e removido na recuperação, em qualquer tamanho. Isso cobre uma queda no
+  `create`, quando o ext4 persiste o tamanho sem os dados. O critério é: o
+  arquivo é só zeros, ou um prefixo do magic seguido só de zeros.
+* Uma falha ao zerar (p.ex. ENOSPC) não envenena a WAL: o append segue
+  crescendo o arquivo, só perde a otimização, e tenta estender de novo no
+  próximo append.
+* **Downgrade:** um binário anterior lê a cauda zerada como bytes inválidos. No
+  último segmento ele trunca, o que é inofensivo. Num segmento com sucessores
+  ele recusa abrir. Antes de voltar de versão, faça um shutdown limpo e um
+  `FLUSH TABLES` (o checkpoint apaga os segmentos antigos), ou trunque cada
+  segmento ao fim lógico.
+
 ### Atomicidade por statement (lotes)
 
 Cada statement escreve num **lote** (`batch.rs`): as linhas ficam num buffer
@@ -697,7 +724,7 @@ de arquivo v3 recusa explicitamente ("version 3 not supported").
 
 **Rotação/aposentadoria de chave**: o MANIFEST declara a versão da chave com que foi selado, então aposentar uma versão exige que ele tenha sido regravado depois da rotação. Recomendação: depois de rotacionar, rode `OPTIMIZE TABLE` (reescreve chunks e MANIFEST na versão nova) e confira (`CHECK TABLE` limpo, a tabela abre numa réplica de teste sem a versão antiga) antes de aposentar a versão. A reabertura de tabela ociosa também regrava o MANIFEST, mas não é garantia: com a MemTable não vazia o checkpoint da abertura não é gravado. Com a versão antiga já aposentada e sem essa regravação a abertura falha fechada (`Crypto`), como para um chunk.
 
-**WAL**: registrar no MANIFEST o último segmento/seq durável só detectaria a remoção de segmento inteiro ou o corte do fim se fosse atualizado a cada `sync` do WAL, isto é, um MANIFEST autenticado por commit de statement, no caminho quente do append. Não foi feito. A cauda do WAL posterior ao último checkpoint pode ser removida ou cortada sem detecção (perde-se no máximo o que a MemTable ainda não virou chunk). O que é detectado: alteração de entrada, troca de segmento (o AAD tem o número), segmento em claro em tabela cifrada.
+**WAL**: registrar no MANIFEST o último segmento/seq durável só detectaria a remoção de segmento inteiro ou o corte do fim se fosse atualizado a cada `sync` do WAL, isto é, um MANIFEST autenticado por commit de statement, no caminho quente do append. Não foi feito. A cauda do WAL posterior ao último checkpoint pode ser removida ou cortada sem detecção (perde-se no máximo o que a MemTable ainda não virou chunk). Com o segmento pré-zerado (§Protocolo de durabilidade), **zerar** a cauda a partir de uma entrada (inclusive em segmento selado) também equivale a cortá-la. O que é detectado: alteração de entrada, troca de segmento (o AAD tem o número), segmento em claro em tabela cifrada.
 
 **Limites do modelo de ameaça**: a autenticação de chunk e WAL é por unidade; o MANIFEST v4 é autenticado como um todo e amarra os chunks pelo IV. Quem escreve no datadir **ainda** consegue: (a) apagar um segmento WAL ou cortar o fim do último (acima; o CRC de entrada é recalculável sem a chave); (b) voltar o **diretório inteiro** a uma cópia antiga consistente (exigiria estado fora do datadir, p.ex. um contador monotônico; fora de escopo); (c) restaurar **só o arquivo MANIFEST** por uma cópia antiga *dele mesmo* (a tag é válida): se a cópia lista um chunk que já não existe (compactação ou retenção posterior) a abertura falha, mas se todos os chunks listados ainda existem os chunks posteriores viram órfãos e são apagados, e `replay_seq` e tombstones voltam; detectar isso pede um número de geração fora do MANIFEST; (d) nas tabelas **sem** criptografia nada disso é protegido (CRC32). O `CHECK TABLE` continua sem chave e só confere CRC32. Salvaguardas:
 

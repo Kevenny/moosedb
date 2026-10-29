@@ -376,8 +376,14 @@ mod recovery_tests {
         t.sync_wal(true).unwrap();
         drop(t);
         let wal = files_with_suffix(&path, ".tfl.wal").pop().unwrap();
-        let len = fs::metadata(&wal).unwrap().len();
-        OpenOptions::new().write(true).open(&wal).unwrap().set_len(len - 3).unwrap();
+        // The segment ends in preallocated zeros: tear 3 bytes off the last entry.
+        let bytes = fs::read(&wal).unwrap();
+        let mut data_end = 8; // plain header; then entries: crc (never 0), len, payload
+        while u32::from_le_bytes(bytes[data_end..data_end + 4].try_into().unwrap()) != 0 {
+            data_end += 8 + u32::from_le_bytes(bytes[data_end + 4..data_end + 8].try_into().unwrap()) as usize;
+        }
+        let data_end = data_end as u64;
+        OpenOptions::new().write(true).open(&wal).unwrap().set_len(data_end - 3).unwrap();
 
         let t = reopen(&path);
         let got = all_rows(&t);

@@ -311,8 +311,9 @@ mantém a tabela (e o handle do WAL) viva mesmo se o handler a fechar antes;
 `moosedb_table_close` faz `sync_wal(true)` e a tabela não tem `Drop`. Erro no
 fsync: a tabela é envenenada e o `COMMIT` falha. Custo: uma queda antes do
 `COMMIT` pode perder statements da transação já retornados; `DELETE` e o caminho
-de spill (MANIFEST) continuam duráveis por statement. Medido antes: `BEGIN` +
-100 INSERTs de 1 linha, 1.179 linhas/s contra 7.352 do InnoDB.
+de spill (MANIFEST) continuam duráveis por statement. Medido no lab
+(2026-10-28, ext4) com `BEGIN` + 100 INSERTs de 1 linha: antes 1.179
+linhas/s, depois 7.617, contra 7.204 do InnoDB.
 
 Limites conhecidos: (1) o commit no `prepare` é durável antes do binlog e das
 outras engines; se o binlog ou o `prepare` de outra engine falhar depois, as

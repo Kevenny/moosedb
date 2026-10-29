@@ -51,7 +51,7 @@ pub mod unique;
 mod wal;
 pub mod zone;
 
-pub use batch::Batch;
+pub use batch::{Batch, Durability};
 pub use delete::DeleteBatch;
 pub use compaction::CompactionReport;
 pub use error::{Error, Result};

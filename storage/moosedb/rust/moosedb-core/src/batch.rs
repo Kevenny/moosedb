@@ -564,15 +564,25 @@ impl Batch {
     /// durable on return (WAL fsync, or — spill path — the MANIFEST swap,
     /// which is always fsynced). The batch is consumed, also on error.
     pub fn commit(mut self, sync: bool) -> Result<()> {
-        self.commit_inner(sync)
+        self.commit_inner(sync, false).map(|_| ())
     }
 
-    fn commit_inner(&mut self, sync: bool) -> Result<()> {
+    /// Like `commit(true)` but returns before the fsync: the rows are visible
+    /// and in the OS, and the returned token waits for the disk (group commit,
+    /// one fsync can serve many tokens). `None` when nothing is left to wait
+    /// for (empty batch, or the spill path, durable by the MANIFEST swap). For
+    /// a multi-statement transaction that syncs once, at its end. The token
+    /// keeps the table alive. The batch is consumed, also on error.
+    pub fn commit_deferred(mut self) -> Result<Option<Durability>> {
+        self.commit_inner(true, true)
+    }
+
+    fn commit_inner(&mut self, sync: bool, defer: bool) -> Result<Option<Durability>> {
         let table = self.table.clone();
         if !self.spilled {
             if self.rows.is_empty() {
                 self.cleanup();
-                return Ok(());
+                return Ok(None);
             }
             if !self.logged {
                 return Err(invalid("internal error: batch rows were not logged"));
@@ -652,9 +662,13 @@ impl Batch {
             }
             drop(guard);
             if sync {
-                table.wait_durable(target)?;
+                let token = Durability { table, target };
+                if defer {
+                    return Ok(Some(token));
+                }
+                token.wait()?;
             }
-            return Ok(());
+            return Ok(None);
         }
 
         if !self.rows.is_empty() {
@@ -662,7 +676,7 @@ impl Batch {
         }
         if self.staged.is_empty() {
             self.cleanup();
-            return Ok(());
+            return Ok(None);
         }
         let mut guard = table.lock()?;
         let inner = &mut *guard;
@@ -688,7 +702,7 @@ impl Batch {
         if let Err(e) = table.collect_wal_locked(inner) {
             warn(&format!("cannot collect WAL segments after a batch commit: {e}"));
         }
-        Ok(())
+        Ok(None)
     }
 
     /// Discards the batch: its rows never become visible. (Dropping the batch
@@ -710,6 +724,21 @@ impl Batch {
                 g.open_batches.remove(&self.id);
             }
         }
+    }
+}
+
+/// What a deferred commit still owes: the WAL on stable storage up to
+/// `target`. Holds the table (and with it the WAL handle), so it stays valid
+/// even if the caller closes its own handle first.
+pub struct Durability {
+    table: Arc<Table>,
+    target: (u64, u64),
+}
+
+impl Durability {
+    /// Blocks until the commit is durable. On error the table is poisoned.
+    pub fn wait(self) -> Result<()> {
+        self.table.wait_durable(self.target)
     }
 }
 
@@ -1018,6 +1047,32 @@ mod tests {
         assert_eq!(t.stats().unwrap().row_count, 2);
     }
 
+    #[test]
+    fn deferred_commits_wait_once_and_survive_a_reopen() {
+        const N: i64 = 20;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t");
+        let t = open(&path);
+        let mut tokens = Vec::new();
+        for i in 0..N {
+            let mut b = t.begin_batch().unwrap();
+            b.write(row(i)).unwrap();
+            tokens.push(b.commit_deferred().unwrap().expect("a logged batch owes an fsync"));
+        }
+        assert_eq!(t.group_fsyncs(), 0, "no fsync before the wait");
+        assert!(t.begin_batch().unwrap().commit_deferred().unwrap().is_none(), "empty batch: no token");
+        assert_eq!(t.stats().unwrap().row_count, N as u64, "rows are visible already");
+        let mut it = tokens.into_iter();
+        // The token outlives the caller's handle on the table.
+        let last = it.next_back().unwrap();
+        drop(t);
+        last.wait().unwrap();
+        for tok in it {
+            tok.wait().unwrap();
+        }
+        let t = Table::open(config(&path)).unwrap();
+        assert_eq!(t.stats().unwrap().row_count, N as u64);
+    }
     #[test]
     fn empty_batch_commit_is_a_noop() {
         let dir = tempfile::tempdir().unwrap();

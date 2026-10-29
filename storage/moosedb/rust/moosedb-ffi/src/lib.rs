@@ -272,6 +272,11 @@ pub struct MooseDBTable {
     table: Arc<Table>,
 }
 
+/// Durability token of a deferred batch commit (see `moosedb_batch_commit_deferred`).
+pub struct MooseDBDurability {
+    durability: moosedb_core::Durability,
+}
+
 /// Opaque statement batch (see `moosedb_batch_begin`). Used by one thread.
 pub struct MooseDBBatch {
     batch: Batch,
@@ -838,6 +843,68 @@ pub unsafe extern "C" fn moosedb_batch_commit(batch: *mut MooseDBBatch, sync: bo
         // SAFETY: ownership is transferred back from C, exactly once.
         let b = unsafe { Box::from_raw(batch) };
         b.batch.commit(sync)
+    })
+}
+
+/// Like `moosedb_batch_commit(batch, true)`, but returns before the fsync. The
+/// rows are visible and handed to the OS; `*out_token` receives a durability
+/// token (NULL when there is nothing to wait for: empty batch or spilled
+/// batch, already durable) that must end in `moosedb_durability_wait` or
+/// `moosedb_durability_free`. The batch handle is released, also on error. The
+/// token keeps the table alive, so it stays valid after `moosedb_table_close`.
+///
+/// # Safety
+/// `batch` must come from `moosedb_batch_begin` and not be used afterwards;
+/// `out_token` writable.
+#[no_mangle]
+pub unsafe extern "C" fn moosedb_batch_commit_deferred(
+    batch: *mut MooseDBBatch,
+    out_token: *mut *mut MooseDBDurability,
+) -> TFStatus {
+    guard(|| {
+        let out = handle_mut(out_token, "out_token")?;
+        *out = ptr::null_mut();
+        if batch.is_null() {
+            return Err(invalid("batch is NULL"));
+        }
+        // SAFETY: ownership is transferred back from C, exactly once.
+        let b = unsafe { Box::from_raw(batch) };
+        if let Some(d) = b.batch.commit_deferred()? {
+            *out = Box::into_raw(Box::new(MooseDBDurability { durability: d }));
+        }
+        Ok(())
+    })
+}
+
+/// Blocks until the commit behind `token` is on stable storage (group commit)
+/// and releases the token, also on error. NULL is ignored.
+///
+/// # Safety
+/// `token` must come from `moosedb_batch_commit_deferred` and not be used afterwards.
+#[no_mangle]
+pub unsafe extern "C" fn moosedb_durability_wait(token: *mut MooseDBDurability) -> TFStatus {
+    guard(|| {
+        if token.is_null() {
+            return Ok(());
+        }
+        // SAFETY: ownership is transferred back from C, exactly once.
+        let t = unsafe { Box::from_raw(token) };
+        t.durability.wait()
+    })
+}
+
+/// Releases the token without waiting. NULL is ignored.
+///
+/// # Safety
+/// `token` must come from `moosedb_batch_commit_deferred` and not be used afterwards.
+#[no_mangle]
+pub unsafe extern "C" fn moosedb_durability_free(token: *mut MooseDBDurability) -> TFStatus {
+    guard(|| {
+        if !token.is_null() {
+            // SAFETY: ownership is transferred back from C, exactly once.
+            drop(unsafe { Box::from_raw(token) });
+        }
+        Ok(())
     })
 }
 

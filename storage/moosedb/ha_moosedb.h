@@ -107,6 +107,13 @@ struct tf_delete_closer
 {
   void operator()(MooseDBDelete *d) const noexcept;
 };
+/* Durability token of a statement committed without its fsync (end of a
+   multi-statement transaction waits for it); freed without waiting. */
+struct tf_durable_closer
+{
+  void operator()(MooseDBDurability *d) const noexcept { moosedb_durability_free(d); }
+};
+using tf_durable_ptr= std::unique_ptr<MooseDBDurability, tf_durable_closer>;
 using tf_batch_ptr= std::unique_ptr<MooseDBBatch, tf_batch_closer>;
 using tf_delete_ptr= std::unique_ptr<MooseDBDelete, tf_delete_closer>;
 using tf_table_ptr= std::unique_ptr<MooseDBTable, tf_table_closer>;
@@ -354,7 +361,9 @@ private:
   void recheck_projection();
   int key_to_ts(uint idx, const uchar *key, uint part, longlong *out);
   int map_status(TFStatus status, const char *name= nullptr);
-  int commit_batch();   /* publish + sync the open statement batch, if any */
+  /* publish + sync the open statement batch, if any. With `defer_to`, the
+     fsync is left to the end of that THD's transaction (token kept there). */
+  int commit_batch(THD *defer_to= nullptr);
   int commit_delete();  /* apply the rows collected by delete_row(), if any */
   void abort_batch();   /* discard the open batch and DELETE, if any */
   void join_stmt_trx(THD *thd);  /* register in the server's statement transaction */

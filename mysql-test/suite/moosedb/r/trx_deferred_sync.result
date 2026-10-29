@@ -1,0 +1,75 @@
+CREATE TABLE d (ts DATETIME(6) NOT NULL, v INT NOT NULL, INDEX(ts)) ENGINE=MooseDB;
+# BEGIN, several INSERTs, COMMIT
+BEGIN;
+INSERT INTO d VALUES ('2026-01-01', 1);
+INSERT INTO d VALUES ('2026-01-02', 2);
+INSERT INTO d VALUES ('2026-01-03', 3), ('2026-01-04', 4);
+# visible inside the transaction before the COMMIT
+SELECT COUNT(*) FROM d;
+COUNT(*)
+4
+COMMIT;
+# BEGIN, INSERT, ROLLBACK: the statement stays
+BEGIN;
+INSERT INTO d VALUES ('2026-02-01', 10);
+ROLLBACK;
+# autocommit=0, COMMIT
+SET autocommit=0;
+INSERT INTO d VALUES ('2026-03-01', 20);
+INSERT INTO d VALUES ('2026-03-02', 21);
+COMMIT;
+SET autocommit=1;
+# a failed statement inside a transaction leaves nothing; the others stay
+BEGIN;
+INSERT INTO d VALUES ('2026-04-01', 30);
+INSERT INTO d VALUES ('2026-04-02', 31), ('0000-00-00', 32);
+ERROR HY000: Got error 1205 'column 'ts': zero or partial dates cannot be stored' from MooseDB
+COMMIT;
+# InnoDB in the same transaction (prepare of both engines)
+CREATE TABLE i (a INT PRIMARY KEY) ENGINE=InnoDB;
+BEGIN;
+INSERT INTO d VALUES ('2026-05-01', 40);
+INSERT INTO i VALUES (1);
+INSERT INTO d VALUES ('2026-05-02', 41);
+COMMIT;
+# DDL ends the transaction (implicit commit)
+BEGIN;
+INSERT INTO d VALUES ('2026-06-01', 50);
+CREATE TABLE implicit (a INT) ENGINE=InnoDB;
+DROP TABLE implicit;
+# LOCK TABLES with autocommit=0
+SET autocommit=0;
+LOCK TABLES d WRITE;
+INSERT INTO d VALUES ('2026-07-01', 60);
+UNLOCK TABLES;
+SET autocommit=1;
+# Same rows after kill -9
+# Kill the server
+# restart
+SELECT v FROM d ORDER BY ts;
+v
+1
+2
+3
+4
+10
+20
+21
+30
+40
+41
+50
+60
+SELECT a FROM i;
+a
+1
+# Connection closed in the middle of a transaction: statements stay
+connect  c1,localhost,root,,test;
+BEGIN;
+INSERT INTO d VALUES ('2026-08-01', 70);
+disconnect c1;
+connection default;
+SELECT v FROM d WHERE v >= 70;
+v
+70
+DROP TABLE d, i;

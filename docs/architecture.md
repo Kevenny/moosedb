@@ -289,6 +289,24 @@ confirmar um statement nela, o handler marca `all.modified_non_trans_table`
 mesmas linhas. No deadlock a transação inteira é marcada para
 rollback (`mark_transaction_to_rollback(true)`, como o InnoDB).
 
+**Fsync no fim da transação.** Em `BEGIN` / `autocommit=0`
+(`in_multi_stmt_transaction_mode`, fsync mode), o commit de cada statement usa
+`Batch::commit_deferred`: publica as linhas e entrega ao SO, mas devolve um
+`Durability` (`Arc<Table>` + alvo `(seq, offset)` do group commit) em vez de
+esperar o fsync. O handler guarda os tokens em `tf_stmt_handlers::pending`
+(por THD) e `moosedb_wait_pending` os espera (um fsync serve vários, via
+`wait_durable`) em `hton->prepare(all=true)` (antes do binlog/`XA PREPARE`),
+`commit(all=true)` (idempotente; caminho sem binlog), `rollback(all=true)`
+(as linhas dos statements confirmados ficam, divergência #12, e estão no binlog)
+e `close_connection`. Um statement autocommit seguinte também esvazia a lista.
+Fora de transação nada muda: um fsync por statement, antes do binlog. O token
+mantém a tabela (e o handle do WAL) viva mesmo se o handler a fechar antes;
+`moosedb_table_close` faz `sync_wal(true)` e a tabela não tem `Drop`. Erro no
+fsync: a tabela é envenenada e o `COMMIT` falha. Custo: uma queda antes do
+`COMMIT` pode perder statements da transação já retornados; `DELETE` e o caminho
+de spill (MANIFEST) continuam duráveis por statement. Medido antes: `BEGIN` +
+100 INSERTs de 1 linha, 1.179 linhas/s contra 7.352 do InnoDB.
+
 Limites conhecidos: (1) o commit no `prepare` é durável antes do binlog e das
 outras engines; se o binlog ou o `prepare` de outra engine falhar depois, as
 linhas ficam sem evento (o mesmo que o MyISAM); (2) a engine não participa de XA
@@ -297,7 +315,12 @@ replicação paralela que refaz um grupo após deadlock/timeout reaplica stateme
 MooseDB já confirmados do grupo (duplicata em tabela sem PK — não testado);
 (4) `DELETE` em trigger/função espera o fim do statement externo (o caminho
 direto é recusado em sub-statement), então não é visível às instruções seguintes
-da mesma rotina.
+da mesma rotina; (5) com binlog ligado, o `ROLLBACK` de uma transação que escreveu em
+MooseDB grava o binlog primeiro (`run_binlog_first`; os statements restantes vão
+para o binlog por `OPTION_BINLOG_THIS_TRX`) e só depois `rollback(all=true)` faz o
+fsync: uma queda do SO ou de energia nessa janela pode deixar na réplica linhas que
+o primário perdeu (`kill -9` não é afetado). O `COMMIT` está na ordem certa:
+`prepare(all=true)` roda antes do binlog.
 
 Casos específicos:
 
@@ -826,7 +849,7 @@ Cada teste copia a fixture, abre com o código atual e exige as mesmas linhas e
 | 9 | TFValue com `bool`/enum/união anônima | `uint8_t bool_val`, `uint8_t kind`, união `data` | Ler `bool`/enum inválido vindo do C é UB no Rust; cbindgen não gera união anônima. |
 | 10 | — | `TF_ERR_INTERNAL`, `TF_ERR_UNSUPPORTED`, `TF_ERR_CRYPTO` (10) | Panic capturado / recurso indisponível / falha de decriptação ou chave indisponível (vira `HA_ERR_DECRYPTION_FAILED`). |
 | 11 | API FFI mínima | + sync do WAL, truncate, scans filtrados/bidirecionais, snapshots, séries, check, estimativa, inspeção, manutenção, chaves, settings | Necessárias para a Handler API completa e os recursos acima. |
-| 12 | fsync por `write_row` | commit do **lote** no fim do statement (transação de statement do servidor: `hton->prepare`/`commit`; erro → descartado) com fsync conforme `wal_sync_mode` | Linha confirmada = statement retornou OK; fsync por linha inviabiliza 1M linhas em 30 s. Ver §Atomicidade por statement. |
+| 12 | fsync por `write_row` | commit do **lote** no fim do statement (transação de statement do servidor: `hton->prepare`/`commit`; erro → descartado) com fsync conforme `wal_sync_mode`; em `BEGIN`/`autocommit=0` o fsync fica para o fim da transação (`COMMIT`/`ROLLBACK`) | Linha confirmada = statement retornou OK; fsync por linha inviabiliza 1M linhas em 30 s. Ver §Atomicidade por statement. |
 | 13 | Entrada do WAL `[CRC][len][ts][series_id][valores]` | header de segmento + `[CRC][len][linha]` | Header guarda os parâmetros de criptografia; `series_id` é reconstruído no replay. |
 | 14 | Header de 64 bytes com os campos listados | mesmos campos + `column_count`, `chunk_id`, `wal_seq`, `schema_fingerprint`; codec nas flags | Os campos listados somam 40 bytes; o resto valida schema e ajuda diagnóstico. |
 | 15 | Checkpoint implícito | `MANIFEST` explícito | Um flush gera vários chunks; sem commit único, um crash duplicaria ou perderia linhas. |

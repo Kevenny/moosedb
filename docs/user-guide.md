@@ -265,8 +265,13 @@ SELECT * FROM metricas WHERE host = 'srv01' ORDER BY ts DESC LIMIT 10;
   chamadas por ele) só ficam visíveis quando ele termina: uma rotina que apaga uma
   chave e a insere de novo no mesmo statement recebe `ER_DUP_ENTRY`.
 * Uma linha está durável quando o statement retorna OK
-  (`moosedb_wal_sync_mode=fsync`). Com `write`, sobrevive a um crash do
-  `mysqld`, mas não a uma queda do sistema operacional.
+  (`moosedb_wal_sync_mode=fsync`), com um fsync por statement. **Dentro de
+  `BEGIN` ou `autocommit=0`**, o fsync fica para o fim da transação, como no
+  InnoDB: as linhas ficam duráveis no `COMMIT` ou no `ROLLBACK` (que não as
+  desfaz). Uma queda do sistema operacional ou de energia antes disso pode perder
+  statements da transação que já retornaram OK (as linhas já estavam visíveis, mas
+  só no cache do SO). `DELETE` mantém um fsync por statement. Com `write`,
+  sobrevive a um crash do `mysqld`, mas não a uma queda do sistema operacional. Com binlog ligado, o `ROLLBACK` grava o binlog antes do fsync: uma queda do SO ou de energia nessa janela pode deixar na réplica linhas que o primário perdeu (`COMMIT` não tem essa janela).
 
 ## DELETE
 

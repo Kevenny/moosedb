@@ -1138,7 +1138,7 @@ void tf_batch_closer::operator()(MooseDBBatch *b) const noexcept
       sql_print_warning("MooseDB: statement batch commit failed on cleanup: "
                         "%s", take_last_error().c_str());
   }
-  catch (...)
+  catch (const std::bad_alloc &)
   {
   }
 }
@@ -1933,6 +1933,9 @@ static void register_trx(THD *thd)
 struct tf_stmt_handlers
 {
   std::vector<ha_moosedb *> open;
+  /* statements committed without their fsync, inside a multi-statement
+     transaction; waited for at its end (moosedb_wait_pending) */
+  std::vector<tf_durable_ptr> pending;
 };
 
 static tf_stmt_handlers *stmt_handlers(const THD *thd)
@@ -1969,6 +1972,7 @@ void ha_moosedb::leave_stmt_trx()
 
 int ha_moosedb::moosedb_stmt_end(bool commit, bool *wrote)
 {
+  THD *thd= stmt_thd_;
   stmt_thd_= nullptr;
   if (!commit)
   {
@@ -1977,7 +1981,43 @@ int ha_moosedb::moosedb_stmt_end(bool commit, bool *wrote)
   }
   if (batch_ || del_)
     *wrote= true;
-  return commit_batch();
+  /*
+    Inside BEGIN / autocommit=0 the fsync waits for the end of the
+    transaction (moosedb_prepare/commit/rollback with all=true), as InnoDB
+    does. Outside, one fsync per statement, before the binlog.
+  */
+  const bool defer= thd && thd->in_multi_stmt_transaction_mode() &&
+                    srv_wal_sync_mode == WAL_SYNC_FSYNC;
+  return commit_batch(defer ? thd : nullptr);
+}
+
+/*
+  Waits for the fsync of the statements committed without one inside a
+  multi-statement transaction (commit_batch with defer_to), and releases the
+  tokens. Idempotent: the list is emptied first, so a second call finds nothing.
+  An error means the WAL fsync failed (the core poisoned the table).
+*/
+static int moosedb_wait_pending(THD *thd)
+{
+  tf_stmt_handlers *h= stmt_handlers(thd);
+  if (!h || h->pending.empty())
+    return 0;
+  std::vector<tf_durable_ptr> pending;
+  pending.swap(h->pending);
+  int error= 0;
+  for (tf_durable_ptr &t : pending)
+  {
+    /* wait releases the token, also on error */
+    if (moosedb_durability_wait(t.release()) != TF_OK && !error)
+    {
+      error= HA_ERR_INTERNAL_ERROR;
+      char *msg= moosedb_last_error();
+      sql_print_error("MooseDB: transaction fsync failed: %s",
+                      msg ? msg : "unknown error");
+      moosedb_free_str(msg);
+    }
+  }
+  return error;
 }
 
 static int moosedb_stmt_finish(THD *thd, bool commit)
@@ -1992,6 +2032,13 @@ static int moosedb_stmt_finish(THD *thd, bool commit)
   for (ha_moosedb *f : open)
   {
     const int e= f->moosedb_stmt_end(commit, &wrote);
+    if (e && !error)
+      error= e;
+  }
+  /* Back in autocommit: nothing may stay pending past the statement. */
+  if (commit && !thd->in_multi_stmt_transaction_mode())
+  {
+    const int e= moosedb_wait_pending(thd);
     if (e && !error)
       error= e;
   }
@@ -2016,20 +2063,32 @@ static int moosedb_stmt_finish(THD *thd, bool commit)
   non-transactional engine -- engine first, then binlog: a crash in between
   loses the binlog event, never rows the binlog already has -- and keeps
   2PC for InnoDB in the same statement. moosedb_commit then finds nothing.
+
+  all=true is the end of a multi-statement transaction: the statements were
+  committed as they ended but their fsync was left for here. Prepare makes
+  them durable before the binlog / XA PREPARE; commit does it again (no-op
+  after a prepare) for the path without binlog, where the server does not
+  prepare. Rollback keeps the rows of the committed statements (divergence
+  #12) and they are in the binlog (OPTION_BINLOG_THIS_TRX), so they must
+  be durable too. Known limit: ROLLBACK runs run_binlog_first, so the binlog
+  gets those events BEFORE moosedb_rollback(all=true) fsyncs: an OS or power
+  crash in that window can leave a replica with rows the primary lost
+  (kill -9 is not affected). COMMIT is ordered right: prepare(all=true) runs
+  before the binlog is written.
 */
 static int moosedb_prepare(handlerton *, THD *thd, bool all)
 {
-  return all ? 0 : moosedb_stmt_finish(thd, true);
+  return all ? moosedb_wait_pending(thd) : moosedb_stmt_finish(thd, true);
 }
 
 static int moosedb_commit(handlerton *, THD *thd, bool all)
 {
-  return all ? 0 : moosedb_stmt_finish(thd, true);
+  return all ? moosedb_wait_pending(thd) : moosedb_stmt_finish(thd, true);
 }
 
 static int moosedb_rollback(handlerton *, THD *thd, bool all)
 {
-  return all ? 0 : moosedb_stmt_finish(thd, false);
+  return all ? moosedb_wait_pending(thd) : moosedb_stmt_finish(thd, false);
 }
 
 /* statements are committed as they end: a savepoint has nothing to keep */
@@ -2040,6 +2099,8 @@ static int moosedb_savepoint(handlerton *, THD *, void *)
 
 static int moosedb_close_connection(handlerton *, THD *thd)
 {
+  /* statements already visible and returned must not lose their fsync */
+  moosedb_wait_pending(thd);
   std::unique_ptr<tf_stmt_handlers> h(stmt_handlers(thd));
   thd_set_ha_data(thd, moosedb_hton, nullptr);
   if (h)
@@ -2048,15 +2109,36 @@ static int moosedb_close_connection(handlerton *, THD *thd)
   return 0;
 }
 
-int ha_moosedb::commit_batch()
+int ha_moosedb::commit_batch(THD *defer_to)
 {
   int del_error= commit_delete();
   if (!batch_)
     return del_error;
   /* commit always releases the handle, also on error */
   MooseDBBatch *b= batch_.release();
-  int error= map_status(
-    moosedb_batch_commit(b, srv_wal_sync_mode == WAL_SYNC_FSYNC));
+  tf_stmt_handlers *h= defer_to ? stmt_handlers(defer_to) : nullptr;
+  int error;
+  if (h)
+  {
+    MooseDBDurability *raw= nullptr;
+    error= map_status(moosedb_batch_commit_deferred(b, &raw));
+    tf_durable_ptr token(raw);
+    if (!error && token)
+    {
+      try
+      {
+        h->pending.push_back(std::move(token));
+      }
+      catch (const std::bad_alloc &)
+      {
+        /* no room for the token: pay the fsync now (push_back keeps `token`) */
+        error= map_status(moosedb_durability_wait(token.release()));
+      }
+    }
+  }
+  else
+    error= map_status(
+      moosedb_batch_commit(b, srv_wal_sync_mode == WAL_SYNC_FSYNC));
   if (error)
   {
     sql_print_error("MooseDB: statement commit failed: %s",

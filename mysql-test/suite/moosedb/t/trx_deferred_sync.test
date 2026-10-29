@@ -1,0 +1,83 @@
+#
+# Inside BEGIN / autocommit=0 the WAL fsync of each statement waits for the
+# end of the transaction (COMMIT or ROLLBACK), as in InnoDB. Rows are
+# visible at once and durable after COMMIT / ROLLBACK (kill -9 keeps them);
+# ROLLBACK cannot undo statements that already ended (divergence #12).
+# NOTE: kill -9 does not prove durability (the OS cache survives it); this test
+# covers only functional behavior. Durability against OS/power loss is not
+# observable here.
+#
+--source include/not_embedded.inc
+--source include/have_innodb.inc
+--source suite/moosedb/include/have_moosedb.inc
+
+CREATE TABLE d (ts DATETIME(6) NOT NULL, v INT NOT NULL, INDEX(ts)) ENGINE=MooseDB;
+
+--echo # BEGIN, several INSERTs, COMMIT
+BEGIN;
+INSERT INTO d VALUES ('2026-01-01', 1);
+INSERT INTO d VALUES ('2026-01-02', 2);
+INSERT INTO d VALUES ('2026-01-03', 3), ('2026-01-04', 4);
+--echo # visible inside the transaction before the COMMIT
+SELECT COUNT(*) FROM d;
+COMMIT;
+
+--echo # BEGIN, INSERT, ROLLBACK: the statement stays
+--disable_warnings
+BEGIN;
+INSERT INTO d VALUES ('2026-02-01', 10);
+ROLLBACK;
+--enable_warnings
+
+--echo # autocommit=0, COMMIT
+SET autocommit=0;
+INSERT INTO d VALUES ('2026-03-01', 20);
+INSERT INTO d VALUES ('2026-03-02', 21);
+COMMIT;
+SET autocommit=1;
+
+--echo # a failed statement inside a transaction leaves nothing; the others stay
+BEGIN;
+INSERT INTO d VALUES ('2026-04-01', 30);
+--error ER_GET_ERRMSG
+INSERT INTO d VALUES ('2026-04-02', 31), ('0000-00-00', 32);
+COMMIT;
+
+--echo # InnoDB in the same transaction (prepare of both engines)
+CREATE TABLE i (a INT PRIMARY KEY) ENGINE=InnoDB;
+BEGIN;
+INSERT INTO d VALUES ('2026-05-01', 40);
+INSERT INTO i VALUES (1);
+INSERT INTO d VALUES ('2026-05-02', 41);
+COMMIT;
+
+--echo # DDL ends the transaction (implicit commit)
+BEGIN;
+INSERT INTO d VALUES ('2026-06-01', 50);
+CREATE TABLE implicit (a INT) ENGINE=InnoDB;
+DROP TABLE implicit;
+
+--echo # LOCK TABLES with autocommit=0
+SET autocommit=0;
+LOCK TABLES d WRITE;
+INSERT INTO d VALUES ('2026-07-01', 60);
+UNLOCK TABLES;
+SET autocommit=1;
+
+--echo # Same rows after kill -9
+--source include/kill_mysqld.inc
+--source include/start_mysqld.inc
+SELECT v FROM d ORDER BY ts;
+SELECT a FROM i;
+
+--echo # Connection closed in the middle of a transaction: statements stay
+--connect (c1,localhost,root,,test)
+BEGIN;
+INSERT INTO d VALUES ('2026-08-01', 70);
+--disconnect c1
+--connection default
+--let $wait_condition= SELECT COUNT(*) = 1 FROM d WHERE v = 70
+--source include/wait_condition.inc
+SELECT v FROM d WHERE v >= 70;
+
+DROP TABLE d, i;

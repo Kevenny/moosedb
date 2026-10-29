@@ -131,6 +131,9 @@ typedef struct MooseDBBatch MooseDBBatch;
 // Opaque set of rows a `DELETE` removes one by one (see `moosedb_delete_begin`).
 typedef struct MooseDBDelete MooseDBDelete;
 
+// Durability token of a deferred batch commit (see `moosedb_batch_commit_deferred`).
+typedef struct MooseDBDurability MooseDBDurability;
+
 // Opaque diagnostics handle.
 typedef struct MooseDBInfo MooseDBInfo;
 
@@ -623,6 +626,31 @@ TFStatus moosedb_batch_write(MooseDBBatch *batch, const TFRow *row);
 // # Safety
 // `batch` must come from `moosedb_batch_begin` and not be used afterwards.
 TFStatus moosedb_batch_commit(MooseDBBatch *batch, bool sync);
+
+// Like `moosedb_batch_commit(batch, true)`, but returns before the fsync. The
+// rows are visible and handed to the OS; `*out_token` receives a durability
+// token (NULL when there is nothing to wait for: empty batch or spilled
+// batch, already durable) that must end in `moosedb_durability_wait` or
+// `moosedb_durability_free`. The batch handle is released, also on error. The
+// token keeps the table alive, so it stays valid after `moosedb_table_close`.
+//
+// # Safety
+// `batch` must come from `moosedb_batch_begin` and not be used afterwards;
+// `out_token` writable.
+TFStatus moosedb_batch_commit_deferred(MooseDBBatch *batch, MooseDBDurability **out_token);
+
+// Blocks until the commit behind `token` is on stable storage (group commit)
+// and releases the token, also on error. NULL is ignored.
+//
+// # Safety
+// `token` must come from `moosedb_batch_commit_deferred` and not be used afterwards.
+TFStatus moosedb_durability_wait(MooseDBDurability *token);
+
+// Releases the token without waiting. NULL is ignored.
+//
+// # Safety
+// `token` must come from `moosedb_batch_commit_deferred` and not be used afterwards.
+TFStatus moosedb_durability_free(MooseDBDurability *token);
 
 // Discards the batch (none of its rows ever becomes visible) and releases the
 // handle. NULL is ignored.

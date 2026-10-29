@@ -207,10 +207,17 @@ solta o mutex e espera a durabilidade em `Table::wait_durable(seq, offset)`:
 
 * a primeira sessão que encontra o alvo ainda não durável vira líder e faz um
   único `fdatasync`;
-* o líder trabalha num handle clonado do segmento atual, sob um mutex próprio
-  (`group`, ordem `group` → tabela), sem segurar o mutex da tabela;
-* esse fsync cobre tudo o que já estava no SO, e os outros commits que
-  esperavam na fila recebem OK sem fazer fsync próprio.
+* o líder trabalha num handle clonado do segmento atual e não segura nenhum
+  mutex durante o fsync: nem o da tabela nem o `group`, que só guarda o
+  estado (`durable`, `syncing`, `failed`) e nunca é tomado junto com o da
+  tabela;
+* quem chega durante o fsync dorme numa `Condvar`. Ao fim do fsync o líder
+  acorda todos de uma vez: os commits cobertos recebem OK sem fsync próprio,
+  e um dos que ficaram de fora vira o próximo líder.
+* Antes, o líder segurava o mutex `group` durante o fsync. Os seguidores
+  recebiam o mutex um de cada vez, e o próprio líder o retomava antes deles.
+  O grupo ficava em 4 a 5 commits por fsync com 16 e 32 sessões, contra 8 a 16
+  no InnoDB (medido no lab em 2026-10-28).
 
 Garantias e escolhas:
 

@@ -3968,12 +3968,16 @@ int ha_moosedb::open_scan(longlong lo, longlong hi, bool sorted,
         last_error_= take_last_error();
         return HA_ERR_INTERNAL_ERROR;
       }
+      if (pushed_valid_ && pushed_version_ != v0)
+        pushed_valid_= false;
       const std::vector<uint64_t> *ids= nullptr;
       if (!series_for_index(&ids) || !ids)
       {
         last_error_= "cannot resolve the TAG values of the index key";
         return HA_ERR_INTERNAL_ERROR;
       }
+      if (pushed_valid_)
+        pushed_version_= v0;
       MooseDBScan *s= nullptr;
       if (int error= map_status(moosedb_scan_open_projected(
               share_->table.get(), lo, hi, ids->data(),
@@ -3988,6 +3992,7 @@ int ha_moosedb::open_scan(longlong lo, longlong hi, bool sorted,
         return 0;
       }
       take_last_error();
+      pushed_valid_= false;
     }
     last_error_= "the set of series kept changing while the index was read";
     return HA_ERR_LOCK_WAIT_TIMEOUT;
@@ -4843,31 +4848,46 @@ bool ha_moosedb::series_for_index(const std::vector<uint64_t> **ids)
   const tf_index_def *def= index_def(idx_req_.index);
   if (!def || !table || idx_req_.index >= table->s->keys)
     return false;
-  std::vector<const tf_tag_predicate *> preds;
+  /*
+    The WHERE's own TAG conditions still apply to every series picked. Their
+    series are resolved once per series version (pushed_ids_, see
+    open_scan()): a loose index scan does one read per group,
+    and resolving an IN of N items each time made it O(groups x N).
+  */
+  const std::vector<uint64_t> *f= nullptr;
+  bool any_pushed= false;
   for (const auto &level : pushed_)
-    for (const tf_tag_predicate &p : level)
-      preds.push_back(&p);
-  const size_t npushed= preds.size();
+    any_pushed|= !level.empty();
+  if (any_pushed && (!pushed_series(&f) || !f))
+    return false;
+  std::vector<const tf_tag_predicate *> keyp;
   for (const tf_tag_predicate &p : idx_req_.preds)
-    preds.push_back(&p);
+    keyp.push_back(&p);
+  /* the series of the key's own tags that the WHERE allows (sorted ids) */
+  auto key_series= [&]() {
+    if (!resolve_series(keyp, &idx_ids_))
+      return false;
+    if (f)
+      idx_ids_.erase(std::remove_if(idx_ids_.begin(), idx_ids_.end(),
+                                    [&](uint64_t id) {
+                                      return !std::binary_search(f->begin(),
+                                                                 f->end(), id);
+                                    }),
+                     idx_ids_.end());
+    return true;
+  };
   if (!idx_req_.ordered)
   {
-    if (preds.empty())
-      return false;
-    return resolve_series(preds, &idx_ids_);
+    if (keyp.empty())
+    {
+      if (!f)
+        return false;
+      idx_ids_= *f;
+      return true;
+    }
+    return key_series();
   }
 
-  /* The WHERE's own TAG conditions still apply to every series picked. */
-  std::vector<uint64_t> filt;
-  const bool use_filter= npushed > 0;
-  if (use_filter)
-  {
-    std::vector<const tf_tag_predicate *> w(preds.begin(),
-                                            preds.begin() + npushed);
-    if (!resolve_series(w, &filt))
-      return false;
-  }
-  const std::vector<uint64_t> *f= use_filter ? &filt : nullptr;
   if (idx_req_.walk)
     return walk_entry(f, idx_req_.backward);
 
@@ -4882,7 +4902,7 @@ bool ha_moosedb::series_for_index(const std::vector<uint64_t> **ids)
   if (nkey == k && nkey > 0 &&
       (op == idx_op::EQ || op == idx_op::GE || op == idx_op::LE))
   {
-    if (!resolve_series(preds, &idx_ids_))
+    if (!key_series())
       return false;
     if (!idx_ids_.empty())
     {
@@ -5416,6 +5436,15 @@ ulong ha_moosedb::index_flags(uint idx, uint part, bool all_parts) const
   if (!f)
     return 0;
   /*
+    A composite index is "covering" (HA_KEYREAD_ONLY: the scan decodes the
+    read_set, which then holds key columns only), so MAX(clock) GROUP BY
+    itemid can use the loose index scan: one PREFIX_LAST read per series. Not
+    the time index: a covering full scan would then go through its k-way
+    merge, which is slower than the plain scan the server would use instead.
+  */
+  const Field *f0= key.key_part[0].field;
+  const ulong cover= f0 && is_tag_comment(f0->comment) ? HA_KEYREAD_ONLY : 0;
+  /*
     A part after the time column (UNIQUE key, e.g. ns): within one timestamp
     the scans return rows ordered by it (the core sorts timestamp ties by the
     key's extra columns), so ORDER BY clock DESC, ns DESC LIMIT 1 needs no
@@ -5425,12 +5454,12 @@ ulong ha_moosedb::index_flags(uint idx, uint part, bool all_parts) const
   {
     const Field *g= key.key_part[q].field;
     if (g && !is_tag_comment(g->comment))
-      return HA_READ_NEXT | HA_READ_PREV | HA_READ_ORDER;
+      return HA_READ_NEXT | HA_READ_PREV | HA_READ_ORDER | cover;
   }
   if (!is_tag_comment(f->comment))
-    return TIME;
-  return all_parts ? (HA_READ_NEXT | HA_READ_PREV)
-                   : (HA_READ_NEXT | HA_READ_PREV | HA_READ_ORDER);
+    return TIME | cover;
+  return cover | (all_parts ? (HA_READ_NEXT | HA_READ_PREV)
+                            : (HA_READ_NEXT | HA_READ_PREV | HA_READ_ORDER));
 }
 
 int ha_moosedb::info(uint flag)

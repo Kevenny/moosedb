@@ -444,7 +444,7 @@ id	select_type	table	type	possible_keys	key	key_len	ref	rows	Extra
 1	PRIMARY	h	ref	clock_idx,item_clock	item_clock	12	s.itemid,s.clock	1	Using where
 2	DERIVED	<derived3>	ALL	NULL	NULL	NULL	NULL	119	Using where; Using temporary; Using filesort
 2	DERIVED	h2	ref	clock_idx,item_clock	item_clock	12	s2.itemid,s2.clock	1	
-3	DERIVED	m	range	clock_idx,item_clock	item_clock	12	NULL	119	Using where; Using temporary; Using filesort
+3	DERIVED	m	range	clock_idx,item_clock	item_clock	12	NULL	119	Using where; Using index; Using temporary; Using filesort
 # last value per hour for three items
 result_rows	vs_innodb
 9	SAME
@@ -830,13 +830,13 @@ result_rows	vs_innodb
 ##################################################################
 EXPLAIN SELECT itemid, clock FROM m ORDER BY itemid, clock LIMIT 3;
 id	select_type	table	type	possible_keys	key	key_len	ref	rows	Extra
-1	SIMPLE	m	ALL	NULL	NULL	NULL	NULL	7203	Using filesort
+1	SIMPLE	m	index	NULL	item_clock	12	NULL	7203	Using index; Using filesort
 EXPLAIN SELECT itemid, MAX(clock) FROM m GROUP BY itemid;
 id	select_type	table	type	possible_keys	key	key_len	ref	rows	Extra
-1	SIMPLE	m	ALL	NULL	NULL	NULL	NULL	7203	Using temporary; Using filesort
+1	SIMPLE	m	range	NULL	item_clock	8	NULL	62	Using index for group-by; Using temporary; Using filesort
 EXPLAIN SELECT DISTINCT itemid FROM m;
 id	select_type	table	type	possible_keys	key	key_len	ref	rows	Extra
-1	SIMPLE	m	ALL	NULL	NULL	NULL	NULL	7203	Using temporary
+1	SIMPLE	m	range	NULL	item_clock	8	NULL	62	Using index for group-by; Using temporary
 # ORDER BY itemid, clock LIMIT 4
 _n	itemid	clock
 1	101	1700000000
@@ -867,12 +867,40 @@ _n	COUNT(*)	MIN(itemid)	MAX(itemid)
 1	61	101	999
 result_rows	vs_innodb
 1	SAME
+# Loose index scan over an IN (the WHERE's series are resolved once, each group reads its own)
+EXPLAIN SELECT itemid, MAX(clock) FROM m WHERE itemid IN (101,103,105,999) GROUP BY itemid;
+id	select_type	table	type	possible_keys	key	key_len	ref	rows	Extra
+1	SIMPLE	m	range	item_clock	item_clock	8	NULL	4	Using where; Using index for group-by; Using temporary; Using filesort
+# loose scan, IN with a missing id
+_n	itemid	MAX(clock)	MIN(clock)
+1	101	1700007140	1700000000
+2	103	1700007140	1700000000
+3	105	1700007140	1700000000
+4	999	1700003000	1700003000
+result_rows	vs_innodb
+4	SAME
+# loose scan, IN and a time bound
+_n	itemid	MAX(clock)
+1	102	1700002940
+2	104	1700002940
+3	110	1700002940
+result_rows	vs_innodb
+3	SAME
+# last value of five items
+_n	itemid	clock	value
+1	101	1700007140	1119
+2	102	1700007140	2119
+3	103	1700007140	3119
+4	104	1700007140	4119
+5	105	1700007140	5119
+result_rows	vs_innodb
+5	SAME
 ##################################################################
 # Descending range reads end at the first row of the series
 ##################################################################
 EXPLAIN SELECT clock FROM m WHERE itemid = 110 AND clock BETWEEN 1700001000 AND 1700002000 ORDER BY clock DESC;
 id	select_type	table	type	possible_keys	key	key_len	ref	rows	Extra
-1	SIMPLE	m	range	clock_idx,item_clock	item_clock	12	NULL	17	Using where
+1	SIMPLE	m	range	clock_idx,item_clock	item_clock	12	NULL	17	Using where; Using index
 # itemid = 110 AND clock BETWEEN ... ORDER BY clock DESC
 result_rows	vs_innodb
 17	SAME
@@ -902,7 +930,7 @@ INSERT INTO d VALUES (101), (130), (424242);
 EXPLAIN SELECT d.itemid, COUNT(*) FROM d JOIN ti ON ti.itemid = d.itemid GROUP BY d.itemid;
 id	select_type	table	type	possible_keys	key	key_len	ref	rows	Extra
 1	SIMPLE	d	index	itemid	itemid	8	NULL	3	Using index
-1	SIMPLE	ti	ref	itemid	itemid	8	test.d.itemid	118	
+1	SIMPLE	ti	ref	itemid	itemid	8	test.d.itemid	118	Using index
 EXPLAIN SELECT * FROM ti WHERE itemid = 130;
 id	select_type	table	type	possible_keys	key	key_len	ref	rows	Extra
 1	SIMPLE	ti	ref	itemid	itemid	8	const	119	

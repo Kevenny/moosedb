@@ -568,6 +568,18 @@ Segmento cifrado só com header não exige a chave no replay.
   `itemid > 5` nunca usam o índice (filesort / outro índice), então nenhuma
   ordem errada pode ser devolvida. `index_next_same` de leitura exata não
   recompara as partes (todas as linhas já casam).
+  **Índice composto é "covering"** (`HA_KEYREAD_ONLY`; o índice só de tempo
+  não): habilita o *loose index scan* (`Using index for group-by`) em
+  `MAX(clock) ... GROUP BY itemid`, uma leitura `PREFIX_LAST` por série, e as
+  séries do `WHERE` (`itemid IN (...)`) são resolvidas uma vez por versão de
+  séries (`pushed_ids_`), não a cada grupo. Último valor de 500 itens
+  (2.000 séries × 5.000 pontos): 252 → 7,5 ms (InnoDB 4,4). Custo aceito: no
+  11.4 uma varredura total que só lê colunas de um índice coberto vira
+  `type=index` sem comparação de custo (`make_join_readinfo`), e a leitura
+  série a série ordenada por tempo é 1,2–1,6× mais lenta que a varredura
+  (`SUM(clock)` sem `WHERE`: 380 → 540 ms em 10 M linhas). Consultas que leem
+  `value` não são afetadas. Ler sem ordem nesse caso não serve: o loose scan
+  usa a linha de `index_first` como o `MIN` do primeiro grupo.
   **Estimativas.** `records_in_range` = linhas da janela de tempo (estimativa
   por chunk, já existente) × séries casadas ÷ séries da tabela (as séries
   casadas vêm do mesmo cache); nunca 0. `rec_per_key` das partes (`info`):

@@ -570,6 +570,17 @@ EXPLAIN SELECT DISTINCT itemid FROM m;
 --let $q= SELECT COUNT(*), MIN(itemid), MAX(itemid) FROM (SELECT DISTINCT itemid FROM {T}) x
 --let $label= DISTINCT itemid
 --source suite/moosedb/include/cmp_query.inc
+--echo # Loose index scan over an IN (the WHERE's series are resolved once, each group reads its own)
+EXPLAIN SELECT itemid, MAX(clock) FROM m WHERE itemid IN (101,103,105,999) GROUP BY itemid;
+--let $q= SELECT itemid, MAX(clock), MIN(clock) FROM {T} WHERE itemid IN (101,103,105,999) GROUP BY itemid
+--let $label= loose scan, IN with a missing id
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT itemid, MAX(clock) FROM {T} WHERE itemid IN (102,104,110) AND clock < 1700003000 GROUP BY itemid
+--let $label= loose scan, IN and a time bound
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT h.itemid, h.clock, h.value FROM {T} h JOIN (SELECT itemid, MAX(clock) c FROM {T} WHERE itemid IN (101,102,103,104,105) GROUP BY itemid) l ON h.itemid=l.itemid AND h.clock=l.c ORDER BY h.itemid, h.ns
+--let $label= last value of five items
+--source suite/moosedb/include/cmp_query.inc
 
 --echo ##################################################################
 --echo # Descending range reads end at the first row of the series

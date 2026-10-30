@@ -43,7 +43,7 @@ COUNT(*)	SUM(v)
 20	970
 EXPLAIN SELECT COUNT(*) FROM l64 WHERE process = CONCAT('proc-2', REPEAT('é', 40));
 id	select_type	table	type	possible_keys	key	key_len	ref	rows	Extra
-1	SIMPLE	l64	ref	process	process	258	const	20	Using where
+1	SIMPLE	l64	ref	process	process	258	const	20	Using where; Using index
 SELECT COUNT(*) AS groups_l64 FROM (SELECT process FROM l64 GROUP BY process) x;
 groups_l64
 5

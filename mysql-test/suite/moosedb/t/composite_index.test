@@ -582,6 +582,63 @@ EXPLAIN SELECT itemid, MAX(clock) FROM m WHERE itemid IN (101,103,105,999) GROUP
 --let $label= last value of five items
 --source suite/moosedb/include/cmp_query.inc
 
+--echo # Loose scan over an IN: the ordered view holds only the series the WHERE allows
+--let $show= 0
+CREATE TABLE n (
+  hostid BIGINT UNSIGNED NOT NULL COMMENT 'TAG',
+  itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG',
+  clock  INT NOT NULL,
+  value  DOUBLE NOT NULL,
+  INDEX clock_idx (clock),
+  INDEX item_clock (itemid, clock),
+  INDEX host_item_clock (hostid, itemid, clock)
+) ENGINE=MooseDB TIMESTAMP_COLUMN='clock' CHUNK_INTERVAL='1 HOUR';
+CREATE TABLE ni (
+  hostid BIGINT UNSIGNED NOT NULL,
+  itemid BIGINT UNSIGNED NOT NULL,
+  clock  INT NOT NULL,
+  value  DOUBLE NOT NULL,
+  KEY clock_idx (clock)
+) ENGINE=InnoDB;
+--let $gen= SELECT 1 + (a.seq MOD 3), 200 + a.seq, 1700000000 + b.seq * 60, a.seq * 100 + b.seq
+eval INSERT INTO n $gen FROM seq_1_to_30 a, seq_0_to_9 b;
+eval INSERT INTO ni $gen FROM seq_1_to_30 a, seq_0_to_9 b;
+--let $mt= n
+--let $it= ni
+--let $q= SELECT itemid, MAX(clock) FROM {T} WHERE itemid IN (201,205,210,229,230) GROUP BY itemid ORDER BY itemid DESC
+--let $label= filtered view: IN, GROUP BY itemid ORDER BY itemid DESC (backward)
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT itemid, MIN(clock) FROM {T} WHERE itemid IN (201,205,210,229,230) GROUP BY itemid ORDER BY itemid
+--let $label= filtered view: IN, forward
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT itemid, MAX(clock) FROM {T} WHERE itemid IN (9001,9002) GROUP BY itemid
+--let $label= filtered view: IN of nonexistent items only
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT itemid, MAX(clock) FROM {T} WHERE itemid IN (201,9001,230,9002) GROUP BY itemid ORDER BY itemid DESC
+--let $label= filtered view: IN with nonexistent items among real ones
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT hostid, itemid, MAX(clock) FROM {T} WHERE hostid IN (1,3) GROUP BY hostid, itemid ORDER BY hostid DESC, itemid DESC
+--let $label= filtered view, two TAGs: IN on the first, backward
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT hostid, itemid, MIN(clock) FROM {T} WHERE hostid IN (2,9) AND itemid > 210 GROUP BY hostid, itemid ORDER BY hostid, itemid
+--let $label= filtered view, two TAGs: IN on the first and a range on the second
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT h.itemid, h.clock, h.value FROM {T} h JOIN (SELECT itemid, MAX(clock) c FROM {T} WHERE itemid IN (SELECT 200 + seq FROM seq_1_to_30 WHERE seq MOD 2 = 0) GROUP BY itemid) l ON h.itemid=l.itemid AND h.clock=l.c ORDER BY h.itemid
+--let $label= filtered view: last value of fifteen items
+--source suite/moosedb/include/cmp_query.inc
+--echo # Series created between two runs of the same IN: new items, and a new series of an existing item (merged into its tuple)
+INSERT INTO n VALUES (4, 205, 1700009000, 7), (1, 2001, 1700009000, 8), (2, 2002, 1700009100, 9);
+INSERT INTO ni VALUES (4, 205, 1700009000, 7), (1, 2001, 1700009000, 8), (2, 2002, 1700009100, 9);
+--let $q= SELECT itemid, MAX(clock), COUNT(*) FROM {T} WHERE itemid IN (201,205,210,2001,2002,9001) GROUP BY itemid ORDER BY itemid DESC
+--let $label= filtered view after new series: IN, backward
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT hostid, itemid, MAX(clock) FROM {T} WHERE hostid IN (1,2,4) GROUP BY hostid, itemid ORDER BY hostid DESC, itemid DESC
+--let $label= filtered view after new series, two TAGs
+--source suite/moosedb/include/cmp_query.inc
+DROP TABLE n, ni;
+--let $mt= m
+--let $it= i
+
 --echo ##################################################################
 --echo # Descending range reads end at the first row of the series
 --echo ##################################################################

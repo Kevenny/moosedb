@@ -397,6 +397,10 @@ private:
                          std::vector<tf_tag_predicate> *out);
   bool series_for_index(const std::vector<uint64_t> **ids);
   std::shared_ptr<const tf_tuple_index> tuple_index(uint idx);
+  std::shared_ptr<const tf_tuple_index> filtered_tuple_index(
+      uint idx, const std::vector<uint64_t> &f);
+  std::shared_ptr<const tf_tuple_index> ordered_view(
+      uint idx, const std::vector<uint64_t> *f);
   bool pick_entry(const std::vector<uint64_t> *filter, int64_t entry,
                   bool backward);
   bool walk_entry(const std::vector<uint64_t> *filter, bool backward);
@@ -500,6 +504,16 @@ private:
   bool pushed_valid_= false;            /* pushed_ids_ is up to date      */
   bool pushed_filter_= false;           /* some predicate restricts rows  */
   std::vector<uint64_t> pushed_ids_;    /* series matching all predicates */
+  /*
+    Ordered view of just the series of pushed_ids_ (see filtered_tuple_index()).
+    Dropped when pushed_ids_ is re-resolved with other content or the pushed
+    conditions change; fview_epoch_/fview_version_ tell if the series list
+    behind it was replaced (TRUNCATE, reopen).
+  */
+  std::shared_ptr<const tf_tuple_index> fview_;
+  uint fview_idx_= MAX_KEY;
+  uint64_t fview_epoch_= 0;
+  uint64_t fview_version_= 0;
 };
 
 /* Helpers the group_by_handler (moosedb_gbh.cc) shares with the handler. */

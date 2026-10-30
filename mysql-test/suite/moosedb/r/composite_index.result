@@ -895,6 +895,56 @@ _n	itemid	clock	value
 5	105	1700007140	5119
 result_rows	vs_innodb
 5	SAME
+# Loose scan over an IN: the ordered view holds only the series the WHERE allows
+CREATE TABLE n (
+hostid BIGINT UNSIGNED NOT NULL COMMENT 'TAG',
+itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG',
+clock  INT NOT NULL,
+value  DOUBLE NOT NULL,
+INDEX clock_idx (clock),
+INDEX item_clock (itemid, clock),
+INDEX host_item_clock (hostid, itemid, clock)
+) ENGINE=MooseDB TIMESTAMP_COLUMN='clock' CHUNK_INTERVAL='1 HOUR';
+CREATE TABLE ni (
+hostid BIGINT UNSIGNED NOT NULL,
+itemid BIGINT UNSIGNED NOT NULL,
+clock  INT NOT NULL,
+value  DOUBLE NOT NULL,
+KEY clock_idx (clock)
+) ENGINE=InnoDB;
+INSERT INTO n SELECT 1 + (a.seq MOD 3), 200 + a.seq, 1700000000 + b.seq * 60, a.seq * 100 + b.seq FROM seq_1_to_30 a, seq_0_to_9 b;
+INSERT INTO ni SELECT 1 + (a.seq MOD 3), 200 + a.seq, 1700000000 + b.seq * 60, a.seq * 100 + b.seq FROM seq_1_to_30 a, seq_0_to_9 b;
+# filtered view: IN, GROUP BY itemid ORDER BY itemid DESC (backward)
+result_rows	vs_innodb
+5	SAME
+# filtered view: IN, forward
+result_rows	vs_innodb
+5	SAME
+# filtered view: IN of nonexistent items only
+result_rows	vs_innodb
+0	SAME
+# filtered view: IN with nonexistent items among real ones
+result_rows	vs_innodb
+2	SAME
+# filtered view, two TAGs: IN on the first, backward
+result_rows	vs_innodb
+20	SAME
+# filtered view, two TAGs: IN on the first and a range on the second
+result_rows	vs_innodb
+6	SAME
+# filtered view: last value of fifteen items
+result_rows	vs_innodb
+15	SAME
+# Series created between two runs of the same IN: new items, and a new series of an existing item (merged into its tuple)
+INSERT INTO n VALUES (4, 205, 1700009000, 7), (1, 2001, 1700009000, 8), (2, 2002, 1700009100, 9);
+INSERT INTO ni VALUES (4, 205, 1700009000, 7), (1, 2001, 1700009000, 8), (2, 2002, 1700009100, 9);
+# filtered view after new series: IN, backward
+result_rows	vs_innodb
+5	SAME
+# filtered view after new series, two TAGs
+result_rows	vs_innodb
+23	SAME
+DROP TABLE n, ni;
 ##################################################################
 # Descending range reads end at the first row of the series
 ##################################################################

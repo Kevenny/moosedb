@@ -1547,9 +1547,10 @@ int ha_moosedb::write_row(const uchar *buf)
 
 /*
   Adds one row to the statement batch. On a table with a UNIQUE key the core
-  may report that another statement holds the row's series (TF_ERR_BUSY after
-  a short wait): nothing changed, so the same row is offered again until the
-  series is free, the statement is killed or the wait times out.
+  may report that another statement holds the row's key (or, past the hold
+  caps, its series) (TF_ERR_BUSY after a short wait): nothing changed, so the
+  same row is offered again until it is free, the statement is killed or the
+  wait times out.
 */
 int ha_moosedb::write_batch_row(const TFRow &row)
 {
@@ -3053,6 +3054,7 @@ const COND *ha_moosedb::cond_push(const COND *cond)
     pushed_val_.push_back(std::move(vp));
   }
   pushed_valid_= false;
+  fview_.reset();
   /*
     Time bounds of the WHERE for the unordered scan (rnd_init): every
     top-level conjunct capture_delete_cond() reproduces exactly narrows
@@ -3134,6 +3136,7 @@ void ha_moosedb::cond_pop()
   if (!pushed_time_.empty())
     pushed_time_.pop_back();
   pushed_valid_= false;
+  fview_.reset();
 }
 
 int ha_moosedb::reset()
@@ -3168,6 +3171,7 @@ int ha_moosedb::reset()
   pushed_val_.clear();
   pushed_time_.clear();
   pushed_valid_= false;
+  fview_.reset();
   scan_.reset();
   reset_batch_state();
   snapshots_.clear();
@@ -3187,20 +3191,27 @@ bool ha_moosedb::pushed_series(const std::vector<uint64_t> **ids)
   if (pushed_valid_)
     return pushed_filter_;
   pushed_valid_= true;
-  pushed_ids_.clear();
+  std::vector<uint64_t> prev;
+  prev.swap(pushed_ids_);
   std::vector<const tf_tag_predicate *> preds;
   for (const auto &level : pushed_)
     for (const tf_tag_predicate &p : level)
       preds.push_back(&p);
   pushed_filter_= !preds.empty();
   if (!pushed_filter_)
+  {
+    fview_.reset();
     return false;
+  }
   if (!resolve_series(preds, &pushed_ids_))
   {
     pushed_ids_.clear();
     pushed_filter_= false;
+    fview_.reset();
     return false;
   }
+  if (prev != pushed_ids_)
+    fview_.reset();                  /* same ids: the filtered view still holds */
   return true;
 }
 
@@ -4629,6 +4640,90 @@ struct tuple_budget
   ~tuple_budget() { g_tuple_index_bytes.fetch_sub(held); }
 };
 
+/* Most series a filtered ordered view is built for (see filtered_tuple_index()). */
+constexpr size_t TUPLE_INDEX_FILTERED_MAX_IDS= 65536;
+
+struct tuple_row
+{
+  std::vector<std::string> t;
+  uint64_t id;
+};
+
+/* The first `k` key fields of `ki`; false if the key info is incomplete. */
+bool index_fields(const KEY *ki, size_t k, std::vector<const Field *> *fld)
+{
+  if (!ki || !ki->key_part)
+    return false;
+  for (size_t p= 0; p < k; p++)
+  {
+    if (p >= ki->user_defined_key_parts || !ki->key_part[p].field)
+      return false;
+    fld->push_back(ki->key_part[p].field);
+  }
+  return true;
+}
+
+/*
+  Tag tuple of one series for the index `def` and its estimated heap cost.
+  false = the series has no value for a tag of the key (not in the index).
+*/
+bool make_tuple_row(const tf_index_def &def, size_t k, const TFRow &tags,
+                    tuple_row *r, size_t *cost)
+{
+  if (!tags.values || def.tag_pos.size() < k)
+    return false;
+  *cost= sizeof(tuple_row) + sizeof(tf_tuple_entry) + sizeof(uint64_t) + 32;
+  for (size_t p= 0; p < k; p++)
+  {
+    const int pos= def.tag_pos[p];
+    if (pos < 0 || (uint) pos >= tags.col_count || tags.values[pos].is_null)
+      return false;
+    const TFStr s= tags.values[pos].data.str_val;
+    r->t.emplace_back(s.ptr ? s.ptr : "", s.len);
+    *cost+= sizeof(std::string) + s.len + 32;
+  }
+  return true;
+}
+
+/*
+  Sorts the rows like the index and merges tuple-equal series into entries.
+  `est` (the sum of the rows' costs) stays charged to `budget`, then moves to
+  the returned index (freed with it). nullptr when that does not fit.
+*/
+std::shared_ptr<tf_tuple_index> assemble_tuple_index(
+    std::vector<tuple_row> &rows, const std::vector<const Field *> &fld,
+    size_t k, size_t est, uint64_t version, tuple_budget &budget)
+{
+  std::sort(rows.begin(), rows.end(),
+            [&fld, k](const tuple_row &a, const tuple_row &b) {
+    const int c= cmp_tuple_n(fld, a.t, b.t, k);
+    return c ? c < 0 : a.id < b.id;
+  });
+  auto ix= std::make_shared<tf_tuple_index>();
+  ix->version= version;
+  for (tuple_row &r : rows)
+  {
+    if (!ix->entries.empty() &&
+        cmp_tuple_n(fld, ix->entries.back().tuple, r.t, k) == 0)
+    {
+      ix->entries.back().ids.push_back(r.id);
+      continue;
+    }
+    tf_tuple_entry e;
+    e.tuple= std::move(r.t);
+    e.ids.push_back(r.id);
+    ix->entries.push_back(std::move(e));
+  }
+  rows.clear();
+  rows.shrink_to_fit();
+  /* what stays: the index; the budget keeps counting it until it is freed */
+  if (!budget.take(est))
+    return nullptr;
+  ix->bytes= est;
+  budget.held-= est;                 /* ownership moves to the index object */
+  return ix;
+}
+
 } // namespace
 
 tf_tuple_index::~tf_tuple_index()
@@ -4682,14 +4777,9 @@ std::shared_ptr<const tf_tuple_index> ha_moosedb::tuple_index(uint idx)
     take_last_error();
     return nullptr;
   }
-  struct row
-  {
-    std::vector<std::string> t;
-    uint64_t id;
-  };
   const uint64_t n= moosedb_series_list_len(list);
   const uint64_t lv= moosedb_series_list_version(list);
-  std::vector<row> rows;
+  std::vector<tuple_row> rows;
   tuple_budget budget;
   size_t est= 0;                     /* one copy of the data */
   bool ok= true;
@@ -4703,22 +4793,9 @@ std::shared_ptr<const tf_tuple_index> ha_moosedb::tuple_index(uint idx)
       ok= false;
       break;
     }
-    row r{{}, id};
-    bool usable= tags.values != nullptr;
-    size_t cost= sizeof(row) + sizeof(tf_tuple_entry) + sizeof(uint64_t) + 32;
-    for (size_t p= 0; usable && p < k; p++)
-    {
-      const int pos= def->tag_pos[p];
-      if (pos < 0 || (uint) pos >= tags.col_count || tags.values[pos].is_null)
-        usable= false;
-      else
-      {
-        const TFStr s= tags.values[pos].data.str_val;
-        r.t.emplace_back(s.ptr ? s.ptr : "", s.len);
-        cost+= sizeof(std::string) + s.len + 32;
-      }
-    }
-    if (!usable)
+    tuple_row r{{}, id};
+    size_t cost= 0;
+    if (!make_tuple_row(*def, k, tags, &r, &cost))
       continue;
     est+= cost;
     /* rows + merged entries exist together while building: charge both */
@@ -4732,37 +4809,106 @@ std::shared_ptr<const tf_tuple_index> ha_moosedb::tuple_index(uint idx)
   moosedb_series_list_close(list);
   if (!ok)
     return nullptr;
-  std::sort(rows.begin(), rows.end(), [&fld, k](const row &a, const row &b) {
-    const int c= cmp_tuple_n(fld, a.t, b.t, k);
-    return c ? c < 0 : a.id < b.id;
-  });
-  auto ix= std::make_shared<tf_tuple_index>();
-  ix->version= lv;
-  for (row &r : rows)
-  {
-    if (!ix->entries.empty() &&
-        cmp_tuple_n(fld, ix->entries.back().tuple, r.t, k) == 0)
-    {
-      ix->entries.back().ids.push_back(r.id);
-      continue;
-    }
-    tf_tuple_entry e;
-    e.tuple= std::move(r.t);
-    e.ids.push_back(r.id);
-    ix->entries.push_back(std::move(e));
-  }
-  rows.clear();
-  rows.shrink_to_fit();
-  /* what stays: the index; the budget keeps counting it until it is freed */
-  if (!budget.take(est))
+  auto ix= assemble_tuple_index(rows, fld, k, est, lv, budget);
+  if (!ix)
     return nullptr;
-  ix->bytes= est;
-  budget.held-= est;                 /* ownership moves to the index object */
   std::lock_guard<std::mutex> guard(share_->tuple_mutex);
   auto &slot= share_->tuples[idx];
   if (!slot || slot->version <= lv)
     slot= ix;
   return ix;
+}
+
+/*
+  Like tuple_index(), but only for the series `f` (sorted ids: the series the
+  pushed WHERE allows). Entries outside `f` would be discarded by the filter
+  anyway, so every ordered read over it equals the one over the global view --
+  at O(|f| log |f|) instead of O(S log S), and independent of how many series
+  the table has. Tags are fetched by id (O(1) each). Kept in the handler while
+  `f` stays the same (fview_ is dropped when pushed_ids_ changes) and the
+  series list is the same log (same epoch: a series' tags never change in it).
+*/
+std::shared_ptr<const tf_tuple_index> ha_moosedb::filtered_tuple_index(
+    uint idx, const std::vector<uint64_t> &f)
+{
+  const tf_index_def *def= index_def(idx);
+  if (!def || def->simple_ts || !table || !table->key_info ||
+      idx >= table->s->keys || !share_ || !share_->table)
+    return nullptr;
+  const size_t k= def->tag_pos.size();
+  std::vector<const Field *> fld;
+  if (!index_fields(&table->key_info[idx], k, &fld))
+    return nullptr;
+  uint64_t cur= 0;
+  if (moosedb_series_version(share_->table.get(), &cur) != TF_OK)
+  {
+    take_last_error();
+    return nullptr;
+  }
+  const bool mine= fview_ && fview_idx_ == idx;
+  if (mine && fview_version_ == cur)
+    return fview_;
+  MooseDBSeriesList *list= nullptr;
+  if (moosedb_series_list(share_->table.get(), &list) != TF_OK)
+  {
+    take_last_error();
+    return nullptr;
+  }
+  const uint64_t lv= moosedb_series_list_version(list);
+  const uint64_t epoch= moosedb_series_list_epoch(list);
+  if (mine && epoch != 0 && fview_epoch_ == epoch)
+  {
+    moosedb_series_list_close(list);
+    fview_version_= lv;
+    return fview_;
+  }
+  std::vector<tuple_row> rows;
+  tuple_budget budget;
+  size_t est= 0;
+  bool ok= true;
+  for (const uint64_t id : f)
+  {
+    TFRow tags{0, nullptr};
+    if (moosedb_series_list_find(list, id, &tags) != TF_OK)
+    {
+      take_last_error();             /* not in this list: it was replaced */
+      ok= false;
+      break;
+    }
+    tuple_row r{{}, id};
+    size_t cost= 0;
+    if (!make_tuple_row(*def, k, tags, &r, &cost))
+      continue;
+    est+= cost;
+    if (!budget.take(2 * cost))
+    {
+      ok= false;
+      break;
+    }
+    rows.push_back(std::move(r));
+  }
+  moosedb_series_list_close(list);
+  if (!ok)
+    return nullptr;
+  std::shared_ptr<const tf_tuple_index> ix=
+      assemble_tuple_index(rows, fld, k, est, lv, budget);
+  if (!ix)
+    return nullptr;
+  fview_= ix;
+  fview_idx_= idx;
+  fview_epoch_= epoch;
+  fview_version_= lv;
+  return ix;
+}
+
+/* The ordered view an ordered read over the series `f` (or all) walks. */
+std::shared_ptr<const tf_tuple_index> ha_moosedb::ordered_view(
+    uint idx, const std::vector<uint64_t> *f)
+{
+  if (f && f->size() <= TUPLE_INDEX_FILTERED_MAX_IDS)
+    if (auto v= filtered_tuple_index(idx, *f))
+      return v;
+  return tuple_index(idx);
 }
 
 /*
@@ -4814,7 +4960,7 @@ bool ha_moosedb::walk_entry(const std::vector<uint64_t> *filter, bool backward)
     return true;
   }
   if (!idx_req_.tix)
-    idx_req_.tix= tuple_index(idx_req_.index);
+    idx_req_.tix= ordered_view(idx_req_.index, filter);
   const tf_tuple_index *tix= idx_req_.tix.get();
   const tf_index_def *def= index_def(idx_req_.index);
   if (!tix || !def || !table || idx_req_.index >= table->s->keys)
@@ -4928,7 +5074,7 @@ bool ha_moosedb::series_for_index(const std::vector<uint64_t> **ids)
       return false;
     fld.push_back(ki->key_part[p].field);
   }
-  idx_req_.tix= tuple_index(idx_req_.index);
+  idx_req_.tix= ordered_view(idx_req_.index, f);
   if (!idx_req_.tix)
   {
     last_error_= "cannot build the ordered view of the series of this index";

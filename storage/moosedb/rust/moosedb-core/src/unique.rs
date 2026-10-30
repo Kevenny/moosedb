@@ -17,15 +17,26 @@
 //!   the coldest series are dropped and a floor (`evicted`) remembers how far
 //!   their bounds reached, so an absent series is only trusted above it. It is rebuilt at open from the series entries of the chunks
 //!   (`max_ts`, `complete = false`) and the replayed WAL rows.
-//! * **series claims.** A statement's rows are invisible to other sessions
-//!   until it commits, so two statements could both see "no such key" and both
-//!   insert it. The first row a statement writes to a series *claims* the
-//!   series until the statement commits or aborts; a statement that needs a
-//!   series claimed by another one waits for it (`Error::Busy`, retried by the
-//!   caller, the wait itself happens on a condition variable) and then checks
-//!   against committed data. Exactly one of two racing inserts of the same key
-//!   wins, the other gets `Error::Duplicate`. A wait that would close a cycle
-//!   (A holds s1 wants s2, B holds s2 wants s1) fails with `Error::Deadlock`.
+//! * **key holds** (the default concurrency control). A statement's rows are
+//!   invisible to other sessions until it commits, so two statements could both
+//!   see "no such key" and both insert it. Each checked row therefore *holds*
+//!   its exact key `(series, ts, extras)` from the moment it is checked until the
+//!   statement commits or aborts, and the hold is registered before the table
+//!   mutex is dropped for the lookup. A statement that wants a key another one
+//!   holds waits for it (`Error::Busy`, retried by the caller, the wait itself
+//!   happens on a condition variable) and then checks against committed data:
+//!   exactly one of two racing inserts of the same key wins, the other gets
+//!   `Error::Duplicate`. Statements that insert *different* keys into the same
+//!   series never wait for each other, whatever the order. A wait that would
+//!   close a cycle (A holds k1 wants k2, B holds k2 wants k1) fails with
+//!   `Error::Deadlock`. Holds are charged to the memory budget of the batch and
+//!   capped (`HOLDS_PER_BATCH` per statement, `HOLDS_TOTAL` per table).
+//! * **series claims** (fallback). Past those caps the rows that follow *claim*
+//!   the whole series instead, until the statement ends. A claim is exclusive:
+//!   it waits while another statement holds keys in the series or claims it, and
+//!   while it lasts other statements wait for the series (even for a key). The
+//!   holds a statement already has stay valid until it ends. Claim waits take
+//!   part in the same cycle detection.
 //! * **unchecked mode** (`unique_checks = 0`): rows are not checked and do not
 //!   claim, but still update `max_ts` / `top`, so later checked statements stay
 //!   correct for everything that was recorded. Keys inserted unchecked can be
@@ -172,7 +183,18 @@ pub(crate) enum Claim {
     Busy(u64),
     /// Waiting would close a cycle.
     Deadlock,
+    /// (`hold` only) the hold budget is spent: claim the whole series instead.
+    Fallback,
 }
+
+/// Most key holds one statement keeps before it falls back to series claims.
+pub(crate) const HOLDS_PER_BATCH: usize = 65_536;
+/// Most key holds of all statements of a table together.
+pub(crate) const HOLDS_TOTAL: usize = 1 << 20;
+/// Bytes a hold is charged: `keys` bucket (40 B + control byte, up to 2x slack
+/// right after a growth), its one-element list (24 B, 32 with the allocator),
+/// the `(sid, ts)` entry in `held` (16 B, vector growth slack), `holders`.
+pub(crate) const HOLD_COST: usize = 160;
 
 /// Unique-key state of a table, guarded by the table mutex.
 ///
@@ -194,6 +216,20 @@ pub(crate) struct UniqueState {
     cap: usize,
     /// series id -> id of the statement (batch) that holds it
     claims: FastMap<u64, u64>,
+    /// (series, ts) -> (extras, batch) of the keys held by open statements
+    keys: FastMap<(u64, i64), Vec<(Extras, u64)>>,
+    /// series id -> statements that hold at least one key in it
+    holders: FastMap<u64, Vec<u64>>,
+    /// batch id -> the (series, ts) of its holds
+    held: FastMap<u64, Vec<(u64, i64)>>,
+    /// Total holds in `held`.
+    held_total: usize,
+    /// Bumped whenever a statement gives back holds or claims: a lookup that
+    /// started before the bump may have missed the keys that statement had.
+    released: u64,
+    /// Test override of the per-batch / per-table caps (0 = the constants).
+    batch_cap: usize,
+    total_cap: usize,
     /// batch id -> batch id it waits for
     waiting: FastMap<u64, u64>,
 }
@@ -214,6 +250,11 @@ impl UniqueState {
         self.evicted = None;
         self.series = FastMap::default();
         self.claims.clear();
+        self.keys.clear();
+        self.holders.clear();
+        self.held.clear();
+        self.held_total = 0;
+        self.released += 1;
         self.waiting.clear();
     }
 
@@ -309,6 +350,25 @@ impl UniqueState {
         }
     }
 
+    /// Rows of an unchecked statement (no holds) became visible: lookups that
+    /// began before may have missed them.
+    pub(crate) fn note_unchecked_commit(&mut self) {
+        self.released += 1;
+    }
+
+    /// Value to capture (under the mutex) before a lookup that runs without it.
+    pub(crate) fn generation(&self) -> u64 {
+        self.released
+    }
+
+    /// [`UniqueState::accept`] for a row whose lookup began at `generation`: if
+    /// a statement released holds since, `existing` may lack keys it committed
+    /// (and no hold remembers them), so it must not complete the top.
+    pub(crate) fn accept_checked(&mut self, sid: u64, ts: i64, e: Extras, existing: Option<&[Extras]>, generation: u64) {
+        let existing = existing.filter(|_| generation == self.released);
+        self.accept(sid, ts, e, existing);
+    }
+
     /// Records an accepted row. `existing` = every extras tuple already stored
     /// at `ts` (only used to make a state complete that was not).
     pub(crate) fn accept(&mut self, sid: u64, ts: i64, e: Extras, existing: Option<&[Extras]>) {
@@ -326,6 +386,11 @@ impl UniqueState {
             } else if let Some(all) = existing {
                 let mut top = Top::Empty;
                 for x in all {
+                    top.insert(*x);
+                }
+                // `all` is what is stored; other statements' rows at this instant
+                // are in flight, known only by their holds.
+                for (x, _) in self.keys.get(&(sid, ts)).into_iter().flatten() {
                     top.insert(*x);
                 }
                 top.insert(e);
@@ -365,26 +430,77 @@ impl UniqueState {
         }
     }
 
+    /// Does waiting for `from` end up waiting for `me`?
+    fn reaches(&self, from: u64, me: u64) -> bool {
+        let mut cur = from;
+        for _ in 0..1024 {
+            match self.waiting.get(&cur).copied() {
+                Some(n) if n == me => return true,
+                Some(n) => cur = n,
+                None => break,
+            }
+        }
+        false
+    }
+
+    /// `me` must wait for one of `owners` (none of them is `me`); none = free.
+    fn blocked(&self, owners: impl Iterator<Item = u64>, me: u64) -> Claim {
+        let mut first = None;
+        for o in owners {
+            if self.reaches(o, me) {
+                return Claim::Deadlock;
+            }
+            first.get_or_insert(o);
+        }
+        first.map_or(Claim::Held { new: false }, Claim::Busy)
+    }
+
+    /// Claims the whole series for `me`: exclusive, so no other statement may
+    /// claim it or hold a key in it.
     pub(crate) fn claim(&mut self, sid: u64, me: u64) -> Claim {
         match self.claims.get(&sid).copied() {
             None => {
-                self.claims.insert(sid, me);
-                Claim::Held { new: true }
+                let others = self.holders.get(&sid).into_iter().flatten().copied().filter(|b| *b != me);
+                match self.blocked(others, me) {
+                    Claim::Held { .. } => {
+                        self.claims.insert(sid, me);
+                        Claim::Held { new: true }
+                    }
+                    other => other,
+                }
             }
             Some(o) if o == me => Claim::Held { new: false },
-            Some(owner) => {
-                // Follow the chain of who waits for whom: reaching `me` is a cycle.
-                let mut cur = owner;
-                for _ in 0..1024 {
-                    match self.waiting.get(&cur).copied() {
-                        Some(n) if n == me => return Claim::Deadlock,
-                        Some(n) => cur = n,
-                        None => break,
-                    }
-                }
-                Claim::Busy(owner)
-            }
+            Some(owner) => self.blocked(std::iter::once(owner), me),
         }
+    }
+
+    /// Holds the key `(sid, ts, e)` for `me` until [`UniqueState::release`].
+    /// `Held { new }`: `new` = a hold was registered (the caller charges it);
+    /// `Busy`/`Deadlock`: the series is claimed by, or the key held by, another
+    /// statement; `Fallback`: the caps are spent (the caller claims the series).
+    pub(crate) fn hold(&mut self, sid: u64, ts: i64, e: Extras, me: u64) -> Claim {
+        match self.claims.get(&sid).copied() {
+            Some(o) if o == me => return Claim::Held { new: false }, // exclusive already
+            Some(o) => return self.blocked(std::iter::once(o), me),
+            None => {}
+        }
+        if let Some((_, b)) = self.keys.get(&(sid, ts)).and_then(|v| v.iter().find(|(x, _)| *x == e)) {
+            return if *b == me { Claim::Held { new: false } } else { self.blocked(std::iter::once(*b), me) };
+        }
+        let bc = if self.batch_cap > 0 { self.batch_cap } else { HOLDS_PER_BATCH };
+        let tc = if self.total_cap > 0 { self.total_cap } else { HOLDS_TOTAL };
+        let mine = self.held.get(&me).map_or(0, Vec::len);
+        if mine >= bc || self.held_total >= tc {
+            return Claim::Fallback;
+        }
+        self.held.entry(me).or_default().push((sid, ts));
+        self.held_total += 1;
+        self.keys.entry((sid, ts)).or_insert_with(|| Vec::with_capacity(1)).push((e, me));
+        let h = self.holders.entry(sid).or_default();
+        if !h.contains(&me) {
+            h.push(me);
+        }
+        Claim::Held { new: true }
     }
 
     pub(crate) fn set_waiting(&mut self, me: u64, owner: u64) {
@@ -395,7 +511,7 @@ impl UniqueState {
         self.waiting.remove(&me);
     }
 
-    /// Gives back the claims of statement `me`. With `invalidate` the state of
+    /// Gives back the claims and key holds of statement `me`. With `invalidate` the state of
     /// those series is also dropped (the statement did not commit).
     pub(crate) fn release(&mut self, sids: &[u64], me: u64, invalidate: bool) {
         for sid in sids {
@@ -406,7 +522,34 @@ impl UniqueState {
                 }
             }
         }
+        self.released += 1;
+        if let Some(mine) = self.held.remove(&me) {
+            self.held_total = self.held_total.saturating_sub(mine.len());
+            for (sid, ts) in mine {
+                if let Some(v) = self.keys.get_mut(&(sid, ts)) {
+                    v.retain(|(_, b)| *b != me);
+                    if v.is_empty() {
+                        self.keys.remove(&(sid, ts));
+                    }
+                }
+                if let Some(h) = self.holders.get_mut(&sid) {
+                    h.retain(|b| *b != me);
+                    if h.is_empty() {
+                        self.holders.remove(&sid);
+                    }
+                }
+                if invalidate {
+                    self.invalidate(sid);
+                }
+            }
+        }
         self.waiting.remove(&me);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_hold_caps(&mut self, per_batch: usize, total: usize) {
+        self.batch_cap = per_batch;
+        self.total_cap = total;
     }
 
     #[cfg(test)]
@@ -565,6 +708,100 @@ mod tests {
         assert_eq!(s.claim(1, 300), Claim::Busy(100));
         s.release(&[1], 100, true);
         assert_eq!(s.claim(1, 300), Claim::Held { new: true });
+    }
+
+    #[test]
+    fn holds_of_different_keys_in_one_series_coexist_and_a_cycle_is_a_deadlock() {
+        let mut s = UniqueState::default();
+        assert_eq!(s.hold(1, 10, [0, 0], 100), Claim::Held { new: true });
+        assert_eq!(s.hold(1, 10, [0, 0], 100), Claim::Held { new: false });
+        assert_eq!(s.hold(1, 11, [0, 0], 200), Claim::Held { new: true }, "same series, other key");
+        assert_eq!(s.hold(1, 10, [1, 0], 200), Claim::Held { new: true }, "same instant, other extras");
+        assert_eq!(s.hold(1, 10, [0, 0], 200), Claim::Busy(100));
+        s.set_waiting(100, 200);
+        assert_eq!(s.hold(1, 11, [0, 0], 200), Claim::Held { new: false });
+        // 100 waits for 200; 200 now wants 100's key: a cycle
+        assert_eq!(s.hold(1, 10, [0, 0], 200), Claim::Deadlock);
+        s.release(&[], 100, false);
+        assert_eq!(s.hold(1, 10, [0, 0], 200), Claim::Held { new: true });
+        s.release(&[], 200, true);
+        assert!(s.keys.is_empty() && s.holders.is_empty() && s.held.is_empty() && s.held_total == 0);
+    }
+
+    #[test]
+    fn past_the_hold_cap_a_statement_claims_the_series_and_excludes_key_holders() {
+        let mut s = UniqueState::default();
+        s.set_hold_caps(2, 0);
+        assert_eq!(s.hold(1, 1, [0, 0], 100), Claim::Held { new: true });
+        assert_eq!(s.hold(1, 2, [0, 0], 100), Claim::Held { new: true });
+        assert_eq!(s.hold(1, 3, [0, 0], 100), Claim::Fallback);
+        assert_eq!(s.claim(1, 100), Claim::Held { new: true }, "only its own holds in the series");
+        assert_eq!(s.hold(1, 4, [0, 0], 100), Claim::Held { new: false }, "the claim covers it");
+        assert_eq!(s.hold(1, 9, [0, 0], 200), Claim::Busy(100), "claimed series: others wait");
+        s.release(&[1], 100, false);
+        // a key holder blocks a later claimer
+        assert_eq!(s.hold(1, 9, [0, 0], 200), Claim::Held { new: true });
+        assert_eq!(s.claim(1, 100), Claim::Busy(200));
+        s.set_waiting(200, 100);
+        assert_eq!(s.claim(1, 100), Claim::Deadlock, "the holder waits for the claimer");
+        s.release(&[], 200, false);
+        assert_eq!(s.claim(1, 100), Claim::Held { new: true });
+        // the total cap too
+        let mut t = UniqueState::default();
+        t.set_hold_caps(0, 1);
+        assert_eq!(t.hold(1, 1, [0, 0], 1), Claim::Held { new: true });
+        assert_eq!(t.hold(2, 1, [0, 0], 2), Claim::Fallback);
+    }
+
+    #[test]
+    fn a_stale_lookup_does_not_complete_the_top_after_another_statement_released_holds() {
+        let mut s = UniqueState::default();
+        s.note_chunk(1, 100); // max_ts == 100, top unknown
+        // A holds k1 and plans a lookup (nothing stored at 100), mutex dropped
+        assert_eq!(s.hold(1, 100, [1, 0], 7), Claim::Held { new: true });
+        assert_eq!(s.plan(1, 100, &[1, 0]), Plan::Lookup);
+        let gen = s.generation();
+        let stale: Vec<Extras> = Vec::new();
+        // B takes k2 at the same instant, is accepted without completing the
+        // top, commits and lets go of its hold
+        assert_eq!(s.hold(1, 100, [2, 0], 8), Claim::Held { new: true });
+        s.accept(1, 100, [2, 0], None);
+        s.release(&[], 8, false);
+        // A comes back with its old `existing`
+        s.accept_checked(1, 100, [1, 0], Some(&stale), gen);
+        assert!(!s.is_complete(1), "the stale list must not make the top complete");
+        assert_eq!(s.plan(1, 100, &[2, 0]), Plan::Lookup, "k2 is not told apart from a new key");
+        // without an intervening release the same call does complete it
+        let mut t = UniqueState::default();
+        t.note_chunk(1, 100);
+        let gen = t.generation();
+        t.accept_checked(1, 100, [1, 0], Some(&stale), gen);
+        assert!(t.is_complete(1));
+    }
+
+    #[test]
+    fn a_commit_of_unchecked_rows_also_invalidates_lookups_in_flight() {
+        let mut s = UniqueState::default();
+        s.note_chunk(1, 100);
+        assert_eq!(s.hold(1, 100, [1, 0], 7), Claim::Held { new: true });
+        let gen = s.generation();
+        // B (unique_checks=0) wrote k2 at the same instant, no hold, and commits
+        s.note_row(1, 100, Some([2, 0]));
+        s.note_unchecked_commit();
+        s.accept_checked(1, 100, [1, 0], Some(&[]), gen);
+        assert!(!s.is_complete(1), "the stale list must not make the top complete");
+        assert_eq!(s.plan(1, 100, &[2, 0]), Plan::Lookup);
+    }
+
+    #[test]
+    fn completing_the_top_counts_the_keys_other_statements_hold() {
+        let mut s = UniqueState::default();
+        s.note_chunk(1, 100);
+        assert_eq!(s.hold(1, 100, [1, 0], 7), Claim::Held { new: true }); // in flight, not in `top`
+        assert_eq!(s.hold(1, 100, [2, 0], 8), Claim::Held { new: true });
+        s.accept(1, 100, [2, 0], Some(&[[9, 0]]));
+        s.release(&[], 7, false);
+        assert_eq!(s.plan(1, 100, &[1, 0]), Plan::Duplicate, "the key 7 held is known");
     }
 
     #[test]

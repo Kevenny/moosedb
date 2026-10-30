@@ -1,10 +1,11 @@
 #
 # PRIMARY KEY (itemid, clock, ns) with several sessions: statements are
-# invisible to each other until they end, so a statement that needs a series
+# invisible to each other until they end, so a statement that needs a KEY
 # another statement is writing waits for it and then checks against what was
-# committed. Two inserts of one key: exactly one wins. Also: other series are
-# not held up, a lock wait timeout, KILL QUERY of a waiting statement, a
-# cycle of waiting statements (deadlock), unique_checks=0 not waiting.
+# committed. Two inserts of one key: exactly one wins. Other keys, also of the
+# same series, and other series are not held up. Also: a lock wait timeout,
+# KILL QUERY of a waiting statement, a cycle of waiting statements (deadlock),
+# unique_checks=0 not waiting.
 #
 --source include/not_embedded.inc
 --source include/have_innodb.inc
@@ -19,7 +20,7 @@ connect (waiter, localhost, root,,);
 connect (other, localhost, root,,);
 
 --echo ##################################################################
---echo # One statement holds series 7 for 3 seconds (its second row is slow)
+--echo # One statement holds key (7, 501, 1) for 3 seconds (its second row is slow)
 --echo ##################################################################
 connection holder;
 send INSERT INTO t SELECT 7, 500 + seq, SLEEP(IF(seq = 2, 3, 0)), 1 FROM seq_1_to_2;
@@ -39,9 +40,10 @@ SELECT COUNT(*) AS rows_visible_now FROM t;
 connection waiter;
 send INSERT INTO t VALUES (7, 501, 2, 1);
 
---echo # A different key of the same series also waits, and then succeeds
+--echo # A different key of the same series does not wait: it commits while the holder sleeps
 connection other;
-send INSERT INTO t VALUES (7, 900, 3, 1);
+INSERT INTO t VALUES (7, 900, 3, 1);
+SELECT COUNT(*) AS holder_still_sleeping FROM information_schema.PROCESSLIST WHERE INFO LIKE 'INSERT INTO t SELECT 7%' AND STATE = 'User sleep';
 
 connection holder;
 reap;
@@ -49,13 +51,11 @@ connection waiter;
 --error ER_DUP_ENTRY
 reap;
 --echo # (a duplicate of a row nobody could see yet: the statement did wait for the holder)
-connection other;
-reap;
 connection default;
 SELECT itemid, clock, value, ns FROM t ORDER BY itemid, clock, ns;
 
 --echo ##################################################################
---echo # Lock wait timeout
+--echo # Lock wait timeout (on a key the holder holds)
 --echo ##################################################################
 SET @old_timeout = @@GLOBAL.moosedb_unique_lock_wait_timeout;
 SET GLOBAL moosedb_unique_lock_wait_timeout = 1;
@@ -65,16 +65,20 @@ connection default;
 --let $sleeping_like= INSERT INTO t SELECT 20,%
 --let $sleeping_n= 1
 --source suite/moosedb/include/wait_statement_sleeping.inc
+connection other;
+--echo # a different key of the same series goes in without waiting
+INSERT INTO t VALUES (20, 999, 1, 1);
+SELECT COUNT(*) AS holder_still_sleeping FROM information_schema.PROCESSLIST WHERE INFO LIKE 'INSERT INTO t SELECT 20,%' AND STATE = 'User sleep';
 connection waiter;
 --error ER_LOCK_WAIT_TIMEOUT
-INSERT INTO t VALUES (20, 999, 1, 1);
+INSERT INTO t VALUES (20, 101, 1, 1);
 connection holder;
 reap;
 connection default;
 SET GLOBAL moosedb_unique_lock_wait_timeout = @old_timeout;
 SELECT COUNT(*) FROM t WHERE itemid = 20;
 
---echo # With the timeout at 0 a busy series fails at once
+--echo # With the timeout at 0 a held key fails at once
 SET GLOBAL moosedb_unique_lock_wait_timeout = 0;
 connection holder;
 send INSERT INTO t SELECT 21, 100 + seq, SLEEP(IF(seq = 2, 2, 0)), 1 FROM seq_1_to_2;
@@ -82,16 +86,20 @@ connection default;
 --let $sleeping_like= INSERT INTO t SELECT 21,%
 --let $sleeping_n= 1
 --source suite/moosedb/include/wait_statement_sleeping.inc
+connection other;
+--echo # a different key of the same series goes in without waiting
+INSERT INTO t VALUES (21, 999, 1, 1);
+SELECT COUNT(*) AS holder_still_sleeping FROM information_schema.PROCESSLIST WHERE INFO LIKE 'INSERT INTO t SELECT 21,%' AND STATE = 'User sleep';
 connection waiter;
 --error ER_LOCK_WAIT_TIMEOUT
-INSERT INTO t VALUES (21, 999, 1, 1);
+INSERT INTO t VALUES (21, 101, 1, 1);
 connection holder;
 reap;
 connection default;
 SET GLOBAL moosedb_unique_lock_wait_timeout = @old_timeout;
 
 --echo ##################################################################
---echo # KILL QUERY of a statement that waits for a series
+--echo # KILL QUERY of a statement that waits for a key
 --echo ##################################################################
 connection holder;
 send INSERT INTO t SELECT 30, 100 + seq, SLEEP(IF(seq = 2, 4, 0)), 1 FROM seq_1_to_2;
@@ -101,7 +109,7 @@ connection default;
 --source suite/moosedb/include/wait_statement_sleeping.inc
 connection waiter;
 let $waiter_id= `SELECT CONNECTION_ID()`;
-send INSERT INTO t VALUES (30, 999, 1, 1);
+send INSERT INTO t VALUES (30, 101, 1, 1);
 connection default;
 let $wait_condition= SELECT COUNT(*) = 1 FROM information_schema.PROCESSLIST WHERE ID = $waiter_id AND INFO LIKE 'INSERT INTO t VALUES (30%';
 --source include/wait_condition.inc
@@ -117,12 +125,12 @@ SELECT COUNT(*) AS rows_of_30 FROM t WHERE itemid = 30;
 INSERT INTO t VALUES (30, 999, 1, 1);
 
 --echo ##################################################################
---echo # Two statements that each hold the series the other one needs
+--echo # Two statements that each hold the key the other one needs
 --echo ##################################################################
 connection holder;
 send INSERT INTO t SELECT 40 + seq - 1, 100, SLEEP(IF(seq = 2, 6, 0)), 1 FROM seq_1_to_2;
 connection waiter;
-send INSERT INTO t SELECT 42 - seq, 200, SLEEP(IF(seq = 2, 6, 0)), 1 FROM seq_1_to_2;
+send INSERT INTO t SELECT 42 - seq, 100, SLEEP(IF(seq = 2, 6, 0)), 1 FROM seq_1_to_2;
 connection default;
 --let $sleeping_like= INSERT INTO t SELECT 4%
 --let $sleeping_n= 2
@@ -160,25 +168,35 @@ connection default;
 SELECT COUNT(*) AS rows_of_50 FROM t WHERE itemid = 50;
 
 --echo ##################################################################
---echo # Three sessions inserting overlapping keys, all starting on the same series: each key is stored once
+--echo # Three sessions inserting overlapping keys in opposite orders: a cycle of waits is a deadlock (as in InnoDB); no key is stored twice
 --echo ##################################################################
 connection default;
 CREATE TABLE ov (itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG', clock INT NOT NULL, ns INT NOT NULL,
                  PRIMARY KEY (itemid, clock, ns)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock' MEMTABLE_SIZE=1048576;
 CREATE TABLE ov_i (itemid BIGINT UNSIGNED NOT NULL, clock INT NOT NULL, ns INT NOT NULL, PRIMARY KEY (itemid, clock, ns)) ENGINE=InnoDB;
 --disable_warnings
+--disable_result_log
 connection holder;
 send INSERT IGNORE INTO ov SELECT 1 + seq MOD 5, 1000 + seq DIV 5, 1 FROM seq_1_to_40000;
 connection waiter;
 send INSERT IGNORE INTO ov SELECT 1 + seq MOD 5, 1000 + (40001 - seq) DIV 5, 1 FROM seq_1_to_40000;
 connection other;
+--error 0,ER_LOCK_DEADLOCK
 INSERT IGNORE INTO ov SELECT 1 + seq MOD 5, 1000 + (seq * 7) MOD 8000, 1 FROM seq_1_to_40000;
 connection holder;
+--error 0,ER_LOCK_DEADLOCK
 reap;
 connection waiter;
+--error 0,ER_LOCK_DEADLOCK
 reap;
+--enable_result_log
 connection default;
-SELECT COUNT(*) AS rows_stored, COUNT(DISTINCT itemid, clock, ns) AS distinct_keys FROM ov;
+--echo # (which session lost the cycle varies, and a statement that lost was rolled back whole)
+SELECT COUNT(*) = COUNT(DISTINCT itemid, clock, ns) AS each_key_stored_once FROM ov;
+--echo # the same three statements once more, one after the other: the table is complete whoever lost
+INSERT IGNORE INTO ov SELECT 1 + seq MOD 5, 1000 + seq DIV 5, 1 FROM seq_1_to_40000;
+INSERT IGNORE INTO ov SELECT 1 + seq MOD 5, 1000 + (40001 - seq) DIV 5, 1 FROM seq_1_to_40000;
+INSERT IGNORE INTO ov SELECT 1 + seq MOD 5, 1000 + (seq * 7) MOD 8000, 1 FROM seq_1_to_40000;
 --echo # the same three statements, one after the other, on InnoDB
 INSERT IGNORE INTO ov_i SELECT 1 + seq MOD 5, 1000 + seq DIV 5, 1 FROM seq_1_to_40000;
 INSERT IGNORE INTO ov_i SELECT 1 + seq MOD 5, 1000 + (40001 - seq) DIV 5, 1 FROM seq_1_to_40000;

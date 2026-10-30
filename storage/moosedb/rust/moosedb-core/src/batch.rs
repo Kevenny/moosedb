@@ -61,7 +61,7 @@ use crate::memtable::{group_rows, row_bytes, MemRow};
 use crate::scan::Snapshot;
 use crate::schema::{Row, Schema, Value};
 use crate::table::{Inner, OpenBatch, Table};
-use crate::unique::{existing_extras, Claim, Extras, Plan, UniqueSpec};
+use crate::unique::{existing_extras, Claim, Extras, Plan, UniqueSpec, HOLD_COST};
 use crate::wal;
 use std::collections::HashMap;
 
@@ -143,6 +143,9 @@ pub struct Batch {
     unique_checks: bool,
     /// Series (global ids) this statement claimed and has not given back.
     claimed: Vec<u64>,
+    /// Bytes charged to `BATCH_BYTES` for the key holds of this statement (they
+    /// outlive spills, so they are not part of `accounted`).
+    hold_bytes: usize,
     /// Series written with `unique_checks = 0` (no claim): their key state is
     /// dropped too if the statement does not commit.
     unchecked: std::collections::HashSet<u64>,
@@ -216,6 +219,7 @@ impl Table {
             finished: false,
             unique_checks: true,
             claimed: reserved(hint_series, unique_hint),
+            hold_bytes: 0,
             unchecked: std::collections::HashSet::new(),
             local_gid: reserved(hint_series, unique_hint),
             own: None,
@@ -397,16 +401,28 @@ impl Batch {
             }
             sid = inner.series.get_or_insert_keyed_with(key, || row_tags(&table.schema, row));
             if checks {
-                match inner.uniq.claim(sid, self.id) {
-                    Claim::Held { new } => {
-                        if new {
+                // Key mode: hold the exact key (registered before the mutex is
+                // dropped for the lookup). Past the hold caps: claim the series.
+                let mut verdict = inner.uniq.hold(sid, ts, ex, self.id);
+                match verdict {
+                    Claim::Held { new: true } => {
+                        self.hold_bytes += HOLD_COST;
+                        BATCH_BYTES.fetch_add(HOLD_COST as u64, Ordering::Relaxed);
+                    }
+                    Claim::Fallback => {
+                        verdict = inner.uniq.claim(sid, self.id);
+                        if verdict == (Claim::Held { new: true }) {
                             self.claimed.push(sid);
                         }
                     }
+                    _ => {}
+                }
+                match verdict {
+                    Claim::Held { .. } | Claim::Fallback => {}
                     Claim::Busy(owner) => return Err(self.wait_for_claim(guard, owner)),
                     Claim::Deadlock => {
                         return Err(Error::Deadlock(
-                            "statements wait for each other's UNIQUE key series; the statement was stopped".into(),
+                            "statements wait for each other's UNIQUE keys; the statement was stopped".into(),
                         ))
                     }
                 }
@@ -418,9 +434,10 @@ impl Batch {
             }
         }
         let mut existing: Option<Vec<Extras>> = None;
+        let released_at = guard.uniq.generation();
         if let Some(snap) = lookup {
-            // The series is claimed: nobody else can add rows to it while the
-            // chunks are read outside the table mutex.
+            // The key is held: nobody else can add it while the chunks are read
+            // outside the table mutex.
             drop(guard);
             let found = self.find_existing(spec, &snap, sid, ts)?;
             if found.contains(&ex) {
@@ -437,14 +454,14 @@ impl Batch {
         if let Some(p) = payload {
             self.log_row(inner, p)?;
         }
-        inner.uniq.accept(sid, ts, ex, existing.as_deref());
+        inner.uniq.accept_checked(sid, ts, ex, existing.as_deref(), released_at);
         if !checks {
             self.unchecked.insert(sid);
         }
         Ok(sid)
     }
 
-    /// Waits (a short slice) for the statement that holds a series; the caller
+    /// Waits (a short slice) for the statement that holds a key or series; the caller
     /// retries the write on `Busy`.
     fn wait_for_claim(&self, mut guard: MutexGuard<'_, Inner>, owner: u64) -> Error {
         guard.uniq.set_waiting(self.id, owner);
@@ -482,20 +499,37 @@ impl Batch {
         Ok(out)
     }
 
-    /// Gives back the claims after the rows became visible (table mutex held).
+    /// Gives back the claims and key holds after the rows became visible (table
+    /// mutex held).
     fn release_claims_locked(&mut self, inner: &mut Inner) {
-        self.unchecked.clear();
-        if !self.claimed.is_empty() {
+        if !self.unchecked.is_empty() {
+            // Rows without holds became visible: a lookup in flight may lack them,
+            // and one that already completed a `top` did.
+            inner.uniq.note_unchecked_commit();
+            for sid in &self.unchecked {
+                inner.uniq.invalidate(*sid);
+            }
+            self.unchecked.clear();
+        }
+        if !self.claimed.is_empty() || self.hold_bytes > 0 {
             inner.uniq.release(&self.claimed, self.id, false);
             self.claimed.clear();
+            self.release_hold_budget();
             self.table.claims_cv.notify_all();
+        }
+    }
+
+    fn release_hold_budget(&mut self) {
+        if self.hold_bytes > 0 {
+            BATCH_BYTES.fetch_sub(self.hold_bytes as u64, Ordering::Relaxed);
+            self.hold_bytes = 0;
         }
     }
 
     /// Gives back the claims; with `invalidate` the key state of those series is
     /// dropped too (the rows of this statement may not survive).
     fn release_claims(&mut self, invalidate: bool) {
-        if self.claimed.is_empty() && self.unchecked.is_empty() {
+        if self.claimed.is_empty() && self.unchecked.is_empty() && self.hold_bytes == 0 {
             return;
         }
         if let Ok(mut g) = self.table.lock() {
@@ -507,6 +541,7 @@ impl Batch {
             }
         }
         self.unchecked.clear();
+        self.release_hold_budget();
         self.table.claims_cv.notify_all();
         self.claimed.clear();
     }
@@ -1079,5 +1114,44 @@ mod tests {
         let t = open(&dir.path().join("t"));
         t.begin_batch().unwrap().commit(true).unwrap();
         assert_eq!(t.stats().unwrap().row_count, 0);
+    }
+
+    fn open_unique(dir: &std::path::Path) -> Arc<Table> {
+        let cfg = config(dir).with_unique(vec![]).unwrap();
+        Table::create(&cfg).unwrap();
+        Arc::new(Table::open(cfg).unwrap())
+    }
+
+    #[test]
+    fn past_the_hold_cap_a_batch_claims_the_series_and_key_holders_make_it_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = open_unique(&dir.path().join("t"));
+        t.lock().unwrap().uniq.set_hold_caps(2, 0);
+
+        // Over the cap the batch claims "h": another statement waits, even for a
+        // key the first never wrote.
+        let mut a = t.begin_batch().unwrap();
+        for i in 0..3 {
+            a.write(row(i)).unwrap();
+        }
+        assert_eq!(a.claimed.len(), 1, "the third row fell back to a series claim");
+        let mut b = t.begin_batch().unwrap();
+        assert!(matches!(b.write(row(100)), Err(Error::Busy(_))));
+        a.commit(false).unwrap();
+        b.write(row(100)).unwrap();
+        b.abort();
+
+        // A key holder in the series makes a would-be claimer wait.
+        let mut x = t.begin_batch().unwrap();
+        x.write(row(200)).unwrap();
+        let mut a = t.begin_batch().unwrap();
+        a.write(row(300)).unwrap();
+        a.write(row(301)).unwrap();
+        assert!(matches!(a.write(row(302)), Err(Error::Busy(_))), "x holds a key in the series");
+        x.commit(false).unwrap();
+        a.write(row(302)).unwrap();
+        assert_eq!(a.claimed.len(), 1);
+        a.commit(false).unwrap();
+        assert_eq!(t.stats().unwrap().row_count, 3 + 1 + 3);
     }
 }

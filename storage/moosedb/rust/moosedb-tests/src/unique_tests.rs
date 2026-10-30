@@ -341,12 +341,13 @@ fn statements_that_wait_for_each_other_are_told_apart_from_a_plain_wait() {
     let mut b = t.begin_batch().unwrap();
     a.write(r("s1", 1, 1)).unwrap();
     b.write(r("s2", 1, 1)).unwrap();
-    // a wants s2 (held by b): it waits, in slices
-    assert!(matches!(a.write(r("s2", 2, 1)), Err(Error::Busy(_))));
-    // b wants s1 (held by a), but a is not waiting at this moment: a plain wait
-    assert!(matches!(b.write(r("s1", 2, 1)), Err(Error::Busy(_))));
-    // once a finishes, b goes on
+    // a wants the key b holds: it waits, in slices
+    assert!(matches!(a.write(r("s2", 1, 1)), Err(Error::Busy(_))));
+    // b wants the key a holds, but a is not waiting at this moment: a plain wait
+    assert!(matches!(b.write(r("s1", 1, 1)), Err(Error::Busy(_))));
+    // once a finishes, its key is committed: b gets the verdict
     a.commit(false).unwrap();
+    assert!(is_dup(b.write(r("s1", 1, 1))));
     b.write(r("s1", 2, 1)).unwrap();
     b.commit(false).unwrap();
     assert_eq!(t.stats().unwrap().row_count, 3);
@@ -358,6 +359,7 @@ fn a_cycle_of_waiting_statements_is_reported_as_a_deadlock() {
     let t = open_new(&dir.path().join("t"), false);
     let barrier = Arc::new(Barrier::new(2));
     let outcome = Arc::new(AtomicUsize::new(0));
+    // each holds one key and wants the one the other holds
     let threads: Vec<_> = [("s1", "s2"), ("s2", "s1")]
         .into_iter()
         .map(|(first, second)| {
@@ -366,12 +368,13 @@ fn a_cycle_of_waiting_statements_is_reported_as_a_deadlock() {
                 let mut b = t.begin_batch().unwrap();
                 b.write(r(first, 1, 1)).unwrap();
                 barrier.wait();
-                match put(&mut b, r(second, 2, 1)) {
-                    Ok(()) => {}
+                match put(&mut b, r(second, 1, 1)) {
                     Err(Error::Deadlock(_)) => {
                         outcome.fetch_add(1, Ordering::SeqCst);
                     }
-                    Err(e) => panic!("{e}"),
+                    // the survivor finds the key the stopped one committed
+                    Err(Error::Duplicate(_)) => {}
+                    other => panic!("{other:?}"),
                 }
                 b.commit(false).unwrap();
             })
@@ -381,7 +384,77 @@ fn a_cycle_of_waiting_statements_is_reported_as_a_deadlock() {
         th.join().unwrap();
     }
     assert_eq!(outcome.load(Ordering::SeqCst), 1, "one of them is stopped, the other goes on");
-    assert!(t.stats().unwrap().row_count >= 3);
+    assert_eq!(t.stats().unwrap().row_count, 2);
+}
+
+#[test]
+fn statements_inserting_different_keys_into_the_same_series_never_wait() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_new(&dir.path().join("t"), false);
+    let mut a = t.begin_batch().unwrap();
+    let mut b = t.begin_batch().unwrap();
+    // interleaved, opposite orders, one series; plain `write`: any Busy fails the test
+    for k in 0..200i64 {
+        a.write(r("s1", k, 0)).unwrap();
+        b.write(r("s1", 199 - k + 1000, 0)).unwrap();
+        b.write(r("s1", k + 5000, 0)).unwrap();
+        a.write(r("s1", 199 - k + 9000, 0)).unwrap();
+    }
+    a.commit(false).unwrap();
+    b.commit(false).unwrap();
+    assert_eq!(t.stats().unwrap().row_count, 800);
+    assert!(is_dup(insert_one(&t, r("s1", 3, 0))));
+    assert!(is_dup(insert_one(&t, r("s1", 5000, 0))));
+}
+
+#[test]
+fn the_same_key_in_two_statements_has_one_winner_and_an_abort_frees_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_new(&dir.path().join("t"), false);
+    let mut a = t.begin_batch().unwrap();
+    let mut b = t.begin_batch().unwrap();
+    a.write(r("s1", 10, 1)).unwrap();
+    a.write(r("s1", 20, 1)).unwrap();
+    assert!(matches!(b.write(r("s1", 10, 1)), Err(Error::Busy(_))), "held by a");
+    a.commit(false).unwrap();
+    assert!(is_dup(b.write(r("s1", 10, 1))), "a's commit decides");
+
+    // an aborted statement leaves nothing: the key (even above max_ts state it
+    // touched) is accepted afterwards, and the one it never had is still free
+    let mut c = t.begin_batch().unwrap();
+    c.write(r("s1", 30, 1)).unwrap();
+    c.write(r("s1", 20, 2)).unwrap();
+    assert!(matches!(b.write(r("s1", 30, 1)), Err(Error::Busy(_))));
+    c.abort();
+    b.write(r("s1", 30, 1)).unwrap();
+    b.write(r("s1", 20, 2)).unwrap();
+    b.commit(false).unwrap();
+    assert!(is_dup(insert_one(&t, r("s1", 30, 1))));
+    assert!(is_dup(insert_one(&t, r("s1", 20, 2))));
+    assert_eq!(t.stats().unwrap().row_count, 4);
+}
+
+#[test]
+fn a_key_in_flight_is_not_lost_when_another_statement_completes_the_top() {
+    // a holds (s1, 100, 1) in flight; c aborts and wipes the series' top; b then
+    // inserts another key at the same instant (a lookup that completes the top
+    // from committed data only). a's key must still be seen as taken by a third
+    // statement once a commits.
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_new(&dir.path().join("t"), false);
+    insert_one(&t, r("s1", 100, 9)).unwrap();
+    let mut a = t.begin_batch().unwrap();
+    a.write(r("s1", 100, 1)).unwrap();
+    let mut c = t.begin_batch().unwrap();
+    c.write(r("s1", 100, 2)).unwrap();
+    c.abort(); // invalidates the top
+    let mut b = t.begin_batch().unwrap();
+    b.write(r("s1", 100, 3)).unwrap();
+    b.commit(false).unwrap();
+    a.commit(false).unwrap();
+    assert!(is_dup(insert_one(&t, r("s1", 100, 1))));
+    assert!(is_dup(insert_one(&t, r("s1", 100, 3))));
+    assert_eq!(t.stats().unwrap().row_count, 3);
 }
 
 #[test]

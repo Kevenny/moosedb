@@ -194,9 +194,9 @@ impl MemSnapshot {
     }
 }
 
-/// Bytes charged per row for the lazily built per-segment series index (a
-/// `u32` position, see `Segment::index`; the rest is headroom).
-const INDEX_BYTES_PER_ROW: usize = 24;
+/// Bytes charged per row for the lazily built per-segment series index: a
+/// permutation of the rows, one `u32` position each (see `Segment::index`).
+const INDEX_BYTES_PER_ROW: usize = 4;
 
 /// Accounting size of one row (including its share of the series index).
 pub(crate) fn row_bytes(row: &[Value]) -> usize {

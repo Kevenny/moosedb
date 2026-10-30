@@ -1032,17 +1032,26 @@ com três peças em memória (`unique.rs`, estado sob o mutex da tabela):
   velho torna a checagem mais lenta, nunca errada. Reconstruído na abertura a
   partir das entradas de série dos chunks (`max_ts`, `complete=false`) e das
   linhas reaplicadas do WAL; `TRUNCATE` o zera;
-* **reserva de séries (`claims`).** Linhas de um statement são invisíveis aos
-  outros até o commit, então duas sessões veriam "a chave não existe". A primeira
-  linha que um statement escreve numa série a reserva até o commit/abort; outro
-  statement que precise dela espera (`Error::Busy`, em fatias de 50 ms numa
-  condvar; o handler repete respeitando `KILL` e `moosedb_unique_lock_wait_timeout`)
-  e depois confere contra o confirmado. Resultado: de duas inserções da mesma
-  chave, exatamente uma vence (`Duplicate` para a outra). Ciclos de espera
-  (A segura s1 e quer s2, B o inverso) são detectados e o que fecha o ciclo falha
-  com `Error::Deadlock` → `ER_LOCK_DEADLOCK`. Statements em séries disjuntas não
-  se tocam; statements que varrem as mesmas séries na mesma ordem se serializam.
-  Um statement que falha/aborta invalida o estado das séries que segurava;
+* **reserva por chave (`keys`/`holders`) com fallback para série (`claims`).**
+  Linhas de um statement são invisíveis aos outros até o commit, então duas
+  sessões veriam "a chave não existe". Cada linha checada reserva a chave exata
+  `(série, ts, extras)` até o commit/abort, registrada sob o mutex da tabela ANTES
+  do lookup; outro statement que queira a mesma chave espera (`Error::Busy`, em
+  fatias de 50 ms numa condvar; o handler repete respeitando `KILL` e
+  `moosedb_unique_lock_wait_timeout`) e depois confere contra o confirmado. De
+  duas inserções da mesma chave, exatamente uma vence (`Duplicate` para a outra).
+  Statements com chaves distintas na mesma série não se esperam, em qualquer
+  ordem. Ciclos de espera (A segura k1 e quer k2, B o inverso) são detectados e o
+  que fecha o ciclo falha com `Error::Deadlock` → `ER_LOCK_DEADLOCK`. Cada hold
+  custa 160 B no orçamento de lotes (`BATCH_BYTES`) e há tetos de 65.536 por
+  statement e 1 Mi por tabela; acima deles as linhas seguintes reservam a SÉRIE
+  inteira (exclusiva: espera enquanto outro statement tem hold ou claim nela, e
+  bloqueia os demais enquanto durar). Holds e claims duram o mesmo que antes
+  (commit/abort/drop do lote, atravessando spills). Um statement que falha/aborta
+  invalida o estado das séries em que tinha hold ou claim; ao completar o `top`
+  de uma série, as chaves em voo de outros statements entram nele, e um lookup
+  durante o qual algum statement soltou holds (contador `released`) não completa
+  o `top` (a chave confirmada no meio dele poderia faltar);
 * **`unique_checks=0`**: linhas gravadas sem checar e sem reservar, mas ainda
   registradas em `max_ts`/conjunto (as seguintes continuam corretas para o que foi
   registrado). Chaves gravadas assim podem estar duplicadas e isso não é detectado

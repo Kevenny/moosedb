@@ -624,16 +624,17 @@ impl Batch {
             }
             let limit = usize::try_from(table.config.opts.memtable_size_bytes).unwrap_or(usize::MAX);
             let mut guard = table.lock()?;
+            guard.check_writable()?;
+            if guard.epoch != self.epoch {
+                return Err(stale());
+            }
+            // Flushes outrun by writers or failing: wait for / run one rather than
+            // grow without bound. The mutex may be released meanwhile.
+            guard = table.make_room(guard, limit)?;
             let inner = &mut *guard;
             inner.check_writable()?;
             if inner.epoch != self.epoch {
                 return Err(stale());
-            }
-            if inner.memtable.bytes() >= limit.saturating_mul(2) {
-                // Flushes have been failing; refuse rather than grow without bound.
-                table
-                    .flush_locked(inner)
-                    .map_err(|e| Error::Full(format!("MemTable is full and flushing failed: {e}")))?;
             }
             if let Err(e) = inner.wal.append(&wal::commit_entry(self.id)) {
                 if !matches!(e, Error::InvalidArg(_)) {
@@ -689,13 +690,20 @@ impl Batch {
             // The rows now belong to the MemTable, which has its own limits.
             self.release_budget();
             inner.changed();
-            if inner.memtable.bytes() >= limit {
-                // The rows are safe in the WAL: a failed flush is retried later.
-                if let Err(e) = table.flush_locked(inner) {
+            // The rows are safe in the WAL: a failed flush is retried later. The
+            // work happens after the mutex is released.
+            let job = if inner.memtable.bytes() >= limit {
+                table.begin_flush(inner).unwrap_or_else(|e| {
                     warn(&format!("MemTable flush failed, will retry: {e}"));
-                }
-            }
+                    None
+                })
+            } else {
+                None
+            };
             drop(guard);
+            if let Some(Err(e)) = job.map(|j| table.run_flush(j)) {
+                warn(&format!("MemTable flush failed, will retry: {e}"));
+            }
             if sync {
                 let token = Durability { table, target };
                 if defer {

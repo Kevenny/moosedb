@@ -694,7 +694,7 @@ impl Scan {
                 .filter(|s| s.len().saturating_mul(mem.segment_count().max(1)).saturating_mul(4) <= mem.row_total());
             let mut keys: Vec<Key> = match indexed {
                 Some(s) => mem
-                    .rows_of_series(s)
+                    .rows_of_series(s, schema.ts_index())
                     .into_iter()
                     .filter(|(_, m)| f.ts_matches(schema.row_ts(&m.row)))
                     .map(|(o, m)| key_of(schema.row_ts(&m.row), Position { source, ordinal: o }))

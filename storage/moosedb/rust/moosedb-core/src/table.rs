@@ -24,7 +24,7 @@ use crate::fsutil::{is_fsync_error, remove_if_exists, sync_dir, write_atomic};
 use crate::index::series::{row_tags, SeriesIndex, SeriesSnapshot};
 use crate::log::warn;
 use crate::manifest::Manifest;
-use crate::memtable::MemTable;
+use crate::memtable::{MemRow, MemSnapshot, MemTable};
 use crate::options::TableConfig;
 use crate::scan::{check_tag_columns, Position, ResolvedFilter, Scan, ScanFilter, Snapshot};
 use crate::schema::{Row, Schema, Value};
@@ -143,6 +143,13 @@ pub(crate) struct Inner {
     pub(crate) chunks: Vec<Arc<ChunkMeta>>,
     pub(crate) wal: Wal,
     pub(crate) memtable: MemTable,
+    /// Rows a flush is sealing into chunks outside the mutex (see
+    /// `Table::begin_flush`). Still visible: a snapshot shows them before the
+    /// MemTable's rows. Empty unless `flush_running`.
+    pub(crate) flushing: MemTable,
+    /// A flush took `flushing` and has not installed its chunks (or given the
+    /// rows back) yet. At most one at a time; `Table::flush_cv` announces its end.
+    pub(crate) flush_running: bool,
     pub(crate) series: SeriesIndex,
     /// Bumped whenever MemTable rows move into chunks or vanish.
     pub(crate) mem_generation: u64,
@@ -209,6 +216,21 @@ impl Inner {
                 ));
             }
         }
+    }
+
+    /// Rows not yet in chunks: the MemTable and the ones being flushed.
+    pub(crate) fn mem_len(&self) -> usize {
+        self.memtable.len() + self.flushing.len()
+    }
+
+    pub(crate) fn mem_bytes(&self) -> usize {
+        self.memtable.bytes() + self.flushing.bytes()
+    }
+
+    /// [`MemTable::visit_range`] over the rows being flushed and the MemTable.
+    pub(crate) fn visit_mem_range(&self, schema: &Schema, lo: i64, hi: i64, mut visit: impl FnMut(&MemRow)) {
+        self.flushing.visit_range(schema, lo, hi, &mut visit);
+        self.memtable.visit_range(schema, lo, hi, visit);
     }
 
     pub(crate) fn check_writable(&self) -> Result<()> {
@@ -374,6 +396,9 @@ pub struct Table {
     /// Size of the last committed (unspilled) batch: `rows << 32 | series`. The
     /// next batch reserves that much up front instead of growing its buffers.
     pub(crate) batch_hint: AtomicU64,
+    /// Signalled (with `inner`) when a flush ends; whoever needs the MemTable
+    /// to be the only place with uncommitted-to-chunk rows waits on it.
+    flush_cv: Condvar,
     /// Deletes of this table run one at a time (see `delete`); held outside
     /// the table mutex.
     pub(crate) del_gate: Mutex<()>,
@@ -415,6 +440,54 @@ struct GroupSync {
     failed: bool,
     /// fsyncs issued by `wait_durable` (tests count them).
     fsyncs: u64,
+}
+
+fn warn_flush(e: &Error) {
+    warn(&format!("MemTable flush failed, will retry: {e}"));
+}
+
+// Test hook: runs on the thread of a flush after its chunks are written and
+// fsynced and before they are installed; an `Err` makes the flush fail there.
+#[cfg(test)]
+pub(crate) type FlushHook = Box<dyn Fn() -> Result<()>>;
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FLUSH_HOOK: std::cell::RefCell<Option<FlushHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// A flush between its two critical sections: it owns the rows it took out of
+/// the MemTable and, unless it installs them, gives them back when dropped
+/// (error or panic), so the rows are never lost nor left invisible.
+pub(crate) struct FlushJob<'a> {
+    table: &'a Table,
+    /// The rows being sealed (shares the segments of `Inner::flushing`).
+    snap: MemSnapshot,
+    series: SeriesSnapshot,
+    /// Last WAL segment holding rows of `snap`.
+    covered: u64,
+    /// Oldest segment an open batch had logged rows in when the rows were taken.
+    pin: Option<u64>,
+    /// Chunk files written and not yet handed to the MANIFEST: discarded if
+    /// the job is dropped before the install (error or panic).
+    written: Vec<ChunkMeta>,
+    done: bool,
+}
+
+impl Drop for FlushJob<'_> {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        self.written.iter().for_each(|m| m.file.mark_obsolete());
+        // A poisoned mutex means a panic left the state half-updated; the table is unusable then.
+        if let Ok(mut inner) = self.table.inner.lock() {
+            let older = std::mem::take(&mut inner.flushing);
+            inner.memtable.prepend(older);
+            inner.flush_running = false;
+        }
+        self.table.flush_cv.notify_all();
+    }
 }
 
 /// Deletes WAL segments `<= upto`, logging (not failing) on errors: leftover
@@ -852,6 +925,8 @@ impl Table {
                 chunks,
                 wal,
                 memtable,
+                flushing: MemTable::default(),
+                flush_running: false,
                 series,
                 mem_generation: 0,
                 version: 0,
@@ -875,6 +950,7 @@ impl Table {
             last_retention: AtomicI64::new(crate::time::now_micros() / crate::time::MICROS_PER_SEC),
             queued: AtomicBool::new(false),
             claims_cv: Condvar::new(),
+            flush_cv: Condvar::new(),
             batch_hint: AtomicU64::new(0),
             del_gate: Mutex::new(()),
             group: Mutex::new(GroupSync::default()),
@@ -923,14 +999,11 @@ impl Table {
         }
         let tags = row_tags(&self.schema, &row);
 
-        let mut guard = self.lock()?;
+        let limit = usize::try_from(self.config.opts.memtable_size_bytes).unwrap_or(usize::MAX);
+        let guard = self.lock()?;
+        let mut guard = self.make_room(guard, limit)?;
         let inner = &mut *guard;
         inner.check_writable()?;
-        let limit = usize::try_from(self.config.opts.memtable_size_bytes).unwrap_or(usize::MAX);
-        if inner.memtable.bytes() >= limit.saturating_mul(2) {
-            // Flushes have been failing; refuse new rows rather than grow without bound.
-            self.flush_locked(inner).map_err(|e| Error::Full(format!("MemTable is full and flushing failed: {e}")))?;
-        }
         if let Err(e) = inner.wal.append(&payload) {
             // Only a failed I/O leaves the segment in an unknown state.
             if !matches!(e, Error::InvalidArg(_)) {
@@ -941,22 +1014,67 @@ impl Table {
         let sid = inner.series.get_or_insert(&tags);
         inner.memtable.push(self.schema.row_ts(&row), sid, row);
         inner.changed();
-        if inner.memtable.bytes() >= limit {
-            // The row is already safe in the WAL, so a failed flush must not fail
-            // the write; it is retried on the next write.
-            if let Err(e) = self.flush_locked(inner) {
-                warn(&format!("MemTable flush failed, will retry: {e}"));
+        // The row is already safe in the WAL, so a failed flush must not fail
+        // the write; it is retried on the next write.
+        let job = if inner.memtable.bytes() >= limit { self.begin_flush(inner).unwrap_or_else(|e| { warn_flush(&e); None }) } else { None };
+        drop(guard);
+        if let Some(job) = job {
+            if let Err(e) = self.run_flush(job) {
+                warn_flush(&e);
             }
         }
         Ok(())
+    }
+
+    /// Backpressure: while the rows not yet in chunks (MemTable plus the ones
+    /// being flushed) are at twice the limit, waits for the running flush or
+    /// runs one (flushes have been failing, or writers outrun them). Returns the
+    /// guard of a later acquisition of the mutex: the caller must check again
+    /// whatever it checked before.
+    pub(crate) fn make_room<'a>(&'a self, mut guard: MutexGuard<'a, Inner>, limit: usize) -> Result<MutexGuard<'a, Inner>> {
+        let full = |e: Error| Error::Full(format!("MemTable is full and flushing failed: {e}"));
+        loop {
+            guard.check_writable()?;
+            if guard.mem_bytes() < limit.saturating_mul(2) {
+                return Ok(guard);
+            }
+            if guard.flush_running {
+                guard = self.wait_flush(guard)?;
+                continue;
+            }
+            let job = self.begin_flush(&mut guard).map_err(full)?;
+            drop(guard);
+            if let Some(job) = job {
+                self.run_flush(job).map_err(full)?;
+            }
+            guard = self.lock()?;
+        }
+    }
+
+    fn wait_flush<'a>(&'a self, guard: MutexGuard<'a, Inner>) -> Result<MutexGuard<'a, Inner>> {
+        self.flush_cv
+            .wait(guard)
+            .map_err(|_| Error::ReadOnly("table must be reopened: a thread panicked while holding the table state".into()))
+    }
+
+    /// [`Table::lock`] once no flush is running: for operations that change or
+    /// drop the MemTable's rows (DELETE, TRUNCATE...) and so cannot share them
+    /// with a flush that is sealing them. The wait releases the mutex; whatever
+    /// the caller read before must be validated again after this returns.
+    pub(crate) fn lock_idle(&self) -> Result<MutexGuard<'_, Inner>> {
+        let mut guard = self.lock()?;
+        while guard.flush_running {
+            guard = self.wait_flush(guard)?;
+        }
+        Ok(guard)
     }
 
     /// Statement-end hook: pushes buffered WAL entries to the OS and, if
     /// `durable`, to stable storage.
     pub fn sync_wal(&self, durable: bool) -> Result<()> {
         let mut guard = self.lock()?;
+        guard.check_writable()?;
         let inner = &mut *guard;
-        inner.check_writable()?;
         if let Err(e) = inner.wal.sync(durable) {
             // Never report success on a retry: the data may not have reached the disk.
             inner.poison(format!("WAL sync failed: {e}"));
@@ -996,9 +1114,9 @@ impl Table {
             guard.check_writable()?;
             guard.wal.sync_point()?
         };
-        // If the segment of `target` was rotated meanwhile, every rotation
-        // fsyncs it first (or a TRUNCATE made its rows irrelevant); syncing the
-        // current segment is merely redundant then.
+        // Every rotation fsyncs the old segment before the new one exists
+        // (flush, collect), or a TRUNCATE made its rows irrelevant; syncing the
+        // current segment is merely redundant for a target in an older one.
         if let Err(e) = crate::fsutil::sync_data(&handle) {
             if let Ok(mut guard) = self.lock() {
                 guard.wal.mark_failed();
@@ -1017,83 +1135,198 @@ impl Table {
         self.group.lock().unwrap().fsyncs
     }
 
-    /// Seals the MemTable into chunks (one per time bucket).
+    /// Seals the MemTable into chunks (one per time bucket). Waits for a flush
+    /// already running, then flushes what is left; returns when the rows that
+    /// were in the MemTable on entry are in chunks.
     pub fn flush(&self) -> Result<()> {
-        let mut guard = self.lock()?;
-        let inner = &mut *guard;
-        inner.check_writable()?;
-        self.flush_locked(inner)
+        let mut guard = self.lock_idle()?;
+        let job = self.begin_flush(&mut guard)?;
+        drop(guard);
+        match job {
+            Some(job) => self.run_flush(job),
+            None => Ok(()),
+        }
     }
 
-    pub(crate) fn flush_locked(&self, inner: &mut Inner) -> Result<()> {
+    /// First critical section of a flush (table mutex held): moves the MemTable's
+    /// rows to `Inner::flushing` (O(1); they stay visible) and starts a new WAL
+    /// segment, so that every row taken is committed in a segment `<= covered`
+    /// and everything committed from now on lands in a later one. `None` when a
+    /// flush is already running, or when the MemTable is empty (then the WAL is
+    /// merely collected). The caller must call [`Table::run_flush`] on the job
+    /// after releasing the mutex.
+    pub(crate) fn begin_flush(&self, inner: &mut Inner) -> Result<Option<FlushJob<'_>>> {
+        inner.check_writable()?;
+        if inner.flush_running {
+            return Ok(None);
+        }
         if inner.memtable.is_empty() {
             // Nothing to seal, but the WAL may hold only dead entries
             // (spilled or aborted batches): FLUSH TABLES / OPTIMIZE collect them.
-            return self.collect_wal_locked(inner);
+            self.collect_wal_locked(inner)?;
+            return Ok(None);
         }
         let dir = &self.config.dir;
-        let opts = &self.config.opts;
         let covered = inner.wal.seq();
         let after_covered = succ(covered)?;
+        // The old segment must be durable before any entry exists in the next one:
+        // a COMMIT there may refer to rows logged here, and a torn tail followed
+        // by a newer segment is corruption at replay. One fsync per flush.
         if let Err(e) = inner.wal.sync(true) {
             inner.poison(format!("WAL sync failed: {e}"));
             return Err(e);
         }
+        // Nothing has changed if this fails (unlike a rotation after the MANIFEST switch).
+        let created = Wal::create(dir, after_covered, self.config.opts.encryption_key_id);
+        let fresh = match created {
+            Ok(w) => w,
+            Err(e) => {
+                if is_fsync_error(&e) {
+                    inner.poison(format!("cannot create WAL segment: {e}"));
+                } else if !matches!(&e, Error::Io(io) if io.kind() == std::io::ErrorKind::AlreadyExists) {
+                    // A failure after the file was created (directory fsync...) would
+                    // make every retry fail with AlreadyExists.
+                    let _ = remove_if_exists(&segment_path(dir, after_covered));
+                }
+                return Err(e);
+            }
+        };
+        inner.wal = fresh;
+        inner.flushing = inner.memtable.take();
+        inner.flush_running = true;
+        // The view (the rows taken, then the MemTable's) shows the same rows in
+        // the same order as before: ordinals and cached snapshots stay valid.
+        let snap = inner.flushing.snapshot(inner.mem_generation);
+        Ok(Some(FlushJob {
+            table: self,
+            snap,
+            series: inner.series.snapshot(),
+            covered,
+            pin: inner.oldest_pin(),
+            written: Vec::new(),
+            done: false,
+        }))
+    }
+
+    /// Second part of a flush, without the table mutex: fsync the rotated-away
+    /// segments, group, encode, write and fsync the chunks (`.tmp`, fsync,
+    /// rename, `sync_dir`); then, under the mutex again, switch the MANIFEST
+    /// (the commit point), list the chunks and drop the rows taken. On any
+    /// error the chunks written are discarded and the rows go back to the MemTable.
+    pub(crate) fn run_flush(&self, job: FlushJob<'_>) -> Result<()> {
+        // Writers outran the flush: the MemTable is already over the limit
+        // again. One more flush at most, so this statement's latency stays
+        // bounded (and DELETE/TRUNCATE get their turn); the next write over the
+        // limit starts the one after.
+        if let Some(job) = self.run_flush_once(job, true)? {
+            if let Err(e) = self.run_flush_once(job, false) {
+                warn_flush(&e);
+            }
+        }
+        Ok(())
+    }
+
+    fn run_flush_once<'a>(&'a self, mut job: FlushJob<'a>, chain: bool) -> Result<Option<FlushJob<'a>>> {
+        let dir = &self.config.dir;
+        let opts = &self.config.opts;
+        let limit = usize::try_from(opts.memtable_size_bytes).unwrap_or(usize::MAX);
         let now = crate::time::now_micros();
 
-        let mut written: Vec<ChunkMeta> = Vec::new();
-        let mut next_id = inner.manifest.next_chunk_id;
+        // Plan: which chunks the rows make (and so how many ids they need).
+        let groups = job.snap.group(&self.schema, |ts| opts.chunk_interval.bucket(ts));
+        struct Planned<'a> {
+            sid: u64,
+            tags: Arc<[Value]>,
+            parts: Vec<&'a [&'a Row]>,
+        }
+        let mut plan: Vec<((i64, i64), Vec<Planned<'_>>)> = Vec::with_capacity(groups.len());
+        let mut total_ids = 0u64;
+        for (bucket, series) in &groups {
+            let mut planned = Vec::with_capacity(series.len());
+            let mut need = 0u64;
+            for (sid, rows) in series {
+                let tags = job.series.get_by_id(*sid).ok_or_else(|| corrupt(format!("unknown series {sid}")))?;
+                // A series too big for one column block goes to several
+                // chunks of the bucket, as compaction does.
+                let parts = split_series(rows);
+                need = need.max(parts.len() as u64);
+                planned.push(Planned { sid: *sid, tags, parts });
+            }
+            total_ids = total_ids
+                .checked_add(need)
+                .ok_or_else(|| corrupt("chunk ids are exhausted (the MANIFEST holds an implausible next_chunk_id)"))?;
+            plan.push((*bucket, planned));
+        }
+        let mut next_id = {
+            let mut inner = self.lock()?;
+            inner.check_writable()?;
+            // Ids burnt by a failure are harmless (as for compaction).
+            inner.reserve_chunk_ids(total_ids)?
+        };
+
         let result = (|| -> Result<()> {
-            let groups = inner.memtable.group(&self.schema, |ts| opts.chunk_interval.bucket(ts));
-            for (bucket, series) in &groups {
-                let mut parts = Vec::with_capacity(series.len());
-                for (sid, rows) in series {
-                    let tags = inner.series.tags(*sid).ok_or_else(|| corrupt(format!("unknown series {sid}")))?;
-                    // A series too big for one column block goes to several
-                    // chunks of the bucket, as compaction does.
-                    parts.push(SeriesParts { series_id: *sid, tags, parts: split_series(rows) });
-                }
+            for (bucket, planned) in &plan {
+                let parts: Vec<SeriesParts> = planned
+                    .iter()
+                    .map(|p| SeriesParts { series_id: p.sid, tags: &p.tags[..], parts: p.parts.clone() })
+                    .collect();
                 let n = chunks_needed(&parts) as u64;
-                let after = next_id.checked_add(n).ok_or_else(|| {
-                    corrupt("chunk ids are exhausted (the MANIFEST holds an implausible next_chunk_id)")
-                })?;
                 let codec = opts.codec_for(bucket.1, now);
-                let key = opts.encryption_key_id;
-                write_bucket(&self.schema, codec, key, dir, *bucket, &parts, next_id, covered, &mut written)?;
-                next_id = after;
+                write_bucket(&self.schema, codec, opts.encryption_key_id, dir, *bucket, &parts, next_id, job.covered, &mut job.written)?;
+                next_id += n;
             }
             sync_dir(dir)
         })();
+        #[cfg(test)]
+        let result = result.and_then(|()| FLUSH_HOOK.with(|h| h.borrow().as_ref().map_or(Ok(()), |f| f())));
         if let Err(e) = result {
-            for m in &written {
-                m.file.mark_obsolete();
-            }
             if is_fsync_error(&e) {
-                inner.poison(format!("fsync of a new chunk failed: {e}"));
+                if let Ok(mut inner) = self.lock() {
+                    inner.poison(format!("fsync of a new chunk failed: {e}"));
+                }
             }
             return Err(e);
         }
+        let chunks_new: Vec<Arc<ChunkMeta>> = std::mem::take(&mut job.written).into_iter().map(Arc::new).collect();
 
-        // A batch that logged rows before this flush but has not committed
-        // yet will put its COMMIT after the flush point: replay must still
-        // reach its first row.
-        let replay_seq = inner.oldest_pin().map_or(after_covered, |s| s.min(after_covered));
+        // Install.
+        let mut guard = match self.lock().and_then(|g| g.check_writable().map(|()| g)) {
+            Ok(g) => g,
+            Err(e) => {
+                chunks_new.iter().for_each(|m| m.file.mark_obsolete());
+                return Err(e);
+            }
+        };
+        let inner = &mut *guard;
+        let covered = job.covered;
+        let after_covered = succ(covered)?;
+        // A batch that logged rows before the rows were taken and committed (or
+        // not) since has its rows in an older segment and its COMMIT after the
+        // flush point: replay must still reach its first row. Batches that
+        // began later log in segments after `covered`.
+        let replay_seq = job.pin.map_or(after_covered, |s| s.min(after_covered));
         inner.flag_laggards(dir, covered);
-        // The new chunks are born now: every delete so far is already applied to
-        // the MemTable rows they hold (`publish` stamps them with the sequence).
+        // The new chunks are born now: no delete ran since the rows were taken
+        // (DELETE waits for the flush), and earlier ones are applied to those rows.
         let mut chunks = inner.chunks.clone();
-        chunks.extend(written.into_iter().map(Arc::new));
+        chunks.extend(chunks_new.iter().cloned());
         let tombs = (*inner.tombs).clone();
+        // On failure the files are neither listed nor deleted: recovery decides
+        // (as in compaction); the rows return to the MemTable through `job`.
         inner.publish(dir, chunks, tombs, |m| {
             m.wal_seq = covered;
             m.replay_seq = replay_seq;
-            m.next_chunk_id = next_id;
         })?;
-        inner.memtable.clear();
+        inner.flushing = MemTable::default();
+        inner.flush_running = false;
         inner.mem_generation += 1;
-        inner.rotate_wal(dir, opts.encryption_key_id)?;
+        inner.changed();
+        job.done = true;
+        let next = if chain && inner.memtable.bytes() >= limit { self.begin_flush(inner).unwrap_or_else(|e| { warn_flush(&e); None }) } else { None };
+        drop(guard);
+        self.flush_cv.notify_all();
         delete_wal_upto(dir, replay_seq.saturating_sub(1));
-        Ok(())
+        Ok(next)
     }
 
     /// Checkpoint without a flush: with an empty MemTable every committed row
@@ -1106,7 +1339,8 @@ impl Table {
     /// MANIFEST, so a failure to create it changes nothing and does not
     /// poison the table.
     pub(crate) fn collect_wal_locked(&self, inner: &mut Inner) -> Result<()> {
-        if !inner.memtable.is_empty() {
+        // Rows being flushed are in no chunk yet: the log still holds them.
+        if !inner.memtable.is_empty() || inner.flush_running {
             return Ok(());
         }
         let dir = &self.config.dir;
@@ -1146,7 +1380,7 @@ impl Table {
 
     /// Removes every row. Crash-safe: the MANIFEST switch is the commit point.
     pub fn truncate(&self) -> Result<()> {
-        let mut guard = self.lock()?;
+        let mut guard = self.lock_idle()?;
         let inner = &mut *guard;
         inner.check_writable()?;
         let dir = &self.config.dir;
@@ -1203,7 +1437,9 @@ impl Table {
         if let Some(s) = &inner.snapshot_cache {
             return s.clone();
         }
-        let mem = inner.memtable.snapshot(inner.mem_generation);
+        // Rows being flushed are older than the MemTable's and not in any chunk yet.
+        let mut mem = inner.flushing.snapshot(inner.mem_generation);
+        mem.extend(inner.memtable.snapshot(inner.mem_generation));
         let s = Arc::new(Snapshot {
             schema: self.schema.clone(),
             chunks: inner.chunks.clone(),
@@ -1308,7 +1544,7 @@ impl Table {
         let inner = self.lock()?;
         let mut s = TableStats {
             chunk_count: inner.chunks.len() as u32,
-            memtable_rows: inner.memtable.len() as u64,
+            memtable_rows: inner.mem_len() as u64,
             series_count: inner.series.len() as u64,
             series_bytes: inner.series.bytes() as u64,
             unique_bytes: inner.uniq.bytes() as u64,
@@ -1321,7 +1557,7 @@ impl Table {
         }
         s.row_count = s.row_count.saturating_sub(inner.tombs.dead_total());
         s.row_count += s.memtable_rows;
-        s.data_bytes += inner.memtable.bytes() as u64;
+        s.data_bytes += inner.mem_bytes() as u64;
         Ok(s)
     }
 
@@ -1338,7 +1574,7 @@ impl Table {
             let overlap = (hi.min(cmax) as i128 - lo.max(cmin) as i128 + 1).clamp(1, span);
             total += ((c.header.row_count as i128 * overlap / span) as u64).max(1);
         }
-        total += inner.memtable.estimate_in_range(lo, hi);
+        total += inner.flushing.estimate_in_range(lo, hi) + inner.memtable.estimate_in_range(lo, hi);
         Ok(total)
     }
 

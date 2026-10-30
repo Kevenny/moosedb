@@ -153,7 +153,7 @@ impl Table {
         let (chunks, tombs, in_mem) = {
             let guard = self.lock()?;
             let mut n = 0u64;
-            guard.memtable.visit_range(&self.schema, lo, hi, |r| n += u64::from(sel.contains(r.series_id)));
+            guard.visit_mem_range(&self.schema, lo, hi, |r| n += u64::from(sel.contains(r.series_id)));
             (guard.chunks.clone(), guard.tombs.clone(), n)
         };
         let hits = count_hits(&self.schema, &chunks, &tombs, &sel, lo, hi)?;
@@ -194,7 +194,8 @@ impl Table {
             let hits = count_hits(&self.schema, &chunks, &tombs, &sel, lo, hi)?;
             // Only the table may hold the tombstone set while the delete adds to it (copy-on-write).
             drop((chunks, tombs));
-            let mut guard = self.lock()?;
+            // Idle: the delete edits the MemTable's rows, which a flush may be sealing.
+            let mut guard = self.lock_idle()?;
             let inner = &mut *guard;
             inner.check_writable()?;
             if inner.layout_gen != gen || inner.epoch != epoch {
@@ -203,7 +204,7 @@ impl Table {
             return self.commit_range_delete(inner, sel, lo, hi, hits, max_rows, durable);
         }
         // Writers keep reshaping the chunks: count under the mutex.
-        let mut guard = self.lock()?;
+        let mut guard = self.lock_idle()?;
         let inner = &mut *guard;
         inner.check_writable()?;
         let hits = count_hits(&self.schema, &inner.chunks, &inner.tombs, &sel, lo, hi)?;
@@ -321,7 +322,7 @@ impl Table {
             let found: Vec<Vec<(u64, u32, u32)>>;
             if last {
                 drop((chunks, tombs));
-                guard = self.lock()?;
+                guard = self.lock_idle()?;
                 guard.check_writable()?;
                 let sids2: Vec<Option<u64>> = groups.iter().map(|x| guard.series.lookup(&x.tags)).collect();
                 found = groups
@@ -336,7 +337,7 @@ impl Table {
                     .map(|(g, s)| self.locate(&chunks, &tombs, *s, g.ts, &g.row, g.k, &want))
                     .collect::<Result<_>>()?;
                 drop((chunks, tombs));
-                guard = self.lock()?;
+                guard = self.lock_idle()?;
                 guard.check_writable()?;
                 if guard.layout_gen != gen || guard.epoch != epoch {
                     continue;

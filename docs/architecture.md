@@ -228,10 +228,12 @@ Garantias e escolhas:
   (read-only, sticky). O statement e todos os seguintes recebem erro, e as
   linhas podem ficar visíveis até a reabertura, que reconstrói a partir do
   disco.
-* **Troca de segmento.** Antes de trocar de segmento, toda rotação
-  (flush/checkpoint) faz fsync do segmento antigo sob o mutex da tabela, então
-  um alvo de segmento antigo está coberto. `truncate` descarta as linhas pelo
-  MANIFEST.
+* **Troca de segmento.** Toda rotação (flush, checkpoint) faz fsync do
+  segmento antigo, sob o mutex da tabela, **antes** de o novo existir: um alvo
+  de segmento antigo está coberto, nenhum COMMIT do segmento novo fica durável
+  antes das linhas do lote que ele referencia no antigo, e uma cauda rasgada
+  nunca fica seguida de segmento mais novo. Isso custa 1 fsync por flush sob
+  o mutex (o resto do flush, não). `truncate` descarta as linhas pelo MANIFEST.
 * **O que fica de fora.** O DELETE continua fazendo fsync sob o mutex: o
   delete só é aplicado em memória depois do fsync. O modo `write` não muda.
 
@@ -261,6 +263,81 @@ journal. Numa área já escrita custa ~0,69 ms (medido no lab, 2026-10-28).
   ele recusa abrir. Antes de voltar de versão, faça um shutdown limpo e um
   `FLUSH TABLES` (o checkpoint apaga os segmentos antigos), ou trunque cada
   segmento ao fim lógico.
+
+### Flush fora do mutex
+
+O flush (agrupar, codificar, comprimir, gravar e fazer fsync dos chunks) não
+roda mais sob o mutex da tabela; antes, leitores e escritores ficavam parados
+durante todo o flush (p95 de leitura de ~25 ms para 69–148 ms sob ingestão
+máxima). Há no máximo **um flush por vez** (`Inner::flush_running`), em três
+tempos, feitos pela sessão cujo commit encheu a MemTable (`bytes >= limite`),
+ou por `Table::flush`:
+
+1. **`begin_flush`, sob o mutex (O(1) + a criação do segmento de WAL).** Cria o
+   segmento de WAL seguinte depois de fazer fsync do atual (se falhar, nada
+   mudou: um arquivo criado pela metade é removido), troca `inner.wal`,
+   move a MemTable inteira para `inner.flushing` (`MemTable::take`: segmentos
+   `Arc` imutáveis, sem cópia) e anota `covered` (último segmento com linhas
+   tomadas), `pin` (`oldest_pin()`) e um snapshot das séries. As linhas
+   **continuam visíveis**: `snapshot_locked` compõe a visão de memória como
+   segmentos de `flushing` + MemTable atual, que é a mesma sequência de antes
+   da troca (ordinais, `Position` e o snapshot em cache continuam válidos, sem
+   bump de `mem_generation`). Tudo que usa `snap.mem` (scans, agregação,
+   `existing_extras` do UNIQUE) vê cada linha exatamente uma vez.
+2. **`run_flush`, sem mutex.** Agrupa o
+   snapshot; reserva de uma vez os ids de chunk (`reserve_chunk_ids`, mutex por
+   instantes); grava cada chunk (`.tmp` → fsync → rename) e `sync_dir`.
+3. **Instalação, sob o mutex.** `publish`: **troca atômica do MANIFEST** (ponto
+   de commit) com `wal_seq = covered` e `replay_seq = min(pin, covered + 1)`;
+   só então memória: chunks novos na lista, `flushing` vazio,
+   `mem_generation += 1`. Se a MemTable já passou do limite, o próximo flush
+   começa em seguida (`begin_flush` sob o mesmo mutex). Segmentos de WAL
+   `< replay_seq` são apagados depois de soltar o mutex. Acorda `flush_cv`.
+
+Invariantes e como se mantêm:
+
+* **O protocolo não muda:** chunk em `.tmp` → fsync → rename → MANIFEST →
+  obsoleto só some com o último snapshot (`ChunkFile::drop`). Um chunk gravado
+  e não instalado (erro, queda) é órfão: marcado obsoleto na falha, apagado na
+  recuperação se houve queda. O snapshot de quem já leu `flushing` segura os
+  segmentos; o de quem lê depois vê os chunks novos e nenhum `flushing`, pois
+  a instalação é um único passo sob o mutex.
+* **Rotação do WAL no início, não no fim.** Commits que chegam durante o flush
+  caem num segmento `> covered`; se a rotação fosse só na instalação eles
+  ficariam em segmento `<= wal_seq` e a recuperação os descartaria como já
+  selados. Pelo mesmo motivo `replay_seq` usa o `pin` de **quando as linhas
+  foram tomadas**: um lote aberto nesse instante que commita durante o flush
+  tem as linhas num segmento antigo e o COMMIT num novo (`> wal_seq`, logo
+  aplicado), e o segmento antigo não pode ser retirado (testado).
+* **Falha no meio** (erro de gravação, fsync de chunk, falha ao trocar o
+  MANIFEST, ou panic): `FlushJob::drop` devolve `flushing` à frente da MemTable
+  (`MemTable::prepend`, mesma ordem, mesmos ordinais, nada perdido nem
+  duplicado), limpa `flush_running` e acorda quem espera. Chunks gravados são
+  marcados obsoletos, também em panic (fsync falho continua envenenando a tabela; falha da troca
+  do MANIFEST também, e seus arquivos ficam para a recuperação decidir).
+* **Quem espera o flush** (`Table::lock_idle`, `Condvar` sobre o mesmo mutex,
+  sem segurá-lo): `delete_range`/`delete_rows` (reescrevem linhas da MemTable e
+  carimbam `born`: depois de acordar, o `layout_gen` mudou e o delete recalcula
+  os acertos nos chunks), `truncate`, `Table::flush` explícito (FLUSH TABLES,
+  OPTIMIZE) e o backpressure (`make_room`: `mem_bytes() >= 2 * limite`, contando
+  MemTable + `flushing`; sem flush rodando, a própria sessão faz o trabalho, sem
+  mutex, e devolve `Full` se falhar). `count_range`, `stats`, `estimate_rows` e
+  `inspect` somam `flushing` e não esperam. Compactação e retenção **não**
+  esperam: só mexem em chunks, e sempre publicaram sobre a lista de chunks
+  corrente (o flush também relê `inner.chunks` na instalação).
+* `collect_wal_locked` não faz nada com flush em curso (as linhas tomadas só
+  estão no WAL até a instalação).
+* **UNIQUE e lotes.** O estado UNIQUE (`UniqueState`, limites "complete",
+  `staged`) nunca foi tocado pelo flush (`note_chunk` só na abertura): o que o
+  lookup lê é `snap.mem` + chunks, e a composição acima mantém a linha em
+  `flushing` visível a `existing_extras`/`rows_at`. Lotes abertos/spill: o
+  `pin` e `replay_seq` acima; `collect_wal_locked` no commit de lote com spill
+  fica para o próximo flush se há um em curso; `flag_laggards` roda na
+  instalação.
+* Quem dispara o flush no commit faz o trabalho depois de soltar o mutex e
+  **antes** de esperar a durabilidade do próprio commit; os demais commits
+  seguem sem esperar. Custo que permanece sob o mutex no início: a criação do
+  segmento de WAL (3 fsync: o do segmento antigo e os 2 da criação do novo).
 
 ### Atomicidade por statement (lotes)
 
@@ -470,6 +547,10 @@ Segmento cifrado só com header não exige a chave no replay.
   no commit; leitores só seguram o mutex para
   pegar um **snapshot**: lista de chunks + segmentos congelados da MemTable
   (sem cópia). O snapshot é compartilhado enquanto a tabela não muda.
+* O flush de dados roda **fora** do mutex (§Flush fora do mutex): enquanto ele
+  grava os chunks, as linhas ficam em `Inner::flushing`, visíveis, e escritores
+  e leitores seguem. Só DELETE, TRUNCATE, flush explícito e o backpressure
+  (`2 x memtable_size_bytes`) esperam o flush em curso.
 * `position()` guarda o snapshot do scan; `rnd_pos()` resolve posições por
   ele. Por isso o filesort continua correto mesmo com flush/compactação
   concorrentes (testado em `concurrency.test` e `moosedb-tests`).
@@ -558,8 +639,15 @@ Segmento cifrado só com header não exige a chave no replay.
   `KEY_OR_NEXT/AFTER_KEY/KEY_OR_PREV/BEFORE_KEY`. Elas usam uma visão
   ordenada das séries (tuplas de tag ordenadas pela comparação da coluna —
   numérica para TAG inteira com ou sem sinal, collation para string —, séries
-  de tupla igual fundidas), reconstruída só quando a versão das séries muda
-  (O(S log S), fora do mutex da tabela; teto de 512 MiB de heap para todas as visões do processo, com estimativa conservadora e cobrança em dobro durante a construção; acima disso a leitura falha com erro). A versão comparada é `moosedb_series_version()`, o mesmo contador que `moosedb_series_list_version()` informa para a lista usada na construção, e `index_next/prev` passam à tupla
+  de tupla igual fundidas), refeita só quando a versão das séries muda. Ela é
+  feita de arrays planos (~25 bytes por série; ~35 bytes extras por série nova
+  durante a ordenação) e, quando a lista de séries só cresceu (mesma época),
+  a versão nova é a anterior fundida com as séries novas ordenadas
+  (O(N log N + S)); senão, O(S log S) do zero. As construções de uma tabela
+  são serializadas (quem espera reaproveita o resultado) e rodam fora do mutex
+  da tabela. Teto de 512 MiB de heap para todas as visões do processo
+  (~10 M séries); acima disso a leitura falha com erro em vez de devolver
+  ordem errada. A versão comparada é `moosedb_series_version()`, o mesmo contador que `moosedb_series_list_version()` informa para a lista usada na construção, e `index_next/prev` passam à tupla
   vizinha quando a atual acaba. **Cada tupla é lida num snapshot próprio** (não há um corte único no statement para leituras ordenadas que atravessam tuplas: linhas commitadas por outra sessão no meio podem aparecer só nas tuplas seguintes; cada tupla individualmente é consistente e atômica por statement). Se a tupla da
   chave existe (o caso comum: `MAX(clock)` de um item) a leitura não toca a
   visão ordenada. `index_flags(idx, parte, 1)` — a pergunta de `ORDER BY` /
@@ -691,7 +779,9 @@ Resultados (mesmo container, 5.000 itens × 7 d × 60 s; `lab/zabbix/README.md`)
 | `agg_hour` (ms) | 27,6 → 27,8 | 32,0 → 25,2 | 35,9 → 27,2 |
 | `agg_last` (ms) | 0,76 → 0,78 | 1,05 → 0,86 | 1,15 → 0,93 (0,75–0,85 em 15 repetições) |
 
-**O que sobrou.** (1) O flush ainda é síncrono, sob o mutex da tabela, no commit
+**O que sobrou.** (1) *(Superado: o flush agora roda fora do mutex, §Flush fora
+do mutex; a sessão que o dispara ainda paga o trabalho no próprio commit.)* O
+flush era síncrono, sob o mutex da tabela, no commit
 que enche a MemTable: ~19 % do tempo do statement, dos quais ZSTD de blocos
 pequenos (~570 B por série/coluna) é a maior parte e a liberação das 350 mil
 linhas (`Arc<Segment>::drop`) ~3 %. Escrever o flush de dados "frios por idade" com
@@ -1450,9 +1540,9 @@ scan não ordenado: só o commitado; o lote privado do statement é invisível).
   DESC, ns DESC LIMIT 1` (índice não único: o `ns` não está nele; com a PK `(itemid,clock,ns)` sai do índice sem sort, ver §Chave única) lê a faixa do item e ordena
   (≈ 1440 linhas/dia a 60 s): ~210 µs por item contra ~55 µs no InnoDB (PK com `ns`);
   a forma do frontend sem PK (`MAX(clock)` + `clock = X ORDER BY ns DESC LIMIT 1`)
-  fica em ~60 µs por item, incluindo o PREPARE/EXECUTE. A visão ordenada de tuplas (leituras `MIN/MAX(tag)`) é refeita quando
-  surge série nova e custa O(S log S); acima de 512 MiB a leitura falha com erro
-  em vez de devolver ordem errada. O estimador supõe séries de tamanho
+  fica em ~60 µs por item, incluindo o PREPARE/EXECUTE. A visão ordenada de tuplas (leituras `MIN/MAX(tag)`, `GROUP BY`/`DISTINCT`
+  pelo índice) é estendida quando surge série nova (O(N log N + S)); acima de
+  512 MiB (~10 M séries) a leitura falha com erro em vez de devolver ordem errada. O estimador supõe séries de tamanho
   parecido.
 * Eixo de tempo inteiro: só `INT`/`BIGINT` e só por `TIMESTAMP_COLUMN`; intervalo
   ±9223372036854 s (≈ ano 292277); `SMALLINT`/`MEDIUMINT`/`TINYINT` não são

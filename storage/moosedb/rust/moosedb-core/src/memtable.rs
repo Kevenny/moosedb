@@ -22,7 +22,8 @@ pub(crate) struct MemRow {
 /// next ones (it is built on first use, once, from the immutable rows).
 pub(crate) struct Segment {
     rows: Vec<MemRow>,
-    /// Row positions sorted by series id (stable, so ascending within a series).
+    /// Row positions sorted by (series id, timestamp), stable. Built with the
+    /// timestamp column of the table's schema: every caller passes the same.
     by_series: OnceLock<Option<Vec<u32>>>,
 }
 
@@ -38,25 +39,35 @@ impl Segment {
     /// a segment too short to be worth it or too long for `u32` positions: the
     /// caller walks its rows. 4 B per row whatever the number of series, so a
     /// batch spread over many series is indexed too.
-    fn index(&self) -> Option<&[u32]> {
+    fn index(&self, ts_index: usize) -> Option<&[u32]> {
         self.by_series
             .get_or_init(|| {
                 if self.rows.len() < MIN_INDEXED_ROWS || u32::try_from(self.rows.len()).is_err() {
                     return None;
                 }
                 let mut perm: Vec<u32> = (0..self.rows.len() as u32).collect();
-                perm.sort_by_key(|&i| self.rows[i as usize].series_id);
+                perm.sort_by_key(|&i| self.key(i, ts_index));
                 Some(perm)
             })
             .as_deref()
     }
 
-    /// Positions of the rows of `id`, via binary search on the index.
-    fn positions_of<'a>(&self, perm: &'a [u32], id: u64) -> &'a [u32] {
-        let sid = |i: u32| self.rows.get(i as usize).map_or(u64::MAX, |r| r.series_id);
-        let lo = perm.partition_point(|&i| sid(i) < id);
-        let hi = lo + perm[lo..].partition_point(|&i| sid(i) == id);
-        &perm[lo..hi]
+    /// Index order of row `i`: its series, then its timestamp.
+    fn key(&self, i: u32, ts_index: usize) -> (u64, i64) {
+        self.rows.get(i as usize).map_or((u64::MAX, i64::MAX), |r| {
+            let ts = match r.row.get(ts_index) {
+                Some(Value::Timestamp(t)) => *t,
+                _ => i64::MIN,
+            };
+            (r.series_id, ts)
+        })
+    }
+
+    /// Positions of the rows whose key is in `lo..=hi`, via binary search.
+    fn positions_of<'a>(&self, perm: &'a [u32], ts_index: usize, lo: (u64, i64), hi: (u64, i64)) -> &'a [u32] {
+        let a = perm.partition_point(|&i| self.key(i, ts_index) < lo);
+        let b = a + perm[a..].partition_point(|&i| self.key(i, ts_index) <= hi);
+        &perm[a..b]
     }
 }
 
@@ -147,17 +158,34 @@ impl MemSnapshot {
         self.segments.len()
     }
 
+    /// Appends the segments of `newer`: the rows of `self` keep their ordinals
+    /// and the rows of `newer` follow them.
+    pub(crate) fn extend(&mut self, newer: MemSnapshot) {
+        self.segments.extend(newer.segments);
+    }
+
+    /// [`MemTable::group`] over the rows of this view (used by a flush that
+    /// runs outside the table mutex on segments it owns).
+    pub(crate) fn group(
+        &self,
+        schema: &Schema,
+        bucket: impl Fn(i64) -> (i64, i64),
+    ) -> BTreeMap<(i64, i64), BTreeMap<u64, Vec<&Row>>> {
+        group_rows(self.segments.iter().flat_map(|s| s.rows.iter()), schema, bucket)
+    }
+
     /// `(ordinal, row)` of the rows of the given series, in no particular
     /// order. O(wanted series x segments + matching rows), not O(rows): the
     /// first call on a segment indexes it, later scans reuse the index.
-    pub(crate) fn rows_of_series(&self, ids: &HashSet<u64>) -> Vec<(u64, &MemRow)> {
+    /// `ts_index` is the timestamp column of the table's schema.
+    pub(crate) fn rows_of_series(&self, ids: &HashSet<u64>, ts_index: usize) -> Vec<(u64, &MemRow)> {
         let mut out = Vec::new();
         let mut base = 0u64;
         for seg in &self.segments {
-            match seg.index() {
+            match seg.index(ts_index) {
                 Some(perm) => {
                     for &id in ids {
-                        for &i in seg.positions_of(perm, id) {
+                        for &i in seg.positions_of(perm, ts_index, (id, i64::MIN), (id, i64::MAX)) {
                             if let Some(r) = seg.rows.get(i as usize) {
                                 out.push((base + u64::from(i), r));
                             }
@@ -173,6 +201,25 @@ impl MemSnapshot {
                 }
             }
             base += seg.rows.len() as u64;
+        }
+        out
+    }
+
+    /// The rows of series `id` at exactly `ts`: O(segments x log rows) on
+    /// indexed segments, not O(rows of the series) as with rows_of_series().
+    pub(crate) fn rows_at(&self, id: u64, ts: i64, ts_index: usize) -> Vec<&MemRow> {
+        let mut out = Vec::new();
+        for seg in &self.segments {
+            match seg.index(ts_index) {
+                Some(perm) => {
+                    for &i in seg.positions_of(perm, ts_index, (id, ts), (id, ts)) {
+                        out.extend(seg.rows.get(i as usize));
+                    }
+                }
+                None => out.extend(seg.rows.iter().filter(|r| {
+                    r.series_id == id && matches!(r.row.get(ts_index), Some(Value::Timestamp(t)) if *t == ts)
+                })),
+            }
         }
         out
     }
@@ -256,6 +303,26 @@ impl MemTable {
 
     pub(crate) fn clear(&mut self) {
         *self = MemTable::default();
+    }
+
+    /// Moves every row out (O(1), segments are shared), leaving this empty.
+    /// The result is fully frozen.
+    pub(crate) fn take(&mut self) -> MemTable {
+        self.freeze_active();
+        mem::take(self)
+    }
+
+    /// Puts `older` (what `take` returned earlier) back in front of the rows
+    /// that arrived since: the arrival order, and so every ordinal, is the
+    /// one rows had before the `take`.
+    pub(crate) fn prepend(&mut self, mut older: MemTable) {
+        older.freeze_active();
+        older.frozen.append(&mut self.frozen);
+        older.frozen_stats.append(&mut self.frozen_stats);
+        self.frozen = older.frozen;
+        self.frozen_stats = older.frozen_stats;
+        self.len += older.len;
+        self.bytes += older.bytes;
     }
 
     fn rows(&self) -> impl Iterator<Item = &MemRow> + Clone {
@@ -387,16 +454,6 @@ impl MemTable {
         }
         removed
     }
-
-    /// Groups rows by `bucket(ts)` and then by series, each series sorted by
-    /// timestamp (stable, so equal timestamps keep arrival order).
-    pub(crate) fn group(
-        &self,
-        schema: &Schema,
-        bucket: impl Fn(i64) -> (i64, i64),
-    ) -> BTreeMap<(i64, i64), BTreeMap<u64, Vec<&Row>>> {
-        group_rows(self.rows(), schema, bucket)
-    }
 }
 
 /// Groups rows by `bucket(ts)` and then by `series_id`, each series sorted by
@@ -481,6 +538,24 @@ mod tests {
     }
 
     #[test]
+    fn take_and_prepend_keep_arrival_order() {
+        let mut m = MemTable::default();
+        m.push(1, 1, row(1));
+        m.push(2, 1, row(2));
+        let mut older = m.take();
+        assert!(m.is_empty());
+        m.push(3, 1, row(3));
+        let mut view = older.snapshot(0);
+        view.extend(m.snapshot(0));
+        assert_eq!(view.len(), 3);
+        assert_eq!(view.get(2).unwrap().row, row(3));
+        m.prepend(older);
+        assert_eq!((m.len(), m.estimate_in_range(i64::MIN, i64::MAX)), (3, 3));
+        let s = m.snapshot(0);
+        assert_eq!((0..3).map(|i| s.get(i).unwrap().row.clone()).collect::<Vec<_>>(), vec![row(1), row(2), row(3)]);
+    }
+
+    #[test]
     fn snapshots_are_stable_and_share_segments() {
         let mut m = MemTable::default();
         m.push(1, 1, row(1));
@@ -520,13 +595,29 @@ mod tests {
             (0..1000).rev().map(|i| MemRow { series_id: if i % 100 == 0 { 7 } else { i as u64 }, row: row(i) }).collect();
         m.append(batch, 0, 0, 999);
         let s = m.snapshot(0);
-        assert!(s.segments.iter().any(|seg| seg.index().is_some()), "batch spread over many series is indexed");
+        assert!(s.segments.iter().any(|seg| seg.index(0).is_some()), "batch spread over many series is indexed");
         let ids: HashSet<u64> = [7, 1, 999, 5000].into_iter().collect();
-        let mut got: Vec<u64> = s.rows_of_series(&ids).into_iter().map(|(o, _)| o).collect();
+        let mut got: Vec<u64> = s.rows_of_series(&ids, 0).into_iter().map(|(o, _)| o).collect();
         got.sort_unstable();
         let want: Vec<u64> =
             (0..s.len() as u64).filter(|&o| ids.contains(&s.get(o).unwrap().series_id)).collect();
         assert_eq!(got, want);
         assert_eq!(want.len(), 13);
+    }
+
+    #[test]
+    fn rows_at_finds_one_timestamp_of_a_series() {
+        let mut m = MemTable::default();
+        // Series 3 at timestamps 0..500 out of order, twice at 42; others mixed in.
+        let mut batch: Vec<MemRow> = (0..500).rev().map(|i| MemRow { series_id: 3, row: row(i) }).collect();
+        batch.extend((0..500).map(|i| MemRow { series_id: 4, row: row(i) }));
+        batch.push(MemRow { series_id: 3, row: row(42) });
+        m.append(batch, 0, 0, 499);
+        m.append(vec![MemRow { series_id: 3, row: row(42) }], 0, 42, 42);
+        let s = m.snapshot(0);
+        assert_eq!(s.rows_at(3, 42, 0).len(), 3, "indexed segment (2) plus the short one (1)");
+        assert_eq!(s.rows_at(4, 42, 0).len(), 1);
+        assert!(s.rows_at(3, 500, 0).is_empty());
+        assert!(s.rows_at(5, 42, 0).is_empty());
     }
 }

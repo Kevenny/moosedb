@@ -128,9 +128,9 @@ pub fn inspect(dir: &Path, now: i64) -> Result<TableInfo> {
             (
                 inner.chunks.clone(),
                 inner.compacting.clone(),
-                inner.memtable.len() as u64,
+                inner.mem_len() as u64,
                 inner.series.len() as u64,
-                inner.memtable.bytes() as u64,
+                inner.mem_bytes() as u64,
             )
         };
         let tombs = t.lock()?.tombs.clone();

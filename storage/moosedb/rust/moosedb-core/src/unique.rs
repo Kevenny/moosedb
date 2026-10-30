@@ -621,10 +621,7 @@ pub(crate) fn existing_extras(
             }
         }
     }
-    for (_, m) in snap.mem.rows_of_series(&ids) {
-        if schema.row_ts(&m.row) != ts {
-            continue;
-        }
+    for m in snap.mem.rows_at(sid, ts, schema.ts_index()) {
         if let Some(x) = spec.extras_of(&m.row) {
             out.push(x);
         }

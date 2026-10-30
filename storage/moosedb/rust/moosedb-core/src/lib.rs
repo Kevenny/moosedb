@@ -31,6 +31,8 @@ pub mod fuzz_api;
 mod fasthash;
 mod format;
 mod fsutil;
+#[cfg(test)]
+mod flush_tests;
 pub mod index;
 pub mod inspect;
 mod log;

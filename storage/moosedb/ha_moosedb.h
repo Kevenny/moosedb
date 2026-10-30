@@ -14,11 +14,13 @@
 
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -196,19 +198,51 @@ struct tf_index_stats
 /*
   The series of a composite index sorted by their tag tuple (the order of the
   index), tuple-equal series merged: what an ordered read (MIN/MAX of a tag,
-  index_first/last, a range on a tag) walks. Rebuilt when the series version
-  moves; entries are sorted with the columns' own comparison.
+  index_first/last, a range on a tag) walks. Entries are sorted with the
+  columns' own comparison. Flat arrays (~25 bytes a series, so millions of
+  series fit); when only series were added since, the next version is merged
+  from this one instead of being sorted from scratch.
 */
-struct tf_tuple_entry
-{
-  std::vector<std::string> tuple;  /* tag texts, one per tag part of the key */
-  std::vector<uint64_t> ids;       /* series_id, sorted                      */
-};
 struct tf_tuple_index
 {
   uint64_t version= 0;
+  uint64_t epoch= 0;               /* series-list log it covers (0: none) */
+  uint64_t len= 0;                 /* series of that log it covers        */
   size_t bytes= 0;                 /* charged to the process-wide budget */
-  std::vector<tf_tuple_entry> entries;
+  size_t parts= 0;                 /* tag parts per tuple                 */
+  std::string text;                /* every entry's tag texts, back to back */
+  std::vector<uint32_t> part_end;  /* entry e, part p ends at [e*parts+p] */
+  std::vector<uint64_t> ids;       /* series ids, entry after entry, each run sorted */
+  std::vector<uint32_t> id_end;    /* entry e's ids end at id_end[e]      */
+
+  size_t size() const { return id_end.size(); }
+  std::string_view part(size_t e, size_t p) const
+  {
+    const size_t i= e * parts + p;
+    if (p >= parts || i >= part_end.size())
+      return {};
+    const size_t from= i ? part_end[i - 1] : 0;
+    if (from > part_end[i] || part_end[i] > text.size())
+      return {};
+    return std::string_view(text).substr(from, part_end[i] - from);
+  }
+  const uint64_t *ids_begin(size_t e) const
+  {
+    const size_t from= e && e <= id_end.size() ? id_end[e - 1] : 0;
+    return ids.data() + std::min<size_t>(from, ids.size());
+  }
+  const uint64_t *ids_end(size_t e) const
+  {
+    const size_t to= e < id_end.size() ? id_end[e] : 0;
+    return std::max(ids_begin(e), ids.data() + std::min<size_t>(to, ids.size()));
+  }
+  std::vector<std::string> tuple(size_t e) const
+  {
+    std::vector<std::string> t;
+    for (size_t p= 0; p < parts; p++)
+      t.emplace_back(part(e, p));
+    return t;
+  }
   ~tf_tuple_index();               /* gives the bytes back                 */
 };
 
@@ -227,6 +261,7 @@ public:
   tf_tag_cache tag_cache; /* TAG pushdown lookup, see pushed_series()  */
   tf_index_stats index_stats; /* cardinalities for rec_per_key          */
   std::mutex tuple_mutex;                        /* guards tuples              */
+  std::mutex tuple_build_mutex;  /* one view build at a time: no duplicate builds */
   std::map<uint, std::shared_ptr<const tf_tuple_index>> tuples;  /* by key  */
 
   MooseDB_share();

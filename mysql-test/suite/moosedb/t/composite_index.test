@@ -748,6 +748,44 @@ SELECT MIN(k) FROM r WHERE ts > NOW() - INTERVAL 2 DAY;
 DROP TABLE r;
 
 --echo ##################################################################
+--echo # The ordered view grows with new series: merged into the previous one
+--echo # (series sharing a tuple of the key end up in one entry)
+--echo ##################################################################
+CREATE TABLE gm (ts INT NOT NULL, host VARCHAR(8) NOT NULL COMMENT 'TAG', item INT NOT NULL COMMENT 'TAG', v INT NOT NULL,
+                 INDEX (ts), INDEX hk (host, ts), INDEX ihk (item, host, ts)) ENGINE=MooseDB TIMESTAMP_COLUMN='ts';
+CREATE TABLE gi (ts INT NOT NULL, host VARCHAR(8) NOT NULL, item INT NOT NULL, v INT NOT NULL,
+                 INDEX (ts), INDEX hk (host, ts), INDEX ihk (item, host, ts)) ENGINE=InnoDB;
+INSERT INTO gm SELECT seq, CONCAT('h', seq MOD 7), seq MOD 11, seq FROM seq_1_to_200;
+INSERT INTO gi SELECT * FROM gm;
+--let $mt= gm
+--let $it= gi
+--let $round= 0
+while ($round < 3)
+{
+  --let $q= SELECT host, MAX(ts), COUNT(*) FROM {T} FORCE INDEX (hk) GROUP BY host ORDER BY host
+  --let $label= round $round: GROUP BY host over (host, ts)
+  --source suite/moosedb/include/cmp_query.inc
+  --let $q= SELECT COUNT(DISTINCT host), MIN(host), MAX(host) FROM {T}
+  --let $label= round $round: COUNT(DISTINCT host), MIN/MAX(host)
+  --source suite/moosedb/include/cmp_query.inc
+  --let $q= SELECT item, host, MAX(ts) FROM {T} FORCE INDEX (ihk) GROUP BY item, host ORDER BY item, host
+  --let $label= round $round: GROUP BY item, host over (item, host, ts)
+  --source suite/moosedb/include/cmp_query.inc
+  --let $q= SELECT MIN(item), MAX(item) FROM {T} WHERE item > 5
+  --let $label= round $round: MIN/MAX(item) with a range on it
+  --source suite/moosedb/include/cmp_query.inc
+  --echo # new series: existing hosts with new items, new hosts sorting first, last and in between
+  eval INSERT INTO gm VALUES (300 + $round, 'h3', 20 + $round, 1), (300 + $round, 'a$round', -1 - $round, 2),
+                             (300 + $round, 'z$round', 99 + $round, 3), (300 + $round, 'h0$round', 7, 4);
+  eval INSERT INTO gi VALUES (300 + $round, 'h3', 20 + $round, 1), (300 + $round, 'a$round', -1 - $round, 2),
+                             (300 + $round, 'z$round', 99 + $round, 3), (300 + $round, 'h0$round', 7, 4);
+  --inc $round
+}
+DROP TABLE gm, gi;
+--let $mt= m
+--let $it= i
+
+--echo ##################################################################
 --echo # TRUNCATE
 --echo ##################################################################
 SELECT COUNT(*) FROM m WHERE itemid = 105;

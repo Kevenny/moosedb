@@ -10,7 +10,6 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::mem;
 use std::sync::{Arc, OnceLock};
 
-use crate::fasthash::FastMap;
 use crate::schema::{Row, Schema, Value};
 
 pub(crate) struct MemRow {
@@ -23,7 +22,8 @@ pub(crate) struct MemRow {
 /// next ones (it is built on first use, once, from the immutable rows).
 pub(crate) struct Segment {
     rows: Vec<MemRow>,
-    by_series: OnceLock<Option<FastMap<u64, Vec<u32>>>>,
+    /// Row positions sorted by series id (stable, so ascending within a series).
+    by_series: OnceLock<Option<Vec<u32>>>,
 }
 
 /// Segments shorter than this are walked, never indexed.
@@ -34,28 +34,29 @@ impl Segment {
         Segment { rows, by_series: OnceLock::new() }
     }
 
-    /// Positions (within the segment) of the rows of each series. `None` for a
-    /// segment that is too short, too long for `u32` positions or with too
-    /// many distinct series for the charged memory: the caller walks its rows.
-    fn index(&self) -> Option<&FastMap<u64, Vec<u32>>> {
+    /// Positions (within the segment) of its rows sorted by series. `None` for
+    /// a segment too short to be worth it or too long for `u32` positions: the
+    /// caller walks its rows. 4 B per row whatever the number of series, so a
+    /// batch spread over many series is indexed too.
+    fn index(&self) -> Option<&[u32]> {
         self.by_series
             .get_or_init(|| {
                 if self.rows.len() < MIN_INDEXED_ROWS || u32::try_from(self.rows.len()).is_err() {
                     return None;
                 }
-                let mut m: FastMap<u64, Vec<u32>> = FastMap::default();
-                for (i, r) in self.rows.iter().enumerate() {
-                    m.entry(r.series_id).or_default().push(i as u32);
-                    // Memory stays within `INDEX_BYTES_PER_ROW` (already charged
-                    // to the MemTable) only while series are much fewer than
-                    // rows; otherwise walking the rows is as cheap.
-                    if m.len() > self.rows.len() / 4 {
-                        return None;
-                    }
-                }
-                Some(m)
+                let mut perm: Vec<u32> = (0..self.rows.len() as u32).collect();
+                perm.sort_by_key(|&i| self.rows[i as usize].series_id);
+                Some(perm)
             })
-            .as_ref()
+            .as_deref()
+    }
+
+    /// Positions of the rows of `id`, via binary search on the index.
+    fn positions_of<'a>(&self, perm: &'a [u32], id: u64) -> &'a [u32] {
+        let sid = |i: u32| self.rows.get(i as usize).map_or(u64::MAX, |r| r.series_id);
+        let lo = perm.partition_point(|&i| sid(i) < id);
+        let hi = lo + perm[lo..].partition_point(|&i| sid(i) == id);
+        &perm[lo..hi]
     }
 }
 
@@ -154,9 +155,9 @@ impl MemSnapshot {
         let mut base = 0u64;
         for seg in &self.segments {
             match seg.index() {
-                Some(index) => {
-                    for id in ids {
-                        for &i in index.get(id).map(Vec::as_slice).unwrap_or(&[]) {
+                Some(perm) => {
+                    for &id in ids {
+                        for &i in seg.positions_of(perm, id) {
                             if let Some(r) = seg.rows.get(i as usize) {
                                 out.push((base + u64::from(i), r));
                             }
@@ -194,8 +195,7 @@ impl MemSnapshot {
 }
 
 /// Bytes charged per row for the lazily built per-segment series index (a
-/// `u32` position plus the amortized map entry; see `Segment::index`, which
-/// refuses to index a segment where that bound would not hold).
+/// `u32` position, see `Segment::index`; the rest is headroom).
 const INDEX_BYTES_PER_ROW: usize = 24;
 
 /// Accounting size of one row (including its share of the series index).
@@ -510,5 +510,23 @@ mod tests {
             assert_eq!(s.get(k as u64).unwrap().row, row(k as i64));
             assert_eq!(last.get(k as u64).unwrap().row, row(k as i64));
         }
+    }
+
+    #[test]
+    fn segments_with_one_series_per_row_are_indexed() {
+        let mut m = MemTable::default();
+        // Reverse order, so the index must sort; series 7 repeats.
+        let batch: Vec<MemRow> =
+            (0..1000).rev().map(|i| MemRow { series_id: if i % 100 == 0 { 7 } else { i as u64 }, row: row(i) }).collect();
+        m.append(batch, 0, 0, 999);
+        let s = m.snapshot(0);
+        assert!(s.segments.iter().any(|seg| seg.index().is_some()), "batch spread over many series is indexed");
+        let ids: HashSet<u64> = [7, 1, 999, 5000].into_iter().collect();
+        let mut got: Vec<u64> = s.rows_of_series(&ids).into_iter().map(|(o, _)| o).collect();
+        got.sort_unstable();
+        let want: Vec<u64> =
+            (0..s.len() as u64).filter(|&o| ids.contains(&s.get(o).unwrap().series_id)).collect();
+        assert_eq!(got, want);
+        assert_eq!(want.len(), 13);
     }
 }

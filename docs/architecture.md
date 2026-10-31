@@ -648,7 +648,19 @@ Segmento cifrado só com header não exige a chave no replay.
   da tabela. Teto de 512 MiB de heap para todas as visões do processo
   (~10 M séries); acima disso a leitura falha com erro em vez de devolver
   ordem errada. A versão comparada é `moosedb_series_version()`, o mesmo contador que `moosedb_series_list_version()` informa para a lista usada na construção, e `index_next/prev` passam à tupla
-  vizinha quando a atual acaba. **Cada tupla é lida num snapshot próprio** (não há um corte único no statement para leituras ordenadas que atravessam tuplas: linhas commitadas por outra sessão no meio podem aparecer só nas tuplas seguintes; cada tupla individualmente é consistente e atômica por statement). Se a tupla da
+  vizinha quando a atual acaba. Para a frente, as tuplas seguintes são lidas
+  em **blocos** (4, 16, 64, … até 1.024 tuplas; o bloco fecha ao atingir
+  8.192 séries) com um scan
+  agrupado só (`moosedb_scan_open_groups`: as linhas de cada grupo de séries
+  em ordem de tempo, grupo após grupo, num snapshot; o merge de um grupo só é
+  montado quando o anterior acaba), em vez de um scan por tupla — abrir e
+  fechar o scan e a busca binária da vizinha eram ~40% do custo por tupla.
+  Uma troca de direção dentro de um bloco materializa o bloco inteiro (antes
+  só a tupla; custo aceito: o servidor não alterna direção nos planos de
+  `GROUP BY`/`DISTINCT`/range medidos), e um batch pode decodificar linhas
+  de tuplas seguintes que uma leitura curta não chega a pedir; para trás
+  continua uma tupla por scan.
+  **Cada bloco é lido num snapshot próprio** (não há um corte único no statement para leituras ordenadas que atravessam blocos: linhas commitadas por outra sessão no meio podem aparecer só nos blocos seguintes; cada bloco individualmente é consistente e atômico por statement). Se a tupla da
   chave existe (o caso comum: `MAX(clock)` de um item) a leitura não toca a
   visão ordenada. `index_flags(idx, parte, 1)` — a pergunta de `ORDER BY` /
   `GROUP BY` — **não** inclui `HA_READ_ORDER` para parte TAG, e nenhuma parte

@@ -3178,6 +3178,7 @@ int ha_moosedb::reset()
   snapshots_.clear();
   idx_req_= idx_request();
   idx_ids_.clear();
+  idx_group_ends_.clear();
   scan_snapshot_saved_= false;
   return error;
 }
@@ -3972,8 +3973,13 @@ int ha_moosedb::open_scan(longlong lo, longlong hi, bool sorted,
       Same protocol as below: resolve the ids, open the scan (which takes the
       snapshot), and redo both if a series appeared in between.
     */
+    /* a retry must walk from the same tuple again, not from the one picked */
+    const std::vector<std::string> cur0= idx_req_.cur;
+    const bool have_cur0= idx_req_.have_cur;
     for (int attempt= 0; attempt < 64; attempt++)
     {
+      idx_req_.cur= cur0;
+      idx_req_.have_cur= have_cur0;
       uint64_t v0= 0, v1= 0;
       if (moosedb_series_version(share_->table.get(), &v0) != TF_OK)
       {
@@ -3991,11 +3997,18 @@ int ha_moosedb::open_scan(longlong lo, longlong hi, bool sorted,
       if (pushed_valid_)
         pushed_version_= v0;
       MooseDBScan *s= nullptr;
-      if (int error= map_status(moosedb_scan_open_projected(
-              share_->table.get(), lo, hi, ids->data(),
-              (int64_t) ids->size(), sorted,
-              proj_all_ ? nullptr : proj_mask_.data(),
-              proj_all_ ? 0 : (uint32_t) proj_mask_.size(), &s)))
+      const int error= sorted && idx_group_ends_.size() > 1
+          ? map_status(moosedb_scan_open_groups(
+                share_->table.get(), lo, hi, ids->data(), ids->size(),
+                idx_group_ends_.data(), idx_group_ends_.size(),
+                proj_all_ ? nullptr : proj_mask_.data(),
+                proj_all_ ? 0 : (uint32_t) proj_mask_.size(), &s))
+          : map_status(moosedb_scan_open_projected(
+                share_->table.get(), lo, hi, ids->data(),
+                (int64_t) ids->size(), sorted,
+                proj_all_ ? nullptr : proj_mask_.data(),
+                proj_all_ ? 0 : (uint32_t) proj_mask_.size(), &s));
+      if (error)
         return error;
       tf_scan_ptr opened(s);
       if (moosedb_series_version(share_->table.get(), &v1) == TF_OK && v1 == v0)
@@ -5013,25 +5026,34 @@ std::shared_ptr<const tf_tuple_index> ha_moosedb::ordered_view(
   return tuple_index(idx);
 }
 
+/* Series ids of one block of tuples (see idx_group_ends_). */
+constexpr size_t TUPLE_BLOCK_MAX_IDS= 8192;
+
 /*
   Makes the series of entry `entry` of the tuple index -- or, moving in
   `backward` direction, the first entry from there on that still has series
   satisfying the pushed WHERE (`filter`, sorted ids, or nullptr) -- the
   series of the request. Empty when the end of the index is reached.
+  Forward, up to `max_groups` such entries are taken as one block.
 */
 bool ha_moosedb::pick_entry(const std::vector<uint64_t> *filter, int64_t entry,
-                            bool backward)
+                            bool backward, size_t max_groups)
 {
   idx_ids_.clear();
+  idx_group_ends_.clear();
   idx_req_.have_cur= false;
   const tf_tuple_index *tix= idx_req_.tix.get();
   if (!tix)
     return false;
+  if (backward)
+    max_groups= 1;
   const int64_t n= (int64_t) tix->size();
+  int64_t first_e= -1, last_e= -1;
   for (int64_t e= entry; e >= 0 && e < n; e+= backward ? -1 : 1)
   {
     const uint64_t *first= tix->ids_begin((size_t) e);
     const uint64_t *last= tix->ids_end((size_t) e);
+    const size_t before= idx_ids_.size();
     if (filter && (size_t) (last - first) * 8 < filter->size())
     {
       /* few series, big filter: probe it instead of merging all of it */
@@ -5043,13 +5065,23 @@ bool ha_moosedb::pick_entry(const std::vector<uint64_t> *filter, int64_t entry,
       std::set_intersection(first, last, filter->begin(), filter->end(),
                             std::back_inserter(idx_ids_));
     else
-      idx_ids_.assign(first, last);
-    if (!idx_ids_.empty())
-    {
-      idx_req_.cur= tix->tuple((size_t) e);
-      idx_req_.have_cur= true;
-      return true;
-    }
+      idx_ids_.insert(idx_ids_.end(), first, last);
+    if (idx_ids_.size() == before)
+      continue;
+    if (first_e < 0)
+      first_e= e;
+    last_e= e;
+    idx_group_ends_.push_back(idx_ids_.size());
+    if (idx_group_ends_.size() >= max_groups ||
+        idx_ids_.size() >= TUPLE_BLOCK_MAX_IDS)
+      break;
+  }
+  if (last_e >= 0)
+  {
+    idx_req_.cur= tix->tuple((size_t) last_e);
+    idx_req_.have_cur= true;
+    if (idx_group_ends_.size() > 1)
+      idx_req_.block_first= tix->tuple((size_t) first_e);
   }
   return true;
 }
@@ -5084,13 +5116,15 @@ bool ha_moosedb::walk_entry(const std::vector<uint64_t> *filter, bool backward)
     const int c= cmp_entry_n(fld, *tix, e, cur, k);
     return backward ? c < 0 : c <= 0;
   });
-  return pick_entry(filter, backward ? pos - 1 : pos, backward);
+  return pick_entry(filter, backward ? pos - 1 : pos, backward,
+                    idx_req_.block);
 }
 
 /* Series of the current composite-index request (see open_scan()). */
 bool ha_moosedb::series_for_index(const std::vector<uint64_t> **ids)
 {
   *ids= &idx_ids_;
+  idx_group_ends_.clear();
   const tf_index_def *def= index_def(idx_req_.index);
   if (!def || !table || idx_req_.index >= table->s->keys)
     return false;
@@ -5221,9 +5255,15 @@ bool ha_moosedb::series_for_index(const std::vector<uint64_t> **ids)
   return pick_entry(f, entry, backward);
 }
 
+/* Tuples of the largest block a forward walk reads with one scan. */
+constexpr size_t TUPLE_BLOCK_MAX_GROUPS= 1024;
+
 /*
   Moves an ordered read to the neighbouring tag tuple. Tuples whose series
   hold no visible row (expired by retention, say) are passed over.
+  Forward walks read the following tuples in blocks (one grouped scan per
+  block instead of one scan per tuple), growing from 4 tuples so that a
+  short range read does not prepare tuples it never reaches.
 */
 int ha_moosedb::advance_group(uchar *buf, bool backward)
 {
@@ -5233,6 +5273,12 @@ int ha_moosedb::advance_group(uchar *buf, bool backward)
     idx_req_.backward= backward;
     if (!idx_req_.have_cur)
       return HA_ERR_END_OF_FILE;
+    /* a block was read out backward: walk on from its first tuple */
+    if (backward && idx_group_ends_.size() > 1)
+      idx_req_.cur= idx_req_.block_first;
+    idx_req_.block= backward ? 1
+        : std::min(std::max<size_t>(idx_req_.block * 4, 4),
+                   TUPLE_BLOCK_MAX_GROUPS);
     if (int rc= open_scan(idx_req_.lo, idx_req_.hi, true, true))
       return rc;
     if (backward)

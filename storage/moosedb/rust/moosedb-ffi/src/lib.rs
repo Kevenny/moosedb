@@ -1116,11 +1116,19 @@ fn open_scan(
     projection: Option<&[bool]>,
     out_scan: *mut *mut MooseDBScan,
 ) -> TFStatus {
+    open_scan_with(table, out_scan, |t| t.scan_projected(filter, sorted, projection))
+}
+
+fn open_scan_with(
+    table: *mut MooseDBTable,
+    out_scan: *mut *mut MooseDBScan,
+    open: impl FnOnce(&Table) -> Result<Scan, Error>,
+) -> TFStatus {
     guard(|| {
         let out = handle_mut(out_scan, "out_scan")?;
         *out = ptr::null_mut();
         let t = table_ref(table)?;
-        let scan = t.table.scan_projected(filter, sorted, projection)?;
+        let scan = open(&t.table)?;
         let types = t.table.schema().columns().iter().map(|c| c.ty).collect();
         *out = Box::into_raw(Box::new(MooseDBScan {
             scan,
@@ -1268,6 +1276,62 @@ pub unsafe extern "C" fn moosedb_scan_open_projected(
         return status;
     }
     open_scan(table, &filter, sorted, mask.as_deref(), out_scan)
+}
+
+/// A forward, timestamp-ordered scan that returns the rows of several series
+/// groups one group after the other: group `g` is
+/// `series_ids[group_ends[g-1] .. group_ends[g]]` (`group_ends[-1]` = 0), and
+/// its rows (`ts_start_us <= ts <= ts_end_us`) come in timestamp order before
+/// those of group `g + 1`. `group_ends` must be non-decreasing and end at
+/// `series_count`. `moosedb_scan_prev` works (the scan is collected whole on a
+/// change of direction); `moosedb_scan_seek_end` is `TF_ERR_UNSUPPORTED`.
+/// `columns_mask` as `moosedb_scan_open_projected`.
+///
+/// # Safety
+/// `series_ids` must hold `series_count` elements, `group_ends`
+/// `group_count`, `columns_mask` `mask_len` (each may be NULL with 0).
+#[no_mangle]
+pub unsafe extern "C" fn moosedb_scan_open_groups(
+    table: *mut MooseDBTable,
+    ts_start_us: i64,
+    ts_end_us: i64,
+    series_ids: *const u64,
+    series_count: u64,
+    group_ends: *const u64,
+    group_count: u64,
+    columns_mask: *const u8,
+    mask_len: u32,
+    out_scan: *mut *mut MooseDBScan,
+) -> TFStatus {
+    let mut groups: Vec<Vec<u64>> = Vec::new();
+    let mut mask: Option<Vec<bool>> = None;
+    let status = guard(|| {
+        // SAFETY: caller contract for every pointer.
+        let (ids, ends) = unsafe {
+            if mask_len > 0 || !columns_mask.is_null() {
+                mask = Some(slice(columns_mask, mask_len as usize, "columns_mask")?.iter().map(|&b| b != 0).collect());
+            }
+            (
+                slice(series_ids, usize::try_from(series_count).map_err(|_| invalid("series_count"))?, "series_ids")?,
+                slice(group_ends, usize::try_from(group_count).map_err(|_| invalid("group_count"))?, "group_ends")?,
+            )
+        };
+        let mut from = 0usize;
+        for &end in ends {
+            let end = usize::try_from(end).map_err(|_| invalid("group_ends"))?;
+            let g = ids.get(from..end).ok_or_else(|| invalid("group_ends must be non-decreasing and within series_count"))?;
+            groups.push(g.to_vec());
+            from = end;
+        }
+        if from != ids.len() {
+            return Err(invalid("group_ends must end at series_count"));
+        }
+        Ok(())
+    });
+    if status != TFStatus::TF_OK {
+        return status;
+    }
+    open_scan_with(table, out_scan, |t| t.scan_groups(ts_start_us, ts_end_us, &groups, mask.as_deref()))
 }
 
 /// `TFColPred::kind`: `lo <= v <= hi` on an INT64 / TIMESTAMP / BOOL (0/1)

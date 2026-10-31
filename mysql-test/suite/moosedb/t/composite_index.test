@@ -782,6 +782,41 @@ while ($round < 3)
   --inc $round
 }
 DROP TABLE gm, gi;
+
+--echo ##################################################################
+--echo # Forward walks read tuples in blocks (one grouped scan per block):
+--echo # 3000 series, rows in a chunk and in the MemTable, UNIQUE key ties
+--echo ##################################################################
+CREATE TABLE bm (itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG', clock INT NOT NULL, ns INT NOT NULL, v INT NOT NULL,
+                 PRIMARY KEY (itemid, clock, ns)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+CREATE TABLE bi (itemid BIGINT UNSIGNED NOT NULL, clock INT NOT NULL, ns INT NOT NULL, v INT NOT NULL,
+                 PRIMARY KEY (itemid, clock, ns)) ENGINE=InnoDB;
+INSERT INTO bm SELECT seq, 1000 + seq MOD 5, 0, seq FROM seq_1_to_3000;
+FLUSH TABLES bm;
+INSERT INTO bm SELECT seq * 2, 1000 + seq MOD 5, 1, seq FROM seq_1_to_1500;
+INSERT INTO bm SELECT seq * 3, 900, 0, seq FROM seq_1_to_1000;
+INSERT INTO bi SELECT * FROM bm;
+--let $mt= bm
+--let $it= bi
+--let $q= SELECT COUNT(DISTINCT itemid) FROM {T}
+--let $label= COUNT(DISTINCT itemid) over 3000 tuples
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT itemid, MIN(clock), MAX(clock), COUNT(*) FROM {T} GROUP BY itemid ORDER BY itemid
+--let $label= GROUP BY itemid over 3000 tuples
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT itemid, clock, ns, v FROM {T} FORCE INDEX (PRIMARY) WHERE itemid BETWEEN 7 AND 2990 ORDER BY itemid, clock, ns
+--let $label= ordered range read across blocks (ties on clock)
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT itemid, clock, ns FROM {T} FORCE INDEX (PRIMARY) WHERE itemid BETWEEN 7 AND 9 ORDER BY itemid, clock, ns
+--let $label= short range read ending inside the first block
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT itemid, clock, ns FROM {T} FORCE INDEX (PRIMARY) ORDER BY itemid DESC, clock DESC, ns DESC LIMIT 40
+--let $label= backward walk
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT itemid, clock, ns FROM {T} FORCE INDEX (PRIMARY) WHERE clock > 1002 ORDER BY itemid, clock, ns
+--let $label= ordered read with a time condition the tuples mostly fail
+--source suite/moosedb/include/cmp_query.inc
+DROP TABLE bm, bi;
 --let $mt= m
 --let $it= i
 

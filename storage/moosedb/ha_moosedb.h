@@ -437,7 +437,7 @@ private:
   std::shared_ptr<const tf_tuple_index> ordered_view(
       uint idx, const std::vector<uint64_t> *f);
   bool pick_entry(const std::vector<uint64_t> *filter, int64_t entry,
-                  bool backward);
+                  bool backward, size_t max_groups= 1);
   bool walk_entry(const std::vector<uint64_t> *filter, bool backward);
   int composite_read(uchar *buf, const uchar *key, key_part_map map,
                      enum ha_rkey_function find_flag);
@@ -525,11 +525,20 @@ private:
     bool walk= false;                   /* moving on from `cur`, no new pick */
     bool have_cur= false;
     std::vector<std::string> cur;       /* tag tuple of the scanned series   */
+                                        /* (of a block: its last tuple)      */
+    std::vector<std::string> block_first; /* first tuple of a block (valid while idx_group_ends_ has > 1) */
+    size_t block= 1;                    /* tuples the next forward walk takes */
     std::shared_ptr<const tf_tuple_index> tix;   /* sorted tuples, if used   */
     std::vector<longlong> extra_vals;   /* values of the key columns after the time part, if given */
     longlong lo= LONGLONG_MIN, hi= LONGLONG_MAX;
   } idx_req_;
   std::vector<uint64_t> idx_ids_;       /* series of idx_req_                   */
+  /*
+    A forward walk reads a block of tuples with one grouped scan: tuple g's
+    series are idx_ids_[idx_group_ends_[g-1] .. idx_group_ends_[g]). One
+    element (or none) = a single tuple.
+  */
+  std::vector<uint64_t> idx_group_ends_;
 
   /* Pushed-down TAG predicates: one entry per cond_push() call. */
   std::vector<std::vector<tf_tag_predicate>> pushed_;

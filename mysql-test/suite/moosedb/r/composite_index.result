@@ -1153,6 +1153,38 @@ INSERT INTO gi VALUES (300 + 2, 'h3', 20 + 2, 1), (300 + 2, 'a2', -1 - 2, 2),
 (300 + 2, 'z2', 99 + 2, 3), (300 + 2, 'h02', 7, 4);
 DROP TABLE gm, gi;
 ##################################################################
+# Forward walks read tuples in blocks (one grouped scan per block):
+# 3000 series, rows in a chunk and in the MemTable, UNIQUE key ties
+##################################################################
+CREATE TABLE bm (itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG', clock INT NOT NULL, ns INT NOT NULL, v INT NOT NULL,
+PRIMARY KEY (itemid, clock, ns)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+CREATE TABLE bi (itemid BIGINT UNSIGNED NOT NULL, clock INT NOT NULL, ns INT NOT NULL, v INT NOT NULL,
+PRIMARY KEY (itemid, clock, ns)) ENGINE=InnoDB;
+INSERT INTO bm SELECT seq, 1000 + seq MOD 5, 0, seq FROM seq_1_to_3000;
+FLUSH TABLES bm;
+INSERT INTO bm SELECT seq * 2, 1000 + seq MOD 5, 1, seq FROM seq_1_to_1500;
+INSERT INTO bm SELECT seq * 3, 900, 0, seq FROM seq_1_to_1000;
+INSERT INTO bi SELECT * FROM bm;
+# COUNT(DISTINCT itemid) over 3000 tuples
+result_rows	vs_innodb
+1	SAME
+# GROUP BY itemid over 3000 tuples
+result_rows	vs_innodb
+3000	SAME
+# ordered range read across blocks (ties on clock)
+result_rows	vs_innodb
+5470	SAME
+# short range read ending inside the first block
+result_rows	vs_innodb
+5	SAME
+# backward walk
+result_rows	vs_innodb
+40	SAME
+# ordered read with a time condition the tuples mostly fail
+result_rows	vs_innodb
+1800	SAME
+DROP TABLE bm, bi;
+##################################################################
 # TRUNCATE
 ##################################################################
 SELECT COUNT(*) FROM m WHERE itemid = 105;

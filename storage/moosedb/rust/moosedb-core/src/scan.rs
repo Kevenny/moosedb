@@ -407,6 +407,10 @@ pub struct Scan {
     tie: Vec<usize>,
     /// Output buffers, reused across calls.
     batch: Option<ScanBatch>,
+    /// Grouped scans (see [`Scan::grouped`]): the series of each group, and
+    /// the group the merge reads. Empty for other scans.
+    groups: Vec<HashSet<u64>>,
+    group: usize,
 }
 
 impl Scan {
@@ -437,11 +441,56 @@ impl Scan {
             plan,
             tie,
             batch: None,
+            groups: Vec::new(),
+            group: 0,
         };
         if sorted {
             scan.mode = Mode::Merge(scan.new_merge(false));
         }
         Ok(scan)
+    }
+
+    /// A forward, timestamp-ordered scan that returns the rows of
+    /// `groups[0]`'s series, then those of `groups[1]`, and so on: one ordered
+    /// read per group (an ordered walk over the tag tuples of an index) on one
+    /// snapshot. A group's runs are only set up once the previous group is
+    /// read out. Backward reads go through the materialized fallback;
+    /// `seek_end` is unsupported.
+    pub(crate) fn grouped(
+        snap: Arc<Snapshot>,
+        mut filter: ResolvedFilter,
+        groups: Vec<HashSet<u64>>,
+        projection: Option<&[bool]>,
+        tie: &[usize],
+    ) -> Result<Scan> {
+        filter.series = Some(groups.first().cloned().unwrap_or_default());
+        let mut scan = Scan::new(snap, filter, true, projection, tie)?;
+        scan.groups = groups;
+        Ok(scan)
+    }
+
+    /// Grouped scans: starts the merge of the next group once the current one
+    /// is read out (ascending only). `false` when there is none.
+    fn next_group(&mut self) -> bool {
+        let last = match &self.mode {
+            Mode::Merge(m) if !m.desc && m.heap.is_empty() && m.pending.is_empty() => m.last,
+            _ => return false,
+        };
+        let Some(next) = self.groups.get(self.group + 1) else { return false };
+        self.group += 1;
+        self.filter.series = Some(next.clone());
+        let mut m = self.new_merge(false);
+        m.last = last;
+        self.mode = Mode::Merge(m);
+        true
+    }
+
+    /// Back to the merge of the first group (grouped scans).
+    fn first_group(&mut self) {
+        if let Some(g) = self.groups.first() {
+            self.group = 0;
+            self.filter.series = Some(g.clone());
+        }
     }
 
     pub fn snapshot(&self) -> &Arc<Snapshot> {
@@ -496,7 +545,13 @@ impl Scan {
         match &self.mode {
             Mode::Stream(_) if backward => Err(Error::Unsupported("backward iteration on an unsorted scan".into())),
             Mode::Stream(_) => self.stream_fill(batch, max),
-            Mode::Merge(m) if m.desc == backward => self.merge_step(batch, max),
+            Mode::Merge(m) if m.desc == backward => {
+                self.merge_step(batch, max)?;
+                while batch.rows() < max && self.next_group() {
+                    self.merge_step(batch, max)?;
+                }
+                Ok(())
+            }
             Mode::Merge(_) => {
                 self.materialize()?;
                 self.materialized_fill(batch, max, backward)
@@ -512,6 +567,7 @@ impl Scan {
         self.mode = if matches!(self.mode, Mode::Stream(_)) {
             Mode::Stream(StreamState::new())
         } else {
+            self.first_group();
             Mode::Merge(self.new_merge(false))
         };
         Ok(())
@@ -522,6 +578,9 @@ impl Scan {
     pub fn seek_end(&mut self) -> Result<()> {
         if matches!(self.mode, Mode::Stream(_)) {
             return Err(Error::Unsupported("seek on an unsorted scan".into()));
+        }
+        if !self.groups.is_empty() {
+            return Err(Error::Unsupported("seek_end on a grouped scan".into()));
         }
         self.mode = Mode::Merge(self.new_merge(true));
         Ok(())
@@ -1050,6 +1109,8 @@ impl Scan {
     fn materialize(&mut self) -> Result<()> {
         let Mode::Merge(m) = &self.mode else { return Ok(()) };
         let (desc, last) = (m.desc, m.last);
+        let (group, series) = (self.group, self.filter.series.clone());
+        self.first_group();
         let fresh = self.new_merge(false);
         // Work on a fresh merge but keep the old mode until the rows are all
         // collected: an error leaves the scan as it was.
@@ -1060,7 +1121,11 @@ impl Scan {
             one.begin(&self.plan.want);
             if let Err(e) = self.merge_step(&mut one, 1) {
                 self.mode = old;
+                (self.group, self.filter.series) = (group, series);
                 return Err(e);
+            }
+            if one.rows() == 0 && self.next_group() {
+                continue;
             }
             let key = match &self.mode {
                 Mode::Merge(m) if one.rows() > 0 => m.last,
@@ -1070,8 +1135,8 @@ impl Scan {
             rows.push((key, one.row_at(0)));
         }
         let cursor = match last {
-            // Tie-ordered rows are not sorted by key alone: find the row itself.
-            Some(k) if !self.tie.is_empty() => rows.iter().position(|(rk, _)| *rk == k).map_or(-1, |i| i as isize),
+            // Tie-ordered (or grouped) rows are not sorted by key alone: find the row itself.
+            Some(k) if !self.tie.is_empty() || !self.groups.is_empty() => rows.iter().position(|(rk, _)| *rk == k).map_or(-1, |i| i as isize),
             Some(k) => rows.binary_search_by_key(&k, |(rk, _)| *rk).map_or_else(|i| i as isize, |i| i as isize),
             None if desc => rows.len() as isize,
             None => -1,
@@ -1187,6 +1252,108 @@ mod batch_cap_tests {
             s.set_bytes_cap(10);
             assert_eq!(s.next_batch(1000, false).unwrap().rows(), 1);
         }
+    }
+
+    #[test]
+    fn a_grouped_scan_returns_group_after_group_in_time_order() {
+        let schema = Schema::new(
+            vec![Column { name: "ts".into(), ty: ColumnType::Timestamp }, Column { name: "host".into(), ty: ColumnType::Tag }],
+            0,
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = TableConfig::new(dir.path().join("t"), schema, &RawOptions::default()).unwrap();
+        Table::create(&cfg).unwrap();
+        let t = Table::open(cfg).unwrap();
+        // ts i belongs to host a/b/c by i % 3; half in a chunk, half in the MemTable
+        let write = |i: i64| {
+            let h = [b"a", b"b", b"c"][(i % 3) as usize];
+            t.write(vec![Value::Timestamp(i), Value::Bytes(h.to_vec())]).unwrap();
+        };
+        (0..30).for_each(write);
+        t.flush().unwrap();
+        (30..60).for_each(write);
+        let id = |h: &[u8]| t.series().unwrap().into_iter().find(|(_, v)| v[0] == Value::Bytes(h.to_vec())).unwrap().0;
+        let groups = vec![vec![id(b"c")], vec![], vec![id(b"a"), id(b"b")]];
+        let ts_of = |r: &Row| match r[0] {
+            Value::Timestamp(v) => v,
+            _ => unreachable!(),
+        };
+        let mut want: Vec<i64> = (10..60).filter(|i| i % 3 == 2).collect();
+        want.extend((10..60).filter(|i| i % 3 != 2));
+        let mut s = t.scan_groups(10, i64::MAX, &groups, None).unwrap();
+        let mut got = Vec::new();
+        loop {
+            let b = s.next_batch(7, false).unwrap();
+            if b.rows() == 0 {
+                break;
+            }
+            got.extend((0..b.rows()).map(|i| ts_of(&b.row_at(i))));
+        }
+        assert_eq!(got, want);
+        // a change of direction continues from the row returned last
+        s.seek_start().unwrap();
+        for w in &want[..20] {
+            assert_eq!(ts_of(&s.next_row().unwrap().unwrap().1), *w);
+        }
+        assert_eq!(ts_of(&s.prev_row().unwrap().unwrap().1), want[18]);
+        assert_eq!(ts_of(&s.next_row().unwrap().unwrap().1), want[19]);
+        assert!(s.seek_end().is_err());
+    }
+
+    #[test]
+    fn a_grouped_scan_keeps_unique_ties_inside_each_group() {
+        let schema = Schema::new(
+            vec![
+                Column { name: "ts".into(), ty: ColumnType::Timestamp },
+                Column { name: "host".into(), ty: ColumnType::Tag },
+                Column { name: "ns".into(), ty: ColumnType::Int64 },
+            ],
+            0,
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = TableConfig::new(dir.path().join("t"), schema, &RawOptions::default()).unwrap().with_unique(vec![2]).unwrap();
+        Table::create(&cfg).unwrap();
+        let t = Arc::new(Table::open(cfg).unwrap());
+        // 3 rows per timestamp, ns written in descending order; part flushed
+        for (i, h) in [(0, b"a"), (1, b"b"), (2, b"c")] {
+            for ts in 0..6 {
+                for ns in (0..3).rev() {
+                    t.write_shared(vec![Value::Timestamp(ts), Value::Bytes(h.to_vec()), Value::Int(ns + 10 * i)]).unwrap();
+                }
+                if ts == 2 {
+                    t.flush().unwrap();
+                }
+            }
+        }
+        let id = |h: &[u8]| t.series().unwrap().into_iter().find(|(_, v)| v[0] == Value::Bytes(h.to_vec())).unwrap().0;
+        let groups = vec![vec![id(b"b")], vec![id(b"a"), id(b"c")]];
+        let key = |r: &Row| match (&r[0], &r[2]) {
+            (Value::Timestamp(ts), Value::Int(ns)) => (*ts, *ns),
+            _ => unreachable!(),
+        };
+        let mut want: Vec<(i64, i64)> = (0..6).flat_map(|ts| (10..13).map(move |ns| (ts, ns))).collect();
+        want.extend((0..6).flat_map(|ts| (0..3).chain(20..23).map(move |ns| (ts, ns))));
+        want[18..].sort();
+        let mut s = t.scan_groups(i64::MIN, i64::MAX, &groups, None).unwrap();
+        let mut got = Vec::new();
+        loop {
+            let b = s.next_batch(4, false).unwrap();
+            if b.rows() == 0 {
+                break;
+            }
+            got.extend((0..b.rows()).map(|i| key(&b.row_at(i))));
+        }
+        assert_eq!(got, want);
+        // back and forth across the border of the two groups
+        s.seek_start().unwrap();
+        for w in &want[..19] {
+            assert_eq!(key(&s.next_row().unwrap().unwrap().1), *w);
+        }
+        assert_eq!(key(&s.prev_row().unwrap().unwrap().1), want[17]);
+        assert_eq!(key(&s.next_row().unwrap().unwrap().1), want[18]);
+        assert_eq!(key(&s.next_row().unwrap().unwrap().1), want[19]);
     }
 }
 

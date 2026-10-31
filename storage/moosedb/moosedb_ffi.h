@@ -795,6 +795,29 @@ TFStatus moosedb_scan_open_projected(MooseDBTable *table,
                                      uint32_t mask_len,
                                      MooseDBScan **out_scan);
 
+// A forward, timestamp-ordered scan that returns the rows of several series
+// groups one group after the other: group `g` is
+// `series_ids[group_ends[g-1] .. group_ends[g]]` (`group_ends[-1]` = 0), and
+// its rows (`ts_start_us <= ts <= ts_end_us`) come in timestamp order before
+// those of group `g + 1`. `group_ends` must be non-decreasing and end at
+// `series_count`. `moosedb_scan_prev` works (the scan is collected whole on a
+// change of direction); `moosedb_scan_seek_end` is `TF_ERR_UNSUPPORTED`.
+// `columns_mask` as `moosedb_scan_open_projected`.
+//
+// # Safety
+// `series_ids` must hold `series_count` elements, `group_ends`
+// `group_count`, `columns_mask` `mask_len` (each may be NULL with 0).
+TFStatus moosedb_scan_open_groups(MooseDBTable *table,
+                                  int64_t ts_start_us,
+                                  int64_t ts_end_us,
+                                  const uint64_t *series_ids,
+                                  uint64_t series_count,
+                                  const uint64_t *group_ends,
+                                  uint64_t group_count,
+                                  const uint8_t *columns_mask,
+                                  uint32_t mask_len,
+                                  MooseDBScan **out_scan);
+
 // `moosedb_scan_open_projected` plus value predicates that skip chunk blocks
 // (see `TFColPred`). `preds` holds `pred_count` elements (may be NULL with 0).
 //

@@ -46,7 +46,8 @@ impl Segment {
                     return None;
                 }
                 let mut perm: Vec<u32> = (0..self.rows.len() as u32).collect();
-                perm.sort_by_key(|&i| self.key(i, ts_index));
+                // Each key read once: reading a row's timestamp is a pointer chase.
+                perm.sort_by_cached_key(|&i| self.key(i, ts_index));
                 Some(perm)
             })
             .as_deref()
@@ -63,11 +64,19 @@ impl Segment {
         })
     }
 
-    /// Positions of the rows whose key is in `lo..=hi`, via binary search.
-    fn positions_of<'a>(&self, perm: &'a [u32], ts_index: usize, lo: (u64, i64), hi: (u64, i64)) -> &'a [u32] {
-        let a = perm.partition_point(|&i| self.key(i, ts_index) < lo);
-        let b = a + perm[a..].partition_point(|&i| self.key(i, ts_index) <= hi);
-        &perm[a..b]
+    /// Positions of the rows of series `id` with a timestamp in `lo..=hi`, via
+    /// binary search: on the series id first (inline in the row), then on the
+    /// timestamp (behind a pointer) only within that series' run.
+    fn positions_of<'a>(&self, perm: &'a [u32], ts_index: usize, id: u64, lo: i64, hi: i64) -> &'a [u32] {
+        let sid = |i: u32| self.rows.get(i as usize).map_or(u64::MAX, |r| r.series_id);
+        let a = perm.partition_point(|&i| sid(i) < id);
+        let run = &perm[a..a + perm[a..].partition_point(|&i| sid(i) == id)];
+        if lo == i64::MIN && hi == i64::MAX {
+            return run;
+        }
+        let ts = |i: u32| self.key(i, ts_index).1;
+        let c = run.partition_point(|&i| ts(i) < lo);
+        &run[c..c + run[c..].partition_point(|&i| ts(i) <= hi)]
     }
 }
 
@@ -185,7 +194,7 @@ impl MemSnapshot {
             match seg.index(ts_index) {
                 Some(perm) => {
                     for &id in ids {
-                        for &i in seg.positions_of(perm, ts_index, (id, i64::MIN), (id, i64::MAX)) {
+                        for &i in seg.positions_of(perm, ts_index, id, i64::MIN, i64::MAX) {
                             if let Some(r) = seg.rows.get(i as usize) {
                                 out.push((base + u64::from(i), r));
                             }
@@ -212,7 +221,7 @@ impl MemSnapshot {
         for seg in &self.segments {
             match seg.index(ts_index) {
                 Some(perm) => {
-                    for &i in seg.positions_of(perm, ts_index, (id, ts), (id, ts)) {
+                    for &i in seg.positions_of(perm, ts_index, id, ts, ts) {
                         out.extend(seg.rows.get(i as usize));
                     }
                 }

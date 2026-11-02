@@ -225,22 +225,22 @@ SELECT COUNT(*) FROM ui WHERE itemid = 123456789012;
 --echo # (the rows before the duplicate stay in MooseDB, which has no multi-row rollback;
 --echo #  InnoDB rolls the statement back)
 
---echo # ---- REPLACE and ON DUPLICATE KEY UPDATE need UPDATE/DELETE, which the engine does not have:
---echo #      a key that exists is an explicit error, not a silent wrong answer
---error ER_ILLEGAL_HA
+--echo # ---- REPLACE and ON DUPLICATE KEY UPDATE of a key that exists update the row (update.test)
 REPLACE INTO um VALUES (1, 100, 7, 1);
---error ER_ILLEGAL_HA
 INSERT INTO um VALUES (1, 100, 7, 1) ON DUPLICATE KEY UPDATE value = 7;
---error ER_ILLEGAL_HA
 INSERT INTO um VALUES (1, 100, 7, 1), (1, 777, 7, 1) ON DUPLICATE KEY UPDATE value = value + 1;
 SELECT value FROM um WHERE itemid = 1 AND clock = 100 AND ns = 1;
+DELETE FROM um WHERE itemid = 1 AND clock = 777;
 --echo # ... and a key that does not exist is a plain insert
 REPLACE INTO um VALUES (1, 200, 7, 1);
 INSERT INTO um VALUES (1, 201, 7, 1) ON DUPLICATE KEY UPDATE value = 8;
 REPLACE INTO um SELECT 9, 9, 9, 9;
 SELECT itemid, clock, value, ns FROM um WHERE itemid = 1 AND clock >= 200 ORDER BY clock;
---error ER_ILLEGAL_HA
-UPDATE um SET value = 1 WHERE itemid = 1;
+UPDATE um SET value = 1 WHERE itemid = 1 AND clock >= 200;
+--echo # the key of the table cannot change
+--error ER_GET_ERRMSG
+UPDATE um SET clock = clock + 1 WHERE itemid = 1 AND clock >= 200;
+SELECT itemid, clock, value, ns FROM um WHERE itemid = 1 AND clock >= 200 ORDER BY clock;
 DROP TABLE um, ui;
 
 --echo ##################################################################

@@ -16,14 +16,13 @@ COUNT(*)	SUM(v)	COUNT(DISTINCT host)
 SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_NAME = 'r';
 ENGINE
 MooseDB
-# UPDATE is refused on the master and never replicates
+# UPDATE replicates as a row event (the slave finds the row by its before-image)
 connection master;
-UPDATE r SET v = 0;
-ERROR HY000: Storage engine MooseDB of the table `test`.`r` doesn't have this option
+UPDATE r SET v = 0 WHERE host = 'h1';
 connection slave;
-SELECT COUNT(*) FROM r;
-COUNT(*)
-100
+SELECT COUNT(*), SUM(v) FROM r;
+COUNT(*)	SUM(v)
+100	833.25
 # DELETE replicates as row events: the replica finds each row by its content
 connection master;
 DELETE FROM r WHERE host = 'h1';

@@ -1008,15 +1008,15 @@ ROW_COUNT()
 rows_m	rows_i
 60	60
 SET SESSION moosedb_group_by_pushdown = DEFAULT;
-# UPDATE on MooseDB is refused by the engine (not a time range matter)
+# UPDATE on MooseDB with a time range: the same on the InnoDB mirror keeps both equal
 INSERT INTO m SELECT '2026-03-01 00:00:00' + INTERVAL seq MINUTE, CONCAT('h', seq MOD 3), seq FROM seq_0_to_59;
 INSERT INTO i SELECT '2026-03-01 00:00:00' + INTERVAL seq MINUTE, CONCAT('h', seq MOD 3), seq FROM seq_0_to_59;
 UPDATE m SET v = v + 1 WHERE ts > '2026-03-01 00:30:00';
-ERROR HY000: Storage engine MooseDB of the table `test`.`m` doesn't have this option
+UPDATE i SET v = v + 1 WHERE ts > '2026-03-01 00:30:00';
 UPDATE m SET ts = ts + INTERVAL 1 DAY WHERE ts > '2026-03-01 00:30:00';
-ERROR HY000: Storage engine MooseDB of the table `test`.`m` doesn't have this option
+UPDATE i SET ts = ts + INTERVAL 1 DAY WHERE ts > '2026-03-01 00:30:00';
 UPDATE m, s SET m.v = 0 WHERE m.host = s.host AND m.ts > '2026-03-01 00:30:00';
-ERROR HY000: Storage engine MooseDB of the table `test`.`m` doesn't have this option
+UPDATE i, s SET i.v = 0 WHERE i.host = s.host AND i.ts > '2026-03-01 00:30:00';
 ##################################################################
 # Lifecycle of the pushed range
 ##################################################################
@@ -1028,7 +1028,7 @@ PREPARE pi FROM @si;
 bound	cnt	vs_innodb
 2026-03-01 00:30:00	58	SAME
 bound	cnt	vs_innodb
-2026-03-01 00:58:00	2	SAME
+2026-03-01 00:58:00	58	SAME
 bound	cnt	vs_innodb
 2020-01-01	120	SAME
 bound	cnt	vs_innodb
@@ -1038,7 +1038,7 @@ bound	cnt	vs_innodb
 bound	cnt	vs_innodb
 2026-03-01 00:00:00.5	118	SAME
 bound	cnt	vs_innodb
-2026-03-01 00:59:00	0	SAME
+2026-03-01 00:59:00	58	SAME
 DEALLOCATE PREPARE pm;
 DEALLOCATE PREPARE pi;
 # stored procedure: loop with a variable in the bound
@@ -1073,7 +1073,7 @@ CALL p_i(@r2);
 CALL p_m(@r3);
 SELECT @r1 AS counts, IF(@r1 = @r2 AND @r1 = @r3, 'SAME', 'DIFFERENT') AS vs_innodb;
 counts	vs_innodb
-118,96,74,52,30,8,	SAME
+118,96,74,58,58,58,	SAME
 DROP PROCEDURE p_m;
 DROP PROCEDURE p_i;
 # inner side of a join rescanned per outer row, constant bound on the inner table
@@ -1117,7 +1117,7 @@ result_rows	vs_innodb
 SET SESSION max_length_for_sort_data = 4;
 # ORDER BY v over the range, rowid filesort
 result_rows	vs_innodb
-42	SAME
+22	SAME
 # ORDER BY host, v LIMIT over an open range
 result_rows	vs_innodb
 7	SAME
@@ -1135,12 +1135,12 @@ SET sql_mode = CONCAT(@@sql_mode, ',TIME_ROUND_FRACTIONAL');
 Variable_name	Value
 Handler_read_rnd_next	99
 a	b	c	vs_innodb
-98	3430	0	SAME
+98	820	0	SAME
 # IGNORE INDEX(ts) WHERE tt.ts > '2026-03-01 00:10:00.5'
 Variable_name	Value
 Handler_read_rnd_next	99
 a	b	c	vs_innodb
-98	3430	0	SAME
+98	820	0	SAME
 # IGNORE INDEX(ts) WHERE tt.ts <= '2026-03-01 00:10:00.5'
 Variable_name	Value
 Handler_read_rnd_next	23
@@ -1166,7 +1166,7 @@ SET sql_mode = DEFAULT;
 Variable_name	Value
 Handler_read_rnd_next	99
 a	b	c	vs_innodb
-98	3430	0	SAME
+98	820	0	SAME
 # IGNORE INDEX(ts) WHERE tt.ts < '2026-03-01 00:10:00.5'
 Variable_name	Value
 Handler_read_rnd_next	23
@@ -1177,7 +1177,7 @@ SET sql_mode = CONCAT(@@sql_mode, ',ALLOW_INVALID_DATES');
 Variable_name	Value
 Handler_read_rnd_next	121
 a	b	c	vs_innodb
-120	3540	0	SAME
+120	930	0	SAME
 # IGNORE INDEX(ts) WHERE tt.ts < '2026-02-31'
 Variable_name	Value
 Handler_read_rnd_next	121

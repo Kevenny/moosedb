@@ -836,7 +836,7 @@ impl Table {
                     }
                     Ok(())
                 }
-                wal::ReplayEvent::Delete(payload) => crate::delete::Replay {
+                wal::ReplayEvent::Delete(payload, cap) => crate::delete::Replay {
                     schema: &schema,
                     chunks: &chunks,
                     tombs: &mut tombs,
@@ -846,7 +846,7 @@ impl Table {
                     memtable: &mut memtable,
                     uniq: &mut uniq,
                 }
-                .apply(payload),
+                .apply(payload, cap),
             })?;
         if !replayed.rejected.is_empty() {
             // Accepted by an older version, but no chunk can hold such a value:

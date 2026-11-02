@@ -431,6 +431,55 @@ WAL v2 (segmentos v1 continuam legíveis, cada entrada = linha commitada):
 | ROW | `batch_id` + linha | linha de lote ainda não commitado |
 | COMMIT | `batch_id` | todas as ROW do lote passam a valer |
 | ROW_COMMIT | linha | lote de uma linha |
+| COMMIT_UPDATE (kind 6) | `batch_id` + `n` + `n` linhas + payload DELETE_ROWS | COMMIT de um lote com pares de UPDATE |
+
+**UPDATE (`Batch::update`, FFI `moosedb_batch_update`)**: o par (linha antiga,
+linha nova) fica num buffer separado do lote (alocado no 1º `update`; lote sem
+pares não paga nada e gera exatamente as mesmas entradas ROW/COMMIT de antes).
+No commit, sob `del_gate` (serializa com os DELETEs), as linhas antigas são
+achadas por conteúdo como no `DeleteBatch` (iguais, uma de cada vez; só entre
+linhas que existiam antes do statement) e o lote grava **uma** entrada
+COMMIT_UPDATE no lugar do COMMIT: o DELETE_ROWS dos pares achados (linhas da
+MemTable + `RowsTomb` de chunks) e as linhas novas só dos pares aplicados. Par
+cuja linha antiga não foi achada (sumiu numa corrida real: o handler já
+segura lock exclusivo) **falha o statement inteiro** com `Error::Conflict`
+("UPDATE: a row to update is no longer in the table (changed concurrently)",
+`TF_ERR_CONFLICT`): nada é aplicado, nem os demais pares nem as ROW do lote —
+perder o update em silêncio divergiria réplicas. O replay aplica,
+nesta ordem: o delete, as ROW do lote, as linhas novas — tudo ou nada, é uma
+entrada com CRC; binário antigo recusa o kind 6 ("unknown kind"). Com `sync` e
+sem `commit_deferred` o WAL é sincronizado **antes** de aplicar (como o DELETE:
+fsync falho não muda a memória; tabela envenenada); em `commit_deferred` as
+linhas ficam visíveis antes do fsync, como no INSERT. Tabela com chave única:
+TAGs, tempo e colunas extras têm de ser iguais nas duas linhas
+(`Unsupported`); a linha nova herda a chave e não passa pela admissão (o estado
+da série é invalidado, como num DELETE). Limite: o UPDATE **nunca faz spill** — se as
+linhas do lote com pares passarem de `MEMTABLE_SIZE` (ou a entrada de WAL de
+`MAX_UPDATE_ENTRY`, 32 MiB), `update`/`write`/`commit` recusam com
+`Unsupported`/erro e nada é aplicado. Em tabela UNIQUE, repetir a mesma linha
+antiga no lote (statement que atualiza a mesma chave duas vezes, p.ex. `REPLACE`
+com chave repetida) é recusado com `Unsupported`. No caminho estrito um fsync
+falho pode deixar o kind 6 no disco e ele é aplicado na reabertura embora o
+cliente tenha recebido erro (igual ao DELETE). O kind 6 impede downgrade: binário
+antigo recusa o segmento ("unknown kind"). No replay o DELETE embutido aceita até
+`MAX_UPDATE_ENTRY`; DELETE avulso segue com 8 MiB.
+
+**Lock do handler.** O UPDATE trava a tabela para escrita durante o statement (sem
+isolamento por linha); INSERTs concorrentes esperam. `store_lock` mantém `TL_WRITE`
+em `UPDATE`, `UPDATE` multi-tabela, `REPLACE[..SELECT]` e `INSERT[..SELECT] … ODKU`: os
+pares (antiga, nova) são casados por conteúdo no fim do statement, e dois UPDATEs
+concorrentes da mesma linha perderiam um incremento. INSERT puro, SELECT e DELETE
+com WHERE seguem concorrentes. Falha fechado: qualquer statement com `duplicates` =
+REPLACE/ODKU (inclui `LOAD DATA … REPLACE`) trava. UPDATE dentro de função/trigger chamada
+por outro tipo de statement não é visto por `store_lock` (roda em `TL_WRITE_ALLOW_WRITE`):
+`update_row` o **recusa** (erro "UPDATE inside a trigger or stored function called by
+another statement is not supported on MooseDB tables"), exceto no applier de réplica
+(`slave_thread`). O par cuja linha antiga sumiu é **erro** do core (não no-op). Teto: o
+statement inteiro precisa caber no buffer do lote (`MEMTABLE_SIZE`, padrão 64 MiB; medido
+com (ts, host TAG, v DOUBLE): 150 k linhas passam, 175 k não; ~450 B por par, MEMTABLE_SIZE 64 MiB) — divida em statements menores. UPDATE+DELETE da mesma tabela no mesmo statement
+(multi-tabela) não são atômicos entre si: o DELETE é aplicado antes (caso raro). Sem projeção de colunas em
+`INSERT..SELECT`/`REPLACE..SELECT` com REPLACE/ODKU, e `update_row` recusa uma
+varredura projetada.
 
 Replay e checkpoint (granularidade de segmento):
 

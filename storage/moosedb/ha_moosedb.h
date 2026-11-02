@@ -287,8 +287,10 @@ public:
 
   /* ── DML ──────────────────────────────────────────────────────────── */
   int write_row(const uchar *buf) override;
-  int update_row(const uchar *, const uchar *) override
-  { return HA_ERR_WRONG_COMMAND; }   /* append-only: UPDATE not supported */
+  int update_row(const uchar *old_data, const uchar *new_data) override;  /* (old, new) pair in the statement batch */
+  /* no direct UPDATE: the server updates row by row through update_row() */
+  int direct_update_rows_init(List<Item> *) override
+  { return HA_ERR_WRONG_COMMAND; }
   int delete_row(const uchar *buf) override;   /* collected, applied at statement end */
   int direct_delete_rows_init() override;
   int direct_delete_rows(ha_rows *deleted) override;
@@ -403,7 +405,7 @@ private:
   void abort_batch();   /* discard the open batch and DELETE, if any */
   void join_stmt_trx(THD *thd);  /* register in the server's statement transaction */
   void leave_stmt_trx();
-  int record_to_row(const uchar *buf, TFRow *out);   /* record -> values_ */
+  int record_to_row(const uchar *buf, TFRow *out, bool second= false);   /* record -> values_ (second: values2_) */
   bool capture_delete_cond(Item *item, std::vector<tf_tag_predicate> *preds,
                            longlong *lo, longlong *hi);
   int write_batch_row(const TFRow &row);  /* batch write, waiting for UNIQUE series claims */
@@ -504,6 +506,8 @@ private:
   uchar *tag_buf_= nullptr;       /* record buffer the memo refers to      */
   std::vector<String> str_bufs_;
   std::vector<TFValue> values_;
+  std::vector<String> str_bufs2_;   /* second image, for update_row() */
+  std::vector<TFValue> values2_;
 
   /*
     State of the current index scan on a composite index. `preds` are the

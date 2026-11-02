@@ -18,6 +18,7 @@ Storage engine **time-series** para MariaDB 11.4+, carregada como plugin
 | Leitura | varredura em streaming, poda por chunk (zone maps), Bloom por chunk, pushdown de `=`/`IN` em colunas TAG, índices compostos `(TAGs…, tempo)` |
 | Chave única | `PRIMARY KEY`/`UNIQUE` no formato `(TAGs…, tempo[, extras])` — a PK do histórico do Zabbix funciona |
 | `DELETE` | suportado (tombstones); caminho direto por série + faixa de tempo em µs–ms |
+| `UPDATE` | suportado (fase 1): `UPDATE`, `REPLACE` e `ON DUPLICATE KEY UPDATE` sobre chave existente, atômicos por statement; colunas da chave única não mudam; até ~150 k linhas por statement |
 | Retenção | `RETENTION_PERIOD` por tabela: apaga chunks inteiros |
 | Compressão | delta-of-delta, Simple8b, Gorilla, RLE + LZ4 (quente) / ZSTD (frio) |
 | Agregação na engine | `group_by_handler` opcional (`moosedb_group_by_pushdown`, padrão OFF) |
@@ -81,7 +82,9 @@ Com o Zabbix 7.0.31 real (DDL oficial + `COMMENT 'TAG'` + `TIMESTAMP_COLUMN`):
 | Filtro em coluna **não-TAG** (ex.: `file = 'x'`) | sem índice secundário → varredura | 1,6–3,3 s vs **0,01 s** do InnoDB com `KEY(file)` |
 | **Milhões de séries com poucas linhas** cada | custo por série | 1 M séries: `COUNT(*) WHERE` 1,4–1,6 s vs 0,07 s; `COUNT(DISTINCT)` ~1,45 s vs ~0,2 s |
 | Housekeeper **por item** (DELETE por itemid) | fsync por statement | 8,4 s vs 5,7 s (1,5x mais lento) — use `RETENTION_PERIOD` |
-| `UPDATE`, `REPLACE`/`ON DUPLICATE KEY UPDATE` em chave existente | **não suportado** (`ER_ILLEGAL_HA`) | — |
+| `INSERT … ON DUPLICATE KEY UPDATE` de linhas existentes | acha cada linha por conteúdo | 5.000 linhas: 102 ms vs **20 ms** (5x mais lento) |
+| `UPDATE` grande ou frequente | statement inteiro precisa caber no buffer do lote; trava a tabela para escrita; linhas antigas ficam mortas até a compactação | teto ~150 k linhas/statement (64 MiB); repetir UPDATE nas mesmas linhas fica mais lento até `OPTIMIZE` |
+| `UPDATE` que muda a chave única, ou dentro de trigger/função de outro statement | **recusado** com erro | — |
 | Transação com rollback | `ROLLBACK` **não desfaz** statements MooseDB já terminados (como MyISAM); sem XA real | — |
 | Backup com `mariadb-backup` | **não copia** tabelas MooseDB (a engine faz o backup falhar em vez de ficar incompleto) | use `BACKUP STAGE` + snapshot de volume ou `mariadb-dump --lock-all-tables` |
 | Particionamento | não suportado | retenção/chunks substituem o caso de uso |
@@ -100,8 +103,11 @@ Com o Zabbix 7.0.31 real (DDL oficial + `COMMENT 'TAG'` + `TIMESTAMP_COLUMN`):
 ### Não encaixa
 
 * Tabelas de configuração, inventário, eventos que mudam de status, filas,
-  qualquer coisa com `UPDATE` → **mantenha em InnoDB** (a engine convive no mesmo
-  servidor; só as tabelas de série mudam de engine).
+  qualquer coisa com `UPDATE` **frequente** → **mantenha em InnoDB** (a engine
+  convive no mesmo servidor; só as tabelas de série mudam de engine). `UPDATE`
+  ocasional (correção de valores, recálculo de um período) funciona: por faixa de
+  tempo foi 3–11x mais rápido que o InnoDB sem índice em `clock` (10–100 k linhas:
+  62–245 ms vs 681–796 ms).
 * Consultas "quem/onde" por coluna livre sem TAG → InnoDB com índice, ou tabela
   de resumo.
 
@@ -120,7 +126,7 @@ Com o Zabbix 7.0.31 real (DDL oficial + `COMMENT 'TAG'` + `TIMESTAMP_COLUMN`):
 ### Checklist antes de produção
 
 - [ ] Ambiente aceita plugin `EXPERIMENTAL`.
-- [ ] Nenhuma tabela candidata recebe `UPDATE`/upsert de chave existente.
+- [ ] `UPDATE`/upsert nas tabelas candidatas é ocasional, com menos de ~150 k linhas por statement e sem mudar a chave única.
 - [ ] Nenhuma escrita depende de `ROLLBACK` de transação multi-statement.
 - [ ] Backup ajustado (`BACKUP STAGE` + snapshot ou `mariadb-dump --lock-all-tables`).
 - [ ] Consultas principais filtram por TAG + tempo (conferir com `EXPLAIN`).

@@ -1,0 +1,272 @@
+#
+# UPDATE (phase 1): the statement batch carries (old row -> new row) pairs,
+# applied at the end of the statement together with its inserts. Also REPLACE
+# and INSERT ... ON DUPLICATE KEY UPDATE over an existing key. Compared with
+# an InnoDB mirror.
+#
+--source include/have_innodb.inc
+--source include/have_sequence.inc
+--source suite/moosedb/include/have_moosedb.inc
+
+CREATE TABLE m (ts DATETIME NOT NULL, host VARCHAR(8) NOT NULL COMMENT 'TAG',
+                v INT NOT NULL, INDEX(ts)) ENGINE=MooseDB CHUNK_INTERVAL='1 HOUR';
+CREATE TABLE i (ts DATETIME NOT NULL, host VARCHAR(8) NOT NULL,
+                v INT NOT NULL, KEY(ts)) ENGINE=InnoDB;
+INSERT INTO m SELECT '2026-03-01 00:00:00' + INTERVAL seq MINUTE, CONCAT('h', seq MOD 3), seq FROM seq_0_to_59;
+INSERT INTO i SELECT '2026-03-01 00:00:00' + INTERVAL seq MINUTE, CONCAT('h', seq MOD 3), seq FROM seq_0_to_59;
+
+--let $mt= m
+--let $it= i
+--let $show= 0
+--let $status= 0
+--let $q= SELECT ts, host, v FROM {T} ORDER BY ts, host, v
+
+--echo # ---- value, rows in the MemTable
+UPDATE m SET v = v + 1000 WHERE host = 'h1';
+SELECT ROW_COUNT();
+UPDATE i SET v = v + 1000 WHERE host = 'h1';
+--let $label= value update, MemTable
+--source suite/moosedb/include/cmp_query.inc
+
+--echo # ---- value, rows sealed in chunks
+FLUSH TABLES m;
+UPDATE m SET v = 7 WHERE host = 'h2';
+SELECT ROW_COUNT();
+UPDATE i SET v = 7 WHERE host = 'h2';
+--let $label= value update, after FLUSH
+--source suite/moosedb/include/cmp_query.inc
+FLUSH TABLES m;
+--let $label= value update, after a second FLUSH
+--source suite/moosedb/include/cmp_query.inc
+
+--echo # ---- WHERE by time and by value
+UPDATE m SET v = -1 WHERE ts BETWEEN '2026-03-01 00:10:00' AND '2026-03-01 00:19:00';
+UPDATE i SET v = -1 WHERE ts BETWEEN '2026-03-01 00:10:00' AND '2026-03-01 00:19:00';
+UPDATE m SET v = 0 WHERE v > 1000 AND host = 'h1' AND ts < '2026-03-01 00:40:00';
+UPDATE i SET v = 0 WHERE v > 1000 AND host = 'h1' AND ts < '2026-03-01 00:40:00';
+--let $label= WHERE by time / TAG / value
+--source suite/moosedb/include/cmp_query.inc
+
+--echo # ---- ORDER BY / LIMIT (the rows are chosen by the time order)
+UPDATE m SET v = 555 ORDER BY ts DESC LIMIT 3;
+SELECT ROW_COUNT();
+UPDATE i SET v = 555 ORDER BY ts DESC LIMIT 3;
+--let $label= ORDER BY ts DESC LIMIT 3
+--source suite/moosedb/include/cmp_query.inc
+
+--echo # ---- change of a TAG and of the time (no unique key)
+UPDATE m SET host = 'moved' WHERE host = 'h0' AND ts < '2026-03-01 00:20:00';
+UPDATE i SET host = 'moved' WHERE host = 'h0' AND ts < '2026-03-01 00:20:00';
+UPDATE m SET ts = ts + INTERVAL 1 DAY WHERE host = 'h2';
+UPDATE i SET ts = ts + INTERVAL 1 DAY WHERE host = 'h2';
+UPDATE m SET ts = ts - INTERVAL 3 HOUR, host = 'both' WHERE v = 555;
+UPDATE i SET ts = ts - INTERVAL 3 HOUR, host = 'both' WHERE v = 555;
+--let $label= TAG and time changes
+--source suite/moosedb/include/cmp_query.inc
+--let $q= SELECT COUNT(*), SUM(v), COUNT(DISTINCT host), MIN(ts), MAX(ts) FROM {T}
+--let $label= aggregates after TAG / time changes
+--source suite/moosedb/include/cmp_query.inc
+
+--echo # ---- update to the same values, and to nothing
+UPDATE m SET v = v;
+SELECT ROW_COUNT();
+UPDATE m SET v = 1 WHERE 1 = 0;
+SELECT ROW_COUNT();
+--let $label= no-op updates change nothing
+--source suite/moosedb/include/cmp_query.inc
+
+--echo # ---- duplicate rows: each matching row is updated, once
+CREATE TABLE d (ts DATETIME NOT NULL, host VARCHAR(8) NOT NULL COMMENT 'TAG', v INT NOT NULL, INDEX(ts)) ENGINE=MooseDB;
+CREATE TABLE di (ts DATETIME NOT NULL, host VARCHAR(8) NOT NULL, v INT NOT NULL, KEY(ts)) ENGINE=InnoDB;
+INSERT INTO d VALUES ('2026-01-01', 'a', 1), ('2026-01-01', 'a', 1), ('2026-01-01', 'a', 1), ('2026-01-02', 'a', 2);
+INSERT INTO di VALUES ('2026-01-01', 'a', 1), ('2026-01-01', 'a', 1), ('2026-01-01', 'a', 1), ('2026-01-02', 'a', 2);
+UPDATE d SET v = 9 WHERE ts = '2026-01-01';
+SELECT ROW_COUNT();
+UPDATE di SET v = 9 WHERE ts = '2026-01-01';
+--let $mt= d
+--let $it= di
+--let $q= SELECT ts, host, v FROM {T} ORDER BY ts, host, v
+--let $label= duplicate rows
+--source suite/moosedb/include/cmp_query.inc
+UPDATE d SET v = 3 ORDER BY ts LIMIT 2;
+UPDATE di SET v = 3 ORDER BY ts LIMIT 2;
+--let $label= duplicate rows with LIMIT
+--source suite/moosedb/include/cmp_query.inc
+DROP TABLE d, di;
+
+--echo # ---- BEGIN / COMMIT / ROLLBACK
+--let $mt= m
+--let $it= i
+--let $q= SELECT COUNT(*), SUM(v) FROM {T}
+BEGIN;
+UPDATE m SET v = 1;
+UPDATE m SET v = v + 1 WHERE host = 'both';
+COMMIT;
+UPDATE i SET v = 1;
+UPDATE i SET v = v + 1 WHERE host = 'both';
+--let $label= two updates in a transaction
+--source suite/moosedb/include/cmp_query.inc
+
+--echo # ---- a failing statement leaves nothing of its updates
+SET sql_mode = 'STRICT_ALL_TABLES';
+--error ER_WARN_DATA_OUT_OF_RANGE,ER_DATA_OUT_OF_RANGE
+UPDATE m SET v = 2147483647 + v;
+SET sql_mode = DEFAULT;
+--let $label= failed UPDATE changed nothing
+--source suite/moosedb/include/cmp_query.inc
+
+--echo # ---- multi-table UPDATE
+CREATE TABLE s (host VARCHAR(8) NOT NULL, k INT NOT NULL) ENGINE=InnoDB;
+INSERT INTO s VALUES ('both', 10), ('moved', 20);
+UPDATE m, s SET m.v = s.k WHERE m.host = s.host;
+UPDATE i, s SET i.v = s.k WHERE i.host = s.host;
+DROP TABLE s;
+--let $q= SELECT ts, host, v FROM {T} ORDER BY ts, host, v
+--let $label= multi-table UPDATE
+--source suite/moosedb/include/cmp_query.inc
+
+DROP TABLE m, i;
+
+--echo ##################################################################
+--echo # Table with a PRIMARY KEY (tag, time, ns)
+--echo ##################################################################
+CREATE TABLE p (itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG', clock INT NOT NULL, value DOUBLE NOT NULL, ns INT NOT NULL DEFAULT 0,
+                PRIMARY KEY (itemid, clock, ns)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+CREATE TABLE pi (itemid BIGINT UNSIGNED NOT NULL, clock INT NOT NULL, value DOUBLE NOT NULL, ns INT NOT NULL DEFAULT 0,
+                 PRIMARY KEY (itemid, clock, ns)) ENGINE=InnoDB;
+INSERT INTO p SELECT seq MOD 4, 1767225600 + seq, seq / 2, 0 FROM seq_0_to_39;
+INSERT INTO pi SELECT seq MOD 4, 1767225600 + seq, seq / 2, 0 FROM seq_0_to_39;
+--let $mt= p
+--let $it= pi
+--let $q= SELECT itemid, clock, value, ns FROM {T} ORDER BY itemid, clock, ns
+
+--echo # a value update is fine, in the MemTable and after FLUSH
+UPDATE p SET value = 100 WHERE itemid = 1;
+UPDATE pi SET value = 100 WHERE itemid = 1;
+--let $label= PK table: value update
+--source suite/moosedb/include/cmp_query.inc
+FLUSH TABLES p;
+UPDATE p SET value = value + 1 WHERE itemid IN (1, 2) AND clock > 1767225610;
+UPDATE pi SET value = value + 1 WHERE itemid IN (1, 2) AND clock > 1767225610;
+--let $label= PK table: value update after FLUSH
+--source suite/moosedb/include/cmp_query.inc
+
+--echo # the columns of the key cannot change: clear error, nothing changes
+--error ER_GET_ERRMSG
+UPDATE p SET clock = clock + 1 WHERE itemid = 1;
+--error ER_GET_ERRMSG
+UPDATE p SET itemid = 99 WHERE itemid = 1;
+--error ER_GET_ERRMSG
+UPDATE p SET ns = 5 WHERE itemid = 1;
+--let $label= PK table: key update refused, no change
+--source suite/moosedb/include/cmp_query.inc
+--echo # an update that sets the key to the value it has is fine
+UPDATE p SET clock = clock, value = 1 WHERE itemid = 3;
+UPDATE pi SET clock = clock, value = 1 WHERE itemid = 3;
+--let $label= PK table: key set to itself
+--source suite/moosedb/include/cmp_query.inc
+
+--echo # ---- INSERT ... ON DUPLICATE KEY UPDATE over an existing key
+INSERT INTO p VALUES (1, 1767225601, 5, 0), (1, 1767229999, 6, 0) ON DUPLICATE KEY UPDATE value = VALUES(value) + 1000;
+SELECT ROW_COUNT();
+INSERT INTO pi VALUES (1, 1767225601, 5, 0), (1, 1767229999, 6, 0) ON DUPLICATE KEY UPDATE value = VALUES(value) + 1000;
+--let $label= ODKU: one existing key, one new
+--source suite/moosedb/include/cmp_query.inc
+INSERT INTO p VALUES (2, 1767225602, 1, 0) ON DUPLICATE KEY UPDATE value = value * 2;
+INSERT INTO pi VALUES (2, 1767225602, 1, 0) ON DUPLICATE KEY UPDATE value = value * 2;
+--let $label= ODKU using the old value
+--source suite/moosedb/include/cmp_query.inc
+--echo # ODKU that would change the key is refused
+--error ER_GET_ERRMSG
+INSERT INTO p VALUES (2, 1767225602, 1, 0) ON DUPLICATE KEY UPDATE clock = clock + 1;
+--let $label= ODKU key change refused, no change
+--source suite/moosedb/include/cmp_query.inc
+
+--echo # ---- REPLACE over an existing key
+REPLACE INTO p VALUES (3, 1767225603, 77, 0), (3, 1767299999, 78, 0);
+REPLACE INTO pi VALUES (3, 1767225603, 77, 0), (3, 1767299999, 78, 0);
+--let $label= REPLACE: one existing key, one new
+--source suite/moosedb/include/cmp_query.inc
+FLUSH TABLES p;
+REPLACE INTO p VALUES (3, 1767225603, 88, 0);
+REPLACE INTO pi VALUES (3, 1767225603, 88, 0);
+--let $label= REPLACE of a row in a chunk
+--source suite/moosedb/include/cmp_query.inc
+
+--echo # ---- REPLACE that needs delete + insert (DELETE trigger) is refused, no loop
+CREATE TABLE lg (n INT) ENGINE=InnoDB;
+CREATE TRIGGER p_bd BEFORE DELETE ON p FOR EACH ROW INSERT INTO lg VALUES (1);
+--error ER_GET_ERRMSG
+REPLACE INTO p VALUES (3, 1767225603, 99, 0);
+DROP TRIGGER p_bd;
+DROP TABLE lg;
+--let $label= refused REPLACE changed nothing
+--source suite/moosedb/include/cmp_query.inc
+
+--echo # ---- the same key twice in one statement: refused by the engine, nothing changes
+--error ER_GET_ERRMSG
+REPLACE INTO p VALUES (3, 1767225603, 1, 0), (3, 1767225603, 2, 0);
+--let $label= REPLACE of the same key twice, no change
+--source suite/moosedb/include/cmp_query.inc
+--error ER_GET_ERRMSG
+INSERT INTO p VALUES (2, 1767225602, 1, 0), (2, 1767225602, 1, 0) ON DUPLICATE KEY UPDATE value = value + 1;
+--let $label= ODKU of the same key twice, no change
+--source suite/moosedb/include/cmp_query.inc
+
+--echo # ---- INSERT ... SELECT ... ON DUPLICATE KEY UPDATE over rows sealed in chunks
+FLUSH TABLES p;
+INSERT INTO p SELECT seq MOD 4, 1767225600 + seq, 10, 0 FROM seq_1_to_8 ON DUPLICATE KEY UPDATE value = value + VALUES(value);
+INSERT INTO pi SELECT seq MOD 4, 1767225600 + seq, 10, 0 FROM seq_1_to_8 ON DUPLICATE KEY UPDATE value = value + VALUES(value);
+--let $label= INSERT SELECT ODKU, rows in chunks
+--source suite/moosedb/include/cmp_query.inc
+INSERT INTO p SELECT seq MOD 4, 1767225600 + seq, 20, 0 FROM seq_36_to_44 ON DUPLICATE KEY UPDATE value = value + VALUES(value);
+INSERT INTO pi SELECT seq MOD 4, 1767225600 + seq, 20, 0 FROM seq_36_to_44 ON DUPLICATE KEY UPDATE value = value + VALUES(value);
+--let $label= INSERT SELECT ODKU, mix of existing and new keys
+--source suite/moosedb/include/cmp_query.inc
+
+--echo # ---- UPDATE inside a trigger / function of another statement: refused, table intact
+CREATE TABLE trg (a INT) ENGINE=InnoDB;
+CREATE TRIGGER trg_ai AFTER INSERT ON trg FOR EACH ROW UPDATE p SET value = value + 1 WHERE itemid = 0;
+--error ER_GET_ERRMSG
+INSERT INTO trg VALUES (1);
+SELECT COUNT(*) FROM trg;
+--let $q= SELECT itemid, clock, value, ns FROM {T} ORDER BY itemid, clock, ns
+--let $label= trigger UPDATE refused, table intact
+--source suite/moosedb/include/cmp_query.inc
+DROP TRIGGER trg_ai;
+DROP TABLE trg;
+DELIMITER |;
+CREATE FUNCTION upd_p() RETURNS INT
+BEGIN
+  UPDATE p SET value = value + 1 WHERE itemid = 0;
+  RETURN 1;
+END|
+DELIMITER ;|
+--error ER_GET_ERRMSG
+SELECT upd_p();
+--let $label= function UPDATE refused, table intact
+--source suite/moosedb/include/cmp_query.inc
+DROP FUNCTION upd_p;
+
+--echo # ---- UPDATE as a statement of a stored procedure: locked per statement, works
+CREATE PROCEDURE upd_proc() UPDATE p SET value = value + 1 WHERE itemid = 1;
+CREATE PROCEDURE upd_proci() UPDATE pi SET value = value + 1 WHERE itemid = 1;
+CALL upd_proc();
+CALL upd_proci();
+--let $label= UPDATE inside CALL procedure
+--source suite/moosedb/include/cmp_query.inc
+DROP PROCEDURE upd_proc;
+DROP PROCEDURE upd_proci;
+
+--echo # ---- LOAD DATA ... REPLACE over existing keys (exclusive lock + update_row)
+--replace_result $MYSQLTEST_VARDIR VARDIR
+eval SELECT itemid, clock, value + 100, ns FROM pi WHERE clock < 1767225610 INTO OUTFILE '$MYSQLTEST_VARDIR/tmp/tf_upd_load.txt';
+--replace_result $MYSQLTEST_VARDIR VARDIR
+eval LOAD DATA INFILE '$MYSQLTEST_VARDIR/tmp/tf_upd_load.txt' REPLACE INTO TABLE p;
+--replace_result $MYSQLTEST_VARDIR VARDIR
+eval LOAD DATA INFILE '$MYSQLTEST_VARDIR/tmp/tf_upd_load.txt' REPLACE INTO TABLE pi;
+--let $label= LOAD DATA REPLACE over existing keys
+--source suite/moosedb/include/cmp_query.inc
+--remove_file $MYSQLTEST_VARDIR/tmp/tf_upd_load.txt
+
+DROP TABLE p, pi;

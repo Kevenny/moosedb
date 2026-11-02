@@ -29,15 +29,15 @@ SET SESSION moosedb_group_by_pushdown = OFF;
 --source suite/moosedb/include/warn_cases.inc
 SET SESSION moosedb_group_by_pushdown = DEFAULT;
 
---echo # UPDATE on MooseDB is refused by the engine (not a time range matter)
+--echo # UPDATE on MooseDB with a time range: the same on the InnoDB mirror keeps both equal
 INSERT INTO m SELECT '2026-03-01 00:00:00' + INTERVAL seq MINUTE, CONCAT('h', seq MOD 3), seq FROM seq_0_to_59;
 INSERT INTO i SELECT '2026-03-01 00:00:00' + INTERVAL seq MINUTE, CONCAT('h', seq MOD 3), seq FROM seq_0_to_59;
---error ER_ILLEGAL_HA
 UPDATE m SET v = v + 1 WHERE ts > '2026-03-01 00:30:00';
---error ER_ILLEGAL_HA
+UPDATE i SET v = v + 1 WHERE ts > '2026-03-01 00:30:00';
 UPDATE m SET ts = ts + INTERVAL 1 DAY WHERE ts > '2026-03-01 00:30:00';
---error ER_ILLEGAL_HA
+UPDATE i SET ts = ts + INTERVAL 1 DAY WHERE ts > '2026-03-01 00:30:00';
 UPDATE m, s SET m.v = 0 WHERE m.host = s.host AND m.ts > '2026-03-01 00:30:00';
+UPDATE i, s SET i.v = 0 WHERE i.host = s.host AND i.ts > '2026-03-01 00:30:00';
 
 --echo ##################################################################
 --echo # Lifecycle of the pushed range
@@ -143,7 +143,7 @@ SET SESSION max_length_for_sort_data = 4;
 --let $q= SELECT ts, host, v FROM {T} IGNORE INDEX(ts) WHERE ts BETWEEN '2026-03-01 00:20:00' AND '2026-03-01 00:40:00' ORDER BY v DESC, ts, host
 --let $label= ORDER BY v over the range, rowid filesort
 --source suite/moosedb/include/cmp_query.inc
---let $q= SELECT ts, host, v FROM {T} IGNORE INDEX(ts) WHERE ts > '2026-03-01 00:50:00' ORDER BY host, v LIMIT 7
+--let $q= SELECT ts, host, v FROM {T} IGNORE INDEX(ts) WHERE ts > '2026-03-01 00:50:00' ORDER BY host, v, ts LIMIT 7
 --let $label= ORDER BY host, v LIMIT over an open range
 --source suite/moosedb/include/cmp_query.inc
 FLUSH STATUS;

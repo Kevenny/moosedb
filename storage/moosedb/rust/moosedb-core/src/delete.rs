@@ -28,7 +28,7 @@
 //! before the delete or as it is after it.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, PoisonError};
+use std::sync::{Arc, MutexGuard, PoisonError};
 
 use crate::chunk::ChunkMeta;
 use crate::chunk_reader::load_window;
@@ -95,6 +95,174 @@ fn encoded(row: &[Value]) -> Vec<u8> {
     b
 }
 
+
+/// Equal rows to delete form a group: `k` of them are to go.
+pub(crate) struct Group {
+    row: Row,
+    ts: i64,
+    tags: Vec<Value>,
+    k: usize,
+}
+
+/// The rows of one row delete (or of the old rows of UPDATE pairs), grouped by content.
+#[derive(Default)]
+pub(crate) struct DelGroups {
+    index: HashMap<Vec<u8>, usize>,
+    groups: Vec<Group>,
+}
+
+impl DelGroups {
+    /// Whether a row equal to `row` is already in a group.
+    pub(crate) fn contains(&self, row: &[Value]) -> bool {
+        self.index.contains_key(&encoded(row))
+    }
+
+    /// Adds one row to delete; returns the group (equal rows share one).
+    pub(crate) fn add(&mut self, schema: &Schema, row: Row) -> usize {
+        let key = encoded(&row);
+        match self.index.get(&key) {
+            Some(&g) => {
+                self.groups[g].k += 1;
+                g
+            }
+            None => {
+                let g = self.groups.len();
+                self.index.insert(key, g);
+                self.groups.push(Group { ts: schema.row_ts(&row), tags: row_tags(schema, &row), row, k: 1 });
+                g
+            }
+        }
+    }
+
+    /// Decides, with the table mutex held (and no flush running), which rows
+    /// go: the MemTable's first, then those `found` in the chunks. Changes nothing.
+    pub(crate) fn plan(&self, schema: &Schema, inner: &Inner, found: &[Vec<(u64, u32, u32)>]) -> Result<DelPlan> {
+        let sids: Vec<Option<u64>> = self.groups.iter().map(|x| inner.series.lookup(&x.tags)).collect();
+        let (lo, hi) = self.groups.iter().fold((i64::MAX, i64::MIN), |(l, h), g| (l.min(g.ts), h.max(g.ts)));
+        // (series, timestamp) of every group: a cheap test before a row is encoded.
+        let mut by_key: HashSet<(u64, i64)> = HashSet::new();
+        for (gi, s) in sids.iter().enumerate() {
+            if let Some(s) = s {
+                by_key.insert((*s, self.groups[gi].ts));
+            }
+        }
+        let ks: Vec<usize> = self.groups.iter().map(|g| g.k).collect();
+        let mut plan = DelPlan {
+            seq: 0,
+            lo,
+            hi,
+            sids,
+            by_key,
+            ks: ks.clone(),
+            mem_rows: Vec::new(),
+            tombs_new: Vec::new(),
+            deleted: Vec::new(),
+        };
+        let mut left = ks.clone();
+        let mut mem_rows: Vec<Row> = Vec::new();
+        inner.memtable.visit_range(schema, lo, hi, |r| {
+            let ts = schema.row_ts(&r.row);
+            if self.take_from_mem(&plan.by_key, &mut left, r, ts) {
+                mem_rows.push(r.row.clone());
+            }
+        });
+        let from_mem: Vec<usize> = ks.iter().zip(&left).map(|(k, l)| k - l).collect();
+
+        // What the chunks give for the rest.
+        let mut dead: HashMap<(u64, u32), Vec<u32>> = HashMap::new();
+        let mut deleted = from_mem.clone();
+        for (gi, f) in found.iter().enumerate() {
+            let need = ks[gi] - from_mem[gi];
+            for &(c, e, o) in f.iter().take(need) {
+                dead.entry((c, e)).or_default().push(o);
+                deleted[gi] += 1;
+            }
+        }
+        let mut tombs_new: Vec<RowsTomb> = Vec::with_capacity(dead.len());
+        let mut keys: Vec<(u64, u32)> = dead.keys().copied().collect();
+        keys.sort_unstable();
+        let seq = inner.tseq.checked_add(1).ok_or_else(|| corrupt("tombstone sequence numbers are exhausted"))?;
+        for key in keys {
+            let mut ords = dead.remove(&key).unwrap_or_default();
+            ords.sort_unstable();
+            ords.dedup();
+            tombs_new.push(RowsTomb { seq, chunk: key.0, entry: key.1, runs: runs_of(&ords) });
+        }
+        plan.seq = seq;
+        plan.mem_rows = mem_rows;
+        plan.tombs_new = tombs_new;
+        plan.deleted = deleted;
+        Ok(plan)
+    }
+
+    fn take_from_mem(&self, by_key: &HashSet<(u64, i64)>, left: &mut [usize], r: &crate::memtable::MemRow, ts: i64) -> bool {
+        if !by_key.contains(&(r.series_id, ts)) {
+            return false;
+        }
+        match self.index.get(&encoded(&r.row)) {
+            Some(&gi) if left[gi] > 0 => {
+                left[gi] -= 1;
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// What a row delete will do (see [`DelGroups::plan`]).
+/// Per group of a row delete: `(chunk id, series entry, ordinal)` of each row found.
+pub(crate) type Found = Vec<Vec<(u64, u32, u32)>>;
+
+pub(crate) struct DelPlan {
+    seq: u64,
+    lo: i64,
+    hi: i64,
+    sids: Vec<Option<u64>>,
+    by_key: HashSet<(u64, i64)>,
+    ks: Vec<usize>,
+    mem_rows: Vec<Row>,
+    tombs_new: Vec<RowsTomb>,
+    /// Rows deleted per group (at most the group's `k`).
+    pub(crate) deleted: Vec<usize>,
+}
+
+impl DelPlan {
+    pub(crate) fn total(&self) -> u64 {
+        self.mem_rows.len() as u64 + self.tombs_new.iter().map(RowsTomb::rows).sum::<u64>()
+    }
+
+    /// The DELETE_ROWS payload that logs this delete.
+    pub(crate) fn entry(&self) -> Vec<u8> {
+        let refs: Vec<&[Value]> = self.mem_rows.iter().map(Vec::as_slice).collect();
+        wal::rows_delete_entry(self.seq, &refs, &self.tombs_new)
+    }
+
+    /// Applies the delete after its entry is logged (table mutex held).
+    pub(crate) fn apply(self, groups: &DelGroups, schema: &Schema, inner: &mut Inner) {
+        inner.changed();
+        if !self.mem_rows.is_empty() {
+            let mut left = self.ks.clone();
+            let removed = inner.memtable.remove_where(schema, self.lo, self.hi, |r| {
+                let ts = schema.row_ts(&r.row);
+                groups.take_from_mem(&self.by_key, &mut left, r, ts)
+            });
+            debug_assert_eq!(removed, self.mem_rows.len());
+            inner.mem_generation += 1;
+        }
+        inner.tseq = self.seq;
+        let set = Arc::make_mut(&mut inner.tombs);
+        for t in self.tombs_new {
+            set.add_rows(t);
+        }
+        for (gi, s) in self.sids.iter().enumerate() {
+            if let Some(s) = s {
+                if self.ks[gi] > 0 {
+                    inner.uniq.invalidate(*s);
+                }
+            }
+        }
+    }
+}
 
 /// Rows `sel` selects between `lo` and `hi` that the chunks of `chunks`
 /// still show, per chunk: `(chunk id, rows)`, chunks with none left out.
@@ -289,25 +457,39 @@ impl Table {
     }
 
     fn delete_piece(&self, rows: Vec<Row>, durable: bool) -> Result<u64> {
-        // Equal rows form a group: `k` of them are to go.
-        struct Group {
-            row: Row,
-            ts: i64,
-            tags: Vec<Value>,
-            k: usize,
-        }
-        let mut index: HashMap<Vec<u8>, usize> = HashMap::new();
-        let mut groups: Vec<Group> = Vec::new();
+        let mut groups = DelGroups::default();
         for row in rows {
-            let key = encoded(&row);
-            match index.get(&key) {
-                Some(&g) => groups[g].k += 1,
-                None => {
-                    index.insert(key, groups.len());
-                    groups.push(Group { ts: self.schema.row_ts(&row), tags: row_tags(&self.schema, &row), row, k: 1 });
-                }
-            }
+            groups.add(&self.schema, row);
         }
+        let (mut guard, found) = self.lock_with_found(&groups)?;
+        let inner = &mut *guard;
+        let plan = groups.plan(&self.schema, inner, &found)?;
+        let total = plan.total();
+        if total == 0 {
+            return Ok(0);
+        }
+        let entry = plan.entry();
+        if entry.len() > wal::MAX_DELETE_ENTRY {
+            return Err(Error::Unsupported(format!(
+                "a DELETE piece of {} bytes exceeds the {} byte log entry limit",
+                entry.len(),
+                wal::MAX_DELETE_ENTRY
+            )));
+        }
+        log_delete(inner, &entry, durable)?;
+
+        // Committed. Apply.
+        plan.apply(&groups, &self.schema, inner);
+        Ok(total)
+    }
+
+    /// Step 1-2 of a row delete: looks for the rows of `groups` in the chunks
+    /// outside the table mutex, then takes the mutex (idle: no flush sealing
+    /// the MemTable) and checks the chunks did not change meanwhile; after
+    /// `OPTIMISTIC_ATTEMPTS` the search is done under the mutex. Returns the
+    /// guard and, per group, `(chunk id, series entry, ordinal)` of its rows.
+    /// The caller still checks the table epoch if it cares.
+    pub(crate) fn lock_with_found(&self, groups: &DelGroups) -> Result<(MutexGuard<'_, Inner>, Found)> {
         let want: Vec<bool> = (0..self.schema.columns().len()).map(|c| self.schema.tag_position(c).is_none()).collect();
         for attempt in 0..=OPTIMISTIC_ATTEMPTS {
             let last = attempt == OPTIMISTIC_ATTEMPTS;
@@ -315,128 +497,35 @@ impl Table {
             let (chunks, tombs, gen, epoch, sids) = {
                 let g = self.lock()?;
                 g.check_writable()?;
-                let sids: Vec<Option<u64>> = groups.iter().map(|x| g.series.lookup(&x.tags)).collect();
+                let sids: Vec<Option<u64>> = groups.groups.iter().map(|x| g.series.lookup(&x.tags)).collect();
                 (g.chunks.clone(), g.tombs.clone(), g.layout_gen, g.epoch, sids)
             };
-            let mut guard;
-            let found: Vec<Vec<(u64, u32, u32)>>;
             if last {
                 drop((chunks, tombs));
-                guard = self.lock_idle()?;
+                let guard = self.lock_idle()?;
                 guard.check_writable()?;
-                let sids2: Vec<Option<u64>> = groups.iter().map(|x| guard.series.lookup(&x.tags)).collect();
-                found = groups
+                let sids2: Vec<Option<u64>> = groups.groups.iter().map(|x| guard.series.lookup(&x.tags)).collect();
+                let found = groups
+                    .groups
                     .iter()
                     .zip(&sids2)
                     .map(|(g, s)| self.locate(&guard.chunks, &guard.tombs, *s, g.ts, &g.row, g.k, &want))
                     .collect::<Result<_>>()?;
-            } else {
-                found = groups
-                    .iter()
-                    .zip(&sids)
-                    .map(|(g, s)| self.locate(&chunks, &tombs, *s, g.ts, &g.row, g.k, &want))
-                    .collect::<Result<_>>()?;
-                drop((chunks, tombs));
-                guard = self.lock_idle()?;
-                guard.check_writable()?;
-                if guard.layout_gen != gen || guard.epoch != epoch {
-                    continue;
-                }
+                return Ok((guard, found));
             }
-            let inner = &mut *guard;
-
-            // Step 2: the MemTable first (cheaper, and what an equal row in a
-            // chunk would lose to), then the chunks for what is left.
-            let sids: Vec<Option<u64>> = groups.iter().map(|x| inner.series.lookup(&x.tags)).collect();
-            let (lo, hi) = groups.iter().fold((i64::MAX, i64::MIN), |(l, h), g| (l.min(g.ts), h.max(g.ts)));
-            // (series, timestamp) of every group: a cheap test before a row is encoded.
-            let mut by_key: HashSet<(u64, i64)> = HashSet::new();
-            for (gi, s) in sids.iter().enumerate() {
-                if let Some(s) = s {
-                    by_key.insert((*s, groups[gi].ts));
-                }
+            let found: Vec<Vec<(u64, u32, u32)>> = groups
+                .groups
+                .iter()
+                .zip(&sids)
+                .map(|(g, s)| self.locate(&chunks, &tombs, *s, g.ts, &g.row, g.k, &want))
+                .collect::<Result<_>>()?;
+            drop((chunks, tombs));
+            let guard = self.lock_idle()?;
+            guard.check_writable()?;
+            if guard.layout_gen != gen || guard.epoch != epoch {
+                continue;
             }
-            let ks: Vec<usize> = groups.iter().map(|g| g.k).collect();
-            let take_from_mem = |left: &mut Vec<usize>, r: &crate::memtable::MemRow, ts: i64| -> bool {
-                if !by_key.contains(&(r.series_id, ts)) {
-                    return false;
-                }
-                match index.get(&encoded(&r.row)) {
-                    Some(&gi) if left[gi] > 0 => {
-                        left[gi] -= 1;
-                        true
-                    }
-                    _ => false,
-                }
-            };
-            let mut left = ks.clone();
-            let mut mem_rows: Vec<Row> = Vec::new();
-            inner.memtable.visit_range(&self.schema, lo, hi, |r| {
-                let ts = self.schema.row_ts(&r.row);
-                if take_from_mem(&mut left, r, ts) {
-                    mem_rows.push(r.row.clone());
-                }
-            });
-            let from_mem: Vec<usize> = ks.iter().zip(&left).map(|(k, l)| k - l).collect();
-
-            // What the chunks give for the rest.
-            let mut dead: HashMap<(u64, u32), Vec<u32>> = HashMap::new();
-            for (gi, f) in found.iter().enumerate() {
-                let need = ks[gi] - from_mem[gi];
-                for &(c, e, o) in f.iter().take(need) {
-                    dead.entry((c, e)).or_default().push(o);
-                }
-            }
-            let mut tombs_new: Vec<RowsTomb> = Vec::with_capacity(dead.len());
-            let mut keys: Vec<(u64, u32)> = dead.keys().copied().collect();
-            keys.sort_unstable();
-            let seq = inner.tseq.checked_add(1).ok_or_else(|| corrupt("tombstone sequence numbers are exhausted"))?;
-            for key in keys {
-                let mut ords = dead.remove(&key).unwrap_or_default();
-                ords.sort_unstable();
-                ords.dedup();
-                tombs_new.push(RowsTomb { seq, chunk: key.0, entry: key.1, runs: runs_of(&ords) });
-            }
-            let in_chunks: u64 = tombs_new.iter().map(RowsTomb::rows).sum();
-            let total = mem_rows.len() as u64 + in_chunks;
-            if total == 0 {
-                return Ok(0);
-            }
-            let refs: Vec<&[Value]> = mem_rows.iter().map(Vec::as_slice).collect();
-            let entry = wal::rows_delete_entry(seq, &refs, &tombs_new);
-            if entry.len() > wal::MAX_DELETE_ENTRY {
-                return Err(Error::Unsupported(format!(
-                    "a DELETE piece of {} bytes exceeds the {} byte log entry limit",
-                    entry.len(),
-                    wal::MAX_DELETE_ENTRY
-                )));
-            }
-            log_delete(inner, &entry, durable)?;
-
-            // Committed. Apply.
-            inner.changed();
-            if !mem_rows.is_empty() {
-                let mut left = ks.clone();
-                let removed = inner.memtable.remove_where(&self.schema, lo, hi, |r| {
-                    let ts = self.schema.row_ts(&r.row);
-                    take_from_mem(&mut left, r, ts)
-                });
-                debug_assert_eq!(removed, mem_rows.len());
-                inner.mem_generation += 1;
-            }
-            inner.tseq = seq;
-            let set = Arc::make_mut(&mut inner.tombs);
-            for t in tombs_new {
-                set.add_rows(t);
-            }
-            for (gi, s) in sids.iter().enumerate() {
-                if let Some(s) = s {
-                    if ks[gi] > 0 {
-                        inner.uniq.invalidate(*s);
-                    }
-                }
-            }
-            return Ok(total);
+            return Ok((guard, found));
         }
         Err(Error::Busy("the table kept changing while a DELETE looked for its rows".into()))
     }
@@ -538,9 +627,10 @@ pub(crate) struct Replay<'a> {
 }
 
 impl Replay<'_> {
-    pub(crate) fn apply(&mut self, payload: &[u8]) -> Result<()> {
+    /// `cap`: the largest payload accepted (see `wal::ReplayEvent::Delete`).
+    pub(crate) fn apply(&mut self, payload: &[u8], cap: usize) -> Result<()> {
         let schema = self.schema;
-        match wal::decode_delete(payload)? {
+        match wal::decode_delete_capped(payload, cap)? {
             DeleteEntry::Range { seq, lo, hi, series } => {
                 let sel = match series {
                     None => Sel::All,

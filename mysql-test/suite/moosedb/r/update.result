@@ -1,0 +1,262 @@
+CREATE TABLE m (ts DATETIME NOT NULL, host VARCHAR(8) NOT NULL COMMENT 'TAG',
+v INT NOT NULL, INDEX(ts)) ENGINE=MooseDB CHUNK_INTERVAL='1 HOUR';
+CREATE TABLE i (ts DATETIME NOT NULL, host VARCHAR(8) NOT NULL,
+v INT NOT NULL, KEY(ts)) ENGINE=InnoDB;
+INSERT INTO m SELECT '2026-03-01 00:00:00' + INTERVAL seq MINUTE, CONCAT('h', seq MOD 3), seq FROM seq_0_to_59;
+INSERT INTO i SELECT '2026-03-01 00:00:00' + INTERVAL seq MINUTE, CONCAT('h', seq MOD 3), seq FROM seq_0_to_59;
+# ---- value, rows in the MemTable
+UPDATE m SET v = v + 1000 WHERE host = 'h1';
+SELECT ROW_COUNT();
+ROW_COUNT()
+20
+UPDATE i SET v = v + 1000 WHERE host = 'h1';
+# value update, MemTable
+result_rows	vs_innodb
+60	SAME
+# ---- value, rows sealed in chunks
+FLUSH TABLES m;
+UPDATE m SET v = 7 WHERE host = 'h2';
+SELECT ROW_COUNT();
+ROW_COUNT()
+20
+UPDATE i SET v = 7 WHERE host = 'h2';
+# value update, after FLUSH
+result_rows	vs_innodb
+60	SAME
+FLUSH TABLES m;
+# value update, after a second FLUSH
+result_rows	vs_innodb
+60	SAME
+# ---- WHERE by time and by value
+UPDATE m SET v = -1 WHERE ts BETWEEN '2026-03-01 00:10:00' AND '2026-03-01 00:19:00';
+UPDATE i SET v = -1 WHERE ts BETWEEN '2026-03-01 00:10:00' AND '2026-03-01 00:19:00';
+UPDATE m SET v = 0 WHERE v > 1000 AND host = 'h1' AND ts < '2026-03-01 00:40:00';
+UPDATE i SET v = 0 WHERE v > 1000 AND host = 'h1' AND ts < '2026-03-01 00:40:00';
+# WHERE by time / TAG / value
+result_rows	vs_innodb
+60	SAME
+# ---- ORDER BY / LIMIT (the rows are chosen by the time order)
+UPDATE m SET v = 555 ORDER BY ts DESC LIMIT 3;
+SELECT ROW_COUNT();
+ROW_COUNT()
+3
+UPDATE i SET v = 555 ORDER BY ts DESC LIMIT 3;
+# ORDER BY ts DESC LIMIT 3
+result_rows	vs_innodb
+60	SAME
+# ---- change of a TAG and of the time (no unique key)
+UPDATE m SET host = 'moved' WHERE host = 'h0' AND ts < '2026-03-01 00:20:00';
+UPDATE i SET host = 'moved' WHERE host = 'h0' AND ts < '2026-03-01 00:20:00';
+UPDATE m SET ts = ts + INTERVAL 1 DAY WHERE host = 'h2';
+UPDATE i SET ts = ts + INTERVAL 1 DAY WHERE host = 'h2';
+UPDATE m SET ts = ts - INTERVAL 3 HOUR, host = 'both' WHERE v = 555;
+UPDATE i SET ts = ts - INTERVAL 3 HOUR, host = 'both' WHERE v = 555;
+# TAG and time changes
+result_rows	vs_innodb
+60	SAME
+# aggregates after TAG / time changes
+result_rows	vs_innodb
+1	SAME
+# ---- update to the same values, and to nothing
+UPDATE m SET v = v;
+SELECT ROW_COUNT();
+ROW_COUNT()
+0
+UPDATE m SET v = 1 WHERE 1 = 0;
+SELECT ROW_COUNT();
+ROW_COUNT()
+0
+# no-op updates change nothing
+result_rows	vs_innodb
+1	SAME
+# ---- duplicate rows: each matching row is updated, once
+CREATE TABLE d (ts DATETIME NOT NULL, host VARCHAR(8) NOT NULL COMMENT 'TAG', v INT NOT NULL, INDEX(ts)) ENGINE=MooseDB;
+CREATE TABLE di (ts DATETIME NOT NULL, host VARCHAR(8) NOT NULL, v INT NOT NULL, KEY(ts)) ENGINE=InnoDB;
+INSERT INTO d VALUES ('2026-01-01', 'a', 1), ('2026-01-01', 'a', 1), ('2026-01-01', 'a', 1), ('2026-01-02', 'a', 2);
+INSERT INTO di VALUES ('2026-01-01', 'a', 1), ('2026-01-01', 'a', 1), ('2026-01-01', 'a', 1), ('2026-01-02', 'a', 2);
+UPDATE d SET v = 9 WHERE ts = '2026-01-01';
+SELECT ROW_COUNT();
+ROW_COUNT()
+3
+UPDATE di SET v = 9 WHERE ts = '2026-01-01';
+# duplicate rows
+result_rows	vs_innodb
+4	SAME
+UPDATE d SET v = 3 ORDER BY ts LIMIT 2;
+UPDATE di SET v = 3 ORDER BY ts LIMIT 2;
+# duplicate rows with LIMIT
+result_rows	vs_innodb
+4	SAME
+DROP TABLE d, di;
+# ---- BEGIN / COMMIT / ROLLBACK
+BEGIN;
+UPDATE m SET v = 1;
+UPDATE m SET v = v + 1 WHERE host = 'both';
+COMMIT;
+UPDATE i SET v = 1;
+UPDATE i SET v = v + 1 WHERE host = 'both';
+# two updates in a transaction
+result_rows	vs_innodb
+1	SAME
+# ---- a failing statement leaves nothing of its updates
+SET sql_mode = 'STRICT_ALL_TABLES';
+UPDATE m SET v = 2147483647 + v;
+Got one of the listed errors
+SET sql_mode = DEFAULT;
+# failed UPDATE changed nothing
+result_rows	vs_innodb
+1	SAME
+# ---- multi-table UPDATE
+CREATE TABLE s (host VARCHAR(8) NOT NULL, k INT NOT NULL) ENGINE=InnoDB;
+INSERT INTO s VALUES ('both', 10), ('moved', 20);
+UPDATE m, s SET m.v = s.k WHERE m.host = s.host;
+UPDATE i, s SET i.v = s.k WHERE i.host = s.host;
+DROP TABLE s;
+# multi-table UPDATE
+result_rows	vs_innodb
+60	SAME
+DROP TABLE m, i;
+##################################################################
+# Table with a PRIMARY KEY (tag, time, ns)
+##################################################################
+CREATE TABLE p (itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG', clock INT NOT NULL, value DOUBLE NOT NULL, ns INT NOT NULL DEFAULT 0,
+PRIMARY KEY (itemid, clock, ns)) ENGINE=MooseDB TIMESTAMP_COLUMN='clock';
+CREATE TABLE pi (itemid BIGINT UNSIGNED NOT NULL, clock INT NOT NULL, value DOUBLE NOT NULL, ns INT NOT NULL DEFAULT 0,
+PRIMARY KEY (itemid, clock, ns)) ENGINE=InnoDB;
+INSERT INTO p SELECT seq MOD 4, 1767225600 + seq, seq / 2, 0 FROM seq_0_to_39;
+INSERT INTO pi SELECT seq MOD 4, 1767225600 + seq, seq / 2, 0 FROM seq_0_to_39;
+# a value update is fine, in the MemTable and after FLUSH
+UPDATE p SET value = 100 WHERE itemid = 1;
+UPDATE pi SET value = 100 WHERE itemid = 1;
+# PK table: value update
+result_rows	vs_innodb
+40	SAME
+FLUSH TABLES p;
+UPDATE p SET value = value + 1 WHERE itemid IN (1, 2) AND clock > 1767225610;
+UPDATE pi SET value = value + 1 WHERE itemid IN (1, 2) AND clock > 1767225610;
+# PK table: value update after FLUSH
+result_rows	vs_innodb
+40	SAME
+# the columns of the key cannot change: clear error, nothing changes
+UPDATE p SET clock = clock + 1 WHERE itemid = 1;
+ERROR HY000: Got error 1209 'UPDATE cannot change the columns of the UNIQUE/PRIMARY key' from MooseDB
+UPDATE p SET itemid = 99 WHERE itemid = 1;
+ERROR HY000: Got error 1209 'UPDATE cannot change the columns of the UNIQUE/PRIMARY key' from MooseDB
+UPDATE p SET ns = 5 WHERE itemid = 1;
+ERROR HY000: Got error 1209 'UPDATE cannot change the columns of the UNIQUE/PRIMARY key' from MooseDB
+# PK table: key update refused, no change
+result_rows	vs_innodb
+40	SAME
+# an update that sets the key to the value it has is fine
+UPDATE p SET clock = clock, value = 1 WHERE itemid = 3;
+UPDATE pi SET clock = clock, value = 1 WHERE itemid = 3;
+# PK table: key set to itself
+result_rows	vs_innodb
+40	SAME
+# ---- INSERT ... ON DUPLICATE KEY UPDATE over an existing key
+INSERT INTO p VALUES (1, 1767225601, 5, 0), (1, 1767229999, 6, 0) ON DUPLICATE KEY UPDATE value = VALUES(value) + 1000;
+SELECT ROW_COUNT();
+ROW_COUNT()
+3
+INSERT INTO pi VALUES (1, 1767225601, 5, 0), (1, 1767229999, 6, 0) ON DUPLICATE KEY UPDATE value = VALUES(value) + 1000;
+# ODKU: one existing key, one new
+result_rows	vs_innodb
+41	SAME
+INSERT INTO p VALUES (2, 1767225602, 1, 0) ON DUPLICATE KEY UPDATE value = value * 2;
+INSERT INTO pi VALUES (2, 1767225602, 1, 0) ON DUPLICATE KEY UPDATE value = value * 2;
+# ODKU using the old value
+result_rows	vs_innodb
+41	SAME
+# ODKU that would change the key is refused
+INSERT INTO p VALUES (2, 1767225602, 1, 0) ON DUPLICATE KEY UPDATE clock = clock + 1;
+ERROR HY000: Got error 1209 'UPDATE cannot change the columns of the UNIQUE/PRIMARY key' from MooseDB
+# ODKU key change refused, no change
+result_rows	vs_innodb
+41	SAME
+# ---- REPLACE over an existing key
+REPLACE INTO p VALUES (3, 1767225603, 77, 0), (3, 1767299999, 78, 0);
+REPLACE INTO pi VALUES (3, 1767225603, 77, 0), (3, 1767299999, 78, 0);
+# REPLACE: one existing key, one new
+result_rows	vs_innodb
+42	SAME
+FLUSH TABLES p;
+REPLACE INTO p VALUES (3, 1767225603, 88, 0);
+REPLACE INTO pi VALUES (3, 1767225603, 88, 0);
+# REPLACE of a row in a chunk
+result_rows	vs_innodb
+42	SAME
+# ---- REPLACE that needs delete + insert (DELETE trigger) is refused, no loop
+CREATE TABLE lg (n INT) ENGINE=InnoDB;
+CREATE TRIGGER p_bd BEFORE DELETE ON p FOR EACH ROW INSERT INTO lg VALUES (1);
+REPLACE INTO p VALUES (3, 1767225603, 99, 0);
+ERROR HY000: Got error 1209 'REPLACE that must delete the old row first (DELETE trigger or foreign key) is not supported' from MooseDB
+DROP TRIGGER p_bd;
+DROP TABLE lg;
+# refused REPLACE changed nothing
+result_rows	vs_innodb
+42	SAME
+# ---- the same key twice in one statement: refused by the engine, nothing changes
+REPLACE INTO p VALUES (3, 1767225603, 1, 0), (3, 1767225603, 2, 0);
+ERROR HY000: Got error 1209 'unsupported: a statement that updates the same key twice is not supported on a table with a UNIQUE key' from MooseDB
+# REPLACE of the same key twice, no change
+result_rows	vs_innodb
+42	SAME
+INSERT INTO p VALUES (2, 1767225602, 1, 0), (2, 1767225602, 1, 0) ON DUPLICATE KEY UPDATE value = value + 1;
+ERROR HY000: Got error 1209 'unsupported: a statement that updates the same key twice is not supported on a table with a UNIQUE key' from MooseDB
+# ODKU of the same key twice, no change
+result_rows	vs_innodb
+42	SAME
+# ---- INSERT ... SELECT ... ON DUPLICATE KEY UPDATE over rows sealed in chunks
+FLUSH TABLES p;
+INSERT INTO p SELECT seq MOD 4, 1767225600 + seq, 10, 0 FROM seq_1_to_8 ON DUPLICATE KEY UPDATE value = value + VALUES(value);
+INSERT INTO pi SELECT seq MOD 4, 1767225600 + seq, 10, 0 FROM seq_1_to_8 ON DUPLICATE KEY UPDATE value = value + VALUES(value);
+# INSERT SELECT ODKU, rows in chunks
+result_rows	vs_innodb
+42	SAME
+INSERT INTO p SELECT seq MOD 4, 1767225600 + seq, 20, 0 FROM seq_36_to_44 ON DUPLICATE KEY UPDATE value = value + VALUES(value);
+INSERT INTO pi SELECT seq MOD 4, 1767225600 + seq, 20, 0 FROM seq_36_to_44 ON DUPLICATE KEY UPDATE value = value + VALUES(value);
+# INSERT SELECT ODKU, mix of existing and new keys
+result_rows	vs_innodb
+47	SAME
+# ---- UPDATE inside a trigger / function of another statement: refused, table intact
+CREATE TABLE trg (a INT) ENGINE=InnoDB;
+CREATE TRIGGER trg_ai AFTER INSERT ON trg FOR EACH ROW UPDATE p SET value = value + 1 WHERE itemid = 0;
+INSERT INTO trg VALUES (1);
+ERROR HY000: Got error 1209 'an UPDATE that runs inside a trigger or stored function of another statement (or that the engine cannot lock exclusively) is not supported on MooseDB tables' from MooseDB
+SELECT COUNT(*) FROM trg;
+COUNT(*)
+0
+# trigger UPDATE refused, table intact
+result_rows	vs_innodb
+47	SAME
+DROP TRIGGER trg_ai;
+DROP TABLE trg;
+CREATE FUNCTION upd_p() RETURNS INT
+BEGIN
+UPDATE p SET value = value + 1 WHERE itemid = 0;
+RETURN 1;
+END|
+SELECT upd_p();
+ERROR HY000: Got error 1209 'an UPDATE that runs inside a trigger or stored function of another statement (or that the engine cannot lock exclusively) is not supported on MooseDB tables' from MooseDB
+# function UPDATE refused, table intact
+result_rows	vs_innodb
+47	SAME
+DROP FUNCTION upd_p;
+# ---- UPDATE as a statement of a stored procedure: locked per statement, works
+CREATE PROCEDURE upd_proc() UPDATE p SET value = value + 1 WHERE itemid = 1;
+CREATE PROCEDURE upd_proci() UPDATE pi SET value = value + 1 WHERE itemid = 1;
+CALL upd_proc();
+CALL upd_proci();
+# UPDATE inside CALL procedure
+result_rows	vs_innodb
+47	SAME
+DROP PROCEDURE upd_proc;
+DROP PROCEDURE upd_proci;
+# ---- LOAD DATA ... REPLACE over existing keys (exclusive lock + update_row)
+SELECT itemid, clock, value + 100, ns FROM pi WHERE clock < 1767225610 INTO OUTFILE 'VARDIR/tmp/tf_upd_load.txt';
+LOAD DATA INFILE 'VARDIR/tmp/tf_upd_load.txt' REPLACE INTO TABLE p;
+LOAD DATA INFILE 'VARDIR/tmp/tf_upd_load.txt' REPLACE INTO TABLE pi;
+# LOAD DATA REPLACE over existing keys
+result_rows	vs_innodb
+47	SAME
+DROP TABLE p, pi;

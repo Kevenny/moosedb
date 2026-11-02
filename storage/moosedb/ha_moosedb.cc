@@ -1170,6 +1170,7 @@ int ha_moosedb::map_status(TFStatus status, const char *name)
   case TF_ERR_DUPLICATE: return HA_ERR_FOUND_DUPP_KEY;
   case TF_ERR_DEADLOCK:  return HA_ERR_LOCK_DEADLOCK;
   case TF_ERR_BUSY:      return HA_ERR_LOCK_WAIT_TIMEOUT;
+  case TF_ERR_CONFLICT:  return HA_ERR_RECORD_CHANGED;
   default:               return HA_ERR_MOOSEDB_BASE + (int) status;
   }
 }
@@ -1355,6 +1356,8 @@ int ha_moosedb::open(const char *name, int, uint)
   thr_lock_data_init(&share_->lock, &lock_data_, NULL);
   str_bufs_.resize(share_->layout.columns.size());
   values_.resize(share_->layout.columns.size());
+  str_bufs2_.resize(share_->layout.columns.size());
+  values2_.resize(share_->layout.columns.size());
   DBUG_RETURN(0);
 }
 
@@ -1404,15 +1407,18 @@ int ha_moosedb::rename_table(const char *from, const char *to)
   Converts the record in `buf` into values_ (the TFRow handed to the core).
   Shared by write_row() and delete_row(): a row to delete is found in the
   table by its content, so it must be converted exactly as it was stored.
+  `second` converts into values2_ (update_row() holds two images at once).
 */
-int ha_moosedb::record_to_row(const uchar *buf, TFRow *out)
+int ha_moosedb::record_to_row(const uchar *buf, TFRow *out, bool second)
 {
   assert(table);
   if (!table || !buf || !share_ || !share_->table)
     return HA_ERR_INTERNAL_ERROR;
 
   const tf_layout &l= share_->layout;
-  if (values_.size() < l.columns.size() || str_bufs_.size() < l.columns.size())
+  std::vector<TFValue> &vals= second ? values2_ : values_;
+  std::vector<String> &bufs= second ? str_bufs2_ : str_bufs_;
+  if (vals.size() < l.columns.size() || bufs.size() < l.columns.size())
     return HA_ERR_INTERNAL_ERROR;
   const my_ptrdiff_t diff= buf - table->record[0];
   MY_BITMAP *old_map= dbug_tmp_use_all_columns(table, &table->read_set);
@@ -1422,13 +1428,13 @@ int ha_moosedb::record_to_row(const uchar *buf, TFRow *out)
   {
     const tf_column &c= l.columns[i];
     if (c.field_index >= table->s->fields || !table->field[c.field_index] ||
-        i >= values_.size() || i >= str_bufs_.size())
+        i >= vals.size() || i >= bufs.size())
     {
       error= HA_ERR_INTERNAL_ERROR;
       break;
     }
     Field *f= table->field[c.field_index];
-    TFValue &v= values_[i];
+    TFValue &v= vals[i];
     v.kind= (uint8_t) c.type;
     v.data.int_val= 0;
     f->move_field_offset(diff);
@@ -1486,7 +1492,7 @@ int ha_moosedb::record_to_row(const uchar *buf, TFRow *out)
       case tf_conv::STRING:
       case tf_conv::TAG:
       {
-        String *s= f->val_str(&str_bufs_[i], &str_bufs_[i]);
+        String *s= f->val_str(&bufs[i], &bufs[i]);
         v.data.str_val.ptr= s ? s->ptr() : "";
         v.data.str_val.len= s ? (uint32_t) s->length() : 0;
         break;
@@ -1498,7 +1504,7 @@ int ha_moosedb::record_to_row(const uchar *buf, TFRow *out)
   dbug_tmp_restore_column_map(&table->read_set, old_map);
   if (error)
     return error;
-  *out= TFRow{(uint32_t) values_.size(), values_.data()};
+  *out= TFRow{(uint32_t) vals.size(), vals.data()};
   return 0;
 }
 
@@ -1539,8 +1545,128 @@ int ha_moosedb::write_row(const uchar *buf)
   join_stmt_trx(thd);
   error= write_batch_row(row);
   if (error == HA_ERR_FOUND_DUPP_KEY)
+  {
     dup_key_= share_->layout.unique_key;
+    /*
+      REPLACE that deletes + re-inserts (DELETE trigger, FK, key not last)
+      calls delete_row() -- queued until the statement ends -- and retries
+      this write, which would hit the same row forever. Refuse instead.
+      Only a real REPLACE (lex->duplicates of the running statement, also
+      inside a function / trigger): a plain INSERT after a DELETE of the same
+      statement keeps its ER_DUP_ENTRY.
+    */
+    if (del_rows_ > 0 && thd->lex && thd->lex->duplicates == DUP_REPLACE)
+    {
+      last_error_= "REPLACE that must delete the old row first (DELETE trigger "
+                    "or foreign key) is not supported";
+      DBUG_RETURN(HA_ERR_MOOSEDB_BASE + TF_ERR_UNSUPPORTED);
+    }
+  }
   /* as InnoDB: a deadlock ends the whole transaction, not just the statement */
+  if (error == HA_ERR_LOCK_DEADLOCK)
+    thd->mark_transaction_to_rollback(true);
+  DBUG_RETURN(error);
+}
+
+/* True if the two values of a column differ (bitwise). */
+static bool tf_value_differs(const TFValue &a, const TFValue &b)
+{
+  if (a.is_null != b.is_null)
+    return true;
+  if (a.is_null)
+    return false;
+  if (a.kind == TF_COL_VARCHAR || a.kind == TF_COL_TAG || a.kind == TF_COL_DECIMAL)
+    return a.data.str_val.len != b.data.str_val.len ||
+           (a.data.str_val.len &&
+            memcmp(a.data.str_val.ptr, b.data.str_val.ptr, a.data.str_val.len));
+  return a.data.int_val != b.data.int_val;   /* int_val is zeroed before each store */
+}
+
+/*
+  UPDATE: the (old image, new image) pair goes into the statement batch and is
+  applied with its inserts when the statement ends (old row found by content,
+  all columns: build_projection() never projects UPDATE / REPLACE / ODKU, and
+  update_row refuses a projected scan).
+  The UNIQUE key of the table cannot change in this phase: the core checks it
+  too, here the user gets a clear message before anything is queued.
+*/
+int ha_moosedb::update_row(const uchar *old_data, const uchar *new_data)
+{
+  DBUG_ENTER("ha_moosedb::update_row");
+  assert(table);
+  if (!table || !old_data || !new_data || !share_ || !share_->table)
+    DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
+  /* system versioning keeps no history here: UPDATE / DELETE stay refused (ER_ILLEGAL_HA) */
+  if (table->versioned())
+    DBUG_RETURN(HA_ERR_WRONG_COMMAND);
+  /*
+    Shared lock (TL_WRITE_ALLOW_WRITE, set by store_lock and kept in
+    lock_data_.type until the statement unlocks) means the outer command was not
+    an UPDATE/REPLACE/ODKU: this is a trigger / function UPDATE, whose pair
+    could be lost against a concurrent writer. The replica applier is exempt:
+    the core fails the statement if the old row is gone.
+  */
+  {
+    THD *thd= ha_thd();
+    if (thd && !thd->slave_thread && lock_data_.type == TL_WRITE_ALLOW_WRITE)
+    {
+      last_error_= "an UPDATE that runs inside a trigger or stored function of "
+                   "another statement (or that the engine cannot lock "
+                   "exclusively) is not supported on MooseDB tables";
+      DBUG_RETURN(HA_ERR_MOOSEDB_BASE + TF_ERR_UNSUPPORTED);
+    }
+  }
+  /* the old image is searched by content: a projected (partial) read cannot be used */
+  if (!proj_all_)
+  {
+    last_error_= "UPDATE needs the whole old row but the row was read with a column projection";
+    DBUG_RETURN(HA_ERR_MOOSEDB_BASE + TF_ERR_UNSUPPORTED);
+  }
+  TFRow old_row{0, nullptr}, new_row{0, nullptr};
+  int error= record_to_row(old_data, &old_row, false);
+  if (!error)
+    error= record_to_row(new_data, &new_row, true);
+  if (error)
+    DBUG_RETURN(error);
+  const tf_layout &l= share_->layout;
+  const bool unique= l.unique_key != MAX_KEY;
+  if (unique && l.unique_key < l.indexes.size())
+  {
+    std::vector<size_t> key_cols{l.ts_column};
+    for (uint32_t p : l.unique_extra_cols)
+      key_cols.push_back(p);
+    for (uint fi : l.indexes[l.unique_key].tag_fields)
+      for (size_t i= 0; i < l.columns.size(); i++)
+        if (l.columns[i].field_index == fi)
+          key_cols.push_back(i);
+    for (size_t i : key_cols)
+      if (i < values_.size() && i < values2_.size() &&
+          tf_value_differs(values_[i], values2_[i]))
+      {
+        last_error_= "UPDATE cannot change the columns of the UNIQUE/PRIMARY key";
+        DBUG_RETURN(HA_ERR_MOOSEDB_BASE + TF_ERR_UNSUPPORTED);
+      }
+  }
+  THD *thd= ha_thd();
+  if (!thd)
+    DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
+  if (in_bulk_insert_ && bulk_query_id_ != thd->query_id)
+    in_bulk_insert_= false;
+  if (!batch_)
+  {
+    MooseDBBatch *b= nullptr;
+    if ((error= map_status(moosedb_batch_begin(share_->table.get(), &b))))
+      DBUG_RETURN(error);
+    if (!b)
+      DBUG_RETURN(HA_ERR_INTERNAL_ERROR);
+    batch_.reset(b);
+    if (unique && (thd->variables.option_bits & OPTION_RELAXED_UNIQUE_CHECKS) &&
+        moosedb_batch_set_unique_checks(batch_.get(), false) != TF_OK)
+      take_last_error();
+  }
+  join_stmt_trx(thd);
+  /* map_status() keeps the core's message (key change, too big, same key twice) */
+  error= map_status(moosedb_batch_update(batch_.get(), &old_row, &new_row));
   if (error == HA_ERR_LOCK_DEADLOCK)
     thd->mark_transaction_to_rollback(true);
   DBUG_RETURN(error);
@@ -2111,6 +2237,12 @@ static int moosedb_close_connection(handlerton *, THD *thd)
   return 0;
 }
 
+/*
+  Order at the end of a statement: queued DELETEs first (commit_delete), then
+  the batch (inserts + UPDATE pairs). A multi-table statement that deletes and
+  updates the same table sees the deletes applied before the update pairs, so
+  a pair whose old row was deleted is a no-op (core rule).
+*/
 int ha_moosedb::commit_batch(THD *defer_to)
 {
   int del_error= commit_delete();
@@ -2199,6 +2331,34 @@ int ha_moosedb::external_lock(THD *thd, int lock_type)
   rows that existed when it committed. A DELETE without WHERE becomes TRUNCATE
   (delete_all_rows), which keeps the exclusive lock.
 */
+/*
+  UPDATE (and REPLACE / ON DUPLICATE KEY UPDATE, which call update_row) keep the
+  exclusive lock: the (old, new) pairs are matched by content at statement end,
+  so two concurrent UPDATEs of the same row would lose one increment.
+  Fails closed: any statement with DUP_REPLACE / DUP_UPDATE (LOAD DATA ...
+  REPLACE included) is exclusive. An UPDATE inside a trigger / function of
+  another statement is not seen here (store_lock sees the outer command);
+  update_row refuses it when the lock granted is the shared one.
+*/
+static bool update_needs_exclusive(THD *thd, int cmd)
+{
+  if (thd->lex &&
+      (thd->lex->duplicates == DUP_REPLACE || thd->lex->duplicates == DUP_UPDATE))
+    return true;
+  switch (cmd) {
+  case SQLCOM_UPDATE:
+  case SQLCOM_UPDATE_MULTI:
+  case SQLCOM_REPLACE:
+  case SQLCOM_REPLACE_SELECT:
+    return true;
+  case SQLCOM_INSERT:
+  case SQLCOM_INSERT_SELECT:
+    return thd->lex && thd->lex->duplicates == DUP_UPDATE;
+  default:
+    return false;
+  }
+}
+
 static bool delete_needs_exclusive(THD *thd, int cmd)
 {
   if (cmd != SQLCOM_DELETE)
@@ -2217,12 +2377,14 @@ THR_LOCK_DATA **ha_moosedb::store_lock(THD *thd, THR_LOCK_DATA **to,
       SELECTs. The core serializes appends internally, and scans read
       immutable snapshots, so row positions stay valid under concurrent
       flushes and compactions. Statements that rebuild or empty the table
-      keep the exclusive lock.
+      keep the exclusive lock, and so do UPDATE / REPLACE / ODKU (see
+      update_needs_exclusive: no row-level isolation, concurrent INSERTs wait).
     */
     const int cmd= thd_sql_command(thd);
     if (lock_type >= TL_WRITE_CONCURRENT_INSERT && lock_type <= TL_WRITE &&
         !thd_in_lock_tables(thd) && cmd != SQLCOM_TRUNCATE &&
         cmd != SQLCOM_OPTIMIZE && !delete_needs_exclusive(thd, cmd) &&
+        !update_needs_exclusive(thd, cmd) &&
         cmd != SQLCOM_CREATE_TABLE && cmd != SQLCOM_ALTER_TABLE)
       lock_type= TL_WRITE_ALLOW_WRITE;
     else if (lock_type == TL_READ_NO_INSERT && !thd_in_lock_tables(thd))
@@ -3884,6 +4046,9 @@ void ha_moosedb::build_projection(bool index_scan)
   case SQLCOM_SELECT:
   case SQLCOM_INSERT_SELECT:
   case SQLCOM_REPLACE_SELECT:
+    /* REPLACE / ODKU re-read the duplicate row whole (update_row matches it by content) */
+    if (thd->lex && thd->lex->duplicates != DUP_ERROR)
+      return;
     break;
   default:
     return;
@@ -4146,7 +4311,10 @@ int ha_moosedb::rnd_init(bool scan)
   /* scan == false: only rnd_pos() follows; positions resolve through the
      snapshots kept by position(). */
   if (!scan)
+  {
+    proj_all_= true;  /* do not inherit a stale projection in the rnd_pos phase */
     DBUG_RETURN(0);
+  }
   /* Unordered anyway: bound the scan by the time range of the pushed WHERE
      (prunes chunks and rows, see cond_push). */
   longlong lo= LONGLONG_MIN, hi= LONGLONG_MAX;

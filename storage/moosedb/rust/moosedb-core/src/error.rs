@@ -12,6 +12,8 @@ pub enum Error {
     /// flushing keeps failing).
     Full(String),
     NotFound(String),
+    /// An UPDATE found a row changed concurrently (nothing applied).
+    Conflict(String),
     InvalidArg(String),
     /// The table refuses writes, usually because an earlier failure left the
     /// in-memory state unable to guarantee durability.
@@ -42,6 +44,7 @@ impl fmt::Display for Error {
             Error::Corrupt(m) => write!(f, "corrupt data: {m}"),
             Error::Full(m) => write!(f, "full: {m}"),
             Error::NotFound(m) => write!(f, "not found: {m}"),
+            Error::Conflict(m) => write!(f, "conflict: {m}"),
             Error::InvalidArg(m) => write!(f, "invalid argument: {m}"),
             Error::ReadOnly(m) => write!(f, "read-only: {m}"),
             Error::Unsupported(m) => write!(f, "unsupported: {m}"),

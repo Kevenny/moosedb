@@ -1,0 +1,36 @@
+#
+# kill -9 in the middle of a large UPDATE: the statement is atomic, so after
+# the restart every row has the old value or every row has the new one (the
+# UPDATE batch is only committed, as one WAL entry, when the statement ends).
+# The row count stays under the UPDATE batch limit (it never spills); SLEEP
+# makes the statement last long enough to be killed while it runs.
+#
+--source include/not_embedded.inc
+--source include/have_sequence.inc
+--source suite/moosedb/include/have_moosedb.inc
+
+CREATE TABLE k (ts DATETIME(6) NOT NULL, v INT, INDEX(ts)) ENGINE=MooseDB;
+INSERT INTO k SELECT '2026-01-01' + INTERVAL seq SECOND, 1 FROM seq_1_to_200000;
+SELECT COUNT(*) FROM k;
+
+connect (big, localhost, root,,);
+connection big;
+--send UPDATE k SET v = 2 + SLEEP(0.0001) * 0
+connection default;
+--let $wait_condition= SELECT COUNT(*) = 1 FROM information_schema.PROCESSLIST WHERE INFO LIKE 'UPDATE k SET%' AND TIME >= 1
+--source include/wait_condition.inc
+
+--echo # kill -9 while the UPDATE is running
+--source include/kill_mysqld.inc
+disconnect big;
+connection default;
+--source include/start_mysqld.inc
+
+--echo # All rows have the same value (old or new, never a mix)
+SELECT COUNT(*) AS n, COUNT(DISTINCT v) AS distinct_values FROM k;
+CHECK TABLE k;
+
+--echo # The table keeps working
+UPDATE k SET v = 3 LIMIT 5;
+SELECT COUNT(*) FROM k WHERE v = 3;
+DROP TABLE k;

@@ -239,16 +239,20 @@ TRUNCATE TABLE t;
 # ---- UPDATE / DELETE / multi-table statements ----
 INSERT INTO t VALUES ('2026-01-01', 'a', 1), ('2026-01-02', 'b', 2);
 INSERT INTO c VALUES ('2026-01-01', 'a', 1), ('2026-01-02', 'b', 2);
+# UPDATE is supported (update.test), also multi-table
 UPDATE t SET v = v + 1;
-ERROR HY000: Storage engine MooseDB of the table `test`.`t` doesn't have this option
 UPDATE t SET v = 0 WHERE host = 'a';
-ERROR HY000: Storage engine MooseDB of the table `test`.`t` doesn't have this option
-UPDATE t SET v = 0 ORDER BY ts LIMIT 1;
-ERROR HY000: Storage engine MooseDB of the table `test`.`t` doesn't have this option
+UPDATE t SET v = 5 ORDER BY ts LIMIT 1;
 UPDATE t, c SET t.v = c.v + 100 WHERE t.host = c.host;
-ERROR HY000: Storage engine MooseDB of the table `test`.`t` doesn't have this option
+SELECT ts, host, v FROM t ORDER BY ts;
+ts	host	v
+2026-01-01 00:00:00	a	101
+2026-01-02 00:00:00	b	102
 UPDATE c, t SET t.v = 7 WHERE t.host = c.host;
-ERROR HY000: Storage engine MooseDB of the table `test`.`t` doesn't have this option
+SELECT ts, host, v FROM t ORDER BY ts;
+ts	host	v
+2026-01-01 00:00:00	a	7
+2026-01-02 00:00:00	b	7
 # DELETE is supported (delete.test): range, ORDER BY/LIMIT and multi-table forms
 DELETE FROM t WHERE ts < '2030-01-01';
 SELECT ROW_COUNT();

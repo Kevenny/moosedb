@@ -1,0 +1,27 @@
+CREATE TABLE k (ts DATETIME(6) NOT NULL, v INT, INDEX(ts)) ENGINE=MooseDB;
+INSERT INTO k SELECT '2026-01-01' + INTERVAL seq SECOND, 1 FROM seq_1_to_200000;
+SELECT COUNT(*) FROM k;
+COUNT(*)
+200000
+connect  big, localhost, root,,;
+connection big;
+UPDATE k SET v = 2 + SLEEP(0.0001) * 0;
+connection default;
+# kill -9 while the UPDATE is running
+# Kill the server
+disconnect big;
+connection default;
+# restart
+# All rows have the same value (old or new, never a mix)
+SELECT COUNT(*) AS n, COUNT(DISTINCT v) AS distinct_values FROM k;
+n	distinct_values
+200000	1
+CHECK TABLE k;
+Table	Op	Msg_type	Msg_text
+test.k	check	status	OK
+# The table keeps working
+UPDATE k SET v = 3 LIMIT 5;
+SELECT COUNT(*) FROM k WHERE v = 3;
+COUNT(*)
+5
+DROP TABLE k;

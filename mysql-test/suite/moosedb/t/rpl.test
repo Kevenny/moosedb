@@ -19,12 +19,11 @@ SELECT COUNT(*), SUM(v) FROM r;
 SELECT COUNT(*), SUM(v), COUNT(DISTINCT host) FROM r;
 SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_NAME = 'r';
 
---echo # UPDATE is refused on the master and never replicates
+--echo # UPDATE replicates as a row event (the slave finds the row by its before-image)
 connection master;
---error ER_ILLEGAL_HA
-UPDATE r SET v = 0;
+UPDATE r SET v = 0 WHERE host = 'h1';
 --sync_slave_with_master
-SELECT COUNT(*) FROM r;
+SELECT COUNT(*), SUM(v) FROM r;
 
 --echo # DELETE replicates as row events: the replica finds each row by its content
 connection master;

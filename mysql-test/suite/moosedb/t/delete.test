@@ -291,15 +291,14 @@ INSERT INTO i4 VALUES (8, 1767225600 + 2 * 86400 + 1439 * 60, 7.5, 1);
 INSERT INTO h4 VALUES (8, 1767225600 + 2 * 86400 + 1439 * 60, 8.5, 1);
 INSERT IGNORE INTO h4 VALUES (8, 1767225600 + 2 * 86400 + 1439 * 60, 8.5, 1);
 SHOW WARNINGS;
---echo # REPLACE and ON DUPLICATE KEY UPDATE of a deleted key insert it; of a live key they are still refused
+--echo # REPLACE and ON DUPLICATE KEY UPDATE of a deleted key insert it; of a live key they update it
 DELETE FROM h4 WHERE itemid = 11 AND clock = 1767225600 AND ns = 0;
 REPLACE INTO h4 VALUES (11, 1767225600, 3.5, 0);
 DELETE FROM h4 WHERE itemid = 11 AND clock = 1767225600 AND ns = 0;
 INSERT INTO h4 VALUES (11, 1767225600, 4.5, 0) ON DUPLICATE KEY UPDATE value = 9;
 SELECT value FROM h4 WHERE itemid = 11 AND clock = 1767225600 AND ns = 0;
---error ER_ILLEGAL_HA
 REPLACE INTO h4 VALUES (11, 1767225600, 3.5, 0);
-INSERT INTO i4 VALUES (11, 1767225600, 4.5, 0);
+INSERT INTO i4 VALUES (11, 1767225600, 3.5, 0);
 --let $mt= h4
 --let $it= i4
 --let $q= SELECT itemid, clock, ns, value FROM {T} WHERE itemid IN (5, 8, 11) AND clock >= 1767225600 + 86400 ORDER BY itemid, clock, ns

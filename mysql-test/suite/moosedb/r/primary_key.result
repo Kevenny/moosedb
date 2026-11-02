@@ -304,17 +304,14 @@ COUNT(*)
 0
 # (the rows before the duplicate stay in MooseDB, which has no multi-row rollback;
 #  InnoDB rolls the statement back)
-# ---- REPLACE and ON DUPLICATE KEY UPDATE need UPDATE/DELETE, which the engine does not have:
-#      a key that exists is an explicit error, not a silent wrong answer
+# ---- REPLACE and ON DUPLICATE KEY UPDATE of a key that exists update the row (update.test)
 REPLACE INTO um VALUES (1, 100, 7, 1);
-ERROR HY000: Storage engine MooseDB of the table `test`.`um` doesn't have this option
 INSERT INTO um VALUES (1, 100, 7, 1) ON DUPLICATE KEY UPDATE value = 7;
-ERROR HY000: Storage engine MooseDB of the table `test`.`um` doesn't have this option
 INSERT INTO um VALUES (1, 100, 7, 1), (1, 777, 7, 1) ON DUPLICATE KEY UPDATE value = value + 1;
-ERROR HY000: Storage engine MooseDB of the table `test`.`um` doesn't have this option
 SELECT value FROM um WHERE itemid = 1 AND clock = 100 AND ns = 1;
 value
-1.5
+8
+DELETE FROM um WHERE itemid = 1 AND clock = 777;
 # ... and a key that does not exist is a plain insert
 REPLACE INTO um VALUES (1, 200, 7, 1);
 INSERT INTO um VALUES (1, 201, 7, 1) ON DUPLICATE KEY UPDATE value = 8;
@@ -323,8 +320,14 @@ SELECT itemid, clock, value, ns FROM um WHERE itemid = 1 AND clock >= 200 ORDER 
 itemid	clock	value	ns
 1	200	7	1
 1	201	7	1
-UPDATE um SET value = 1 WHERE itemid = 1;
-ERROR HY000: Storage engine MooseDB of the table `test`.`um` doesn't have this option
+UPDATE um SET value = 1 WHERE itemid = 1 AND clock >= 200;
+# the key of the table cannot change
+UPDATE um SET clock = clock + 1 WHERE itemid = 1 AND clock >= 200;
+ERROR HY000: Got error 1209 'UPDATE cannot change the columns of the UNIQUE/PRIMARY key' from MooseDB
+SELECT itemid, clock, value, ns FROM um WHERE itemid = 1 AND clock >= 200 ORDER BY clock;
+itemid	clock	value	ns
+1	200	1	1
+1	201	1	1
 DROP TABLE um, ui;
 ##################################################################
 # Duplicates against every place a row can live

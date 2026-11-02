@@ -251,8 +251,16 @@ SELECT host, AVG(value) FROM metricas
 SELECT * FROM metricas WHERE host = 'srv01' ORDER BY ts DESC LIMIT 10;
 ```
 
-* `UPDATE` retorna `ER_ILLEGAL_HA` (os dados não são alterados no lugar). `DELETE`
-  é suportado — ver [DELETE](#delete).
+* `UPDATE` é suportado (exceto nas colunas da chave única). **O UPDATE trava a tabela
+  para escrita durante o statement (sem isolamento por linha); INSERTs concorrentes
+  esperam.** O mesmo vale para `REPLACE`, `INSERT … ON DUPLICATE KEY UPDATE` e `LOAD DATA … REPLACE`.
+  `UPDATE` dentro de trigger ou função chamada por outro statement é **recusado**. Se a
+  linha a atualizar sumir no meio do statement (DELETE concorrente), o statement falha
+  (não é no-op). O statement inteiro precisa caber no buffer do lote (`MEMTABLE_SIZE`,
+  padrão 64 MiB; medido com `ts, host TAG, v DOUBLE`: 150 k linhas passam, 175 k não; ~450 B por par):
+  divida em statements menores. `UPDATE` e `DELETE` da mesma tabela no mesmo statement
+  (multi-tabela) não são atômicos entre si: o DELETE é aplicado antes (caso raro).
+  `DELETE` é suportado — ver [DELETE](#delete).
 * Cada statement é **atômico para leitura e para crash**: outras sessões veem
   todas as linhas de um INSERT de uma vez, e um crash no meio dele não deixa
   nada. Se o statement falhar (erro de valor, duplicata, deadlock, `KILL`), nada

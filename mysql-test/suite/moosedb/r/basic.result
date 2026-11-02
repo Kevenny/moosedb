@@ -19,9 +19,15 @@ SELECT * FROM t1 WHERE ts BETWEEN '2026-10-01 10:00:00' AND '2026-10-01 10:00:01
 ts	host	value
 2026-10-01 10:00:00.000000	srv01	42.5
 2026-10-01 10:00:01.000000	srv01	43.1
-# UPDATE is not supported; row-level DELETE is (delete.test)
+# UPDATE (update.test) and row-level DELETE (delete.test)
 UPDATE t1 SET value = 0 WHERE host = 'srv01';
-ERROR HY000: Storage engine MooseDB of the table `test`.`t1` doesn't have this option
+SELECT ROW_COUNT();
+ROW_COUNT()
+2
+SELECT * FROM t1 WHERE host = 'srv01';
+ts	host	value
+2026-10-01 10:00:00.000000	srv01	0
+2026-10-01 10:00:01.000000	srv01	0
 DELETE FROM t1 WHERE host = 'srv01';
 SELECT ROW_COUNT();
 ROW_COUNT()

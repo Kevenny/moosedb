@@ -67,6 +67,8 @@ pub enum TFStatus {
     TF_ERR_DEADLOCK = 13,
     /// The caller cancelled a long operation (aggregation).
     TF_ERR_CANCELLED = 14,
+    /// An UPDATE found a row changed concurrently (nothing applied).
+    TF_ERR_CONFLICT = 15,
 }
 
 /// Column type codes used in `TFTableConfig::column_types` and `TFValue::kind`.
@@ -357,6 +359,7 @@ fn status_of(e: &Error) -> TFStatus {
         Error::Crypto(_) => TFStatus::TF_ERR_CRYPTO,
         Error::Full(_) => TFStatus::TF_ERR_FULL,
         Error::NotFound(_) => TFStatus::TF_ERR_NOT_FOUND,
+        Error::Conflict(_) => TFStatus::TF_ERR_CONFLICT,
         Error::InvalidArg(_) => TFStatus::TF_ERR_INVALID_ARG,
         Error::ReadOnly(_) => TFStatus::TF_ERR_READONLY,
         Error::Unsupported(_) => TFStatus::TF_ERR_UNSUPPORTED,
@@ -825,6 +828,32 @@ pub unsafe extern "C" fn moosedb_batch_write(batch: *mut MooseDBBatch, row: *con
         // SAFETY: caller contract.
         let row = unsafe { row_from_c(b.batch.schema(), row) }?;
         b.batch.write(row)
+    })
+}
+
+/// Adds to the statement batch an update: `old_row` (a row of the table, as
+/// read) is replaced by `new_row`. Applied at batch commit, atomically with the
+/// batch's inserts; a pair whose old row is gone by then is dropped (its new
+/// row is not inserted). `TF_ERR_UNSUPPORTED` (see `moosedb_last_error`) when
+/// the table has a UNIQUE key and the key columns differ between the two rows,
+/// or when the statement's rows outgrow the statement buffer (an update is
+/// never spilled). On error the pair is not part of the batch.
+///
+/// # Safety
+/// `batch` must be a live batch handle; both rows as in `moosedb_write_row`.
+#[no_mangle]
+pub unsafe extern "C" fn moosedb_batch_update(
+    batch: *mut MooseDBBatch,
+    old_row: *const TFRow,
+    new_row: *const TFRow,
+) -> TFStatus {
+    guard(|| {
+        let b = handle_mut(batch, "batch")?;
+        // SAFETY: caller contract.
+        let old = unsafe { row_from_c(b.batch.schema(), old_row) }?;
+        // SAFETY: caller contract.
+        let new = unsafe { row_from_c(b.batch.schema(), new_row) }?;
+        b.batch.update(old, new)
     })
 }
 

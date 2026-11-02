@@ -33,6 +33,8 @@ mod format;
 mod fsutil;
 #[cfg(test)]
 mod flush_tests;
+#[cfg(test)]
+mod update_tests;
 pub mod index;
 pub mod inspect;
 mod log;

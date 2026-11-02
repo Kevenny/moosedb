@@ -274,8 +274,8 @@ pub fn wal_segment(data: &[u8]) {
                 return;
             }
             let _ = wal::replay_events(&dir, &[1], 0, recover, None, &ReplayLimits::standard(), &|_| false, |_, ev| {
-                if let wal::ReplayEvent::Delete(p) = ev {
-                    let _ = wal::decode_delete(p);
+                if let wal::ReplayEvent::Delete(p, _) = ev {
+                    let _ = wal::decode_delete_capped(p, wal::MAX_UPDATE_ENTRY);
                 }
                 Ok(())
             });
@@ -283,7 +283,7 @@ pub fn wal_segment(data: &[u8]) {
         for torn in [TornTail::Error, TornTail::Ignore] {
             let _ = std::fs::write(wal::segment_path(&dir, 1), bytes);
             let _ = wal::replay(&dir, 1, torn, None, |_, p| {
-                let _ = wal::decode_delete(p);
+                let _ = wal::decode_delete_capped(p, wal::MAX_UPDATE_ENTRY);
                 let _ = decode_row(&mut ByteReader::new(p));
                 Ok(())
             });
@@ -293,7 +293,7 @@ pub fn wal_segment(data: &[u8]) {
 
 /// Raw WAL entry payloads (after the framing): row/commit/delete bodies.
 pub fn wal_payload(data: &[u8]) {
-    let _ = wal::decode_delete(data);
+    let _ = wal::decode_delete_capped(data, wal::MAX_UPDATE_ENTRY);
     let _ = decode_row(&mut ByteReader::new(data));
 }
 

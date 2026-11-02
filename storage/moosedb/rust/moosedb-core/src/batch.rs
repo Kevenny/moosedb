@@ -45,13 +45,14 @@
 //!   Evicting it instead would fail a statement the binlog already recorded.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, MutexGuard};
+use std::sync::{Arc, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use crate::chunk::ChunkMeta;
 use crate::chunk_writer::{chunks_needed, write_bucket, SeriesParts};
 use crate::codec::encode_value;
 use crate::compaction::split_series;
+use crate::delete::DelGroups;
 use crate::error::{corrupt, invalid, Error, Result};
 use crate::fasthash::FastMap;
 use crate::fsutil::{is_fsync_error, sync_dir};
@@ -153,6 +154,25 @@ pub struct Batch {
     local_gid: Vec<u64>,
     /// Keys of the rows now in `rows`, built when a lookup first needs them.
     own: Option<HashMap<(u64, i64), Vec<Extras>>>,
+    /// UPDATE pairs (see [`Batch::update`]); allocated by the first one, so a
+    /// statement without any pays a single `None`.
+    upd: Option<Box<Updates>>,
+}
+
+/// UPDATE pairs of a statement: the old rows (grouped by content, as a row
+/// DELETE does) and the new row of each pair, in call order.
+#[derive(Default)]
+struct Updates {
+    groups: DelGroups,
+    /// `(group of the old row, new row)`.
+    pairs: Vec<(usize, Row)>,
+}
+
+fn update_too_big(limit: usize) -> Error {
+    Error::Unsupported(format!(
+        "the statement's UPDATE rows do not fit the {limit} byte statement buffer; an UPDATE is applied atomically \
+         in memory and never spilled to staged chunks (split the statement)"
+    ))
 }
 
 /// Half-open time interval `[start, end)` of a chunk.
@@ -223,6 +243,7 @@ impl Table {
             unchecked: std::collections::HashSet::new(),
             local_gid: reserved(hint_series, unique_hint),
             own: None,
+            upd: None,
         })
     }
 }
@@ -280,6 +301,9 @@ impl Batch {
         // Spill *before* taking the row: a failed spill then fails this row
         // alone instead of reporting an error for a row that was kept.
         if !self.rows.is_empty() && self.should_spill() {
+            if self.upd.is_some() {
+                return Err(update_too_big(self.spill_limit));
+            }
             self.spill()?;
         }
         // The series key and the WAL payload are encoded into buffers the batch
@@ -290,6 +314,68 @@ impl Batch {
         self.key_buf = key;
         self.wal_buf = wal_buf;
         result
+    }
+
+    /// Adds an update to the statement: `old` (a row of the table, as read) is
+    /// replaced by `new`. Nothing happens, and nothing is visible, until
+    /// `commit`: there the old row is looked for by content (equal rows one
+    /// at a time, as `DELETE` does) among the rows that existed before the
+    /// statement; a pair whose old row is gone (another session deleted it) fails
+    /// the whole commit with `Conflict` (nothing applied). The deletes and the inserts of the
+    /// pairs and the rows of [`Batch::write`] share one commit point in the
+    /// WAL (COMMIT_UPDATE).
+    ///
+    /// On a table with a UNIQUE key the key columns (TAGs, time, extras) must
+    /// be equal in both rows, else `Unsupported`: the new row inherits the key
+    /// of the old one and is not admitted again. `Unsupported` too if the
+    /// statement already spilled or the pairs would pass the statement buffer
+    /// (`MEMTABLE_SIZE`): an update is never spilled. After an error the pair
+    /// is not part of the batch and the batch stays usable.
+    pub fn update(&mut self, old: Row, new: Row) -> Result<()> {
+        if self.finished {
+            return Err(invalid("the batch is already finished"));
+        }
+        let table = self.table.clone();
+        table.schema.validate_row(&old)?;
+        table.schema.validate_for_write(&new)?;
+        if self.spilled {
+            return Err(update_too_big(self.spill_limit));
+        }
+        if let Some(spec) = table.config.unique.as_ref() {
+            if spec.extras_of(&new).is_none() {
+                return Err(invalid("a column of the UNIQUE key is NULL"));
+            }
+            let s = &table.schema;
+            if row_tags(s, &old) != row_tags(s, &new) || s.row_ts(&old) != s.row_ts(&new) || spec.extras_of(&old) != spec.extras_of(&new) {
+                return Err(Error::Unsupported(
+                    "UPDATE of a column of the UNIQUE key (tags, time or key columns) is not supported".into(),
+                ));
+            }
+        }
+        // The server hands the same old row again when the statement repeats a key
+        // (REPLACE / ODKU): the second pair would find no row left and fail the
+        // statement, so on a UNIQUE table it is refused (nothing applied).
+        let seen = self.upd.as_deref().is_some_and(|u| u.groups.contains(&old));
+        if seen && table.config.unique.is_some() {
+            return Err(Error::Unsupported(
+                "a statement that updates the same key twice is not supported on a table with a UNIQUE key".into(),
+            ));
+        }
+        // Both rows and the bookkeeping of the pair count toward the statement
+        // buffer; a new group also keeps an encoded copy of its old row (the
+        // index key, about its size) and its tags.
+        let group_cost = if seen { 0 } else { row_bytes(&old) + row_bytes(&row_tags(&table.schema, &old)) };
+        let cost = row_bytes(&old) + row_bytes(&new) + group_cost + std::mem::size_of::<(usize, Row)>();
+        if self.bytes + self.series_bytes + cost >= self.spill_limit {
+            return Err(update_too_big(self.spill_limit));
+        }
+        let u = self.upd.get_or_insert_with(Default::default);
+        let g = u.groups.add(&table.schema, old);
+        u.pairs.push((g, new));
+        self.series_bytes += cost;
+        self.accounted += cost;
+        BATCH_BYTES.fetch_add(cost as u64, Ordering::Relaxed);
+        Ok(())
     }
 
     fn write_row(&mut self, table: &Arc<Table>, row: Row, key: &mut Vec<u8>, wal_buf: &mut Vec<u8>) -> Result<()> {
@@ -614,12 +700,15 @@ impl Batch {
 
     fn commit_inner(&mut self, sync: bool, defer: bool) -> Result<Option<Durability>> {
         let table = self.table.clone();
+        if self.spilled && self.upd.is_some() {
+            return Err(update_too_big(self.spill_limit));
+        }
         if !self.spilled {
-            if self.rows.is_empty() {
+            if self.rows.is_empty() && self.upd.is_none() {
                 self.cleanup();
                 return Ok(None);
             }
-            if !self.logged {
+            if !self.rows.is_empty() && !self.logged {
                 return Err(invalid("internal error: batch rows were not logged"));
             }
             let limit = usize::try_from(table.config.opts.memtable_size_bytes).unwrap_or(usize::MAX);
@@ -631,12 +720,61 @@ impl Batch {
             // Flushes outrun by writers or failing: wait for / run one rather than
             // grow without bound. The mutex may be released meanwhile.
             guard = table.make_room(guard, limit)?;
+            // UPDATE pairs: find their old rows (as a row DELETE does, one at a
+            // time with the DELETEs of the table) and decide which pairs apply.
+            // The guard comes back with the MemTable idle and the chunks as
+            // searched, so the plan holds until this commit's WAL entry.
+            let mut gate = None;
+            let upd = self.upd.take();
+            let mut update: Option<(crate::delete::DelPlan, Vec<bool>)> = None;
+            if let Some(u) = upd.as_deref() {
+                drop(guard);
+                gate = Some(table.del_gate.lock().unwrap_or_else(PoisonError::into_inner));
+                let (g, found) = table.lock_with_found(&u.groups)?;
+                guard = g;
+                guard.check_writable()?;
+                if guard.epoch != self.epoch {
+                    return Err(stale());
+                }
+                let plan = u.groups.plan(&table.schema, &guard, &found)?;
+                // Of the pairs of a group of equal old rows, the first ones are those found.
+                let mut used = vec![0usize; plan.deleted.len()];
+                let applied: Vec<bool> = u
+                    .pairs
+                    .iter()
+                    .map(|&(g, _)| {
+                        let ok = used[g] < plan.deleted[g];
+                        used[g] += usize::from(ok);
+                        ok
+                    })
+                    .collect();
+                // A missing old row fails the whole statement (nothing applied): the
+                // handler holds the table lock, so it only vanishes in a real race.
+                if applied.contains(&false) {
+                    return Err(Error::Conflict(
+                        "UPDATE: a row to update is no longer in the table (changed concurrently)".into(),
+                    ));
+                }
+                update = Some((plan, applied));
+            }
             let inner = &mut *guard;
             inner.check_writable()?;
             if inner.epoch != self.epoch {
                 return Err(stale());
             }
-            if let Err(e) = inner.wal.append(&wal::commit_entry(self.id)) {
+            let commit_payload = match (&update, upd.as_deref()) {
+                (Some((plan, applied)), Some(u)) => {
+                    let news: Vec<&[Value]> =
+                        u.pairs.iter().zip(applied).filter(|(_, &ok)| ok).map(|(p, _)| p.1.as_slice()).collect();
+                    let entry = wal::update_commit_entry(self.id, &news, &plan.entry());
+                    if entry.len() > wal::MAX_UPDATE_ENTRY {
+                        return Err(update_too_big(self.spill_limit));
+                    }
+                    entry
+                }
+                _ => wal::commit_entry(self.id),
+            };
+            if let Err(e) = inner.wal.append(&commit_payload) {
                 if !matches!(e, Error::InvalidArg(_)) {
                     inner.poison(format!("WAL append failed: {e}"));
                 }
@@ -649,7 +787,18 @@ impl Batch {
             // (read-only), the statement errors, and the rows may have been
             // visible until the table is reopened; recovery rebuilds from what
             // is on disk.
-            let target = match inner.wal.flush_for_commit() {
+            // An UPDATE that must be durable on return (`sync`, not deferred) is
+            // fsynced here, under the mutex and *before* it is applied, like a
+            // DELETE: a failed fsync then changes nothing in memory. Deferred, or
+            // without `sync`, it is visible before it is durable, like an INSERT.
+            let strict = update.is_some() && sync && !defer;
+            let sync = sync && !strict;
+            let flushed = if strict {
+                inner.wal.sync(true).and_then(|()| inner.wal.flush_for_commit())
+            } else {
+                inner.wal.flush_for_commit()
+            };
+            let target = match flushed {
                 Ok(t) => t,
                 Err(e) => {
                     inner.poison(format!("WAL sync failed: {e}"));
@@ -684,7 +833,32 @@ impl Batch {
             for r in &mut rows {
                 r.series_id = ids[r.series_id as usize];
             }
-            inner.memtable.append(rows, self.bytes, self.ts_min, self.ts_max);
+            let (mut bytes, mut ts_min, mut ts_max) = (self.bytes, self.ts_min, self.ts_max);
+            if let (Some((plan, applied)), Some(u)) = (update, upd) {
+                // The delete first, against the rows that existed before the
+                // statement; then the new rows of the pairs that applied.
+                plan.apply(&u.groups, &table.schema, inner);
+                let mut key = std::mem::take(&mut self.key_buf);
+                for ((_, row), ok) in u.pairs.into_iter().zip(applied) {
+                    if !ok {
+                        continue;
+                    }
+                    key.clear();
+                    for &i in table.schema.tag_indices() {
+                        encode_value(&mut key, &row[i]);
+                    }
+                    let sid = inner.series.get_or_insert_keyed_with(&key, || row_tags(&table.schema, &row));
+                    let ts = table.schema.row_ts(&row);
+                    bytes += row_bytes(&row);
+                    ts_min = ts_min.min(ts);
+                    ts_max = ts_max.max(ts);
+                    rows.push(MemRow { series_id: sid, row });
+                }
+                self.key_buf = key;
+            }
+            if !rows.is_empty() {
+                inner.memtable.append(rows, bytes, ts_min, ts_max);
+            }
             // The rows are visible: the series it held can be written by others.
             self.release_claims_locked(inner);
             // The rows now belong to the MemTable, which has its own limits.
@@ -701,6 +875,7 @@ impl Batch {
                 None
             };
             drop(guard);
+            drop(gate);
             if let Some(Err(e)) = job.map(|j| table.run_flush(j)) {
                 warn(&format!("MemTable flush failed, will retry: {e}"));
             }

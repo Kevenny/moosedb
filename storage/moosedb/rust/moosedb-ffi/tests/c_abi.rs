@@ -301,6 +301,68 @@ fn batches_through_c_abi() {
     assert_eq!(unsafe { moosedb_batch_abort(ptr::null_mut()) }, TFStatus::TF_OK);
 }
 
+
+fn sorted(mut v: Vec<(i64, f64)>) -> Vec<(i64, f64)> {
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    v
+}
+
+fn batch_update(b: *mut MooseDBBatch, old: (i64, &str, f64), new: (i64, &str, f64)) -> FfiResult<()> {
+    let (mut o, mut n) = (ts_row(old.0, old.1, old.2), ts_row(new.0, new.1, new.2));
+    let (old, new) = (TFRow { col_count: 3, values: o.as_mut_ptr() }, TFRow { col_count: 3, values: n.as_mut_ptr() });
+    check(unsafe { moosedb_batch_update(b, &old, &new) })
+}
+
+#[test]
+fn updates_through_c_abi() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t_update");
+    let t = Handle::create_and_open(path.to_str().unwrap()).unwrap();
+    for i in 0..4 {
+        t.write(i * 1_000_000, "srv01", i as f64).unwrap();
+    }
+    let mut b = ptr::null_mut();
+    check(unsafe { moosedb_batch_begin(t.0, &mut b) }).unwrap();
+    batch_update(b, (1_000_000, "srv01", 1.0), (1_000_000, "srv01", 100.0)).unwrap();
+    batch_update(b, (2_000_000, "srv01", 2.0), (2_000_000, "srv02", 2.0)).unwrap(); // tag change
+    batch_write(b, 9_000_000, "srv01").unwrap();
+    assert_eq!(t.range(Some("srv01"), 0, i64::MAX, false).unwrap().len(), 4, "invisible before commit");
+    // A bad row is rejected and the batch stays usable.
+    let mut v = ts_row(1, "x", 1.0);
+    let bad = TFRow { col_count: 2, values: v.as_mut_ptr() };
+    assert_eq!(unsafe { moosedb_batch_update(b, &bad, &bad) }, TFStatus::TF_ERR_INVALID_ARG);
+    // A pair whose old row does not exist fails the commit (CONFLICT); nothing applied.
+    let mut nb = ptr::null_mut();
+    check(unsafe { moosedb_batch_begin(t.0, &mut nb) }).unwrap();
+    batch_update(nb, (1_000_000, "srv01", 1.0), (1_000_000, "srv01", 100.0)).unwrap();
+    batch_update(nb, (99, "srv01", 7.0), (99, "srv01", 8.0)).unwrap();
+    assert_eq!(unsafe { moosedb_batch_commit(nb, true) }, TFStatus::TF_ERR_CONFLICT);
+    assert_eq!(t.count().unwrap(), 4);
+    check(unsafe { moosedb_batch_commit(b, true) }).unwrap();
+    assert_eq!(t.count().unwrap(), 5);
+    assert_eq!(
+        sorted(t.range(Some("srv01"), 0, i64::MAX, false).unwrap()),
+        vec![(0, 0.0), (1_000_000, 100.0), (3_000_000, 3.0), (9_000_000, 1.0)]
+    );
+    assert_eq!(t.range(Some("srv02"), 0, i64::MAX, false).unwrap(), vec![(2_000_000, 2.0)]);
+    assert_eq!(unsafe { moosedb_batch_update(ptr::null_mut(), ptr::null(), ptr::null()) }, TFStatus::TF_ERR_INVALID_ARG);
+
+    // UNIQUE table: the key (tags + time) cannot change.
+    let mut c = config();
+    c.cfg.unique = true;
+    let p = CString::new(dir.path().join("t_update_unique").to_str().unwrap()).unwrap();
+    check(unsafe { moosedb_table_create(p.as_ptr(), &c.cfg) }).unwrap();
+    let mut raw = ptr::null_mut();
+    check(unsafe { moosedb_table_open(p.as_ptr(), &c.cfg, &mut raw) }).unwrap();
+    let u = Handle(raw);
+    u.write(1_000_000, "srv01", 1.0).unwrap();
+    check(unsafe { moosedb_batch_begin(u.0, &mut b) }).unwrap();
+    let (st, msg) = batch_update(b, (1_000_000, "srv01", 1.0), (2_000_000, "srv01", 1.0)).unwrap_err();
+    assert_eq!(st, TFStatus::TF_ERR_UNSUPPORTED, "{msg}");
+    batch_update(b, (1_000_000, "srv01", 1.0), (1_000_000, "srv01", 5.0)).unwrap();
+    check(unsafe { moosedb_batch_commit(b, true) }).unwrap();
+    assert_eq!(u.range(Some("srv01"), 0, i64::MAX, false).unwrap(), vec![(1_000_000, 5.0)]);
+}
 #[test]
 fn series_versions_and_shared_lists_through_c_abi() {
     let dir = tempfile::tempdir().unwrap();

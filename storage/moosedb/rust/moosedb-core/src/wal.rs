@@ -25,7 +25,18 @@
 //!       3 ROW_COMMIT  row                  a one-row batch (plain `write`)
 //!       4 DELETE_RANGE  seq lo hi series   deletes (see `tomb`), committed on its own
 //!       5 DELETE_ROWS   seq rows hits      deletes of exact rows, committed on its own
+//!       6 COMMIT_UPDATE batch_id n rows* DELETE_ROWS-payload
+//!                                          COMMIT of a batch that holds UPDATE pairs
 //! ```
+//!
+//! A COMMIT_UPDATE is the one commit point of a statement with UPDATEs: it
+//! commits the batch's ROW entries (if any) like a COMMIT, *and* carries, whole,
+//! the row deletes of the pairs that found their old row (a complete DELETE_ROWS
+//! payload) plus the `n` new rows of those pairs. Replay applies it in this
+//! order: the delete, the batch's ROW rows, the new rows -- all or nothing, since
+//! it is one CRC-checked entry. A pair whose old row was gone is simply absent
+//! from it. A binary that does not know kind 6 refuses the segment ("unknown
+//! kind"): it can never read an update as a plain COMMIT or skip it.
 //!
 //! Batches of one table may interleave in the log. Replay applies a batch
 //! only when it reaches its COMMIT; rows of batches without one are dropped.
@@ -62,6 +73,7 @@ const K_COMMIT: u8 = 2;
 const K_ROW_COMMIT: u8 = 3;
 const K_DELETE_RANGE: u8 = 4;
 const K_DELETE_ROWS: u8 = 5;
+const K_COMMIT_UPDATE: u8 = 6;
 const FLAG_ENCRYPTED: u16 = 1;
 /// Set on encrypted segments written by a version with an authenticated
 /// MANIFEST (header is bound to the entry tags; see `manifest`).
@@ -166,6 +178,46 @@ pub(crate) fn commit_entry(batch: u64) -> Vec<u8> {
     p
 }
 
+/// Payload of a COMMIT_UPDATE entry (kind 6; a binary that predates it refuses
+/// the segment as "unknown kind", so a table that logged one cannot be downgraded).
+/// On the strict path a failed fsync may leave this entry on disk: it is applied
+/// at reopen although the client got an error, as for a DELETE.
+///
+/// Commits batch `batch`, deletes what
+/// `delete` (a complete DELETE_ROWS payload) names and adds `new_rows`.
+pub(crate) fn update_commit_entry(batch: u64, new_rows: &[&[Value]], delete: &[u8]) -> Vec<u8> {
+    let mut p = Vec::with_capacity(13 + delete.len() + 16 * new_rows.len());
+    p.push(K_COMMIT_UPDATE);
+    put_u64(&mut p, batch);
+    put_u32(&mut p, new_rows.len() as u32);
+    for row in new_rows {
+        encode_row(&mut p, row);
+    }
+    p.extend_from_slice(delete);
+    p
+}
+
+/// Splits the body of a COMMIT_UPDATE (after the batch id) into the encoded
+/// new rows and the DELETE_ROWS payload.
+fn split_update(body: &[u8]) -> Result<(Vec<&[u8]>, &[u8])> {
+    let mut r = ByteReader::new(body);
+    let n = r.u32()? as usize;
+    if n > r.remaining() / 2 {
+        return Err(corrupt("COMMIT_UPDATE lists more rows than it has bytes"));
+    }
+    let mut rows = Vec::with_capacity(n.min(4096));
+    for _ in 0..n {
+        let start = r.position();
+        decode_row(&mut r)?;
+        rows.push(&body[start..r.position()]);
+    }
+    let delete = &body[r.position()..];
+    if delete.first() != Some(&K_DELETE_ROWS) {
+        return Err(corrupt("COMMIT_UPDATE without its DELETE_ROWS payload"));
+    }
+    Ok((rows, delete))
+}
+
 /// A DELETE entry, decoded (the series of a range delete are named by their
 /// tag values, which survive a restart; series ids may not).
 #[derive(Debug, PartialEq)]
@@ -222,9 +274,13 @@ pub(crate) fn rows_delete_entry(seq: u64, mem: &[&[Value]], hits: &[RowsTomb]) -
 
 /// Largest DELETE entry the writer produces; a bigger one is not from us.
 pub(crate) const MAX_DELETE_ENTRY: usize = 8 << 20;
+/// Largest COMMIT_UPDATE the writer produces (only the DELETE part embedded in
+/// it is decoded with this bound; a standalone DELETE keeps `MAX_DELETE_ENTRY`).
+/// A statement whose pairs need more is refused.
+pub(crate) const MAX_UPDATE_ENTRY: usize = 32 << 20;
 
-pub(crate) fn decode_delete(payload: &[u8]) -> Result<DeleteEntry> {
-    if payload.len() > MAX_DELETE_ENTRY {
+pub(crate) fn decode_delete_capped(payload: &[u8], cap: usize) -> Result<DeleteEntry> {
+    if payload.len() > cap {
         return Err(corrupt("DELETE entry larger than any the engine writes"));
     }
     let mut r = ByteReader::new(payload);
@@ -278,6 +334,8 @@ pub(crate) fn decode_delete(payload: &[u8]) -> Result<DeleteEntry> {
 enum Entry<'a> {
     Row(u64, &'a [u8]),
     Commit(u64),
+    /// `COMMIT_UPDATE`: batch id and the rest of the body.
+    CommitUpdate(u64, &'a [u8]),
     RowCommit(&'a [u8]),
     Delete(&'a [u8]),
 }
@@ -286,8 +344,9 @@ enum Entry<'a> {
 pub(crate) enum ReplayEvent<'a> {
     /// A row of a batch that committed (or a single-row commit).
     Row(&'a [u8]),
-    /// A DELETE entry (see [`decode_delete`]).
-    Delete(&'a [u8]),
+    /// A DELETE entry (see [`decode_delete_capped`]) and the largest payload it may have:
+    /// `MAX_DELETE_ENTRY` for a standalone one, `MAX_UPDATE_ENTRY` inside a COMMIT_UPDATE.
+    Delete(&'a [u8], usize),
 }
 
 fn parse_entry(version: u16, payload: &[u8]) -> Result<Entry<'_>> {
@@ -301,6 +360,10 @@ fn parse_entry(version: u16, payload: &[u8]) -> Result<Entry<'_>> {
             Ok(Entry::Row(batch, &payload[r.position()..]))
         }
         K_COMMIT => Ok(Entry::Commit(r.u64()?)),
+        K_COMMIT_UPDATE => {
+            let batch = r.u64()?;
+            Ok(Entry::CommitUpdate(batch, &payload[r.position()..]))
+        }
         K_ROW_COMMIT => Ok(Entry::RowCommit(&payload[1..])),
         K_DELETE_RANGE | K_DELETE_ROWS => Ok(Entry::Delete(payload)),
         k => Err(corrupt(format!("WAL entry of unknown kind {k}"))),
@@ -961,7 +1024,7 @@ pub(crate) fn replay_committed(
 ) -> Result<Replayed> {
     replay_events(dir, segs, flushed_seq, recover, encrypted, limits, reject, |seq, ev| match ev {
         ReplayEvent::Row(p) => on_row(seq, p),
-        ReplayEvent::Delete(_) => Ok(()),
+        ReplayEvent::Delete(..) => Ok(()),
     })
 }
 
@@ -1018,7 +1081,7 @@ pub(crate) fn replay_events(
         let outcome = replay(dir, seq, torn, None, |version, payload| {
             match parse_entry(version, payload)? {
                 Entry::Row(batch, _) => max_batch_id = max_batch_id.max(batch),
-                Entry::Commit(batch) => {
+                Entry::Commit(batch) | Entry::CommitUpdate(batch, _) => {
                     max_batch_id = max_batch_id.max(batch);
                     if seq > flushed_seq {
                         commits.insert(batch);
@@ -1109,9 +1172,46 @@ pub(crate) fn replay_events(
                         }
                     }
                 }
+                Entry::CommitUpdate(batch, body) => {
+                    if seq <= flushed_seq {
+                        return Ok(());
+                    }
+                    commits.remove(&batch);
+                    // An update-only statement logged no ROW: no pending rows is fine here.
+                    let p = pending.remove(&batch).unwrap_or_default();
+                    pending_rows -= p.rows.len();
+                    if p.vetoed {
+                        rejected.push(Rejected {
+                            batch: Some(batch),
+                            rows: p.row_count,
+                            bytes: p.payload_bytes,
+                            segments: p.segments,
+                        });
+                    } else {
+                        let (new_rows, delete) = split_update(body)?;
+                        // Same veto as a ROW: a new row the engine would not load withholds the statement whole.
+                        if new_rows.iter().any(|r| reject(r)) {
+                            rejected.push(Rejected {
+                                batch: Some(batch),
+                                rows: p.row_count + new_rows.len(),
+                                bytes: p.payload_bytes + new_rows.iter().map(|r| r.len()).sum::<usize>(),
+                                segments: p.segments.iter().copied().chain(std::iter::once(seq)).collect(),
+                            });
+                            return Ok(());
+                        }
+                        // The delete first: it looks for rows that existed before the statement.
+                        on_event(seq, ReplayEvent::Delete(delete, MAX_UPDATE_ENTRY))?;
+                        for &(rseg, rpos) in &p.rows {
+                            on_event(seq, ReplayEvent::Row(reader.row(rseg, rpos)?))?;
+                        }
+                        for row in new_rows {
+                            on_event(seq, ReplayEvent::Row(row))?;
+                        }
+                    }
+                }
                 Entry::Delete(p) => {
                     if seq > flushed_seq {
-                        on_event(seq, ReplayEvent::Delete(p))?;
+                        on_event(seq, ReplayEvent::Delete(p, MAX_DELETE_ENTRY))?;
                     }
                 }
                 Entry::RowCommit(row) => {

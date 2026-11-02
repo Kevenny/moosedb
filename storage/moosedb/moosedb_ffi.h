@@ -108,6 +108,8 @@ typedef enum {
   TF_ERR_DEADLOCK = 13,
   // The caller cancelled a long operation (aggregation).
   TF_ERR_CANCELLED = 14,
+  // An UPDATE found a row changed concurrently (nothing applied).
+  TF_ERR_CONFLICT = 15,
 } TFStatus;
 
 // Column type codes used in `TFTableConfig::column_types` and `TFValue::kind`.
@@ -618,6 +620,18 @@ TFStatus moosedb_batch_set_unique_checks(MooseDBBatch *batch, bool enabled);
 // # Safety
 // `batch` must be a live batch handle; `row` as in `moosedb_write_row`.
 TFStatus moosedb_batch_write(MooseDBBatch *batch, const TFRow *row);
+
+// Adds to the statement batch an update: `old_row` (a row of the table, as
+// read) is replaced by `new_row`. Applied at batch commit, atomically with the
+// batch's inserts; a pair whose old row is gone by then is dropped (its new
+// row is not inserted). `TF_ERR_UNSUPPORTED` (see `moosedb_last_error`) when
+// the table has a UNIQUE key and the key columns differ between the two rows,
+// or when the statement's rows outgrow the statement buffer (an update is
+// never spilled). On error the pair is not part of the batch.
+//
+// # Safety
+// `batch` must be a live batch handle; both rows as in `moosedb_write_row`.
+TFStatus moosedb_batch_update(MooseDBBatch *batch, const TFRow *old_row, const TFRow *new_row);
 
 // Publishes every row of the batch at once and releases the handle (also on
 // error: the handle is invalid afterwards). With `sync` the commit is durable

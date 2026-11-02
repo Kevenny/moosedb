@@ -344,7 +344,7 @@ Warning	1062	Duplicate entry '8-1767484740-1' for key 'PRIMARY'
 SHOW WARNINGS;
 Level	Code	Message
 Warning	1062	Duplicate entry '8-1767484740-1' for key 'PRIMARY'
-# REPLACE and ON DUPLICATE KEY UPDATE of a deleted key insert it; of a live key they are still refused
+# REPLACE and ON DUPLICATE KEY UPDATE of a deleted key insert it; of a live key they update it
 DELETE FROM h4 WHERE itemid = 11 AND clock = 1767225600 AND ns = 0;
 REPLACE INTO h4 VALUES (11, 1767225600, 3.5, 0);
 DELETE FROM h4 WHERE itemid = 11 AND clock = 1767225600 AND ns = 0;
@@ -353,8 +353,7 @@ SELECT value FROM h4 WHERE itemid = 11 AND clock = 1767225600 AND ns = 0;
 value
 4.5
 REPLACE INTO h4 VALUES (11, 1767225600, 3.5, 0);
-ERROR HY000: Storage engine MooseDB of the table `test`.`h4` doesn't have this option
-INSERT INTO i4 VALUES (11, 1767225600, 4.5, 0);
+INSERT INTO i4 VALUES (11, 1767225600, 3.5, 0);
 # v4 reinserted keys (REPLACE/ODKU rows are not in the mirror: items 5, 8 and 11 hold them)
 result_rows	vs_innodb
 3728	SAME

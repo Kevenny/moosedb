@@ -35,6 +35,10 @@ impl Segment {
         Segment { rows, by_series: OnceLock::new() }
     }
 
+    pub(crate) fn rows(&self) -> &[MemRow] {
+        &self.rows
+    }
+
     /// Positions (within the segment) of its rows sorted by series. `None` for
     /// a segment too short to be worth it or too long for `u32` positions: the
     /// caller walks its rows. 4 B per row whatever the number of series, so a
@@ -379,6 +383,142 @@ impl MemTable {
                 }
             }
         }
+    }
+
+    /// Shares the segments that may hold a row with `lo <= ts <= hi`, in
+    /// arrival order, so the caller can look at them without the table mutex.
+    /// Freezes the active segment only if its range overlaps.
+    pub(crate) fn segments_in_range(&mut self, lo: i64, hi: i64) -> Vec<Arc<Segment>> {
+        let st = &self.active_stats;
+        if st.len != 0 && hi >= st.ts_min && lo <= st.ts_max {
+            self.freeze_active();
+        }
+        self.frozen
+            .iter()
+            .zip(&self.frozen_stats)
+            .filter(|(_, st)| st.len != 0 && hi >= st.ts_min && lo <= st.ts_max)
+            .map(|(s, _)| s.clone())
+            .collect()
+    }
+
+    /// [`MemTable::visit_range`] that also gives each row's ordinal (its
+    /// position in arrival order over the whole MemTable).
+    pub(crate) fn visit_range_ord(&self, schema: &Schema, lo: i64, hi: i64, mut visit: impl FnMut(u64, &MemRow)) {
+        let stats = self.frozen_stats.iter().chain(std::iter::once(&self.active_stats));
+        let segs = self.frozen.iter().map(|s| &s.rows[..]).chain(std::iter::once(&self.active[..]));
+        let mut base = 0u64;
+        for (rows, st) in segs.zip(stats) {
+            if !(st.len == 0 || hi < st.ts_min || lo > st.ts_max) {
+                for (i, r) in rows.iter().enumerate() {
+                    let ts = schema.row_ts(&r.row);
+                    if lo <= ts && ts <= hi {
+                        visit(base + i as u64, r);
+                    }
+                }
+            }
+            base += rows.len() as u64;
+        }
+    }
+
+    /// The rows at these ordinals (strictly ascending), in order; ordinals
+    /// past the end are skipped.
+    pub(crate) fn rows_at_ordinals(&self, ords: &[u64]) -> Vec<&[Value]> {
+        let mut out = Vec::with_capacity(ords.len());
+        let mut next = 0usize;
+        let mut base = 0u64;
+        for rows in self.frozen.iter().map(|s| &s.rows[..]).chain(std::iter::once(&self.active[..])) {
+            let end = base + rows.len() as u64;
+            while next < ords.len() && ords[next] < end {
+                out.extend(rows.get((ords[next] - base) as usize).map(|r| r.row.as_slice()));
+                next += 1;
+            }
+            base = end;
+        }
+        out
+    }
+
+    /// Removes the rows at these ordinals (strictly ascending, as found by
+    /// `visit_range_ord` with no change to the MemTable since); returns how
+    /// many went. Like `remove_where`, a segment that a snapshot shares is
+    /// rebuilt (the snapshot keeps the old one); a segment nobody else holds
+    /// gives its kept rows up without copying them.
+    pub(crate) fn remove_ordinals(&mut self, schema: &Schema, ords: &[u64]) -> usize {
+        let mut next = 0usize;
+        let mut base = 0u64;
+        let (mut removed, mut freed) = (0usize, 0usize);
+        let old = mem::take(&mut self.frozen);
+        let old_stats = mem::take(&mut self.frozen_stats);
+        for (seg, st) in old.into_iter().zip(old_stats) {
+            let end = base + seg.rows.len() as u64;
+            let from = next;
+            while next < ords.len() && ords[next] < end {
+                next += 1;
+            }
+            let local = &ords[from..next];
+            if local.is_empty() {
+                self.frozen.push(seg);
+                self.frozen_stats.push(st);
+                base = end;
+                continue;
+            }
+            removed += local.len();
+            let mut kept = Vec::with_capacity(seg.rows.len().saturating_sub(local.len()));
+            let mut stats = SegStats::EMPTY;
+            let mut j = 0usize;
+            let mut gone = |i: usize| -> bool {
+                let g = j < local.len() && local[j] - base == i as u64;
+                j += usize::from(g);
+                g
+            };
+            match Arc::try_unwrap(seg) {
+                Ok(owned) => {
+                    for (i, r) in owned.rows.into_iter().enumerate() {
+                        if gone(i) {
+                            freed += row_bytes(&r.row);
+                        } else {
+                            let ts = schema.row_ts(&r.row);
+                            stats.add(1, ts, ts);
+                            kept.push(r);
+                        }
+                    }
+                }
+                Err(shared) => {
+                    for (i, r) in shared.rows.iter().enumerate() {
+                        if gone(i) {
+                            freed += row_bytes(&r.row);
+                        } else {
+                            let ts = schema.row_ts(&r.row);
+                            stats.add(1, ts, ts);
+                            kept.push(MemRow { series_id: r.series_id, row: r.row.clone() });
+                        }
+                    }
+                }
+            }
+            if !kept.is_empty() {
+                self.frozen.push(Arc::new(Segment::new(kept)));
+                self.frozen_stats.push(stats);
+            }
+            base = end;
+        }
+        if next < ords.len() {
+            let old = mem::take(&mut self.active);
+            let mut stats = SegStats::EMPTY;
+            for (i, r) in old.into_iter().enumerate() {
+                if next < ords.len() && ords[next] - base == i as u64 {
+                    next += 1;
+                    removed += 1;
+                    freed += row_bytes(&r.row);
+                } else {
+                    let ts = schema.row_ts(&r.row);
+                    stats.add(1, ts, ts);
+                    self.active.push(r);
+                }
+            }
+            self.active_stats = stats;
+        }
+        self.len -= removed;
+        self.bytes = self.bytes.saturating_sub(freed);
+        removed
     }
 
     /// Removes the rows with `lo <= ts <= hi` for which `remove` says yes

@@ -766,7 +766,7 @@ impl Batch {
                 (Some((plan, applied)), Some(u)) => {
                     let news: Vec<&[Value]> =
                         u.pairs.iter().zip(applied).filter(|(_, &ok)| ok).map(|(p, _)| p.1.as_slice()).collect();
-                    let entry = wal::update_commit_entry(self.id, &news, &plan.entry());
+                    let entry = wal::update_commit_entry(self.id, &news, &plan.entry(&*inner)?);
                     if entry.len() > wal::MAX_UPDATE_ENTRY {
                         return Err(update_too_big(self.spill_limit));
                     }
@@ -837,7 +837,7 @@ impl Batch {
             if let (Some((plan, applied)), Some(u)) = (update, upd) {
                 // The delete first, against the rows that existed before the
                 // statement; then the new rows of the pairs that applied.
-                plan.apply(&u.groups, &table.schema, inner);
+                plan.apply(&table.schema, inner);
                 let mut key = std::mem::take(&mut self.key_buf);
                 for ((_, row), ok) in u.pairs.into_iter().zip(applied) {
                     if !ok {

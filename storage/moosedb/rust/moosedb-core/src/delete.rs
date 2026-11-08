@@ -138,32 +138,26 @@ impl DelGroups {
     /// go: the MemTable's first, then those `found` in the chunks. Changes nothing.
     pub(crate) fn plan(&self, schema: &Schema, inner: &Inner, found: &[Vec<(u64, u32, u32)>]) -> Result<DelPlan> {
         let sids: Vec<Option<u64>> = self.groups.iter().map(|x| inner.series.lookup(&x.tags)).collect();
-        let (lo, hi) = self.groups.iter().fold((i64::MAX, i64::MIN), |(l, h), g| (l.min(g.ts), h.max(g.ts)));
-        // (series, timestamp) of every group: a cheap test before a row is encoded.
-        let mut by_key: HashSet<(u64, i64)> = HashSet::new();
-        for (gi, s) in sids.iter().enumerate() {
-            if let Some(s) = s {
-                by_key.insert((*s, self.groups[gi].ts));
-            }
-        }
+        let (lo, hi) = self.bounds();
+        let by_key = self.keys(&sids);
         let ks: Vec<usize> = self.groups.iter().map(|g| g.k).collect();
         let mut plan = DelPlan {
             seq: 0,
-            lo,
-            hi,
             sids,
-            by_key,
             ks: ks.clone(),
-            mem_rows: Vec::new(),
+            mem_ords: Vec::new(),
             tombs_new: Vec::new(),
             deleted: Vec::new(),
         };
         let mut left = ks.clone();
-        let mut mem_rows: Vec<Row> = Vec::new();
-        inner.memtable.visit_range(schema, lo, hi, |r| {
+        // Where the rows are, not the rows: the MemTable cannot change until `apply`
+        // (the table mutex is held), so `apply` removes by position.
+        let mut mem_ords: Vec<u64> = Vec::new();
+        let mut buf = Vec::new();
+        inner.memtable.visit_range_ord(schema, lo, hi, |ord, r| {
             let ts = schema.row_ts(&r.row);
-            if self.take_from_mem(&plan.by_key, &mut left, r, ts) {
-                mem_rows.push(r.row.clone());
+            if self.take_from_mem(&by_key, &mut left, r, ts, &mut buf) {
+                mem_ords.push(ord);
             }
         });
         let from_mem: Vec<usize> = ks.iter().zip(&left).map(|(k, l)| k - l).collect();
@@ -189,17 +183,42 @@ impl DelGroups {
             tombs_new.push(RowsTomb { seq, chunk: key.0, entry: key.1, runs: runs_of(&ords) });
         }
         plan.seq = seq;
-        plan.mem_rows = mem_rows;
+        plan.mem_ords = mem_ords;
         plan.tombs_new = tombs_new;
         plan.deleted = deleted;
         Ok(plan)
     }
 
-    fn take_from_mem(&self, by_key: &HashSet<(u64, i64)>, left: &mut [usize], r: &crate::memtable::MemRow, ts: i64) -> bool {
+    /// Timestamp range of the groups.
+    fn bounds(&self) -> (i64, i64) {
+        self.groups.iter().fold((i64::MAX, i64::MIN), |(l, h), g| (l.min(g.ts), h.max(g.ts)))
+    }
+
+    /// (series, timestamp) of every group: a cheap test before a row is encoded.
+    fn keys(&self, sids: &[Option<u64>]) -> HashSet<(u64, i64)> {
+        sids.iter().zip(&self.groups).filter_map(|(s, g)| s.map(|s| (s, g.ts))).collect()
+    }
+
+    /// Per group, how many of its `k` rows `feed` (which calls its argument on
+    /// the MemTable's rows, in arrival order) shows.
+    fn mem_have(&self, schema: &Schema, sids: &[Option<u64>], feed: impl FnOnce(&mut dyn FnMut(&crate::memtable::MemRow))) -> Vec<usize> {
+        let by_key = self.keys(sids);
+        let mut left: Vec<usize> = self.groups.iter().map(|g| g.k).collect();
+        let mut buf = Vec::new();
+        feed(&mut |r| {
+            let ts = schema.row_ts(&r.row);
+            self.take_from_mem(&by_key, &mut left, r, ts, &mut buf);
+        });
+        self.groups.iter().zip(&left).map(|(g, l)| g.k - l).collect()
+    }
+
+    fn take_from_mem(&self, by_key: &HashSet<(u64, i64)>, left: &mut [usize], r: &crate::memtable::MemRow, ts: i64, buf: &mut Vec<u8>) -> bool {
         if !by_key.contains(&(r.series_id, ts)) {
             return false;
         }
-        match self.index.get(&encoded(&r.row)) {
+        buf.clear();
+        encode_row(buf, &r.row);
+        match self.index.get(buf.as_slice()) {
             Some(&gi) if left[gi] > 0 => {
                 left[gi] -= 1;
                 true
@@ -215,12 +234,11 @@ pub(crate) type Found = Vec<Vec<(u64, u32, u32)>>;
 
 pub(crate) struct DelPlan {
     seq: u64,
-    lo: i64,
-    hi: i64,
     sids: Vec<Option<u64>>,
-    by_key: HashSet<(u64, i64)>,
     ks: Vec<usize>,
-    mem_rows: Vec<Row>,
+    /// Ordinals (ascending) of the MemTable rows to remove; valid while the
+    /// table mutex stays held from `plan` to `apply`.
+    mem_ords: Vec<u64>,
     tombs_new: Vec<RowsTomb>,
     /// Rows deleted per group (at most the group's `k`).
     pub(crate) deleted: Vec<usize>,
@@ -228,25 +246,32 @@ pub(crate) struct DelPlan {
 
 impl DelPlan {
     pub(crate) fn total(&self) -> u64 {
-        self.mem_rows.len() as u64 + self.tombs_new.iter().map(RowsTomb::rows).sum::<u64>()
+        self.mem_ords.len() as u64 + self.tombs_new.iter().map(RowsTomb::rows).sum::<u64>()
     }
 
-    /// The DELETE_ROWS payload that logs this delete.
-    pub(crate) fn entry(&self) -> Vec<u8> {
-        let refs: Vec<&[Value]> = self.mem_rows.iter().map(Vec::as_slice).collect();
-        wal::rows_delete_entry(self.seq, &refs, &self.tombs_new)
+    /// The DELETE_ROWS payload that logs this delete (`inner`: the one planned against).
+    pub(crate) fn entry(&self, inner: &Inner) -> Result<Vec<u8>> {
+        let refs = inner.memtable.rows_at_ordinals(&self.mem_ords);
+        // The ordinals are only valid under the mutex held since `plan`: fail before logging, never log a wrong delete.
+        if refs.len() != self.mem_ords.len() {
+            return Err(Error::Corrupt(format!(
+                "MemTable changed between planning and logging a delete ({} of {} rows found)",
+                refs.len(),
+                self.mem_ords.len()
+            )));
+        }
+        Ok(wal::rows_delete_entry(self.seq, &refs, &self.tombs_new))
     }
 
     /// Applies the delete after its entry is logged (table mutex held).
-    pub(crate) fn apply(self, groups: &DelGroups, schema: &Schema, inner: &mut Inner) {
+    pub(crate) fn apply(self, schema: &Schema, inner: &mut Inner) {
         inner.changed();
-        if !self.mem_rows.is_empty() {
-            let mut left = self.ks.clone();
-            let removed = inner.memtable.remove_where(schema, self.lo, self.hi, |r| {
-                let ts = schema.row_ts(&r.row);
-                groups.take_from_mem(&self.by_key, &mut left, r, ts)
-            });
-            debug_assert_eq!(removed, self.mem_rows.len());
+        if !self.mem_ords.is_empty() {
+            let removed = inner.memtable.remove_ordinals(schema, &self.mem_ords);
+            if removed != self.mem_ords.len() {
+                // Already logged: the MemTable no longer matches the WAL.
+                inner.poison(format!("row delete removed {removed} of {} MemTable rows", self.mem_ords.len()));
+            }
             inner.mem_generation += 1;
         }
         inner.tseq = self.seq;
@@ -468,7 +493,7 @@ impl Table {
         if total == 0 {
             return Ok(0);
         }
-        let entry = plan.entry();
+        let entry = plan.entry(inner)?;
         if entry.len() > wal::MAX_DELETE_ENTRY {
             return Err(Error::Unsupported(format!(
                 "a DELETE piece of {} bytes exceeds the {} byte log entry limit",
@@ -479,7 +504,7 @@ impl Table {
         log_delete(inner, &entry, durable)?;
 
         // Committed. Apply.
-        plan.apply(&groups, &self.schema, inner);
+        plan.apply(&self.schema, inner);
         Ok(total)
     }
 
@@ -491,38 +516,51 @@ impl Table {
     /// The caller still checks the table epoch if it cares.
     pub(crate) fn lock_with_found(&self, groups: &DelGroups) -> Result<(MutexGuard<'_, Inner>, Found)> {
         let want: Vec<bool> = (0..self.schema.columns().len()).map(|c| self.schema.tag_position(c).is_none()).collect();
+        let (lo, hi) = groups.bounds();
+        // Locates the rows of group `g` the MemTable (`have[g]` of them) does not cover.
+        let locate_all = |chunks: &[Arc<ChunkMeta>], tombs: &TombSet, sids: &[Option<u64>], have: &[usize]| -> Result<Found> {
+            groups
+                .groups
+                .iter()
+                .zip(sids)
+                .zip(have)
+                .map(|((g, s), &h)| match g.k.saturating_sub(h) {
+                    0 => Ok(Vec::new()),
+                    k => self.locate(chunks, tombs, *s, g.ts, &g.row, k, &want),
+                })
+                .collect()
+        };
         for attempt in 0..=OPTIMISTIC_ATTEMPTS {
             let last = attempt == OPTIMISTIC_ATTEMPTS;
             // Step 1: where could each group's rows be in the chunks?
-            let (chunks, tombs, gen, epoch, sids) = {
-                let g = self.lock()?;
+            let (chunks, tombs, gen, epoch, mem_gen, sids, segs) = {
+                let mut g = self.lock()?;
                 g.check_writable()?;
                 let sids: Vec<Option<u64>> = groups.groups.iter().map(|x| g.series.lookup(&x.tags)).collect();
-                (g.chunks.clone(), g.tombs.clone(), g.layout_gen, g.epoch, sids)
+                let segs = if last { Vec::new() } else { g.memtable.segments_in_range(lo, hi) };
+                (g.chunks.clone(), g.tombs.clone(), g.layout_gen, g.epoch, g.mem_generation, sids, segs)
             };
             if last {
                 drop((chunks, tombs));
                 let guard = self.lock_idle()?;
                 guard.check_writable()?;
                 let sids2: Vec<Option<u64>> = groups.groups.iter().map(|x| guard.series.lookup(&x.tags)).collect();
-                let found = groups
-                    .groups
-                    .iter()
-                    .zip(&sids2)
-                    .map(|(g, s)| self.locate(&guard.chunks, &guard.tombs, *s, g.ts, &g.row, g.k, &want))
-                    .collect::<Result<_>>()?;
+                let have = groups.mem_have(&self.schema, &sids2, |f| guard.memtable.visit_range(&self.schema, lo, hi, f));
+                let found = locate_all(&guard.chunks, &guard.tombs, &sids2, &have)?;
                 return Ok((guard, found));
             }
-            let found: Vec<Vec<(u64, u32, u32)>> = groups
-                .groups
-                .iter()
-                .zip(&sids)
-                .map(|(g, s)| self.locate(&chunks, &tombs, *s, g.ts, &g.row, g.k, &want))
-                .collect::<Result<_>>()?;
+            // MemTable first, as the plan will: rows it already holds need no search in the chunks
+            // (a repeated UPDATE finds its old rows there, with their chunk twins tombstoned).
+            // Rows only leave the MemTable by a DELETE (gated), a flush or a TRUNCATE, which all
+            // bump `mem_generation`: checked below.
+            let have = groups.mem_have(&self.schema, &sids, |f| segs.iter().flat_map(|s| s.rows()).for_each(f));
+            drop(segs);
+            let covered = have.iter().any(|&h| h > 0);
+            let found = locate_all(&chunks, &tombs, &sids, &have)?;
             drop((chunks, tombs));
             let guard = self.lock_idle()?;
             guard.check_writable()?;
-            if guard.layout_gen != gen || guard.epoch != epoch {
+            if guard.layout_gen != gen || guard.epoch != epoch || (covered && guard.mem_generation != mem_gen) {
                 continue;
             }
             return Ok((guard, found));
@@ -822,5 +860,32 @@ mod tests {
         let n = count(&t);
         assert!(n == 11 || n == 0, "{n}");
         assert_eq!(t.stats().unwrap().row_count as usize, n);
+    }
+
+    #[test]
+    fn a_row_delete_in_the_memtable_leaves_an_open_snapshot_as_it_was() {
+        let dir = tempfile::tempdir().unwrap();
+        let (t, _) = open(&dir.path().join("t"));
+        let row = |i: i64| vec![Value::Timestamp(i), Value::Bytes(b"a".to_vec())];
+        // several MemTable segments (a scan freezes the active one) plus the active one
+        for i in 0..10 {
+            t.write(row(i)).unwrap();
+            if i % 3 == 0 {
+                let _ = t.scan(&ScanFilter::default(), false).unwrap();
+            }
+        }
+        let mut old = t.scan(&ScanFilter::default(), false).unwrap();
+        assert_eq!(t.delete_rows(vec![row(0), row(4), row(9), row(77)], true).unwrap(), 3);
+        assert_eq!(count(&t), 7);
+        let mut n = 0;
+        while old.next_row().unwrap().is_some() {
+            n += 1;
+        }
+        assert_eq!(n, 10, "the snapshot taken before the delete still shows the deleted rows");
+        // no snapshot left: the unshared path removes by position too
+        drop(old);
+        assert_eq!(t.delete_rows(vec![row(1), row(5)], true).unwrap(), 2);
+        assert_eq!(count(&t), 5);
+        assert_eq!(t.stats().unwrap().row_count, 5);
     }
 }

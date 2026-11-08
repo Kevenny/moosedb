@@ -83,7 +83,7 @@ Com o Zabbix 7.0.31 real (DDL oficial + `COMMENT 'TAG'` + `TIMESTAMP_COLUMN`):
 | **Milhões de séries com poucas linhas** cada | custo por série | 1 M séries: `COUNT(*) WHERE` 1,4–1,6 s vs 0,07 s; `COUNT(DISTINCT)` ~1,45 s vs ~0,2 s |
 | Housekeeper **por item** (DELETE por itemid) | fsync por statement | 8,4 s vs 5,7 s (1,5x mais lento) — use `RETENTION_PERIOD` |
 | `INSERT … ON DUPLICATE KEY UPDATE` de linhas existentes | acha cada linha por conteúdo | 5.000 linhas: 102 ms vs **20 ms** (5x mais lento) |
-| `UPDATE` grande ou frequente | statement inteiro precisa caber no buffer do lote; trava a tabela para escrita; linhas antigas ficam mortas até a compactação | teto ~150 k linhas/statement (64 MiB); repetir UPDATE nas mesmas linhas fica mais lento até `OPTIMIZE` |
+| `UPDATE` grande ou frequente | statement inteiro precisa caber no buffer do lote; trava a tabela para escrita; linhas antigas ficam mortas até a compactação | teto ~150 k linhas/statement (64 MiB); repetir UPDATE de 100 k nas mesmas linhas sobe de ~255 para ~350 ms (linhas recém-atualizadas ficam no MemTable) |
 | `UPDATE` que muda a chave única, ou dentro de trigger/função de outro statement | **recusado** com erro | — |
 | Transação com rollback | `ROLLBACK` **não desfaz** statements MooseDB já terminados (como MyISAM); sem XA real | — |
 | Backup com `mariadb-backup` | **não copia** tabelas MooseDB (a engine faz o backup falhar em vez de ficar incompleto) | use `BACKUP STAGE` + snapshot de volume ou `mariadb-dump --lock-all-tables` |

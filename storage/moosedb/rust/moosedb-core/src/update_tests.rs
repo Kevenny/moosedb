@@ -378,3 +378,44 @@ fn updating_the_same_key_twice_in_a_statement_is_refused_on_a_unique_table_only(
     update_all(&t, vec![(mk(1, "a", 1, 1), mk(1, "a", 2, 1)), (mk(1, "a", 1, 1), mk(1, "a", 3, 1))]);
     assert_eq!(all(&t), vec![k(1, "a", 2, 1), k(1, "a", 3, 1)]);
 }
+
+#[test]
+fn an_update_repeated_on_the_same_rows_finds_them_in_the_memtable_and_in_chunks() {
+    let dir = tempfile::tempdir().unwrap();
+    let (t, _) = create(&dir.path().join("t"), true);
+    for i in 0..5 {
+        t.write_shared(mk(i, "a", i, i)).unwrap();
+    }
+    t.flush().unwrap();
+    for i in 5..10 {
+        t.write_shared(mk(i, "a", i, i)).unwrap();
+    }
+    let mut want: Vec<K> = (0..10).map(|i| k(i, "a", i, i)).collect();
+    for rep in 1..=3 {
+        // rep 1: half the old rows are only in a chunk; later: all of them are in the MemTable
+        let pairs = (0..10)
+            .map(|i| (mk(i, "a", i + rep - 1, i), mk(i, "a", i + rep, i)))
+            .collect();
+        update_all(&t, pairs);
+        want = (0..10).map(|i| k(i, "a", i + rep, i)).collect();
+        assert_eq!(all(&t), want, "rep {rep}");
+    }
+    // a stale old row still fails the statement and changes nothing
+    let mut b = t.begin_batch().unwrap();
+    b.update(mk(3, "a", 0, 3), mk(3, "a", 99, 3)).unwrap();
+    assert!(matches!(b.commit(true), Err(Error::Conflict(_))));
+    assert_eq!(all(&t), want);
+}
+
+#[test]
+fn equal_old_rows_split_between_a_chunk_and_the_memtable_are_all_updated() {
+    let dir = tempfile::tempdir().unwrap();
+    let (t, _) = create(&dir.path().join("t"), false);
+    t.write(mk(1, "a", 7, 7)).unwrap();
+    t.flush().unwrap();
+    t.write(mk(1, "a", 7, 7)).unwrap();
+    for rep in 0..2 {
+        update_all(&t, vec![(mk(1, "a", 7 + rep, 7), mk(1, "a", 8 + rep, 7)), (mk(1, "a", 7 + rep, 7), mk(1, "a", 8 + rep, 7))]);
+        assert_eq!(all(&t), vec![k(1, "a", 8 + rep, 7), k(1, "a", 8 + rep, 7)], "rep {rep}");
+    }
+}

@@ -2277,6 +2277,10 @@ int ha_moosedb::commit_batch(THD *defer_to)
   {
     sql_print_error("MooseDB: statement commit failed: %s",
                     last_error_.c_str());
+    /* The server only reports "error N during COMMIT": the first error raised wins. */
+    THD *cur= ha_thd();
+    if (error == HA_ERR_RECORD_CHANGED && cur && !cur->is_error())
+      my_printf_error(ER_CHECKREAD, "MooseDB: %s", MYF(0), last_error_.c_str());
   }
   return error ? error : del_error;
 }
@@ -3323,7 +3327,7 @@ int ha_moosedb::reset()
   {
     error= commit_batch();
     /* ha_reset()'s return value is ignored by the server: report it here */
-    if (error)
+    if (error && !(thd && thd->is_error()))
       print_error(error, MYF(0));
   }
   if (!batch_ && !del_)

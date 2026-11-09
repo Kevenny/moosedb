@@ -1,0 +1,97 @@
+#
+# INSERT ... ON DUPLICATE KEY UPDATE / REPLACE of keys that exist: the server
+# re-reads the duplicate row through the unique key once per row (a point read
+# that opens a scan each time). Every answer is compared with an InnoDB mirror:
+# rows in sealed chunks and in the MemTable, rows updated earlier in the same
+# statement's table state, keys that do not exist, a row read back through a
+# narrower projection in between (the scan buffers and projection plan are
+# reused from one read to the next), and a repeated key inside one statement.
+#
+--source include/not_embedded.inc
+--source include/have_innodb.inc
+--source include/have_sequence.inc
+--source suite/moosedb/include/have_moosedb.inc
+
+CREATE TABLE m (itemid BIGINT UNSIGNED NOT NULL COMMENT 'TAG', clock INT NOT NULL, value DOUBLE NOT NULL, ns INT NOT NULL,
+                PRIMARY KEY (itemid, clock, ns))
+  ENGINE=MooseDB TIMESTAMP_COLUMN='clock' CHUNK_INTERVAL='1 DAY' HOT_THRESHOLD='1 HOUR';
+CREATE TABLE i (itemid BIGINT UNSIGNED NOT NULL, clock INT NOT NULL, value DOUBLE NOT NULL, ns INT NOT NULL,
+                PRIMARY KEY (itemid, clock, ns)) ENGINE=InnoDB;
+CREATE TABLE sm (host VARCHAR(8) CHARACTER SET utf8mb4 COLLATE utf8mb4_nopad_bin NOT NULL COMMENT 'TAG', clock INT NOT NULL, value INT NOT NULL, ns INT NOT NULL,
+                 PRIMARY KEY (host, clock, ns))
+  ENGINE=MooseDB TIMESTAMP_COLUMN='clock' CHUNK_INTERVAL='1 DAY' HOT_THRESHOLD='1 HOUR';
+CREATE TABLE si (host VARCHAR(8) CHARACTER SET utf8mb4 COLLATE utf8mb4_nopad_bin NOT NULL, clock INT NOT NULL, value INT NOT NULL, ns INT NOT NULL,
+                 PRIMARY KEY (host, clock, ns)) ENGINE=InnoDB;
+
+--let $gen= SELECT 1 + a.seq, 1700000000 + b.seq * 10, a.seq * 100 + b.seq, b.seq MOD 3
+eval INSERT INTO m $gen FROM seq_0_to_19 a, seq_0_to_49 b;
+eval INSERT INTO i $gen FROM seq_0_to_19 a, seq_0_to_49 b;
+INSERT INTO sm SELECT CONCAT('h', a.seq), 1700000000 + b.seq * 10, a.seq * 100 + b.seq, b.seq MOD 3 FROM seq_0_to_9 a, seq_0_to_49 b;
+INSERT INTO si SELECT CONCAT('h', a.seq), 1700000000 + b.seq * 10, a.seq * 100 + b.seq, b.seq MOD 3 FROM seq_0_to_9 a, seq_0_to_49 b;
+--echo # the first 1000 rows now live in a sealed chunk, what follows in the MemTable
+FLUSH TABLES m;
+FLUSH TABLES sm;
+
+--echo # ---- ON DUPLICATE KEY UPDATE: all keys exist (chunk), then half exist and half do not
+--let $odku= SELECT 1 + a.seq, 1700000000 + b.seq * 10, 7, b.seq MOD 3
+eval INSERT INTO m $odku FROM seq_0_to_19 a, seq_0_to_49 b ON DUPLICATE KEY UPDATE value = value + VALUES(value);
+eval INSERT INTO i $odku FROM seq_0_to_19 a, seq_0_to_49 b ON DUPLICATE KEY UPDATE value = value + VALUES(value);
+--let $odku= SELECT 1 + a.seq, 1700000000 + b.seq * 10 + 5 * (a.seq MOD 2), 3, b.seq MOD 3
+eval INSERT INTO m $odku FROM seq_0_to_19 a, seq_0_to_49 b ON DUPLICATE KEY UPDATE value = value * 2 + VALUES(value);
+eval INSERT INTO i $odku FROM seq_0_to_19 a, seq_0_to_49 b ON DUPLICATE KEY UPDATE value = value * 2 + VALUES(value);
+SELECT COUNT(*), SUM(value), SUM(clock), SUM(ns) FROM m;
+SELECT COUNT(*), SUM(value), SUM(clock), SUM(ns) FROM i;
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM m EXCEPT SELECT * FROM i) a) + (SELECT COUNT(*) FROM (SELECT * FROM i EXCEPT SELECT * FROM m) b) AS rows_differing;
+
+--echo # ---- the same keys again: now the rows come from the MemTable and from the chunk
+--let $odku= SELECT 1 + a.seq, 1700000000 + b.seq * 10 + 5 * (a.seq MOD 2), 1, b.seq MOD 3
+eval INSERT INTO m $odku FROM seq_0_to_19 a, seq_0_to_49 b ON DUPLICATE KEY UPDATE value = value + VALUES(value);
+eval INSERT INTO i $odku FROM seq_0_to_19 a, seq_0_to_49 b ON DUPLICATE KEY UPDATE value = value + VALUES(value);
+SELECT COUNT(*), SUM(value), SUM(clock), SUM(ns) FROM m;
+SELECT COUNT(*), SUM(value), SUM(clock), SUM(ns) FROM i;
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM m EXCEPT SELECT * FROM i) a) + (SELECT COUNT(*) FROM (SELECT * FROM i EXCEPT SELECT * FROM m) b) AS rows_differing;
+
+--echo # ---- REPLACE of existing and new keys
+--let $rep= SELECT 1 + a.seq, 1700000000 + b.seq * 10 + 5 * (b.seq MOD 2), 100000 + b.seq, b.seq MOD 3
+eval REPLACE INTO m $rep FROM seq_0_to_24 a, seq_0_to_49 b;
+eval REPLACE INTO i $rep FROM seq_0_to_24 a, seq_0_to_49 b;
+SELECT COUNT(*), SUM(value), SUM(clock), SUM(ns) FROM m;
+SELECT COUNT(*), SUM(value), SUM(clock), SUM(ns) FROM i;
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM m EXCEPT SELECT * FROM i) a) + (SELECT COUNT(*) FROM (SELECT * FROM i EXCEPT SELECT * FROM m) b) AS rows_differing;
+
+--echo # ---- reads with other projections in between, then the same updates again
+SELECT COUNT(*) FROM m WHERE itemid = 3;
+SELECT MAX(value) FROM m WHERE itemid = 4;
+SELECT itemid FROM m WHERE itemid = 5 AND clock = 1700000000 AND ns = 0;
+SELECT value FROM m WHERE itemid = 5 AND clock = 1700000000 AND ns = 0;
+SELECT * FROM m WHERE itemid = 5 AND clock = 1700000000 AND ns = 0;
+--let $odku= SELECT 1 + a.seq, 1700000000 + b.seq * 10, 11, b.seq MOD 3
+eval INSERT INTO m $odku FROM seq_0_to_19 a, seq_0_to_49 b ON DUPLICATE KEY UPDATE value = VALUES(value) + clock MOD 7;
+eval INSERT INTO i $odku FROM seq_0_to_19 a, seq_0_to_49 b ON DUPLICATE KEY UPDATE value = VALUES(value) + clock MOD 7;
+SELECT COUNT(*), SUM(value), SUM(clock), SUM(ns) FROM m;
+SELECT COUNT(*), SUM(value), SUM(clock), SUM(ns) FROM i;
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM m EXCEPT SELECT * FROM i) a) + (SELECT COUNT(*) FROM (SELECT * FROM i EXCEPT SELECT * FROM m) b) AS rows_differing;
+
+--echo # ---- a key repeated inside one statement is still refused where it was refused
+--error ER_DUP_ENTRY
+INSERT INTO m VALUES (900, 1700000000, 1, 0), (900, 1700000000, 2, 0);
+INSERT INTO m VALUES (901, 1700000000, 1, 0) ON DUPLICATE KEY UPDATE value = value + 1;
+--error ER_GET_ERRMSG
+INSERT INTO m VALUES (901, 1700000000, 1, 0), (901, 1700000000, 5, 0) ON DUPLICATE KEY UPDATE value = value + VALUES(value);
+SELECT itemid, clock, value, ns FROM m WHERE itemid >= 900 ORDER BY itemid, clock;
+
+--echo # ---- a string TAG (binary NO PAD collation): the series of each key is found by its text
+INSERT INTO sm SELECT CONCAT('h', a.seq), 1700000000 + b.seq * 10, 5, b.seq MOD 3 FROM seq_0_to_9 a, seq_0_to_49 b
+  ON DUPLICATE KEY UPDATE value = value + VALUES(value);
+INSERT INTO si SELECT CONCAT('h', a.seq), 1700000000 + b.seq * 10, 5, b.seq MOD 3 FROM seq_0_to_9 a, seq_0_to_49 b
+  ON DUPLICATE KEY UPDATE value = value + VALUES(value);
+--echo # 'H3' is another series than 'h3' under a binary collation: it is new, not a duplicate
+INSERT INTO sm VALUES ('H3', 1700000000, 1000, 0) ON DUPLICATE KEY UPDATE value = value + 1;
+INSERT INTO si VALUES ('H3', 1700000000, 1000, 0) ON DUPLICATE KEY UPDATE value = value + 1;
+REPLACE INTO sm SELECT CONCAT('h', a.seq), 1700000000 + b.seq * 10, 9, b.seq MOD 3 FROM seq_0_to_4 a, seq_0_to_49 b;
+REPLACE INTO si SELECT CONCAT('h', a.seq), 1700000000 + b.seq * 10, 9, b.seq MOD 3 FROM seq_0_to_4 a, seq_0_to_49 b;
+SELECT COUNT(*), SUM(value), SUM(clock), SUM(ns) FROM sm;
+SELECT COUNT(*), SUM(value), SUM(clock), SUM(ns) FROM si;
+SELECT (SELECT COUNT(*) FROM (SELECT * FROM sm EXCEPT SELECT * FROM si) a) + (SELECT COUNT(*) FROM (SELECT * FROM si EXCEPT SELECT * FROM sm) b) AS rows_differing;
+
+DROP TABLE m, i, sm, si;

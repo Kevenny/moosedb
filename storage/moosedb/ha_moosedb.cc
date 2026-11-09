@@ -1154,7 +1154,14 @@ int ha_moosedb::map_status(TFStatus status, const char *name)
   if (status == TF_OK)
     return 0;
   /* Every message that can reach a client goes through here: no host path. */
-  if (share_ && !share_->path.empty())
+  if (status == TF_ERR_DUPLICATE)
+  {
+    /* ODKU / REPLACE / IGNORE hit this per row and the server writes its own
+       message: skip the scrub (a getcwd per call). */
+    take_last_error();
+    last_error_= "the UNIQUE key already exists";
+  }
+  else if (share_ && !share_->path.empty())
     last_error_= client_error(share_->path, share_->display);
   else if (name && name[0])
     last_error_= client_error(name, label_from_path(name));

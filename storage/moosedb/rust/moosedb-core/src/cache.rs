@@ -19,7 +19,7 @@ use crate::fasthash::{FastMap, FastState};
 use crate::settings;
 
 struct Lru<K, V> {
-    map: FastMap<K, (V, u64, usize)>,
+    map: FastMap<K, (V, u64, usize, bool)>,
     order: BTreeMap<u64, K>,
     tick: u64,
     used: usize,
@@ -31,28 +31,16 @@ impl<K: Hash + Eq + Clone, V: Clone> Lru<K, V> {
     }
 
     fn get(&mut self, k: &K) -> Option<V> {
-        self.tick += 1;
-        let tick = self.tick;
-        // An entry among the most recently used ~6% keeps its place: a hot
-        // entry read in a loop would otherwise rewrite the order map on every
-        // hit. The LRU is therefore approximate: ticks count every get and
-        // insert, so an entry touched within the last `len / 16` ticks is
-        // treated as fresh and its recency is not updated; it can be evicted
-        // up to that many ticks "too early" relative to exact LRU. (Small
-        // caches, `len < 16`, always refresh, so their order stays exact.)
-        let fresh = (self.map.len() / 16) as u64;
-        let (v, t, _) = self.map.get_mut(k)?;
-        if tick - *t <= fresh {
-            return Some(v.clone());
-        }
-        self.order.remove(t);
-        *t = tick;
-        self.order.insert(tick, k.clone());
+        // Second chance (CLOCK over the order map): a hit only sets a bit, no
+        // BTreeMap work; eviction re-queues referenced entries. Approximately
+        // LRU: recency is "referenced since last eviction pass", not exact order.
+        let (v, _, _, hit) = self.map.get_mut(k)?;
+        *hit = true;
         Some(v.clone())
     }
 
     fn remove(&mut self, k: &K) {
-        if let Some((_, t, size)) = self.map.remove(k) {
+        if let Some((_, t, size, _)) = self.map.remove(k) {
             self.order.remove(&t);
             self.used -= size;
         }
@@ -67,7 +55,7 @@ impl<K: Hash + Eq + Clone, V: Clone> Lru<K, V> {
         }
         self.tick += 1;
         self.order.insert(self.tick, k.clone());
-        self.map.insert(k, (v, self.tick, size));
+        self.map.insert(k, (v, self.tick, size, false));
         self.used += size;
         self.shrink(capacity);
     }
@@ -77,26 +65,31 @@ impl<K: Hash + Eq + Clone, V: Clone> Lru<K, V> {
         self.remove(&k);
         self.tick += 1;
         self.order.insert(self.tick, k.clone());
-        self.map.insert(k, (v, self.tick, size));
+        self.map.insert(k, (v, self.tick, size, false));
         self.used += size;
     }
 
-    /// Drops the least recently used entry; `false` when there is none.
+    /// Drops the least recently used entry (referenced ones get a second
+    /// chance, re-queued as newest); `false` when there is none.
     fn pop_oldest(&mut self) -> bool {
-        let Some((_, k)) = self.order.pop_first() else { return false };
-        if let Some((_, _, size)) = self.map.remove(&k) {
-            self.used -= size;
+        while let Some((_, k)) = self.order.pop_first() {
+            let Some(e) = self.map.get_mut(&k) else { continue };
+            if e.3 {
+                self.tick += 1;
+                e.1 = self.tick;
+                e.3 = false;
+                self.order.insert(self.tick, k);
+            } else {
+                self.used -= e.2;
+                self.map.remove(&k);
+                return true;
+            }
         }
-        true
+        false
     }
 
     fn shrink(&mut self, capacity: usize) {
-        while self.used > capacity {
-            let Some((_, k)) = self.order.pop_first() else { break };
-            if let Some((_, _, size)) = self.map.remove(&k) {
-                self.used -= size;
-            }
-        }
+        while self.used > capacity && self.pop_oldest() {}
     }
 
     fn retain(&mut self, mut keep: impl FnMut(&K) -> bool) {
@@ -209,7 +202,8 @@ impl Sharded {
             l.put(key, v, size);
         }
         let mut total = self.apply(before, l.used);
-        // own oldest entries first (never the new one: it is the newest)
+        // own oldest entries first (the new one enters unreferenced: if every
+        // older entry was hit since the last pass, it is the one that goes)
         while total > capacity && l.map.len() > 1 {
             let b = l.used;
             l.pop_oldest();
@@ -407,6 +401,29 @@ mod tests {
         l.retain(|k| *k != 1);
         assert_eq!(l.get(&1), None);
         assert_eq!(l.used, 1);
+    }
+
+    #[test]
+    fn hits_keep_hot_entries_and_cold_ones_go_first() {
+        let mut l: Lru<u32, u32> = Lru::new();
+        for k in 0..100 {
+            l.insert(k, k, 1, 100);
+        }
+        for k in 0..100 {
+            if k != 50 {
+                assert_eq!(l.get(&k), Some(k)); // all but 50 are hit
+            }
+        }
+        let order_len = l.order.len();
+        l.get(&3);
+        assert_eq!(l.order.len(), order_len, "a hit does not touch the order map");
+        for k in 100..110 {
+            l.insert(k, k, 1, 100); // over budget: 10 evictions
+            assert!(l.used <= 100);
+        }
+        assert_eq!(l.get(&50), None, "the cold entry goes first, though it is the oldest hit-less one");
+        assert!((0..100).filter(|k| *k != 50).filter(|k| l.get(k).is_some()).count() >= 90, "hit entries survive");
+        assert_eq!(l.map.len(), l.order.len());
     }
 
     fn block(n: usize) -> Cached {

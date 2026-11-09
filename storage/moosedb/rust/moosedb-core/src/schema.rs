@@ -110,6 +110,8 @@ pub struct Schema {
     /// Indices of every non-tag column (including the timestamp), in schema
     /// order. Each one gets its own data block per series in a chunk.
     data_indices: Vec<usize>,
+    /// See [`Schema::fingerprint`]; computed once (every scan asks for it).
+    fingerprint: u32,
 }
 
 impl Schema {
@@ -124,7 +126,8 @@ impl Schema {
         }
         let tag_indices = (0..columns.len()).filter(|&i| columns[i].ty == ColumnType::Tag).collect();
         let data_indices = (0..columns.len()).filter(|&i| columns[i].ty != ColumnType::Tag).collect();
-        Ok(Schema { columns, ts_index, tag_indices, data_indices })
+        let fingerprint = Self::compute_fingerprint(&columns, ts_index);
+        Ok(Schema { columns, ts_index, tag_indices, data_indices, fingerprint })
     }
 
     pub fn columns(&self) -> &[Column] {
@@ -204,9 +207,13 @@ impl Schema {
     /// Stable fingerprint of the column type layout, stored in every chunk to
     /// detect a chunk being opened with an incompatible schema.
     pub fn fingerprint(&self) -> u32 {
+        self.fingerprint
+    }
+
+    fn compute_fingerprint(columns: &[Column], ts_index: usize) -> u32 {
         let mut h = crc32fast::Hasher::new();
-        h.update(&(self.ts_index as u32).to_le_bytes());
-        for c in &self.columns {
+        h.update(&(ts_index as u32).to_le_bytes());
+        for c in columns {
             h.update(&[c.ty as u8]);
         }
         h.finalize()

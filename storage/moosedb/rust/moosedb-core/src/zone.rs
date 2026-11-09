@@ -48,9 +48,11 @@ const MAX_DATA_COLUMNS: u32 = 1 << 16;
 
 // ─── what the SQL layer pushes ───────────────────────────────────────────────
 
-/// A predicate on a data column used **only to skip entries** that cannot
-/// match. Rows of entries that are not skipped come back whether they match or
-/// not, so the caller still evaluates its WHERE clause. NULL never matches any
+/// A predicate on a data column used **only to skip what cannot match**: whole
+/// entries (Int, Float, Bytes) and, for `Bytes`, the rows of the entries that
+/// are read (exact test, see below). Int and Float rows of entries that are not
+/// skipped come back whether they match or not, so the caller still evaluates
+/// its WHERE clause. NULL never matches any
 /// of these (the caller must not push `IS NULL`, `<=>`, `OR`, ...). Bounds are
 /// inclusive; a strict bound is pushed as the inclusive one (a wider range is
 /// always safe).
@@ -65,7 +67,13 @@ pub enum ColPred {
     /// -- only valid when the SQL comparison is exactly that (binary NO PAD
     /// collation), or, with `pad_space`, binary PAD SPACE of a charset whose
     /// space is the byte 0x20 (see `agg::ValueFilter`). An empty list matches
-    /// nothing.
+    /// nothing. The test is exact on the rows too: only rows that equal a value
+    /// come back (chunk windows decode this column first and the others only
+    /// if a row passes; MemTable rows are tested one by one). A sorted scan may
+    /// still return a few non-matching rows between matches when they are
+    /// scattered (more than 16 runs in a series window). Because rows are
+    /// dropped, pushing a comparison that is not byte equality (a ci collation,
+    /// DECIMAL compared as a number: '1.0' = '1.00') loses rows silently.
     Bytes { col: usize, values: Vec<Vec<u8>>, pad_space: bool },
 }
 
@@ -78,6 +86,7 @@ static ROWS: AtomicU64 = AtomicU64::new(0);
 static SKIPPED: AtomicU64 = AtomicU64::new(0);
 static READ: AtomicU64 = AtomicU64::new(0);
 static READ_NS: AtomicU64 = AtomicU64::new(0);
+static FILTERED: AtomicU64 = AtomicU64::new(0);
 
 /// Process-wide pruning counters (all tables, scans and aggregations), for
 /// benchmarks. An entry is one series of one chunk (its column blocks are read
@@ -99,6 +108,10 @@ pub struct PruneStats {
     /// Nanoseconds spent reading, decrypting and decompressing those blocks
     /// (summed over threads).
     pub block_read_ns: u64,
+    /// Rows of entries that were read (chunk windows and MemTable rows) but
+    /// dropped by the exact byte filter of a `ColPred::Bytes` (window rows
+    /// hidden by deletes are counted too), so never handed to the caller.
+    pub rows_filtered: u64,
 }
 
 pub fn prune_stats() -> PruneStats {
@@ -110,6 +123,7 @@ pub fn prune_stats() -> PruneStats {
         blocks_skipped: SKIPPED.load(Relaxed),
         blocks_read: READ.load(Relaxed),
         block_read_ns: READ_NS.load(Relaxed),
+        rows_filtered: FILTERED.load(Relaxed),
     }
 }
 
@@ -119,8 +133,15 @@ pub(crate) fn note_block_read(ns: u64) {
     READ_NS.fetch_add(ns, Relaxed);
 }
 
+/// `n` rows were dropped by the exact byte filter.
+pub(crate) fn note_rows_filtered(n: u64) {
+    if n > 0 {
+        FILTERED.fetch_add(n, Relaxed);
+    }
+}
+
 pub fn reset_prune_stats() {
-    for c in [&TESTED, &BY_ZONE, &BY_BLOOM, &ROWS, &SKIPPED, &READ, &READ_NS] {
+    for c in [&TESTED, &BY_ZONE, &BY_BLOOM, &ROWS, &SKIPPED, &READ, &READ_NS, &FILTERED] {
         c.store(0, Relaxed);
     }
 }
@@ -142,7 +163,7 @@ fn hash_bytes(b: &[u8]) -> u64 {
 }
 
 /// `v` without its trailing 0x20 bytes.
-fn trim_spaces(v: &[u8]) -> &[u8] {
+pub(crate) fn trim_spaces(v: &[u8]) -> &[u8] {
     let n = v.iter().rposition(|&c| c != b' ').map_or(0, |i| i + 1);
     &v[..n]
 }
@@ -430,11 +451,34 @@ pub(crate) struct Pruner {
     fingerprint: u32,
     ndata: usize,
     preds: Vec<Pred>,
+    /// Row-level exact tests (`ColPred::Bytes` only): unlike `preds` they decide
+    /// rows, not entries, and need no summaries.
+    exact: Vec<ExactBytes>,
+}
+
+/// Exact test of one VARCHAR / DECIMAL column: byte equality with one of the
+/// values, trailing 0x20 ignored on both sides under `pad_space` (the same rule
+/// as `agg::ValueFilter` and the Bloom hashes). NULL never passes.
+#[derive(Clone, Debug)]
+pub(crate) struct ExactBytes {
+    /// Schema column.
+    pub(crate) col: usize,
+    pad: bool,
+    /// Sorted, deduplicated (trimmed under `pad`).
+    vals: Vec<Box<[u8]>>,
+}
+
+impl ExactBytes {
+    #[inline]
+    pub(crate) fn accepts(&self, v: &[u8]) -> bool {
+        let v = if self.pad { trim_spaces(v) } else { v };
+        self.vals.binary_search_by(|x| (**x).cmp(v)).is_ok()
+    }
 }
 
 impl Pruner {
     pub(crate) fn new(schema: &Schema) -> Pruner {
-        Pruner { fingerprint: schema.fingerprint(), ndata: schema.data_indices().len(), preds: Vec::new() }
+        Pruner { fingerprint: schema.fingerprint(), ndata: schema.data_indices().len(), preds: Vec::new(), exact: Vec::new() }
     }
 
     pub(crate) fn from_cols(schema: &Schema, cols: &[ColPred]) -> Result<Pruner> {
@@ -467,6 +511,13 @@ impl Pruner {
                         matches!(t, ColumnType::Varchar | ColumnType::Decimal)
                     })?;
                     p.add_bytes(schema, *col, values.iter().map(Vec::as_slice), *pad_space, false);
+                    let mut vals: Vec<Box<[u8]>> = values
+                        .iter()
+                        .map(|v| Box::from(if *pad_space { trim_spaces(v) } else { v.as_slice() }))
+                        .collect();
+                    vals.sort_unstable();
+                    vals.dedup();
+                    p.exact.push(ExactBytes { col: *col, pad: *pad_space, vals });
                 }
             }
         }
@@ -507,6 +558,19 @@ impl Pruner {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.preds.is_empty()
+    }
+
+    pub(crate) fn exact(&self) -> &[ExactBytes] {
+        &self.exact
+    }
+
+    /// Whether a MemTable row passes the exact tests (counted as filtered if not).
+    pub(crate) fn row_passes(&self, row: &[Value]) -> bool {
+        let ok = self.exact.iter().all(|p| matches!(row.get(p.col), Some(Value::Bytes(b)) if p.accepts(b)));
+        if !ok {
+            note_rows_filtered(1);
+        }
+        ok
     }
 
     /// Whether entry `si` of chunk `c` cannot hold a row that satisfies all the

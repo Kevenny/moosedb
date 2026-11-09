@@ -256,7 +256,10 @@ O `ANALYZE` instrumenta cada linha e infla os tempos de varredura (~1,5x) em rel
    q02 0,68 x 0,47; q03 0,40 x 0,21; q04 17,7 x 14,4). Exceção: q05/q05b, varredura sem filtro de TAG (q05 2,22 x 3,04 s é ruído de
    varredura). Só use TAG dupla se a consulta filtrar pela segunda (q06: 4,8 x 3,8 ms, quase igual). Com só `host`,
    a MooseDB empata com o ClickHouse em disco (555 x 519 MiB).
-4. **[alto impacto para q05, esforço alto, risco médio] Sem índice secundário em coluna não-TAG, "quem acessa um
+4. **Atualizado em 2026-11-09:** com Bloom por (série, coluna) e o filtro exato de VARCHAR na engine, q05 caiu para
+   **0,048 s** (host+process TAG; 0,18 s só host), q05b para 0,012 s, arquivo popular para 0,64 s (InnoDB com
+   `KEY(file)`: 0,011 / 0,009 / 28,1 s); resultados idênticos (md5). Texto original, do HEAD `5c771db`:
+   **[alto impacto para q05, esforço alto, risco médio] Sem índice secundário em coluna não-TAG, "quem acessa um
    arquivo" é varredura de 20 M linhas (1,6-3,3 s):** 170-340x mais lento que o InnoDB com `KEY(file)` (0,0118 e
    0,0095 s) e 1,4-2,0x mais lento que o InnoDB sem esse índice (1,53 e 2,30 s). `file` como TAG foi descartado
    (2 M de séries): **não medido**. O ClickHouse resolve o caso em 0,115 s varrendo a coluna comprimida com 8 threads.

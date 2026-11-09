@@ -17,6 +17,7 @@ use crate::crypto::{CipherParams, TAG_LEN};
 use crate::error::{corrupt, Error, Result};
 use crate::index::bloom::Bloom;
 use crate::schema::{ColumnType, Row, Schema};
+use crate::zone::ExactBytes;
 
 struct Footer {
     index_offset: u64,
@@ -288,9 +289,35 @@ pub(crate) struct Window {
     ts_index: usize,
     /// A narrow read: columns decoded later are kept whole in the cache.
     narrow: bool,
+    /// Sorted, disjoint row runs (within `[lo, hi)`) that pass the exact byte
+    /// filter; `None` = no filter, every row. See [`Window::restrict`].
+    keep: Option<Arc<Vec<(usize, usize)>>>,
 }
 
 impl Window {
+    /// Cuts the live `stretches` (sorted, disjoint) to the rows the exact
+    /// filter keeps.
+    pub(crate) fn keep_all(&self) -> bool {
+        self.keep.is_none()
+    }
+
+    pub(crate) fn restrict(&self, stretches: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+        let Some(keep) = &self.keep else { return stretches };
+        let mut out = Vec::new();
+        let mut j = 0;
+        for (a, b) in stretches {
+            while j < keep.len() && keep[j].1 <= a {
+                j += 1;
+            }
+            let mut k = j;
+            while k < keep.len() && keep[k].0 < b {
+                out.push((a.max(keep[k].0), b.min(keep[k].1)));
+                k += 1;
+            }
+        }
+        out
+    }
+
     /// The timestamps of rows `[0, hi)` of the series, when decoded.
     pub(crate) fn ts_slice(&self) -> Option<&[i64]> {
         self.cols.get(self.ts_index).and_then(Option::as_ref).and_then(|c| c.ints())
@@ -336,9 +363,28 @@ pub(crate) fn load_window(
     schema: &Schema,
     meta: &ChunkMeta,
     idx: usize,
+    range: (i64, i64),
+    want: &[bool],
+    need_ts: bool,
+) -> Result<Option<Window>> {
+    load_window_exact(schema, meta, idx, range, want, need_ts, &[], usize::MAX)
+}
+
+/// [`load_window`] with an exact byte filter (late materialization): the
+/// filter columns are decoded first and the other wanted columns only if some
+/// row passes; otherwise `None`. The window then carries the passing row runs
+/// ([`Window::restrict`]), coalesced into their span when there are more than
+/// `max_runs` (a superset is always safe: the caller re-evaluates its WHERE).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn load_window_exact(
+    schema: &Schema,
+    meta: &ChunkMeta,
+    idx: usize,
     (ts_min, ts_max): (i64, i64),
     want: &[bool],
     need_ts: bool,
+    exact: &[ExactBytes],
+    max_runs: usize,
 ) -> Result<Option<Window>> {
     let entry = meta.series.get(idx).ok_or_else(|| corrupt("series entry index out of range"))?;
     let n = entry.row_count as usize;
@@ -410,13 +456,65 @@ pub(crate) fn load_window(
             cache::put_column(uid, series_key, column_key(ts_idx), ts);
         }
     }
-    let mut window = Window { lo, hi, cols, ts_index: ts_idx, narrow };
+    let mut window = Window { lo, hi, cols, ts_index: ts_idx, narrow, keep: None };
+    let exact: Vec<&ExactBytes> = exact.iter().filter(|p| schema.data_indices().contains(&p.col)).collect();
+    if !exact.is_empty() {
+        for p in &exact {
+            if window.cols[p.col].is_none() {
+                load_column(schema, meta, idx, &mut window, p.col)?;
+            }
+        }
+        let mut runs = matching_runs(&exact, &window);
+        if runs.len() > max_runs {
+            runs = vec![(runs[0].0, runs[runs.len() - 1].1)];
+        }
+        let kept_after: usize = runs.iter().map(|r| r.1 - r.0).sum();
+        crate::zone::note_rows_filtered(((hi - lo) - kept_after) as u64);
+        if runs.is_empty() {
+            return Ok(None);
+        }
+        window.keep = Some(Arc::new(runs));
+    }
     for &col in schema.data_indices() {
-        if col != ts_idx && want.get(col).copied().unwrap_or(false) {
+        if col != ts_idx && want.get(col).copied().unwrap_or(false) && window.cols[col].is_none() {
             load_column(schema, meta, idx, &mut window, col)?;
         }
     }
     Ok(Some(window))
+}
+
+/// Runs of rows of `win` (within `[lo, hi)`) that pass every exact test. A
+/// column that is not a plain byte column or is malformed passes everything
+/// (the caller still evaluates its WHERE).
+fn matching_runs(exact: &[&ExactBytes], win: &Window) -> Vec<(usize, usize)> {
+    let mut cols = Vec::with_capacity(exact.len());
+    for p in exact {
+        let Some(c) = win.cols[p.col].as_deref() else { return vec![(win.lo, win.hi)] };
+        let block::DenseRef::Bytes { offsets, data } = c.dense() else { return vec![(win.lo, win.hi)] };
+        cols.push((*p, offsets, data, c.null_flags()));
+    }
+    let pass = |i: usize| {
+        cols.iter().all(|(p, off, data, nulls)| {
+            if nulls.is_some_and(|m| m.get(i).copied().unwrap_or(false)) {
+                return false;
+            }
+            match (off.get(i), off.get(i + 1)) {
+                (Some(&s), Some(&e)) => data.get(s as usize..e as usize).map_or(true, |v| p.accepts(v)),
+                _ => true,
+            }
+        })
+    };
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    for i in win.lo..win.hi {
+        if !pass(i) {
+            continue;
+        }
+        match runs.last_mut() {
+            Some(r) if r.1 == i => r.1 = i + 1,
+            _ => runs.push((i, i + 1)),
+        }
+    }
+    runs
 }
 
 /// Decodes data column `col` of series `idx` into `win` (rows `[0, hi)` at

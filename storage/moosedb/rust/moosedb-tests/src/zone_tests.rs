@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use super::helpers::*;
 use moosedb_core::agg::{AggSpec, FuncSpec, KeyCol, KeySpec, ValueFilter};
 use moosedb_core::time::MICROS_PER_SEC;
-use moosedb_core::{prune_stats, ColPred, RawOptions, Row, ScanFilter, Table, Value};
+use moosedb_core::{prune_stats, ColPred, RawOptions, Row, ScanFilter, Table, TableConfig, Value};
 
 /// Columns of the helper schema.
 const VALUE: usize = 3;
@@ -450,4 +450,194 @@ fn aggregation_range_hints_do_not_change_the_result() {
         assert_eq!(got, want, "{p:?}");
     }
     assert!(prune_stats().pruned_by_zone > before.pruned_by_zone, "the hints must prune something");
+}
+
+// ─── exact byte filter (late materialization) ───────────────────────────────
+
+fn random_bytes_pred(g: &mut Lcg) -> ColPred {
+    loop {
+        if let p @ ColPred::Bytes { .. } = random_pred(g) {
+            return p;
+        }
+    }
+}
+
+/// Positions and rows of a scan, in order.
+fn scan_pos(t: &Table, f: &ScanFilter, sorted: bool, proj: Option<&[bool]>) -> Vec<([u8; 16], Row)> {
+    let mut s = t.scan_projected(f, sorted, proj).unwrap();
+    let mut out = Vec::new();
+    while let Some((p, r)) = s.next_row().unwrap() {
+        out.push((p.to_bytes(), r));
+    }
+    out
+}
+
+fn check_exact(t: &Table, g: &mut Lcg, rounds: usize) {
+    let all = ScanFilter::default();
+    // everything but the filtered column, and only the timestamp
+    let no_note: Vec<bool> = (0..6).map(|c| c != NOTE).collect();
+    let only_ts: Vec<bool> = (0..6).map(|c| c == 0).collect();
+    for _ in 0..rounds {
+        let preds: Vec<ColPred> = (0..1 + g.below(2)).map(|_| random_bytes_pred(g)).collect();
+        let f = ScanFilter { cols: preds.clone(), ..ScanFilter::default() };
+        for sorted in [false, true] {
+            let proj: [Option<&[bool]>; 3] = [None, Some(&no_note), Some(&only_ts)];
+            for proj in proj {
+                let full = scan_pos(t, &all, sorted, None);
+                let want: Vec<[u8; 16]> =
+                    full.iter().filter(|(_, r)| preds.iter().all(|p| matches(r, p))).map(|(p, _)| *p).collect();
+                let got: Vec<[u8; 16]> = scan_pos(t, &f, sorted, proj).into_iter().map(|(p, _)| p).collect();
+                if sorted {
+                    // a merge run may read a span of passing rows: a superset, same order
+                    let mut it = got.iter();
+                    assert!(want.iter().all(|w| it.any(|x| x == w)), "sorted lost a row: {preds:?}");
+                } else {
+                    assert_eq!(got, want, "stream is exact: {preds:?} proj {proj:?}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn exact_bytes_filter_loses_no_row_and_returns_only_matches() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = create_open(&dir.path().join("t"), RawOptions::default());
+    let mut g = Lcg(0xe4ac7);
+    let mut sec = 0i64;
+    for round in 0..4 {
+        for _ in 0..1500 {
+            sec += 1 + g.below(3) as i64;
+            let host = g.below(6);
+            t.write(model_row(&mut g, host, sec)).unwrap();
+        }
+        if round < 3 {
+            t.flush().unwrap();
+        }
+    }
+    let h2: Vec<u64> = t
+        .series()
+        .unwrap()
+        .into_iter()
+        .filter(|(_, tags)| tags[0] == Value::Bytes(b"h2".to_vec()))
+        .map(|(id, _)| id)
+        .collect();
+    let lo = base_ts() + 300 * MICROS_PER_SEC;
+    t.delete_range(Some(&h2), lo, lo + 900 * MICROS_PER_SEC, None, true).unwrap();
+    let before = prune_stats().rows_filtered;
+    check_exact(&t, &mut g, 40);
+    assert!(prune_stats().rows_filtered > before, "rows were dropped by the filter");
+    t.flush().unwrap();
+    t.compact(i64::MIN, i64::MAX, base_ts()).unwrap();
+    check_exact(&t, &mut g, 20);
+}
+
+#[test]
+fn exact_bytes_filter_handles_decoded_series_without_summaries_and_empty_lists() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = create_open(&dir.path().join("t"), RawOptions::default());
+    for i in 0..50 {
+        t.write(row(i, "srv1", 1.0)).unwrap();
+    }
+    t.flush().unwrap();
+    for i in 50..60 {
+        t.write(row(i, "srv1", 1.0)).unwrap();
+    }
+    let one = |values: Vec<Vec<u8>>, pad_space| ScanFilter {
+        cols: vec![ColPred::Bytes { col: NOTE, values, pad_space }],
+        ..ScanFilter::default()
+    };
+    // chunk row 7 and MemTable row 52; NULLs (every third second) never match
+    assert_eq!(scan_rows(&t, &one(vec![b"n7".to_vec(), b"n52".to_vec()], false), false).len(), 2);
+    assert_eq!(scan_rows(&t, &one(vec![b"n7  ".to_vec()], false), false).len(), 0);
+    assert_eq!(scan_rows(&t, &one(vec![b"n7  ".to_vec()], true), false).len(), 1);
+    assert_eq!(scan_rows(&t, &one(vec![], true), false).len(), 0, "an empty list matches nothing");
+}
+
+// ─── exact byte filter x ordered scan of a UNIQUE table (merge_fill_tie) ────
+
+/// `(ts, itemid TAG, ns, note VARCHAR)`, key `(itemid, ts, ns)`.
+fn unique_note_config(dir: &std::path::Path) -> TableConfig {
+    use moosedb_core::{Column, ColumnType, Schema};
+    let schema = Schema::new(
+        vec![
+            Column { name: "ts".into(), ty: ColumnType::Timestamp },
+            Column { name: "itemid".into(), ty: ColumnType::Tag },
+            Column { name: "ns".into(), ty: ColumnType::Int64 },
+            Column { name: "note".into(), ty: ColumnType::Varchar },
+        ],
+        0,
+    )
+    .unwrap();
+    TableConfig::new(dir, schema, &RawOptions::default()).unwrap().with_unique(vec![2]).unwrap()
+}
+
+/// The ordered scan with an exact filter is a superset (same order) of the
+/// rows that match, and exactly them while at most MERGE_KEEP_RUNS (16) runs
+/// match; with more, a run may keep a span of non-matching rows.
+#[test]
+fn exact_bytes_filter_on_ordered_unique_scan_with_ties() {
+    const NOTE_U: usize = 3;
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = unique_note_config(&dir.path().join("t"));
+    Table::create(&cfg).unwrap();
+    let t = std::sync::Arc::new(Table::open(cfg).unwrap());
+    let mut g = Lcg(0x7137);
+    let mut written: Vec<Row> = Vec::new();
+    // 24 series x 3 chunks + MemTable: well over 16 runs when "common" matches.
+    for round in 0..4 {
+        for _ in 0..600 {
+            let (item, sec, ns) = (g.below(24), g.below(60) as i64, g.below(3) as i64);
+            let note = match (item, g.below(10)) {
+                (_, 0) => Value::Null,
+                (0..=1, 1) => Value::Bytes(b"rare".to_vec()), // only 2 series
+                (_, 2..=5) => Value::Bytes(b"common".to_vec()),
+                (_, 6) => Value::Bytes(b"common  ".to_vec()),
+                _ => Value::Bytes(format!("x{}", g.below(5)).into_bytes()),
+            };
+            let row = vec![
+                Value::Timestamp(base_ts() + sec * MICROS_PER_SEC),
+                Value::Bytes(format!("i{item}").into_bytes()),
+                Value::Int(ns),
+                note,
+            ];
+            // a duplicate key is refused: that is part of the model
+            if t.write_shared(row.clone()).is_ok() {
+                written.push(row);
+            }
+        }
+        if round < 3 {
+            t.flush().unwrap();
+        }
+    }
+    // deletes hit chunk rows and MemTable rows
+    let gone: Vec<Row> = written.iter().step_by(11).cloned().collect();
+    assert_eq!(t.delete_rows(gone, true).unwrap(), written.iter().step_by(11).count() as u64);
+
+    let all = ScanFilter::default();
+    let proj_all: [Option<&[bool]>; 3] = [None, Some(&[true, true, true, false]), Some(&[true, false, false, false])];
+    let lists: [(&[&[u8]], bool, bool); 5] = [
+        (&[b"rare"], false, true),
+        (&[b"common"], false, false),
+        (&[b"common"], true, false),
+        (&[b"x1", b"x3", b"rare"], false, false),
+        (&[b"absent"], false, true),
+    ];
+    let before = prune_stats().rows_filtered;
+    for (values, pad_space, exact) in lists {
+        let p = ColPred::Bytes { col: NOTE_U, values: values.iter().map(|v| v.to_vec()).collect(), pad_space };
+        let f = ScanFilter { cols: vec![p.clone()], ..ScanFilter::default() };
+        for proj in proj_all {
+            let full = scan_pos(&t, &all, true, None);
+            let want: Vec<[u8; 16]> = full.iter().filter(|(_, r)| matches(r, &p)).map(|(q, _)| *q).collect();
+            assert!(!want.is_empty() || values == [b"absent"], "{values:?} must match something");
+            let got: Vec<[u8; 16]> = scan_pos(&t, &f, true, proj).into_iter().map(|(q, _)| q).collect();
+            let mut it = got.iter();
+            assert!(want.iter().all(|w| it.any(|x| x == w)), "lost or reordered a row: {values:?} proj {proj:?}");
+            if exact {
+                assert_eq!(got, want, "<= 16 matching runs is exact: {values:?} proj {proj:?}");
+            }
+        }
+    }
+    assert!(prune_stats().rows_filtered > before, "the exact filter dropped rows");
 }

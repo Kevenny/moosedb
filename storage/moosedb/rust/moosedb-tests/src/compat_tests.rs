@@ -720,6 +720,18 @@ fn chunks_without_zone_maps_are_read_and_never_pruned() {
         assert!(t.chunks().unwrap().iter().all(|c| c.zones.is_none()), "{case}");
         // no summaries: the value test is never even reached (modulo parallel tests)
         pruned_equals_unpruned(&t, case);
+        // the exact byte filter needs no summaries either
+        let f = moosedb_core::ScanFilter {
+            cols: vec![moosedb_core::ColPred::Bytes { col: 5, values: vec![b"n7".to_vec(), b"n101".to_vec()], pad_space: false }],
+            ..Default::default()
+        };
+        let mut s = t.scan(&f, false).unwrap();
+        let mut n = 0;
+        while let Some((_, r)) = s.next_row().unwrap() {
+            assert!(matches!(&r[5], moosedb_core::Value::Bytes(b) if b == b"n7" || b == b"n101"), "{case}: {r:?}");
+            n += 1;
+        }
+        assert_eq!(n, 2, "{case}");
     }
 }
 

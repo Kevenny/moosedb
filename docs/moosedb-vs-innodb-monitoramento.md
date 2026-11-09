@@ -79,7 +79,7 @@ Com o Zabbix 7.0.31 real (DDL oficial + `COMMENT 'TAG'` + `TIMESTAMP_COLUMN`):
 
 | Situação | Impacto | Números |
 |---|---|---|
-| Filtro em coluna **não-TAG** (ex.: `file = 'x'`) | sem índice secundário → varredura | 1,6–3,3 s vs **0,01 s** do InnoDB com `KEY(file)` |
+| Filtro em coluna **não-TAG** (ex.: `file = 'x'`) | sem índice secundário: Bloom por série poda ~98 % e a engine filtra as linhas, mas ainda lê a coluna das séries restantes | 20 M linhas: 0,048 s vs **0,011 s** do InnoDB com `KEY(file)` (com 1 dia: 0,012 vs 0,009 s); valor popular (587 mil linhas) 0,64 s vs 28 s do InnoDB |
 | **Milhões de séries com poucas linhas** cada | custo por série | 1 M séries: `COUNT(*) WHERE` 1,4–1,6 s vs 0,07 s; `COUNT(DISTINCT)` ~1,45 s vs ~0,2 s |
 | Housekeeper **por item** (DELETE por itemid) | fsync por statement | 8,4 s vs 5,7 s (1,5x mais lento) — use `RETENTION_PERIOD` |
 | `INSERT … ON DUPLICATE KEY UPDATE` de linhas existentes | acha cada linha por conteúdo | 5.000 linhas: 102 ms vs **20 ms** (5x mais lento) |

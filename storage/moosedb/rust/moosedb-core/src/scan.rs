@@ -29,13 +29,17 @@ use std::collections::{BinaryHeap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use crate::chunk::ChunkMeta;
-use crate::chunk_reader::{fetch_row, load_more_columns, load_window, Window};
+use crate::chunk_reader::{fetch_row, load_more_columns, load_window_exact, Window};
 use crate::error::{invalid, Error, Result};
 use crate::memtable::MemSnapshot;
 use crate::rowbatch::{Plan, ScanBatch, DEFAULT_BATCH_ROWS, MAX_BATCH_ROWS};
 use crate::schema::{Row, Schema, Value};
 use crate::tomb::{split_by_holes, TombSet};
-use crate::zone::{ColPred, Pruner};
+use crate::zone::{ColPred, ExactBytes, Pruner};
+
+/// Merge runs are separate heap entries: a window whose passing rows form more
+/// runs than this is read over their span instead (still a superset).
+const MERGE_KEEP_RUNS: usize = 16;
 
 pub const POSITION_LEN: usize = 16;
 /// High bit of `Position::source` marks MemTable rows; the remaining bits
@@ -91,10 +95,11 @@ pub struct ScanFilter {
     /// Restrict to these series ids (from `Table::series`), if set.
     pub series: Option<Vec<u64>>,
     /// Value predicates on data columns, ANDed. Unlike the fields above they
-    /// are only a **skip hint**: series entries (chunk blocks) whose zone map
-    /// or column Bloom proves no row can match are not read; rows of the
-    /// entries that are read come back whether they match or not, and the
-    /// MemTable is not pruned. See [`ColPred`] for what the caller may push.
+    /// are a **skip hint**: series entries (chunk blocks) whose zone map
+    /// or column Bloom proves no row can match are not read; Int / Float rows
+    /// of the entries that are read come back whether they match or not, and the
+    /// MemTable is not pruned by them. `Bytes` also filters rows exactly (see
+    /// [`ColPred::Bytes`]). See [`ColPred`] for what the caller may push.
     pub cols: Vec<ColPred>,
 }
 
@@ -131,6 +136,11 @@ impl ResolvedFilter {
 
     pub(crate) fn ts_matches(&self, ts: i64) -> bool {
         self.ts_min <= ts && ts <= self.ts_max
+    }
+
+    /// MemTable row passes the exact byte filter (always, if none was pushed).
+    pub(crate) fn row_ok(&self, row: &[Value]) -> bool {
+        self.prune.exact().is_empty() || self.prune.row_passes(row)
     }
 
     pub(crate) fn series_matches(&self, id: u64) -> bool {
@@ -264,11 +274,11 @@ impl Visible {
 
     /// The next decoded window and its live stretches `[a, b)` (ascending,
     /// never empty), or `None` when the entry is done.
-    pub(crate) fn next(&mut self, snap: &Snapshot, want: &[bool]) -> Result<Option<Loaded>> {
+    pub(crate) fn next(&mut self, snap: &Snapshot, want: &[bool], exact: &[ExactBytes]) -> Result<Option<Loaded>> {
         while let Some(iv) = self.first.take().or_else(|| self.ivs.pop()) {
             let meta = &snap.chunks[self.chunk];
-            if let Some(win) = load_window(&snap.schema, meta, self.entry, iv, want, false)? {
-                let stretches = split_by_holes(win.lo, win.hi, &self.holes);
+            if let Some(win) = load_window_exact(&snap.schema, meta, self.entry, iv, want, false, exact, usize::MAX)? {
+                let stretches = win.restrict(split_by_holes(win.lo, win.hi, &self.holes));
                 if !stretches.is_empty() {
                     return Ok(Some((win, stretches)));
                 }
@@ -289,7 +299,7 @@ pub(crate) fn visible_stretches(
     mut f: impl FnMut(&Window, usize, usize) -> Result<()>,
 ) -> Result<()> {
     let mut v = Visible::plan(snap, chunk, entry, lo, hi);
-    while let Some((win, stretches)) = v.next(snap, want)? {
+    while let Some((win, stretches)) = v.next(snap, want, &[])? {
         for (a, b) in stretches {
             f(&win, a, b)?;
         }
@@ -324,11 +334,11 @@ enum Run {
 
 /// Cursors over the stretches of `win` that the dead ordinals `holes` leave.
 fn cursors_of(win: Window, holes: &[(u32, u32)]) -> Vec<RunCursor> {
-    if holes.is_empty() {
+    if holes.is_empty() && win.keep_all() {
         let (front, back) = (win.lo, win.hi);
         return vec![RunCursor { win, front, back }];
     }
-    split_by_holes(win.lo, win.hi, holes).into_iter().map(|(front, back)| RunCursor { win: win.clone(), front, back }).collect()
+    win.restrict(split_by_holes(win.lo, win.hi, holes)).into_iter().map(|(front, back)| RunCursor { win: win.clone(), front, back }).collect()
 }
 
 struct HeapEntry {
@@ -631,7 +641,7 @@ impl Scan {
             }
             // Windows of the entry being visited (several when tombstones cut its range).
             if let Some(v) = &mut st.todo {
-                match v.next(snap, &plan.want)? {
+                match v.next(snap, &plan.want, f.prune.exact())? {
                     Some((win, mut stretches)) => {
                         stretches.reverse();
                         if let Some((x, y)) = stretches.pop() {
@@ -667,7 +677,7 @@ impl Scan {
             let source = MEM_SOURCE | snap.mem.generation;
             while batch.rows() < max {
                 let Some(m) = snap.mem.get(st.mem_next) else { return Ok(()) };
-                if f.series_matches(m.series_id) && f.ts_matches(snap.schema.row_ts(&m.row)) {
+                if f.series_matches(m.series_id) && f.ts_matches(snap.schema.row_ts(&m.row)) && f.row_ok(&m.row) {
                     if !batch.row_room(plan, &m.row) {
                         return Ok(());
                     }
@@ -755,12 +765,12 @@ impl Scan {
                 Some(s) => mem
                     .rows_of_series(s, schema.ts_index())
                     .into_iter()
-                    .filter(|(_, m)| f.ts_matches(schema.row_ts(&m.row)))
+                    .filter(|(_, m)| f.ts_matches(schema.row_ts(&m.row)) && f.row_ok(&m.row))
                     .map(|(o, m)| key_of(schema.row_ts(&m.row), Position { source, ordinal: o }))
                     .collect(),
                 None => mem
                     .iter()
-                    .filter(|(_, m)| f.series_matches(m.series_id) && f.ts_matches(schema.row_ts(&m.row)))
+                    .filter(|(_, m)| f.series_matches(m.series_id) && f.ts_matches(schema.row_ts(&m.row)) && f.row_ok(&m.row))
                     .map(|(o, m)| key_of(schema.row_ts(&m.row), Position { source, ordinal: o }))
                     .collect(),
             };
@@ -777,7 +787,7 @@ impl Scan {
     }
 
     fn merge_fill(&mut self, batch: &mut ScanBatch, max: usize) -> Result<()> {
-        let Scan { snap, mode, plan, .. } = self;
+        let Scan { snap, mode, plan, filter, .. } = self;
         let Mode::Merge(m) = mode else { return Ok(()) };
         let desc = m.desc;
         while batch.rows() < max {
@@ -794,7 +804,7 @@ impl Scan {
                     };
                     if !*loaded {
                         *loaded = true;
-                        if let Some(win) = load_window(&snap.schema, meta, *series, *range, &plan.want, true)? {
+                        if let Some(win) = load_window_exact(&snap.schema, meta, *series, *range, &plan.want, true, filter.prune.exact(), MERGE_KEEP_RUNS)? {
                             let mut stretches = cursors_of(win, holes).into_iter();
                             if let Some(c) = stretches.next() {
                                 m.heap.push(HeapEntry { key: next_key(&c)?, run: top.run, desc });
@@ -900,7 +910,7 @@ impl Scan {
     /// put in order and handed out from `pending`, which survives the end of a
     /// batch.
     fn merge_fill_tie(&mut self, batch: &mut ScanBatch, max: usize) -> Result<()> {
-        let Scan { snap, mode, plan, tie, .. } = self;
+        let Scan { snap, mode, plan, tie, filter, .. } = self;
         let Mode::Merge(m) = mode else { return Ok(()) };
         let MergeState { desc, runs, heap, last, pending } = m;
         let desc = *desc;
@@ -1015,7 +1025,7 @@ impl Scan {
                         let base = meta.series_offsets[*series];
                         if !*loaded {
                             *loaded = true;
-                            if let Some(win) = load_window(&snap.schema, meta, *series, *range, &plan.want, true)? {
+                            if let Some(win) = load_window_exact(&snap.schema, meta, *series, *range, &plan.want, true, filter.prune.exact(), MERGE_KEEP_RUNS)? {
                                 let first_key = |c: &RunCursor| -> Result<Key> {
                                     let i = if desc { c.back - 1 } else { c.front };
                                     Ok((c.win.ts_at(i)?, meta.id, base + i as u64))

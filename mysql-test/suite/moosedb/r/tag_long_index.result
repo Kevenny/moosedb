@@ -24,6 +24,9 @@ SHOW WARNINGS;
 Level	Code	Message
 Error	1478	MooseDB: index 'process' is not supported: column 'process': index prefixes are not supported. MooseDB indexes the timestamp column alone, or TAG columns optionally followed by the timestamp (INDEX (itemid, clock))
 Warning	1030	Got error 140 "Wrong create options" from storage engine MooseDB
+CREATE TABLE lp2 (ts DATETIME NOT NULL, process VARCHAR(64) CHARACTER SET utf8mb4 NOT NULL COMMENT 'TAG', v INT,
+INDEX(ts), KEY(process(10))) ENGINE=MooseDB;
+ERROR HY000: MooseDB: index 'process' is not supported: column 'process': index prefixes are not supported. MooseDB indexes the timestamp column alone, or TAG columns optionally followed by the timestamp (INDEX (itemid, clock))
 INSERT INTO l64 SELECT '2024-01-01' + INTERVAL seq SECOND, CONCAT('proc-', seq MOD 5, REPEAT('é', 40)), seq FROM seq_0_to_99;
 INSERT INTO l255 SELECT '2024-01-01' + INTERVAL seq SECOND, CONCAT('proc-', seq MOD 5, REPEAT('é', 200)), seq FROM seq_0_to_99;
 INSERT INTO l300 SELECT '2024-01-01' + INTERVAL seq SECOND, CONCAT('proc-', seq MOD 5, REPEAT('x', 280)), seq FROM seq_0_to_99;
@@ -41,6 +44,12 @@ COUNT(*)	SUM(v)
 SELECT COUNT(*), SUM(v) FROM l63 WHERE process = 'proc-1';
 COUNT(*)	SUM(v)
 20	970
+EXPLAIN SELECT COUNT(*) FROM l255 WHERE process = CONCAT('proc-3', REPEAT('é', 200)) AND ts < '2024-01-01 00:00:50';
+id	select_type	table	type	possible_keys	key	key_len	ref	rows	Extra
+1	SIMPLE	l255	range	ts,process	process	1027	NULL	10	Using where; Using index
+EXPLAIN SELECT COUNT(*) FROM l300 WHERE process = CONCAT('proc-4', REPEAT('x', 280));
+id	select_type	table	type	possible_keys	key	key_len	ref	rows	Extra
+1	SIMPLE	l300	ref	process	process	302	const	20	Using where; Using index
 EXPLAIN SELECT COUNT(*) FROM l64 WHERE process = CONCAT('proc-2', REPEAT('é', 40));
 id	select_type	table	type	possible_keys	key	key_len	ref	rows	Extra
 1	SIMPLE	l64	ref	process	process	258	const	20	Using where; Using index

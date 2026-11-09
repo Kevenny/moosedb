@@ -263,7 +263,8 @@ O `ANALYZE` instrumenta cada linha e infla os tempos de varredura (~1,5x) em rel
    arquivo" é varredura de 20 M linhas (1,6-3,3 s):** 170-340x mais lento que o InnoDB com `KEY(file)` (0,0118 e
    0,0095 s) e 1,4-2,0x mais lento que o InnoDB sem esse índice (1,53 e 2,30 s). `file` como TAG foi descartado
    (2 M de séries): **não medido**. O ClickHouse resolve o caso em 0,115 s varrendo a coluna comprimida com 8 threads.
-5. **[médio impacto, esforço baixo, risco baixo] Bug de validação: `process VARCHAR(64)` utf8mb4 (256 bytes de chave)
+5. **Resolvido (commit 458fc97: `max_supported_key_part_length` = 3072; teste `tag_long_index`).** Texto original:
+   **[médio impacto, esforço baixo, risco baixo] Bug de validação: `process VARCHAR(64)` utf8mb4 (256 bytes de chave)
    como TAG é recusado em índice composto** ("index prefixes are not supported"), enquanto `VARCHAR(63)` e
    `VARCHAR(100)` latin1 passam. A checagem `kp.length != f->key_length()` em `storage/moosedb/ha_moosedb.cc:723`
    falha exatamente quando a chave passa de 255 bytes (causa provável, não confirmada). Contornado aqui com

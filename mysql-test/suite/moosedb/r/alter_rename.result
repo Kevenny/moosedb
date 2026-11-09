@@ -1,3 +1,5 @@
+# this test counts handler calls / reads EXPLAIN of the scan path: the GROUP BY pushdown (default ON) would bypass it
+SET SESSION moosedb_group_by_pushdown = OFF;
 SET time_zone = '+00:00';
 # ---- Engine conversion ----
 CREATE TABLE m (ts DATETIME(3) NOT NULL, host VARCHAR(8) NOT NULL COMMENT 'TAG', v INT, d DOUBLE, INDEX(ts))

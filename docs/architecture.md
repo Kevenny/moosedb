@@ -1232,8 +1232,9 @@ de 6 execuções (+8 %, de −8 % a +20 % entre execuções; o InnoDB leva ~21 s
 ## Agregação pela engine (group_by_handler)
 
 `hton->create_group_by` aponta para `moosedb_create_group_by`
-(`moosedb_gbh.cc`). Com `moosedb_group_by_pushdown=OFF` (padrão) devolve
-`nullptr` e nada muda. Com `ON`, `analyze()` decide se a consulta está no escopo
+(`moosedb_gbh.cc`). Com `moosedb_group_by_pushdown=OFF` devolve
+`nullptr` e nada muda; o padrão é `ON` (validado com a suíte MTR inteira nos dois modos e
+em `gbh_*`/`gbh_toplevel`, que comparam OFF x ON x InnoDB). Com `ON`, `analyze()` decide se a consulta está no escopo
 e monta o plano; se estiver, o handler `moosedb_gbh` assume o GROUP BY (zera
 `group_by` e `order_by`), senão devolve `nullptr` e a consulta segue o caminho
 normal. Com `moosedb_gbh_debug=ON` o veredito sai como nota (`gbh: accepted` /

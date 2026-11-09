@@ -21,7 +21,7 @@ Storage engine **time-series** para MariaDB 11.4+, carregada como plugin
 | `UPDATE` | suportado (fase 1): `UPDATE`, `REPLACE` e `ON DUPLICATE KEY UPDATE` sobre chave existente, atômicos por statement; colunas da chave única não mudam; até ~150 k linhas por statement |
 | Retenção | `RETENTION_PERIOD` por tabela: apaga chunks inteiros |
 | Compressão | delta-of-delta, Simple8b, Gorilla, RLE + LZ4 (quente) / ZSTD (frio) |
-| Agregação na engine | `group_by_handler` opcional (`moosedb_group_by_pushdown`, padrão OFF) |
+| Agregação na engine | `group_by_handler` opcional (`moosedb_group_by_pushdown`, padrão ON) |
 | Operação | `INFORMATION_SCHEMA.MOOSEDB_TABLES/CHUNKS`, `OPTIMIZE`, procedures `moosedb_*`, compactação em background |
 | Segurança | criptografia AES-256-GCM (autenticada) com o key management do MariaDB |
 | Replicação | row-based |
@@ -119,7 +119,7 @@ Com o Zabbix 7.0.31 real (DDL oficial + `COMMENT 'TAG'` + `TIMESTAMP_COLUMN`):
 | 2 | TAG só nas colunas que as consultas filtram por igualdade (`itemid`, `host`) | TAG extra custou +40% de disco, 2,4x carga, 1,2–1,9x consultas | baixo | baixo |
 | 3 | PK `(itemid, clock, ns)` com `TIMESTAMP_COLUMN='clock'` no histórico do Zabbix | "último valor" igual ao InnoDB (0,96 vs 0,91 ms) | baixo | baixo |
 | 4 | Rodar `CALL moosedb_compact` / `OPTIMIZE` após cargas grandes | −31% de disco (1.126 → 778 MiB) | baixo | baixo |
-| 5 | Ligar `moosedb_group_by_pushdown=ON` em relatórios/dashboards de agregação | 14,8 s → 1,15 s; 3,07 s → 0,004–0,13 s | baixo | médio (OFF por padrão; só GROUP BY de topo) |
+| 5 | Manter `moosedb_group_by_pushdown=ON` (agora o padrão) em relatórios/dashboards de agregação | 14,8 s → 1,15 s; 3,07 s → 0,004–0,13 s | baixo | médio (ON por padrão desde esta versão; só GROUP BY de topo) |
 | 6 | Pré-aquecer o cache (`moosedb_chunk_cache_size`) após restart | 1ª execução até 2x pior | baixo | baixo (não medido) |
 | 7 | Inserir em lote (`INSERT … SELECT`/multi-row) e, em transações, agrupar statements | 1.179 → 7.617 linhas/s com `BEGIN` + 100 INSERTs (InnoDB 7.204) | baixo | baixo |
 

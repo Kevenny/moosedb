@@ -9,6 +9,8 @@
 --source include/not_embedded.inc
 --source include/have_sequence.inc
 --source suite/moosedb/include/have_moosedb.inc
+--echo # this test counts handler calls / reads EXPLAIN of the scan path: the GROUP BY pushdown (default ON) would bypass it
+SET SESSION moosedb_group_by_pushdown = OFF;
 let MYSQLD_DATADIR= `SELECT @@datadir`;
 SET time_zone = '+00:00';
 

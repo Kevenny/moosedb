@@ -159,7 +159,7 @@ SELECT @@GLOBAL.moosedb_max_open_chunks, @@GLOBAL.moosedb_compaction_trigger_chu
 # ---- GROUP BY pushdown variables ----
 SELECT @@GLOBAL.moosedb_group_by_pushdown, @@SESSION.moosedb_group_by_pushdown;
 @@GLOBAL.moosedb_group_by_pushdown	@@SESSION.moosedb_group_by_pushdown
-0	0
+1	1
 SET SESSION moosedb_group_by_pushdown = ON;
 SELECT @@SESSION.moosedb_group_by_pushdown;
 @@SESSION.moosedb_group_by_pushdown
@@ -167,7 +167,7 @@ SELECT @@SESSION.moosedb_group_by_pushdown;
 SET SESSION moosedb_group_by_pushdown = DEFAULT;
 SELECT @@SESSION.moosedb_group_by_pushdown;
 @@SESSION.moosedb_group_by_pushdown
-0
+1
 SET SESSION moosedb_group_by_pushdown = 'maybe';
 ERROR 42000: Variable 'moosedb_group_by_pushdown' can't be set to the value of 'maybe'
 SELECT @@GLOBAL.moosedb_gbh_debug, @@SESSION.moosedb_gbh_debug;

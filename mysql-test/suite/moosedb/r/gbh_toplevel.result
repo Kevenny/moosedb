@@ -1,0 +1,105 @@
+# the default of the sysvar is ON (this session was not touched)
+SELECT @@GLOBAL.moosedb_group_by_pushdown, @@SESSION.moosedb_group_by_pushdown;
+@@GLOBAL.moosedb_group_by_pushdown	@@SESSION.moosedb_group_by_pushdown
+1	1
+CREATE TABLE t (
+ts    DATETIME NOT NULL,
+host  VARCHAR(16) NOT NULL COMMENT 'TAG',
+svc   VARCHAR(16) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci NOT NULL COMMENT 'TAG',
+name  VARCHAR(16) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci,
+amt   DECIMAL(12,3),
+n     INT,
+INDEX(ts)
+) ENGINE=MooseDB CHUNK_INTERVAL='1 DAY';
+CREATE DATABASE mirror;
+CREATE TABLE mirror.t LIKE test.t;
+ALTER TABLE mirror.t ENGINE=InnoDB;
+# empty table
+# empty table, grouped
+# SELECT host, COUNT(*) c, SUM(n) s, MIN(n) mn, MAX(n) mx, AVG(n) a FROM t GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the server answered by itself (the engine did not run it)
+# empty table, no GROUP BY
+# SELECT COUNT(*), SUM(n), MIN(n), MAX(n), AVG(amt) FROM t
+# same output with and without pushdown and on InnoDB; the server answered by itself (the engine did not run it)
+INSERT INTO t SELECT '2024-05-01' + INTERVAL seq * 90 SECOND, CONCAT('h', seq MOD 7),
+ELT(seq MOD 3 + 1, 'Web', 'web', 'DB'),
+IF(seq MOD 11 = 0, NULL, ELT(seq MOD 4 + 1, 'Alpha', 'alpha', 'Beta', 'gamma')),
+IF(seq MOD 6 = 0, NULL, (seq * 37) MOD 1000 / 8),
+IF(seq MOD 5 = 0, NULL, seq MOD 13)
+FROM seq_0_to_3999;
+FLUSH TABLES t;
+# rows still in the MemTable
+INSERT INTO t SELECT '2024-05-01' + INTERVAL seq * 90 SECOND, CONCAT('h', seq MOD 7),
+ELT(seq MOD 3 + 1, 'Web', 'web', 'DB'),
+IF(seq MOD 11 = 0, NULL, ELT(seq MOD 4 + 1, 'Alpha', 'alpha', 'Beta', 'gamma')),
+IF(seq MOD 6 = 0, NULL, (seq * 37) MOD 1000 / 8),
+IF(seq MOD 5 = 0, NULL, seq MOD 13)
+FROM seq_4000_to_4999;
+INSERT INTO mirror.t SELECT * FROM test.t;
+# COUNT/SUM/MIN/MAX/AVG by TAG
+# SELECT host, COUNT(*) c, COUNT(n) cn, SUM(n) s, MIN(n) mn, MAX(n) mx, AVG(n) a FROM t GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# DECIMAL aggregates (the engine refuses them: the normal path must stay right)
+# SELECT host, COUNT(*) c, SUM(amt) sa, AVG(amt) aa, MIN(amt) mn, MAX(amt) mx FROM t GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# (the key is not selected: which of 'Alpha'/'alpha' names a ci group is unspecified, and OFF/InnoDB vs ON may pick differently)
+# by non-TAG ci VARCHAR with NULL group
+# SELECT COUNT(*) c, SUM(n) sa, MIN(n) mn, MAX(n) mx FROM t GROUP BY name ORDER BY name
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# by ci TAG (Web/web are one group)
+# SELECT COUNT(*) c, SUM(n) s FROM t GROUP BY svc ORDER BY svc
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# two keys, HAVING, ORDER BY aggregate DESC, LIMIT
+# SELECT host, COUNT(*) c, SUM(n) sa FROM t GROUP BY host, svc HAVING c > 100 AND SUM(n) IS NOT NULL ORDER BY sa DESC, host, svc LIMIT 5
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# WHERE time range and TAG
+# SELECT COUNT(*) c, SUM(n) s FROM t WHERE ts >= '2024-05-01 06:00:00' AND ts < '2024-05-02 12:00:00' AND host = 'h3' GROUP BY name ORDER BY name
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# WHERE TAG IN plus non-TAG filter
+# SELECT host, COUNT(*) c FROM t WHERE host IN ('h1', 'h5') AND n > 6 GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# DISTINCT and COUNT(DISTINCT)
+# SELECT DISTINCT host FROM t ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# COUNT DISTINCT per group
+# SELECT host, COUNT(DISTINCT name) d, COUNT(DISTINCT n) dn FROM t GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# no GROUP BY, all aggregates
+# SELECT COUNT(*), COUNT(n), SUM(n), MIN(n), MAX(n), AVG(n), MIN(ts), MAX(ts) FROM t
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# UPDATE and DELETE on rows in chunks and in the MemTable
+UPDATE t SET n = n + 100, amt = amt + 1 WHERE host = 'h2' AND ts < '2024-05-02';
+UPDATE t SET name = 'Zeta' WHERE host = 'h4' AND ts >= '2024-05-02';
+UPDATE mirror.t SET n = n + 100, amt = amt + 1 WHERE host = 'h2' AND ts < '2024-05-02';
+UPDATE mirror.t SET name = 'Zeta' WHERE host = 'h4' AND ts >= '2024-05-02';
+DELETE FROM t WHERE host = 'h5' AND ts BETWEEN '2024-05-01 10:00:00' AND '2024-05-02 02:00:00';
+DELETE FROM mirror.t WHERE host = 'h5' AND ts BETWEEN '2024-05-01 10:00:00' AND '2024-05-02 02:00:00';
+DELETE FROM t WHERE svc = 'db' AND n = 3;
+DELETE FROM mirror.t WHERE svc = 'db' AND n = 3;
+# after UPDATE/DELETE: by TAG
+# SELECT host, COUNT(*) c, SUM(n) s, MIN(n) mn, MAX(n) mx, AVG(n) a FROM t GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# after UPDATE/DELETE: DECIMAL (refused)
+# SELECT host, SUM(amt) sa, MAX(amt) mx FROM t GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# after UPDATE/DELETE: by updated non-TAG
+# SELECT COUNT(*) c, SUM(n) sa, MAX(ts) lt FROM t GROUP BY name ORDER BY name
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# after UPDATE/DELETE: scalar over a range
+# SELECT COUNT(*), SUM(n), MAX(n) FROM t WHERE ts >= '2024-05-01 08:00:00' AND ts < '2024-05-02 04:00:00'
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# after a flush and with everything deleted
+FLUSH TABLES t;
+# after FLUSH
+# SELECT COUNT(*) c, SUM(n) sa FROM t GROUP BY svc ORDER BY svc
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+DELETE FROM t;
+DELETE FROM mirror.t;
+# all rows deleted, grouped
+# SELECT host, COUNT(*) c, SUM(n) s FROM t GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the server answered by itself (the engine did not run it)
+# all rows deleted, scalar
+# SELECT COUNT(*), SUM(n), MIN(n), AVG(n) FROM t
+# same output with and without pushdown and on InnoDB; the server answered by itself (the engine did not run it)
+DROP DATABASE mirror;
+DROP TABLE t;

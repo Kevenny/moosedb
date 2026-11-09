@@ -548,12 +548,12 @@ static MYSQL_SYSVAR_UINT(unique_lock_wait_timeout, srv_unique_lock_wait_timeout,
 /*
   Aggregation done by the engine (group_by_handler, moosedb_gbh.cc), only for
   queries it recognises (moosedb_gbh_debug shows the verdict); others run the
-  normal way. With the pushdown OFF none of these has any effect.
+  normal way. ON by default; with the pushdown OFF none of these has any effect.
 */
 static MYSQL_THDVAR_BOOL(group_by_pushdown, PLUGIN_VAR_RQCMDARG,
   "Let the engine compute GROUP BY aggregates of queries on MooseDB tables "
   "(COUNT/SUM/AVG/MIN/MAX); queries it cannot handle run the normal way",
-  NULL, NULL, 0);
+  NULL, NULL, 1);
 
 static MYSQL_THDVAR_BOOL(gbh_debug, PLUGIN_VAR_RQCMDARG,
   "Report, as a note per query, whether the GROUP BY pushdown recognises it "
@@ -3778,8 +3778,25 @@ bool ha_moosedb::capture_delete_cond(Item *item,
       /* For rnd_init only clean string literals are converted (see scan_literal_ok). */
       if (capture_for_scan_ && !scan_literal_ok(cst))
         return false;
-      if (!thd || (cst->cmp_type() != TIME_RESULT && !cmp_time) ||
-          cst->get_date(thd, &lt, Datetime::Options_cmp(thd)) /* the comparator's own flags and rounding */ || cst->null_value ||
+      if (!thd || (cst->cmp_type() != TIME_RESULT && !cmp_time))
+        return false;
+      /* A constant the comparator cannot use is left to the server, which
+         evaluates (and warns about) it itself: probe silently so the warning is
+         not raised twice. Not for a cached conversion (BETWEEN): the cache would
+         hide the server's own warning after a silent probe. */
+      if (cst->type() != Item::CACHE_ITEM)
+      {
+        Dummy_error_handler quiet;
+        thd->push_internal_handler(&quiet);
+        const bool bad= cst->get_date(thd, &lt, Datetime::Options_cmp(thd)) ||
+                        cst->null_value || lt.month == 0 || lt.day == 0 || lt.neg ||
+                        (lt.time_type != MYSQL_TIMESTAMP_DATETIME &&
+                         lt.time_type != MYSQL_TIMESTAMP_DATE);
+        thd->pop_internal_handler();
+        if (bad)
+          return false;
+      }
+      if (cst->get_date(thd, &lt, Datetime::Options_cmp(thd)) /* the comparator's own flags and rounding */ || cst->null_value ||
           lt.month == 0 || lt.day == 0 || lt.neg ||
           (lt.time_type != MYSQL_TIMESTAMP_DATETIME && lt.time_type != MYSQL_TIMESTAMP_DATE))
         return false;

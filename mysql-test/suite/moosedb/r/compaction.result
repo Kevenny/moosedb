@@ -49,7 +49,7 @@ COUNT(*)	SUM(v)
 1503	374253
 # Errors
 CALL moosedb_compact('c', 'not a date', NULL);
-ERROR 22007: Incorrect datetime value: 'not a date' for column ``.``.`ts_from` at row 1504
+ERROR 22007: Incorrect datetime value: 'not a date' for column ``.``.`ts_from` at row 1
 CALL moosedb_compact('no_such_table', NULL, NULL);
 ERROR 42S02: Table 'test.no_such_table' doesn't exist
 DROP TABLE c;

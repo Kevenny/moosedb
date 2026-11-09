@@ -1,3 +1,5 @@
+# this test counts handler calls / reads EXPLAIN of the scan path: the GROUP BY pushdown (default ON) would bypass it
+SET SESSION moosedb_group_by_pushdown = OFF;
 SET NAMES utf8mb4;
 CREATE TABLE l64 (ts DATETIME NOT NULL, process VARCHAR(64) CHARACTER SET utf8mb4 NOT NULL COMMENT 'TAG', v INT,
 INDEX(ts), INDEX(process, ts)) ENGINE=MooseDB;

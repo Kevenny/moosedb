@@ -4,6 +4,8 @@
 #
 --source include/have_sequence.inc
 --source suite/moosedb/include/have_moosedb.inc
+--echo # this test counts handler calls / reads EXPLAIN of the scan path: the GROUP BY pushdown (default ON) would bypass it
+SET SESSION moosedb_group_by_pushdown = OFF;
 
 CREATE TABLE p (
     ts     DATETIME NOT NULL,

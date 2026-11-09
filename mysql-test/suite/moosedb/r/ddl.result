@@ -12,7 +12,7 @@ moosedb_chunk_cache_size	134217728
 moosedb_compaction_threads	2
 moosedb_compaction_trigger_chunks	10
 moosedb_gbh_debug	OFF
-moosedb_group_by_pushdown	OFF
+moosedb_group_by_pushdown	ON
 moosedb_max_open_chunks	100
 moosedb_memtable_flush_threshold	67108864
 moosedb_recover_damaged_chunks	OFF

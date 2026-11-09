@@ -1,3 +1,5 @@
+# this test counts handler calls / reads EXPLAIN of the scan path: the GROUP BY pushdown (default ON) would bypass it
+SET SESSION moosedb_group_by_pushdown = OFF;
 CREATE TABLE ms (
 ts    DATETIME(3) NOT NULL,
 host  VARCHAR(16) NOT NULL COMMENT 'TAG',

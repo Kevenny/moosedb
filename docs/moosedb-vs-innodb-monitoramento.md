@@ -82,7 +82,7 @@ Com o Zabbix 7.0.31 real (DDL oficial + `COMMENT 'TAG'` + `TIMESTAMP_COLUMN`):
 | Filtro em coluna **não-TAG** (ex.: `file = 'x'`) | sem índice secundário: Bloom por série poda ~98 % e a engine filtra as linhas, mas ainda lê a coluna das séries restantes | 20 M linhas: 0,048 s vs **0,011 s** do InnoDB com `KEY(file)` (com 1 dia: 0,012 vs 0,009 s); valor popular (587 mil linhas) 0,64 s vs 28 s do InnoDB |
 | **Milhões de séries com poucas linhas** cada | custo por série | 1 M séries: `COUNT(*) WHERE` 1,4–1,6 s vs 0,07 s; `COUNT(DISTINCT)` ~1,45 s vs ~0,2 s |
 | Housekeeper **por item** (DELETE por itemid) | fsync por statement | 8,4 s vs 5,7 s (1,5x mais lento) — use `RETENTION_PERIOD` |
-| `INSERT … ON DUPLICATE KEY UPDATE` de linhas existentes | acha cada linha por conteúdo | 5.000 linhas: 102 ms vs **20 ms** (5x mais lento) |
+| `INSERT … ON DUPLICATE KEY UPDATE` de linhas existentes | cada linha é procurada três vezes (checagem da chave, releitura pelo servidor, busca por conteúdo no commit) | 5.000 linhas: 27–55 ms vs **17–25 ms** (1,5–2,2x mais lento; pior com a tabela grande em chunks) |
 | `UPDATE` grande ou frequente | statement inteiro precisa caber no buffer do lote; trava a tabela para escrita; linhas antigas ficam mortas até a compactação | teto ~150 k linhas/statement (64 MiB); repetir UPDATE de 100 k nas mesmas linhas sobe de ~255 para ~350 ms (linhas recém-atualizadas ficam no MemTable) |
 | `UPDATE` que muda a chave única, ou dentro de trigger/função de outro statement | **recusado** com erro | — |
 | Transação com rollback | `ROLLBACK` **não desfaz** statements MooseDB já terminados (como MyISAM); sem XA real | — |

@@ -1314,11 +1314,15 @@ pub unsafe extern "C" fn moosedb_scan_open_projected(
 /// those of group `g + 1`. `group_ends` must be non-decreasing and end at
 /// `series_count`. `moosedb_scan_prev` works (the scan is collected whole on a
 /// change of direction); `moosedb_scan_seek_end` is `TF_ERR_UNSUPPORTED`.
-/// `columns_mask` as `moosedb_scan_open_projected`.
+/// `columns_mask` as `moosedb_scan_open_projected`. `preds` are the value
+/// predicates of `moosedb_scan_open_pruned` (see `TFColPred`; may be NULL with
+/// 0): blocks that cannot match are skipped and `TF_PRED_BYTES` also filters
+/// rows exactly, without changing the order of the rows that remain.
 ///
 /// # Safety
 /// `series_ids` must hold `series_count` elements, `group_ends`
-/// `group_count`, `columns_mask` `mask_len` (each may be NULL with 0).
+/// `group_count`, `columns_mask` `mask_len`, `preds` `pred_count` valid
+/// `TFColPred`s (each may be NULL with 0).
 #[no_mangle]
 pub unsafe extern "C" fn moosedb_scan_open_groups(
     table: *mut MooseDBTable,
@@ -1330,9 +1334,12 @@ pub unsafe extern "C" fn moosedb_scan_open_groups(
     group_count: u64,
     columns_mask: *const u8,
     mask_len: u32,
+    preds: *const TFColPred,
+    pred_count: u32,
     out_scan: *mut *mut MooseDBScan,
 ) -> TFStatus {
     let mut groups: Vec<Vec<u64>> = Vec::new();
+    let mut cols: Vec<ColPred> = Vec::new();
     let mut mask: Option<Vec<bool>> = None;
     let status = guard(|| {
         // SAFETY: caller contract for every pointer.
@@ -1345,6 +1352,8 @@ pub unsafe extern "C" fn moosedb_scan_open_groups(
                 slice(group_ends, usize::try_from(group_count).map_err(|_| invalid("group_count"))?, "group_ends")?,
             )
         };
+        // SAFETY: caller contract.
+        cols = unsafe { col_preds(preds, pred_count) }?;
         let mut from = 0usize;
         for &end in ends {
             let end = usize::try_from(end).map_err(|_| invalid("group_ends"))?;
@@ -1360,7 +1369,7 @@ pub unsafe extern "C" fn moosedb_scan_open_groups(
     if status != TFStatus::TF_OK {
         return status;
     }
-    open_scan_with(table, out_scan, |t| t.scan_groups(ts_start_us, ts_end_us, &groups, mask.as_deref()))
+    open_scan_with(table, out_scan, |t| t.scan_groups(ts_start_us, ts_end_us, &groups, &cols, mask.as_deref()))
 }
 
 /// `TFColPred::kind`: `lo <= v <= hi` on an INT64 / TIMESTAMP / BOOL (0/1)

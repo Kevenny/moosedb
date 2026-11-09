@@ -816,11 +816,15 @@ TFStatus moosedb_scan_open_projected(MooseDBTable *table,
 // those of group `g + 1`. `group_ends` must be non-decreasing and end at
 // `series_count`. `moosedb_scan_prev` works (the scan is collected whole on a
 // change of direction); `moosedb_scan_seek_end` is `TF_ERR_UNSUPPORTED`.
-// `columns_mask` as `moosedb_scan_open_projected`.
+// `columns_mask` as `moosedb_scan_open_projected`. `preds` are the value
+// predicates of `moosedb_scan_open_pruned` (see `TFColPred`; may be NULL with
+// 0): blocks that cannot match are skipped and `TF_PRED_BYTES` also filters
+// rows exactly, without changing the order of the rows that remain.
 //
 // # Safety
 // `series_ids` must hold `series_count` elements, `group_ends`
-// `group_count`, `columns_mask` `mask_len` (each may be NULL with 0).
+// `group_count`, `columns_mask` `mask_len`, `preds` `pred_count` valid
+// `TFColPred`s (each may be NULL with 0).
 TFStatus moosedb_scan_open_groups(MooseDBTable *table,
                                   int64_t ts_start_us,
                                   int64_t ts_end_us,
@@ -830,6 +834,8 @@ TFStatus moosedb_scan_open_groups(MooseDBTable *table,
                                   uint64_t group_count,
                                   const uint8_t *columns_mask,
                                   uint32_t mask_len,
+                                  const TFColPred *preds,
+                                  uint32_t pred_count,
                                   MooseDBScan **out_scan);
 
 // `moosedb_scan_open_projected` plus value predicates that skip chunk blocks

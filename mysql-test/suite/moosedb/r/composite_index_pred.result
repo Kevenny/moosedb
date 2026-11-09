@@ -1,0 +1,74 @@
+CREATE TABLE g (
+ts   DATETIME NOT NULL,
+host VARCHAR(8) NOT NULL COMMENT 'TAG',
+fb   VARCHAR(16) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin,
+fc   VARCHAR(16) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci,
+n    INT,
+INDEX (ts),
+INDEX ix_host_ts (host, ts)
+) ENGINE=MooseDB CHUNK_INTERVAL='1 DAY';
+# 4 days (= 4 chunks) x 6 hosts, one flush per day; 'rare' only on host h2, day 2
+CREATE DATABASE mirror;
+CREATE TABLE mirror.g LIKE test.g;
+ALTER TABLE mirror.g ENGINE=InnoDB;
+INSERT INTO mirror.g SELECT * FROM test.g;
+# ---- one tuple of the index (host = Y) ----
+# fb = 'rare' AND host = 'h2'
+result_rows	vs_innodb
+2	SAME
+# tested=1 expected=1: as expected
+# fb = 'f1-3' AND host = 'h1'
+result_rows	vs_innodb
+7	SAME
+# tested=1 expected=1: as expected
+# fb IN ('rare', 'f3-5') AND host = 'h2'
+result_rows	vs_innodb
+8	SAME
+# tested=1 expected=1: as expected
+# value that exists nowhere
+result_rows	vs_innodb
+0	SAME
+# tested=1 expected=1: as expected
+# ---- several tuples (host IN (...)): the ordered group walk ----
+# fb = 'rare' AND host IN (h0, h2, h5)
+result_rows	vs_innodb
+2	SAME
+# tested=1 expected=1: as expected
+# fb IN (f2-1, f3-4) AND host IN (h5, h1, h3)
+result_rows	vs_innodb
+40	SAME
+# tested=1 expected=1: as expected
+# all hosts, descending
+result_rows	vs_innodb
+40	SAME
+# tested=1 expected=1: as expected
+# with a time bound
+result_rows	vs_innodb
+2	SAME
+# tested=1 expected=1: as expected
+# INT predicate (zone map) on a group walk
+result_rows	vs_innodb
+12	SAME
+# tested=1 expected=1: as expected
+# ---- not pushed: _ci collation, OR, IS NULL ----
+# _ci column = 'f2-1' (matches 'F2-1')
+result_rows	vs_innodb
+14	SAME
+# tested=0 expected=0: as expected
+# OR
+result_rows	vs_innodb
+6	SAME
+# tested=0 expected=0: as expected
+# IS NULL
+result_rows	vs_innodb
+32	SAME
+# tested=0 expected=0: as expected
+# ---- MemTable rows are never skipped ----
+INSERT INTO g VALUES ('2024-03-20 00:00:00', 'h2', 'fresh', 'FRESH', 5000), ('2024-03-20 00:00:01', 'h4', 'fresh', 'FRESH', 5001);
+INSERT INTO mirror.g VALUES ('2024-03-20 00:00:00', 'h2', 'fresh', 'FRESH', 5000), ('2024-03-20 00:00:01', 'h4', 'fresh', 'FRESH', 5001);
+# rows still in the MemTable
+result_rows	vs_innodb
+2	SAME
+# tested=1 expected=1: as expected
+DROP DATABASE mirror;
+DROP TABLE g;

@@ -1291,7 +1291,7 @@ mod batch_cap_tests {
         };
         let mut want: Vec<i64> = (10..60).filter(|i| i % 3 == 2).collect();
         want.extend((10..60).filter(|i| i % 3 != 2));
-        let mut s = t.scan_groups(10, i64::MAX, &groups, None).unwrap();
+        let mut s = t.scan_groups(10, i64::MAX, &groups, &[], None).unwrap();
         let mut got = Vec::new();
         loop {
             let b = s.next_batch(7, false).unwrap();
@@ -1346,7 +1346,7 @@ mod batch_cap_tests {
         let mut want: Vec<(i64, i64)> = (0..6).flat_map(|ts| (10..13).map(move |ns| (ts, ns))).collect();
         want.extend((0..6).flat_map(|ts| (0..3).chain(20..23).map(move |ns| (ts, ns))));
         want[18..].sort();
-        let mut s = t.scan_groups(i64::MIN, i64::MAX, &groups, None).unwrap();
+        let mut s = t.scan_groups(i64::MIN, i64::MAX, &groups, &[], None).unwrap();
         let mut got = Vec::new();
         loop {
             let b = s.next_batch(4, false).unwrap();

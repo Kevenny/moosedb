@@ -709,6 +709,7 @@ Segmento cifrado só com header não exige a chave no replay.
   `GROUP BY`/`DISTINCT`/range medidos), e um batch pode decodificar linhas
   de tuplas seguintes que uma leitura curta não chega a pedir; para trás
   continua uma tupla por scan.
+  O scan agrupado e o de uma tupla recebem os mesmos predicados de valor do scan comum (`moosedb_scan_open_groups` tem `preds`; uma tupla usa `moosedb_scan_open_pruned`): poda por zona/Bloom e filtro exato de VARCHAR, sem mudar a ordem das linhas restantes.
   **Cada bloco é lido num snapshot próprio** (não há um corte único no statement para leituras ordenadas que atravessam blocos: linhas commitadas por outra sessão no meio podem aparecer só nos blocos seguintes; cada bloco individualmente é consistente e atômico por statement). Se a tupla da
   chave existe (o caso comum: `MAX(clock)` de um item) a leitura não toca a
   visão ordenada. `index_flags(idx, parte, 1)` — a pergunta de `ORDER BY` /

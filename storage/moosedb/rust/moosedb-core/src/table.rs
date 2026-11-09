@@ -30,6 +30,7 @@ use crate::scan::{check_tag_columns, Position, ResolvedFilter, Scan, ScanFilter,
 use crate::schema::{Row, Schema, Value};
 use crate::tomb::TombSet;
 use crate::unique::UniqueState;
+use crate::zone::ColPred;
 use crate::wal::{self, list_segments, segment_path, Wal};
 
 pub(crate) const OPTIONS_FILE: &str = "OPTIONS";
@@ -1498,9 +1499,11 @@ impl Table {
     /// One forward scan over one snapshot that returns, group after group,
     /// the rows of each group's series in timestamp order with
     /// `ts_min <= ts <= ts_max` (an ordered index walk over several tag
-    /// tuples without a scan per tuple). See `Scan::grouped`.
-    pub fn scan_groups(&self, ts_min: i64, ts_max: i64, groups: &[Vec<u64>], columns: Option<&[bool]>) -> Result<Scan> {
-        let (snap, resolved) = self.resolved_snapshot(&ScanFilter::range(ts_min, ts_max))?;
+    /// tuples without a scan per tuple). See `Scan::grouped`. `cols` are value
+    /// predicates as in [`ScanFilter::cols`] (pruning + exact `Bytes` filter).
+    pub fn scan_groups(&self, ts_min: i64, ts_max: i64, groups: &[Vec<u64>], cols: &[ColPred], columns: Option<&[bool]>) -> Result<Scan> {
+        let filter = ScanFilter { cols: cols.to_vec(), ..ScanFilter::range(ts_min, ts_max) };
+        let (snap, resolved) = self.resolved_snapshot(&filter)?;
         let tie = self.config.unique.as_ref().map_or(&[][..], |u| u.extra_columns());
         let groups = groups.iter().map(|g| g.iter().copied().collect()).collect();
         Scan::grouped(snap, resolved, groups, columns, tie)

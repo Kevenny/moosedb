@@ -1,0 +1,104 @@
+#
+# Composite index walk (host, ts) + a value predicate on a column outside the
+# index: `file = X AND host = Y` reads through the index, and the engine hands
+# the predicate to the core (zone maps / Blooms prune chunk entries, VARCHAR
+# is filtered exactly). Every answer, in index order, must equal the InnoDB
+# mirror's; conditions that cannot be proven safe (_ci collation, OR, IS NULL)
+# must not be tested at all.
+#
+--source include/not_embedded.inc
+--source include/have_innodb.inc
+--source include/have_sequence.inc
+--source suite/moosedb/include/have_moosedb.inc
+
+CREATE TABLE g (
+  ts   DATETIME NOT NULL,
+  host VARCHAR(8) NOT NULL COMMENT 'TAG',
+  fb   VARCHAR(16) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin,
+  fc   VARCHAR(16) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci,
+  n    INT,
+  INDEX (ts),
+  INDEX ix_host_ts (host, ts)
+) ENGINE=MooseDB CHUNK_INTERVAL='1 DAY';
+
+--echo # 4 days (= 4 chunks) x 6 hosts, one flush per day; 'rare' only on host h2, day 2
+--disable_query_log
+let $day= 0;
+while ($day < 4)
+{
+  eval INSERT INTO g
+    SELECT '2024-03-01' + INTERVAL $day DAY + INTERVAL seq MINUTE,
+           CONCAT('h', seq MOD 6),
+           IF(seq MOD 13 = 0, NULL, IF($day = 2 AND seq MOD 6 = 2 AND seq MOD 50 = 8, 'rare', CONCAT('f', $day, '-', seq MOD 7))),
+           IF(seq MOD 13 = 0, NULL, CONCAT('F', $day, '-', seq MOD 7)),
+           seq
+    FROM seq_0_to_299;
+  FLUSH TABLES g;
+  inc $day;
+}
+--enable_query_log
+
+CREATE DATABASE mirror;
+CREATE TABLE mirror.g LIKE test.g;
+ALTER TABLE mirror.g ENGINE=InnoDB;
+INSERT INTO mirror.g SELECT * FROM test.g;
+
+--let $mt= test.g
+--let $it= mirror.g
+--let $show= 0
+--let $status= 0
+
+--echo # ---- one tuple of the index (host = Y) ----
+--let $expect= 1
+--let $q= SELECT ts, host, fb, n FROM {T} FORCE INDEX (ix_host_ts) WHERE fb = 'rare' AND host = 'h2' ORDER BY host, ts
+--let $label= fb = 'rare' AND host = 'h2'
+--source suite/moosedb/include/idx_pred_case.inc
+--let $q= SELECT ts, host, fb, n FROM {T} FORCE INDEX (ix_host_ts) WHERE fb = 'f1-3' AND host = 'h1' ORDER BY host, ts
+--let $label= fb = 'f1-3' AND host = 'h1'
+--source suite/moosedb/include/idx_pred_case.inc
+--let $q= SELECT ts, host, fb, n FROM {T} FORCE INDEX (ix_host_ts) WHERE fb IN ('rare', 'f3-5') AND host = 'h2' ORDER BY host, ts
+--let $label= fb IN ('rare', 'f3-5') AND host = 'h2'
+--source suite/moosedb/include/idx_pred_case.inc
+--let $q= SELECT ts, host, fb, n FROM {T} FORCE INDEX (ix_host_ts) WHERE fb = 'nosuchvalue' AND host = 'h2' ORDER BY host, ts
+--let $label= value that exists nowhere
+--source suite/moosedb/include/idx_pred_case.inc
+
+--echo # ---- several tuples (host IN (...)): the ordered group walk ----
+--let $q= SELECT ts, host, fb, n FROM {T} FORCE INDEX (ix_host_ts) WHERE fb = 'rare' AND host IN ('h0', 'h2', 'h5') ORDER BY host, ts
+--let $label= fb = 'rare' AND host IN (h0, h2, h5)
+--source suite/moosedb/include/idx_pred_case.inc
+--let $q= SELECT ts, host, fb, n FROM {T} FORCE INDEX (ix_host_ts) WHERE fb IN ('f2-1', 'f3-4') AND host IN ('h5', 'h1', 'h3') ORDER BY host, ts
+--let $label= fb IN (f2-1, f3-4) AND host IN (h5, h1, h3)
+--source suite/moosedb/include/idx_pred_case.inc
+--let $q= SELECT ts, host, fb, n FROM {T} FORCE INDEX (ix_host_ts) WHERE fb = 'f0-2' AND host IN ('h0', 'h1', 'h2', 'h3', 'h4', 'h5') ORDER BY host, ts DESC
+--let $label= all hosts, descending
+--source suite/moosedb/include/idx_pred_case.inc
+--let $q= SELECT ts, host, fb, n FROM {T} FORCE INDEX (ix_host_ts) WHERE fb = 'rare' AND host IN ('h0', 'h2') AND ts >= '2024-03-03' ORDER BY host, ts
+--let $label= with a time bound
+--source suite/moosedb/include/idx_pred_case.inc
+--let $q= SELECT ts, host, fb, n FROM {T} FORCE INDEX (ix_host_ts) WHERE n >= 290 AND host IN ('h0', 'h2') ORDER BY host, ts
+--let $label= INT predicate (zone map) on a group walk
+--source suite/moosedb/include/idx_pred_case.inc
+
+--echo # ---- not pushed: _ci collation, OR, IS NULL ----
+--let $expect= 0
+--let $q= SELECT ts, host, fc, n FROM {T} FORCE INDEX (ix_host_ts) WHERE fc = 'f2-1' AND host IN ('h5', 'h1') ORDER BY host, ts
+--let $label= _ci column = 'f2-1' (matches 'F2-1')
+--source suite/moosedb/include/idx_pred_case.inc
+--let $q= SELECT ts, host, fb, n FROM {T} FORCE INDEX (ix_host_ts) WHERE (fb = 'rare' OR n = 5) AND host IN ('h0', 'h2', 'h5') ORDER BY host, ts
+--let $label= OR
+--source suite/moosedb/include/idx_pred_case.inc
+--let $q= SELECT ts, host, fb, n FROM {T} FORCE INDEX (ix_host_ts) WHERE fb IS NULL AND host IN ('h0', 'h2') ORDER BY host, ts
+--let $label= IS NULL
+--source suite/moosedb/include/idx_pred_case.inc
+
+--echo # ---- MemTable rows are never skipped ----
+INSERT INTO g VALUES ('2024-03-20 00:00:00', 'h2', 'fresh', 'FRESH', 5000), ('2024-03-20 00:00:01', 'h4', 'fresh', 'FRESH', 5001);
+INSERT INTO mirror.g VALUES ('2024-03-20 00:00:00', 'h2', 'fresh', 'FRESH', 5000), ('2024-03-20 00:00:01', 'h4', 'fresh', 'FRESH', 5001);
+--let $expect= 1
+--let $q= SELECT ts, host, fb, n FROM {T} FORCE INDEX (ix_host_ts) WHERE fb = 'fresh' AND host IN ('h2', 'h4') ORDER BY host, ts
+--let $label= rows still in the MemTable
+--source suite/moosedb/include/idx_pred_case.inc
+
+DROP DATABASE mirror;
+DROP TABLE g;

@@ -641,3 +641,82 @@ fn exact_bytes_filter_on_ordered_unique_scan_with_ties() {
     }
     assert!(prune_stats().rows_filtered > before, "the exact filter dropped rows");
 }
+
+// ─── value predicates x grouped scan (composite index walk) ─────────────────
+
+/// A grouped scan with value predicates returns, in the order of the
+/// unfiltered grouped scan, every row that matches (exactly them while at most
+/// MERGE_KEEP_RUNS runs match), on a UNIQUE table with ties, chunks, MemTable
+/// and deletes; and it prunes entries.
+#[test]
+fn grouped_scan_with_value_predicates_keeps_order_and_loses_no_row() {
+    const NOTE_U: usize = 3;
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = unique_note_config(&dir.path().join("t"));
+    Table::create(&cfg).unwrap();
+    let t = std::sync::Arc::new(Table::open(cfg).unwrap());
+    let mut g = Lcg(0x6a0c);
+    let mut written: Vec<Row> = Vec::new();
+    for round in 0..4 {
+        for _ in 0..600 {
+            let (item, sec, ns) = (g.below(24), g.below(60) as i64, g.below(3) as i64);
+            let note = match (item, g.below(10)) {
+                (_, 0) => Value::Null,
+                (0..=1, 1) => Value::Bytes(b"rare".to_vec()),
+                (_, 2..=5) => Value::Bytes(b"common".to_vec()),
+                _ => Value::Bytes(format!("x{}", g.below(5)).into_bytes()),
+            };
+            let row = vec![
+                Value::Timestamp(base_ts() + sec * MICROS_PER_SEC),
+                Value::Bytes(format!("i{item}").into_bytes()),
+                Value::Int(ns),
+                note,
+            ];
+            if t.write_shared(row.clone()).is_ok() {
+                written.push(row);
+            }
+        }
+        if round < 3 {
+            t.flush().unwrap();
+        }
+    }
+    let gone: Vec<Row> = written.iter().step_by(11).cloned().collect();
+    t.delete_rows(gone, true).unwrap();
+
+    let mut ids: Vec<(u64, String)> = t
+        .series()
+        .unwrap()
+        .into_iter()
+        .map(|(id, tags)| (id, String::from_utf8(match &tags[0] { Value::Bytes(b) => b.clone(), _ => panic!() }).unwrap()))
+        .collect();
+    ids.sort_by(|a, b| a.1.cmp(&b.1));
+    let pick = |names: &[&str]| -> Vec<u64> { ids.iter().filter(|(_, n)| names.contains(&n.as_str())).map(|(i, _)| *i).collect() };
+    let groups = vec![pick(&["i5", "i3"]), pick(&["i0"]), vec![], pick(&["i1", "i2", "i4", "i7", "i8", "i9", "i10", "i11", "i12"]), pick(&["i23"])];
+    let run = |cols: &[ColPred], proj: Option<&[bool]>| -> Vec<([u8; 16], Row)> {
+        let mut s = t.scan_groups(i64::MIN, i64::MAX, &groups, cols, proj).unwrap();
+        let mut out = Vec::new();
+        while let Some((p, r)) = s.next_row().unwrap() {
+            out.push((p.to_bytes(), r));
+        }
+        out
+    };
+    let full = run(&[], None);
+    assert!(full.len() > 100);
+    let lists: [(&[&[u8]], bool); 4] = [(&[b"rare"], true), (&[b"common"], false), (&[b"x1", b"rare"], false), (&[b"absent"], true)];
+    let (z0, f0) = (prune_stats(), prune_stats().rows_filtered);
+    for (values, exact) in lists {
+        let p = ColPred::Bytes { col: NOTE_U, values: values.iter().map(|v| v.to_vec()).collect(), pad_space: false };
+        let want: Vec<[u8; 16]> = full.iter().filter(|(_, r)| matches(r, &p)).map(|(q, _)| *q).collect();
+        for proj in [None, Some(&[true, true, true, false][..])] {
+            let got: Vec<[u8; 16]> = run(std::slice::from_ref(&p), proj).into_iter().map(|(q, _)| q).collect();
+            let mut it = got.iter();
+            assert!(want.iter().all(|w| it.any(|x| x == w)), "lost or reordered a row: {values:?}");
+            if exact {
+                assert_eq!(got, want, "{values:?}");
+            }
+        }
+    }
+    let z1 = prune_stats();
+    assert!(z1.entries_tested > z0.entries_tested, "grouped scans test entries now");
+    assert!(z1.rows_filtered > f0 || z1.pruned_by_bloom > z0.pruned_by_bloom, "and drop rows or entries");
+}

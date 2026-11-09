@@ -4133,79 +4133,6 @@ int ha_moosedb::open_scan(longlong lo, longlong hi, bool sorted,
   if (!share_ || !share_->table)
     return HA_ERR_INTERNAL_ERROR;
   build_projection(index_scan);
-  if (index_scan && idx_req_.active)
-  {
-    /*
-      Composite-index read: the series set is part of the *meaning* of the
-      read (the key's tags), so unlike a pushdown it can never be dropped --
-      if the series version keeps moving there is no unfiltered fallback.
-      Same protocol as below: resolve the ids, open the scan (which takes the
-      snapshot), and redo both if a series appeared in between.
-    */
-    /* a retry must walk from the same tuple again, not from the one picked */
-    const std::vector<std::string> cur0= idx_req_.cur;
-    const bool have_cur0= idx_req_.have_cur;
-    for (int attempt= 0; attempt < 64; attempt++)
-    {
-      idx_req_.cur= cur0;
-      idx_req_.have_cur= have_cur0;
-      uint64_t v0= 0, v1= 0;
-      if (moosedb_series_version(share_->table.get(), &v0) != TF_OK)
-      {
-        last_error_= take_last_error();
-        return HA_ERR_INTERNAL_ERROR;
-      }
-      if (pushed_valid_ && pushed_version_ != v0)
-        pushed_valid_= false;
-      const std::vector<uint64_t> *ids= nullptr;
-      if (!series_for_index(&ids) || !ids)
-      {
-        last_error_= "cannot resolve the TAG values of the index key";
-        return HA_ERR_INTERNAL_ERROR;
-      }
-      if (pushed_valid_)
-        pushed_version_= v0;
-      MooseDBScan *s= nullptr;
-      const int error= sorted && idx_group_ends_.size() > 1
-          ? map_status(moosedb_scan_open_groups(
-                share_->table.get(), lo, hi, ids->data(), ids->size(),
-                idx_group_ends_.data(), idx_group_ends_.size(),
-                proj_all_ ? nullptr : proj_mask_.data(),
-                proj_all_ ? 0 : (uint32_t) proj_mask_.size(), &s))
-          : map_status(moosedb_scan_open_projected(
-                share_->table.get(), lo, hi, ids->data(),
-                (int64_t) ids->size(), sorted,
-                proj_all_ ? nullptr : proj_mask_.data(),
-                proj_all_ ? 0 : (uint32_t) proj_mask_.size(), &s));
-      if (error)
-        return error;
-      tf_scan_ptr opened(s);
-      if (moosedb_series_version(share_->table.get(), &v1) == TF_OK && v1 == v0)
-      {
-        scan_= std::move(opened);
-        return 0;
-      }
-      take_last_error();
-      pushed_valid_= false;
-    }
-    last_error_= "the set of series kept changing while the index was read";
-    return HA_ERR_LOCK_WAIT_TIMEOUT;
-  }
-  /*
-    The ids of a TAG filter and the scan are two separate calls: a statement
-    that commits between them with a brand-new series would be seen only
-    partially. The series version read before resolving the ids must still
-    be current once the scan (which snapshots the data) is open; otherwise
-    resolve again and reopen. A false alarm only costs a retry.
-  */
-  /*
-    If the version cannot be read or keeps moving (16 tries), fall back to an
-    unfiltered scan: the server evaluates the whole WHERE anyway, so that is
-    always correct -- only slower -- and never partially visible.
-  */
-  int error= 0;
-  MooseDBScan *s= nullptr;
-  bool unfiltered= false;
   /*
     Value predicates (zone maps / Blooms) are a hint: the server re-evaluates
     the whole WHERE. The buffers behind the TFColPred array live in `bufs`
@@ -4257,6 +4184,87 @@ int ha_moosedb::open_scan(longlong lo, longlong hi, bool sorted,
         cp.push_back(c);
       }
   }
+  if (index_scan && idx_req_.active)
+  {
+    /*
+      Composite-index read: the series set is part of the *meaning* of the
+      read (the key's tags), so unlike a pushdown it can never be dropped --
+      if the series version keeps moving there is no unfiltered fallback.
+      Same protocol as below: resolve the ids, open the scan (which takes the
+      snapshot), and redo both if a series appeared in between.
+    */
+    /* a retry must walk from the same tuple again, not from the one picked */
+    const std::vector<std::string> cur0= idx_req_.cur;
+    const bool have_cur0= idx_req_.have_cur;
+    for (int attempt= 0; attempt < 64; attempt++)
+    {
+      idx_req_.cur= cur0;
+      idx_req_.have_cur= have_cur0;
+      uint64_t v0= 0, v1= 0;
+      if (moosedb_series_version(share_->table.get(), &v0) != TF_OK)
+      {
+        last_error_= take_last_error();
+        return HA_ERR_INTERNAL_ERROR;
+      }
+      if (pushed_valid_ && pushed_version_ != v0)
+        pushed_valid_= false;
+      const std::vector<uint64_t> *ids= nullptr;
+      if (!series_for_index(&ids) || !ids)
+      {
+        last_error_= "cannot resolve the TAG values of the index key";
+        return HA_ERR_INTERNAL_ERROR;
+      }
+      if (pushed_valid_)
+        pushed_version_= v0;
+      MooseDBScan *s= nullptr;
+      const int error= sorted && idx_group_ends_.size() > 1
+          ? map_status(moosedb_scan_open_groups(
+                share_->table.get(), lo, hi, ids->data(), ids->size(),
+                idx_group_ends_.data(), idx_group_ends_.size(),
+                proj_all_ ? nullptr : proj_mask_.data(),
+                proj_all_ ? 0 : (uint32_t) proj_mask_.size(),
+                cp.data(), (uint32_t) cp.size(), &s))
+          : cp.empty()
+          ? map_status(moosedb_scan_open_projected(
+                share_->table.get(), lo, hi, ids->data(),
+                (int64_t) ids->size(), sorted,
+                proj_all_ ? nullptr : proj_mask_.data(),
+                proj_all_ ? 0 : (uint32_t) proj_mask_.size(), &s))
+          : map_status(moosedb_scan_open_pruned(
+                share_->table.get(), lo, hi, ids->data(),
+                (int64_t) ids->size(), sorted,
+                proj_all_ ? nullptr : proj_mask_.data(),
+                proj_all_ ? 0 : (uint32_t) proj_mask_.size(), cp.data(),
+                (uint32_t) cp.size(), &s));
+      if (error)
+        return error;
+      tf_scan_ptr opened(s);
+      if (moosedb_series_version(share_->table.get(), &v1) == TF_OK && v1 == v0)
+      {
+        scan_= std::move(opened);
+        return 0;
+      }
+      take_last_error();
+      pushed_valid_= false;
+    }
+    last_error_= "the set of series kept changing while the index was read";
+    return HA_ERR_LOCK_WAIT_TIMEOUT;
+  }
+  /*
+    The ids of a TAG filter and the scan are two separate calls: a statement
+    that commits between them with a brand-new series would be seen only
+    partially. The series version read before resolving the ids must still
+    be current once the scan (which snapshots the data) is open; otherwise
+    resolve again and reopen. A false alarm only costs a retry.
+  */
+  /*
+    If the version cannot be read or keeps moving (16 tries), fall back to an
+    unfiltered scan: the server evaluates the whole WHERE anyway, so that is
+    always correct -- only slower -- and never partially visible.
+  */
+  int error= 0;
+  MooseDBScan *s= nullptr;
+  bool unfiltered= false;
   for (int attempt= 0; attempt <= 16; attempt++)
   {
     uint64_t v0= 0;

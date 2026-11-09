@@ -88,6 +88,9 @@ impl Segment {
 /// workload alternating single-row writes and scans stays efficient.
 const MAX_FROZEN: usize = 64;
 
+/// `segments_in_range` freezes the active segment only from this many rows on.
+const FREEZE_MIN_ROWS: usize = 1024;
+
 /// Row count and timestamp range of one segment, kept as rows arrive so the
 /// optimizer range estimate never has to visit the rows.
 #[derive(Clone, Copy)]
@@ -386,30 +389,38 @@ impl MemTable {
     }
 
     /// Shares the segments that may hold a row with `lo <= ts <= hi`, in
-    /// arrival order, so the caller can look at them without the table mutex.
-    /// Freezes the active segment only if its range overlaps.
-    pub(crate) fn segments_in_range(&mut self, lo: i64, hi: i64) -> Vec<Arc<Segment>> {
+    /// arrival order, each with the ordinal of its first row, so the caller
+    /// can look at them without the table mutex. Also returns `start`: the
+    /// ordinal from which the rows are *not* covered (the active segment, which
+    /// is frozen only if it overlaps and holds `FREEZE_MIN_ROWS`: freezing a
+    /// small one every time would fragment the MemTable; the caller scans such
+    /// a tail itself).
+    pub(crate) fn segments_in_range(&mut self, lo: i64, hi: i64) -> (u64, Vec<(u64, Arc<Segment>)>) {
         let st = &self.active_stats;
-        if st.len != 0 && hi >= st.ts_min && lo <= st.ts_max {
+        if st.len >= FREEZE_MIN_ROWS && hi >= st.ts_min && lo <= st.ts_max {
             self.freeze_active();
         }
-        self.frozen
-            .iter()
-            .zip(&self.frozen_stats)
-            .filter(|(_, st)| st.len != 0 && hi >= st.ts_min && lo <= st.ts_max)
-            .map(|(s, _)| s.clone())
-            .collect()
+        let mut base = 0u64;
+        let mut out = Vec::new();
+        for (s, st) in self.frozen.iter().zip(&self.frozen_stats) {
+            if st.len != 0 && hi >= st.ts_min && lo <= st.ts_max {
+                out.push((base, s.clone()));
+            }
+            base += s.rows.len() as u64;
+        }
+        (base, out)
     }
 
     /// [`MemTable::visit_range`] that also gives each row's ordinal (its
-    /// position in arrival order over the whole MemTable).
-    pub(crate) fn visit_range_ord(&self, schema: &Schema, lo: i64, hi: i64, mut visit: impl FnMut(u64, &MemRow)) {
+    /// position in arrival order over the whole MemTable), from ordinal `from` on.
+    pub(crate) fn visit_range_ord(&self, schema: &Schema, lo: i64, hi: i64, from: u64, mut visit: impl FnMut(u64, &MemRow)) {
         let stats = self.frozen_stats.iter().chain(std::iter::once(&self.active_stats));
         let segs = self.frozen.iter().map(|s| &s.rows[..]).chain(std::iter::once(&self.active[..]));
         let mut base = 0u64;
         for (rows, st) in segs.zip(stats) {
+            let skip = usize::try_from(from.saturating_sub(base)).unwrap_or(usize::MAX).min(rows.len());
             if !(st.len == 0 || hi < st.ts_min || lo > st.ts_max) {
-                for (i, r) in rows.iter().enumerate() {
+                for (i, r) in rows.iter().enumerate().skip(skip) {
                     let ts = schema.row_ts(&r.row);
                     if lo <= ts && ts <= hi {
                         visit(base + i as u64, r);

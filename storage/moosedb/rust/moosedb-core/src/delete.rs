@@ -136,7 +136,12 @@ impl DelGroups {
 
     /// Decides, with the table mutex held (and no flush running), which rows
     /// go: the MemTable's first, then those `found` in the chunks. Changes nothing.
-    pub(crate) fn plan(&self, schema: &Schema, inner: &Inner, found: &[Vec<(u64, u32, u32)>]) -> Result<DelPlan> {
+    ///
+    /// `pre` is the MemTable look `lock_with_found` took outside the mutex: while
+    /// the MemTable's rows before `pre.start` are the ones it saw (same
+    /// `mem_generation`, nothing but appends since) only the rows from there on
+    /// are looked at again.
+    pub(crate) fn plan(&self, schema: &Schema, inner: &Inner, found: &[Vec<(u64, u32, u32)>], pre: Option<MemPre>) -> Result<DelPlan> {
         let sids: Vec<Option<u64>> = self.groups.iter().map(|x| inner.series.lookup(&x.tags)).collect();
         let (lo, hi) = self.bounds();
         let by_key = self.keys(&sids);
@@ -153,8 +158,12 @@ impl DelGroups {
         // Where the rows are, not the rows: the MemTable cannot change until `apply`
         // (the table mutex is held), so `apply` removes by position.
         let mut mem_ords: Vec<u64> = Vec::new();
+        let mut from = 0u64;
+        if let Some(p) = pre.filter(|p| p.gen == inner.mem_generation && p.sids == plan.sids && p.start <= inner.memtable.len() as u64) {
+            (left, mem_ords, from) = (p.left, p.ords, p.start);
+        }
         let mut buf = Vec::new();
-        inner.memtable.visit_range_ord(schema, lo, hi, |ord, r| {
+        inner.memtable.visit_range_ord(schema, lo, hi, from, |ord, r| {
             let ts = schema.row_ts(&r.row);
             if self.take_from_mem(&by_key, &mut left, r, ts, &mut buf) {
                 mem_ords.push(ord);
@@ -199,17 +208,28 @@ impl DelGroups {
         sids.iter().zip(&self.groups).filter_map(|(s, g)| s.map(|s| (s, g.ts))).collect()
     }
 
-    /// Per group, how many of its `k` rows `feed` (which calls its argument on
-    /// the MemTable's rows, in arrival order) shows.
-    fn mem_have(&self, schema: &Schema, sids: &[Option<u64>], feed: impl FnOnce(&mut dyn FnMut(&crate::memtable::MemRow))) -> Vec<usize> {
-        let by_key = self.keys(sids);
+    /// Looks for the groups' rows in what `feed` shows of the MemTable (it calls
+    /// its argument with each row and its ordinal, in arrival order); `start`
+    /// is the ordinal from which the MemTable was not shown.
+    fn mem_scan(
+        &self,
+        schema: &Schema,
+        sids: Vec<Option<u64>>,
+        gen: u64,
+        start: u64,
+        feed: impl FnOnce(&mut dyn FnMut(u64, &crate::memtable::MemRow)),
+    ) -> MemPre {
+        let by_key = self.keys(&sids);
         let mut left: Vec<usize> = self.groups.iter().map(|g| g.k).collect();
+        let mut ords = Vec::new();
         let mut buf = Vec::new();
-        feed(&mut |r| {
+        feed(&mut |ord, r| {
             let ts = schema.row_ts(&r.row);
-            self.take_from_mem(&by_key, &mut left, r, ts, &mut buf);
+            if self.take_from_mem(&by_key, &mut left, r, ts, &mut buf) {
+                ords.push(ord);
+            }
         });
-        self.groups.iter().zip(&left).map(|(g, l)| g.k - l).collect()
+        MemPre { gen, sids, start, left, ords }
     }
 
     fn take_from_mem(&self, by_key: &HashSet<(u64, i64)>, left: &mut [usize], r: &crate::memtable::MemRow, ts: i64, buf: &mut Vec<u8>) -> bool {
@@ -225,6 +245,24 @@ impl DelGroups {
             }
             _ => false,
         }
+    }
+}
+
+/// What a look at the MemTable for a row delete's rows found: per group how
+/// many are still to find (`left`), where the found ones are (`ords`), over
+/// the MemTable's rows before ordinal `start` as of `mem_generation == gen`.
+pub(crate) struct MemPre {
+    gen: u64,
+    sids: Vec<Option<u64>>,
+    start: u64,
+    left: Vec<usize>,
+    ords: Vec<u64>,
+}
+
+impl MemPre {
+    /// Per group, how many rows the look found.
+    fn have(&self, groups: &DelGroups) -> Vec<usize> {
+        groups.groups.iter().zip(&self.left).map(|(g, l)| g.k - l).collect()
     }
 }
 
@@ -486,9 +524,9 @@ impl Table {
         for row in rows {
             groups.add(&self.schema, row);
         }
-        let (mut guard, found) = self.lock_with_found(&groups)?;
+        let (mut guard, found, pre) = self.lock_with_found(&groups)?;
         let inner = &mut *guard;
-        let plan = groups.plan(&self.schema, inner, &found)?;
+        let plan = groups.plan(&self.schema, inner, &found, pre)?;
         let total = plan.total();
         if total == 0 {
             return Ok(0);
@@ -512,9 +550,10 @@ impl Table {
     /// outside the table mutex, then takes the mutex (idle: no flush sealing
     /// the MemTable) and checks the chunks did not change meanwhile; after
     /// `OPTIMISTIC_ATTEMPTS` the search is done under the mutex. Returns the
-    /// guard and, per group, `(chunk id, series entry, ordinal)` of its rows.
+    /// guard, per group `(chunk id, series entry, ordinal)` of its rows, and the
+    /// look at the MemTable that `DelGroups::plan` may build on (when still valid).
     /// The caller still checks the table epoch if it cares.
-    pub(crate) fn lock_with_found(&self, groups: &DelGroups) -> Result<(MutexGuard<'_, Inner>, Found)> {
+    pub(crate) fn lock_with_found(&self, groups: &DelGroups) -> Result<(MutexGuard<'_, Inner>, Found, Option<MemPre>)> {
         let want: Vec<bool> = (0..self.schema.columns().len()).map(|c| self.schema.tag_position(c).is_none()).collect();
         let (lo, hi) = groups.bounds();
         // Locates the rows of group `g` the MemTable (`have[g]` of them) does not cover.
@@ -533,37 +572,52 @@ impl Table {
         for attempt in 0..=OPTIMISTIC_ATTEMPTS {
             let last = attempt == OPTIMISTIC_ATTEMPTS;
             // Step 1: where could each group's rows be in the chunks?
-            let (chunks, tombs, gen, epoch, mem_gen, sids, segs) = {
+            let (chunks, tombs, gen, epoch, mem_gen, sids, segs, idle) = {
                 let mut g = self.lock()?;
                 g.check_writable()?;
                 let sids: Vec<Option<u64>> = groups.groups.iter().map(|x| g.series.lookup(&x.tags)).collect();
-                let segs = if last { Vec::new() } else { g.memtable.segments_in_range(lo, hi) };
-                (g.chunks.clone(), g.tombs.clone(), g.layout_gen, g.epoch, g.mem_generation, sids, segs)
+                let segs = if last { (0, Vec::new()) } else { g.memtable.segments_in_range(lo, hi) };
+                // With a flush running, the rows it took are not in the MemTable and
+                // would come back in front of it if it failed: ordinals would shift,
+                // so such a look serves `have` only.
+                (g.chunks.clone(), g.tombs.clone(), g.layout_gen, g.epoch, g.mem_generation, sids, segs, !g.flush_running)
             };
             if last {
                 drop((chunks, tombs));
                 let guard = self.lock_idle()?;
                 guard.check_writable()?;
                 let sids2: Vec<Option<u64>> = groups.groups.iter().map(|x| guard.series.lookup(&x.tags)).collect();
-                let have = groups.mem_have(&self.schema, &sids2, |f| guard.memtable.visit_range(&self.schema, lo, hi, f));
-                let found = locate_all(&guard.chunks, &guard.tombs, &sids2, &have)?;
-                return Ok((guard, found));
+                let pre = groups.mem_scan(&self.schema, sids2, guard.mem_generation, guard.memtable.len() as u64, |f| {
+                    guard.memtable.visit_range_ord(&self.schema, lo, hi, 0, f)
+                });
+                let found = locate_all(&guard.chunks, &guard.tombs, &pre.sids, &pre.have(groups))?;
+                return Ok((guard, found, Some(pre)));
             }
             // MemTable first, as the plan will: rows it already holds need no search in the chunks
             // (a repeated UPDATE finds its old rows there, with their chunk twins tombstoned).
             // Rows only leave the MemTable by a DELETE (gated), a flush or a TRUNCATE, which all
             // bump `mem_generation`: checked below.
-            let have = groups.mem_have(&self.schema, &sids, |f| segs.iter().flat_map(|s| s.rows()).for_each(f));
+            let (start, segs) = segs;
+            let pre = groups.mem_scan(&self.schema, sids, mem_gen, start, |f| {
+                for (base, s) in &segs {
+                    for (i, r) in s.rows().iter().enumerate() {
+                        f(base + i as u64, r);
+                    }
+                }
+            });
             drop(segs);
+            let have = pre.have(groups);
             let covered = have.iter().any(|&h| h > 0);
-            let found = locate_all(&chunks, &tombs, &sids, &have)?;
+            let found = locate_all(&chunks, &tombs, &pre.sids, &have)?;
             drop((chunks, tombs));
             let guard = self.lock_idle()?;
             guard.check_writable()?;
             if guard.layout_gen != gen || guard.epoch != epoch || (covered && guard.mem_generation != mem_gen) {
                 continue;
             }
-            return Ok((guard, found));
+            // Nothing but appends since the look: the plan resumes where it stopped.
+            let pre = (idle && guard.mem_generation == mem_gen).then_some(pre);
+            return Ok((guard, found, pre));
         }
         Err(Error::Busy("the table kept changing while a DELETE looked for its rows".into()))
     }
@@ -887,5 +941,58 @@ mod tests {
         assert_eq!(t.delete_rows(vec![row(1), row(5)], true).unwrap(), 2);
         assert_eq!(count(&t), 5);
         assert_eq!(t.stats().unwrap().row_count, 5);
+    }
+
+    /// A plan that resumes from the look taken before more rows were appended
+    /// decides exactly what a plan from scratch decides; after a change that
+    /// is not an append (`mem_generation`) the look is ignored.
+    #[test]
+    fn a_plan_resumed_from_an_earlier_look_equals_a_full_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let (t, _) = open(&dir.path().join("t"));
+        let row = |i: i64| vec![Value::Timestamp(i % 400), Value::Bytes(format!("h{}", i % 3).into_bytes())];
+        for i in 0..1500 {
+            t.write(row(i)).unwrap();
+        }
+        let mut groups = DelGroups::default();
+        for i in (0..2600).step_by(7) {
+            groups.add(&t.schema, row(i));
+            if i % 3 == 0 {
+                groups.add(&t.schema, row(i)); // k = 2
+            }
+        }
+        let found: Found = vec![Vec::new(); groups.groups.len()];
+        let look = |t: &Table| {
+            let mut g = t.lock().unwrap();
+            let (lo, hi) = groups.bounds();
+            let sids: Vec<Option<u64>> = groups.groups.iter().map(|x| g.series.lookup(&x.tags)).collect();
+            let (start, segs) = g.memtable.segments_in_range(lo, hi);
+            groups.mem_scan(&t.schema, sids, g.mem_generation, start, |f| {
+                for (base, s) in &segs {
+                    for (i, r) in s.rows().iter().enumerate() {
+                        f(base + i as u64, r);
+                    }
+                }
+            })
+        };
+        let pre = look(&t);
+        assert_eq!(pre.start, 1500, "the big active segment was frozen and looked at");
+        for i in 1500..2600 {
+            t.write(row(i)).unwrap(); // appends: same generation
+        }
+        let same = |pre: Option<MemPre>| {
+            let g = t.lock().unwrap();
+            let a = groups.plan(&t.schema, &g, &found, pre).unwrap();
+            let b = groups.plan(&t.schema, &g, &found, None).unwrap();
+            assert_eq!((&a.mem_ords, &a.deleted), (&b.mem_ords, &b.deleted));
+            assert!(!a.mem_ords.is_empty() && a.mem_ords.last().is_some_and(|&o| o >= 1500), "the tail was looked at too");
+            b.mem_ords.clone()
+        };
+        let full = same(Some(pre));
+        // a DELETE in between moves ordinals: the old look must not be used
+        let stale = look(&t);
+        assert_eq!(t.delete_rows(vec![row(0)], true).unwrap(), 1);
+        let after = same(Some(stale));
+        assert_ne!(full, after);
     }
 }

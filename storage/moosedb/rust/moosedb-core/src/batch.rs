@@ -730,13 +730,13 @@ impl Batch {
             if let Some(u) = upd.as_deref() {
                 drop(guard);
                 gate = Some(table.del_gate.lock().unwrap_or_else(PoisonError::into_inner));
-                let (g, found) = table.lock_with_found(&u.groups)?;
+                let (g, found, pre) = table.lock_with_found(&u.groups)?;
                 guard = g;
                 guard.check_writable()?;
                 if guard.epoch != self.epoch {
                     return Err(stale());
                 }
-                let plan = u.groups.plan(&table.schema, &guard, &found)?;
+                let plan = u.groups.plan(&table.schema, &guard, &found, pre)?;
                 // Of the pairs of a group of equal old rows, the first ones are those found.
                 let mut used = vec![0usize; plan.deleted.len()];
                 let applied: Vec<bool> = u

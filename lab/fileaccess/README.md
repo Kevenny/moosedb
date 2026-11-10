@@ -321,3 +321,32 @@ o ColumnStore paga ~1 s de piso por consulta e varre a janela sem índice, enqua
 q05 (`file =` em 7 dias) é a pior do ColumnStore (8,8 s): VARCHAR(512) vai para o dicionário e o filtro varre os tokens.
 Sem a agregação na engine, a MooseDB perde para o ColumnStore de 3x a 30x nas agregações largas (q01, q04). O ClickHouse
 continua à frente de ambos em tudo, exceto nas consultas por série.
+
+## MooseDB atual x ClickHouse (20 M linhas, 2026-11-10)
+
+Plugin recompilado do HEAD `fa7cfc0` (agregação na engine ON por padrão, filtro exato, cache CLOCK), MariaDB 11.4.13,
+ClickHouse 26.9.23.15, 8 CPUs/10 GiB por contêiner. Reinício do contêiner antes de cada engine; melhor de 5 quentes (s) e,
+entre parênteses, a 1ª execução. md5 idênticos nas 6 tabelas/engines, inclusive nas 3 consultas extras. Ingestão e disco
+não foram remedidos. Brutos em `results/bench_20m_2026-11-10_{q,extra}.txt` (o Docker Desktop caiu algumas vezes em
+consultas pesadas do InnoDB; os extras de `COUNT(DISTINCT file)` no `moose` tiveram 2 repetições após reinício).
+
+| Consulta | InnoDB | InnoDB+KEY(file) | moose | moose_h | moose_hn | ClickHouse | melhor moose / CH |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| q01 | 3,073 (10,19) | 3,106 (11,88) | 0,0309 (0,986) | 0,0023 (0,208) | 0,0023 (0,159) | 0,014 (0,038) | 0,16x |
+| q02 | 0,501 (0,516) | 0,523 (0,544) | 0,0331 (0,326) | 0,0088 (0,216) | 0,0076 (0,185) | 0,028 (0,056) | 0,27x |
+| q03 | 0,291 (0,305) | 0,298 (0,303) | 0,0314 (0,069) | 0,0052 (0,061) | 0,0051 (0,055) | 0,012 (0,021) | 0,43x |
+| q04 | 14,87 (15,01) | 15,04 (15,01) | 0,167 (0,374) | 0,161 (0,291) | 0,122 (0,287) | 0,080 (0,126) | 1,5x |
+| q05 | 1,545 (12,17) | 0,0118 (1,471) | 0,0358 (0,596) | 0,0862 (0,543) | 0,371 (0,840) | 0,115 (0,209) | 0,31x |
+| q05b | 2,225 (2,244) | 0,0096 (0,0135) | 0,0075 (0,0077) | 0,0068 (0,0075) | 0,0140 (0,0201) | 0,031 (0,037) | 0,22x |
+| q06 | 0,0129 (0,0177) | 0,0130 (0,0226) | 0,00067 (0,00114) | 0,00081 (0,00087) | 0,00078 (0,00090) | 0,003 (0,004) | 0,22x |
+| q07 | 0,0139 (0,0142) | 0,0142 (0,0139) | 0,00140 (0,00145) | 0,00115 (0,00136) | 0,00112 (0,00131) | 0,003 (0,004) | 0,37x |
+| q07b | 0,0017 (0,0017) | 0,0016 (0,0019) | 0,00073 (0,00081) | 0,00059 (0,00068) | 0,00059 (0,00064) | 0,003 (0,003) | 0,20x |
+| `COUNT(DISTINCT host)` | 0,0034 (0,692) | 0,0035 (0,634) | 0,195 (4,29) | 0,0090 (0,732) | 0,0090 (0,670) | 0,010 (0,021) | 0,9x |
+| `COUNT(DISTINCT file)` | 33,27 (60,73) | 8,25 (39,33) | 35,71 (41,69) | 38,83 (43,10) | 41,77 (43,69) | 0,310 (0,443) | 115x |
+| `GROUP BY op` (tabela inteira) | 4,078 (4,093) | 4,106 (31,81) | 0,385 (2,284) | 0,177 (1,412) | 0,168 (1,536) | 0,037 (0,064) | 4,5x |
+
+Leitura: no quente a MooseDB passa do ClickHouse em 9 de 12 consultas (q05 caiu de 0,87 s para 0,036 s com o filtro
+exato). O ClickHouse ganha em `COUNT(DISTINCT)` de coluna com 2 M valores (115x; a MooseDB perde até para o InnoDB com
+índice), em agregação da tabela inteira (`GROUP BY op`, 4,5x) e em GROUP BY de alta cardinalidade (q04, 1,5x). Na 1ª
+execução o ClickHouse ganha de q01 a q05 (ex.: q01 0,038 vs 0,159 s): o cache de chunks frio custa 5 a 60x o quente na
+MooseDB, contra 1,4 a 2,7x no ClickHouse.

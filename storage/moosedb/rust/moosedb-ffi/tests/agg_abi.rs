@@ -400,6 +400,23 @@ fn aggregation_lifecycle_results_dictionaries_and_errors_through_c_abi() {
     d.distinct_key = 1;
     assert_eq!(unsafe { moosedb_agg_run(agg, &d, None, ptr::null_mut()) }, TFStatus::TF_ERR_INVALID_ARG);
 
+    // GROUP BY the TAG value, COUNT(DISTINCT name): host keys come back as bytes, 2 names each
+    for kind in [TF_AGG_KEY_TAG, TF_AGG_KEY_TAG_PAD] {
+        let tkeys = [TFAggKey { kind, col: 1, width_us: 0 }, column(3)];
+        let mut d = spec(&tkeys, &star, &[], 1 << 28, 2);
+        d.has_distinct = 1;
+        d.distinct_key = 1;
+        check(unsafe { moosedb_agg_run(agg, &d, None, ptr::null_mut()) }).unwrap();
+        check(unsafe { moosedb_agg_result(agg, 0, 10, &mut batch) }).unwrap();
+        assert_eq!((batch.total_groups, batch.key_count, batch.func_count), (3, 1, 2), "kind {kind}");
+        assert_eq!(unsafe { (*batch.keys).kind }, TF_AGG_KEYCOL_BYTES);
+        let f = unsafe { std::slice::from_raw_parts(batch.funcs, 2) };
+        assert_eq!(unsafe { std::slice::from_raw_parts(f[1].count, 3) }, [2, 2, 2]);
+        assert_eq!(unsafe { std::slice::from_raw_parts(f[0].count, 3) }.iter().sum::<u64>(), 120);
+    }
+    let not_tag = [TFAggKey { kind: TF_AGG_KEY_TAG_PAD, col: 3, width_us: 0 }];
+    assert_eq!(bad(&not_tag, &star, &[], 1 << 20), TFStatus::TF_ERR_INVALID_ARG, "TAG key on a VARCHAR");
+
     // a snapshot outlives writes; an empty series list means no rows
     write(t, 1, "h0", Some(1), Some("a"));
     check(unsafe { moosedb_agg_run(agg, &spec(&[], &star, &[], 1 << 28, 1), None, ptr::null_mut()) }).unwrap();

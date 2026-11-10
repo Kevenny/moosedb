@@ -1220,7 +1220,7 @@ fn scalar_count_distinct_has_one_group_or_none() {
     for bad in [
         AggSpec { distinct: Some(1), ..sp.clone() },
         AggSpec { top: Some(TopN { func: 0, desc: true, limit: 1 }), funcs: vec![FuncSpec::CountStar], ..sp.clone() },
-        AggSpec { keys: vec![KeySpec::ColumnPad(3), KeySpec::Column(2)], distinct: Some(1), ..sp.clone() },
+        AggSpec { keys: vec![KeySpec::Tag(2)], ..sp.clone() },
     ] {
         assert!(matches!(agg.run(&bad, None), Err(Error::InvalidArg(_))));
     }
@@ -1336,4 +1336,119 @@ fn workers_share_partition_tables_above_the_flush_threshold() {
         agg.run(&AggSpec { threads, max_memory: mem, ..sp.clone() }, None).unwrap();
         assert_eq!(sorted(by_n(&agg)), want, "mix threads={threads} mem={mem}");
     }
+}
+
+/// Per group of a TAG key: (shortest raw value, COUNT(*), COUNT(n), SUM(n), MIN(n), MAX(n), distinct files).
+type TagStats = (Option<Vec<u8>>, u64, u64, i128, i64, i64, usize);
+
+#[test]
+fn tag_value_keys_merge_series_and_count_distinct_also_under_pad_space() {
+    let dir = tempfile::tempdir().unwrap();
+    // (ts, h TAG, p TAG, n INT64, file VARCHAR): every h in several series (one per p)
+    let schema = Schema::new(
+        vec![
+            Column { name: "ts".into(), ty: ColumnType::Timestamp },
+            Column { name: "h".into(), ty: ColumnType::Tag },
+            Column { name: "p".into(), ty: ColumnType::Tag },
+            Column { name: "n".into(), ty: ColumnType::Int64 },
+            Column { name: "file".into(), ty: ColumnType::Varchar },
+        ],
+        0,
+    )
+    .unwrap();
+    let cfg = TableConfig::new(dir.path().join("t"), schema, &RawOptions::default()).unwrap();
+    Table::create(&cfg).unwrap();
+    let t = Arc::new(Table::open(cfg).unwrap());
+    // PAD SPACE classes: {a, "a ", "a  "}, {b, "b "}, {"", " "}, NULL
+    let hosts: [Option<&[u8]>; 8] = [Some(b"a"), Some(b"a "), Some(b"b"), Some(b"a  "), Some(b""), Some(b" "), None, Some(b"b ")];
+    let mk = |i: i64| -> Row {
+        vec![
+            Value::Timestamp(base() + i * MICROS_PER_SEC),
+            hosts[(i / 3 % 8) as usize].map_or(Value::Null, |h| Value::Bytes(h.to_vec())),
+            Value::Bytes(format!("p{}", i % 5).into_bytes()),
+            if i % 11 == 0 { Value::Null } else { Value::Int(i * 31 % 1000 - 500) },
+            if i % 17 == 0 { Value::Null } else { Value::Bytes(format!("f{}", i * 7 % 1300).into_bytes()) },
+        ]
+    };
+    for k in 0..3 {
+        put(&t, (k * 6000..(k + 1) * 6000).map(mk));
+        t.flush().unwrap();
+    }
+    put(&t, (18_000..22_000).map(mk)); // left in the MemTable
+    let trim = |v: &[u8]| v[..v.iter().rposition(|&c| c != b' ').map_or(0, |i| i + 1)].to_vec();
+    let oracle = |pad: bool| -> BTreeMap<Option<Vec<u8>>, TagStats> {
+        let mut files: BTreeMap<Option<Vec<u8>>, std::collections::BTreeSet<Vec<u8>>> = BTreeMap::new();
+        let mut out: BTreeMap<Option<Vec<u8>>, TagStats> = BTreeMap::new();
+        let mut sc = t.scan(&ScanFilter::range(i64::MIN, i64::MAX), false).unwrap();
+        while let Some((_, r)) = sc.next_row().unwrap() {
+            let raw = if let Value::Bytes(h) = &r[1] { Some(h.clone()) } else { None };
+            let key = if pad { raw.as_deref().map(trim) } else { raw.clone() };
+            let st = out.entry(key.clone()).or_insert((raw.clone(), 0, 0, 0, i64::MAX, i64::MIN, 0));
+            if raw.as_ref().map(Vec::len) < st.0.as_ref().map(Vec::len) {
+                st.0 = raw;
+            }
+            st.1 += 1;
+            if let Value::Int(n) = r[3] {
+                st.2 += 1;
+                st.3 += i128::from(n);
+                st.4 = st.4.min(n);
+                st.5 = st.5.max(n);
+            }
+            if let Value::Bytes(f) = &r[4] {
+                files.entry(key).or_default().insert(f.clone());
+            }
+        }
+        for (k, st) in out.iter_mut() {
+            st.6 = files.get(k).map_or(0, |f| f.len());
+        }
+        out
+    };
+    let funcs = vec![FuncSpec::CountStar, FuncSpec::Count(3), FuncSpec::Sum(3), FuncSpec::Min(3), FuncSpec::Max(3)];
+    let mut agg = t.agg_open(i64::MIN, i64::MAX, None).unwrap();
+    agg.set_min_parallel_rows(0);
+    for pad in [false, true] {
+        let want = oracle(pad);
+        assert_eq!(want.len(), if pad { 4 } else { 8 });
+        let key = if pad { KeySpec::TagPad(1) } else { KeySpec::Tag(1) };
+        let plain = AggSpec { keys: vec![key], funcs: funcs.clone(), ..AggSpec::default() };
+        let dist = AggSpec { keys: vec![key, KeySpec::Column(4)], distinct: Some(1), ..plain.clone() };
+        // the small budget cannot hold the ~10k (h, file) groups at once: passes
+        for (sp, mem, threads) in [
+            (&plain, 1 << 30, 1),
+            (&plain, 1 << 30, 4),
+            (&dist, 1 << 30, 1),
+            (&dist, 1 << 30, 4),
+            (&dist, 256 << 10, 1),
+            (&dist, 256 << 10, 4),
+        ] {
+            agg.run(&AggSpec { max_memory: mem, threads, ..sp.clone() }, None).unwrap();
+            let r = agg.result();
+            let KeyCol::Bytes { nulls, starts, lens, data } = &r.keys[0] else { panic!() };
+            let f = &r.funcs;
+            let got: BTreeMap<_, _> = (0..r.groups)
+                .map(|g| {
+                    let shown = (!nulls[g]).then(|| data[starts[g] as usize..][..lens[g] as usize].to_vec());
+                    let key = if pad { shown.as_deref().map(trim) } else { shown.clone() };
+                    let sum = (i128::from(f[2].sum_hi[g]) << 64) | i128::from(f[2].sum_lo[g]);
+                    let d = if sp.distinct.is_some() { f[5].count[g] as usize } else { want[&key].6 };
+                    (key, (shown, f[0].count[g], f[1].count[g], sum, f[3].val[g], f[4].val[g], d))
+                })
+                .collect();
+            assert_eq!(got.len(), r.groups, "a group twice, pad={pad} mem={mem} threads={threads}");
+            assert_eq!(got, want, "pad={pad} distinct={:?} mem={mem} threads={threads}", sp.distinct);
+        }
+        // top-N: COUNT(*) descending, ties by the key (NULL first)
+        let top = AggSpec { top: Some(TopN { func: 0, desc: true, limit: 3 }), ..plain.clone() };
+        agg.run(&top, None).unwrap();
+        let mut order: Vec<_> = want.iter().map(|(k, st)| (std::cmp::Reverse(st.1), k.clone())).collect();
+        order.sort();
+        let r = agg.result();
+        let KeyCol::Bytes { nulls, .. } = &r.keys[0] else { panic!() };
+        let counts: Vec<u64> = (0..r.groups).map(|g| r.funcs[0].count[g]).collect();
+        assert_eq!(counts, order[..3].iter().map(|o| o.0 .0).collect::<Vec<_>>(), "top pad={pad}");
+        assert_eq!(nulls.len(), 3);
+    }
+    // a series key and a TAG key together: the series still splits the groups
+    agg.run(&AggSpec { keys: vec![KeySpec::Tag(2), KeySpec::Series], funcs: funcs.clone(), ..AggSpec::default() }, None).unwrap();
+    assert_eq!(agg.result().groups, t.series().unwrap().len());
 }

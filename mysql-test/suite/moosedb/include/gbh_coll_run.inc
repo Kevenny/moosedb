@@ -5,8 +5,9 @@
 # GROUP BY cases on them.
 #
 # In : $cs, $coll   character set / collation of tg and pc
-#      $exact       1 = the collation is exact (equal strings have equal
-#                   bytes): the key itself can be shown and compared
+#      $exact       1 = binary collation (NO PAD, or PAD SPACE trimmed): the
+#                   key itself can be shown and compared, and the core
+#                   groups tg by its value instead of by series
 #
 --disable_query_log
 DROP TABLE IF EXISTS test.t;
@@ -72,7 +73,7 @@ INSERT INTO mirror.t SELECT * FROM test.t;
 --let $q= SELECT COUNT(DISTINCT pc) d, COUNT(pc) n, COUNT(*) c FROM t; SELECT COUNT(DISTINCT pc) d, SUM(v) s FROM t WHERE rg = 'r1'
 --source suite/moosedb/include/gbh_diff.inc
 
---echo # COUNT(DISTINCT pc) per region: tg is a TAG not grouped, so series are summed: the server answers in every collation
+--echo # COUNT(DISTINCT pc) per region: rg has the default (merged) collation, so it stays a series key and per-series counts cannot be summed: the server answers in every collation
 --let $refused= 1
 --let $label= $coll: COUNT(DISTINCT pc) GROUP BY the region TAG only
 --let $q= SELECT rg, COUNT(DISTINCT pc) d, COUNT(*) c FROM t GROUP BY rg ORDER BY rg
@@ -85,7 +86,17 @@ INSERT INTO mirror.t SELECT * FROM test.t;
 --let $q= SELECT rg, COUNT(DISTINCT pc) d, COUNT(*) c FROM t GROUP BY tg, rg
 --source suite/moosedb/include/gbh_diff.inc
 
---echo # grouped by the plain column pc: the engine counts under a NO PAD binary collation; PAD SPACE and merged ones ('a' = 'A') are left to the server
+--echo # COUNT(DISTINCT pc) per tg, rg not grouped: a binary tg is grouped by value in the core (engine); a merged tg is a series key (server)
+--let $refused= 1
+if ($exact)
+{
+  --let $refused= 0
+}
+--let $label= $coll: COUNT(DISTINCT pc) GROUP BY the string TAG only
+--let $q= SELECT COUNT(DISTINCT pc) d, SUM(v) s, COUNT(*) c FROM t GROUP BY tg ORDER BY tg
+--source suite/moosedb/include/gbh_diff.inc
+
+--echo # grouped by the plain column pc: the engine counts under a binary collation (NO PAD or PAD SPACE); merged ones ('a' = 'A') are left to the server
 --let $either= 1
 --let $label= $coll: COUNT(DISTINCT v) GROUP BY the plain column
 --let $q= SELECT COUNT(DISTINCT v) d, COUNT(*) c FROM t GROUP BY pc ORDER BY d, c

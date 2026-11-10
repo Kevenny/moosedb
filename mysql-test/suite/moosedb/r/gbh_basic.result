@@ -316,7 +316,34 @@ INSERT INTO mirror.dn SELECT * FROM test.dn;
 # same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=3)
 DROP TABLE dn;
 DROP TABLE mirror.dn;
-# COUNT(DISTINCT) grouped by TAGs of a collation the core cannot merge, by only some of the TAGs, or by the distinct column itself: left to the server
+# TAGs of a binary collation are grouped by value in the core: by one of two TAGs, with COUNT(DISTINCT), PAD SPACE and NO PAD
+CREATE TABLE tv (ts DATETIME NOT NULL, a VARCHAR(8) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin COMMENT 'TAG', b VARCHAR(8) CHARACTER SET utf8mb4 COLLATE utf8mb4_nopad_bin NOT NULL COMMENT 'TAG', c INT, v INT, INDEX(ts)) ENGINE=MooseDB CHUNK_INTERVAL='1 DAY';
+INSERT INTO tv SELECT '2024-03-01' + INTERVAL seq * 20 SECOND, IF(seq MOD 11 = 0, NULL, ELT(1 + seq MOD 4, 'x', 'x ', 'y', 'y  ')), ELT(1 + seq MOD 5, 'p', 'p ', 'q', 'q  ', 'r'), IF(seq MOD 7 = 0, NULL, seq MOD 13), seq FROM seq_0_to_5999;
+FLUSH TABLES tv;
+INSERT INTO tv SELECT '2024-03-03' + INTERVAL seq * 20 SECOND, ELT(1 + seq MOD 4, 'x', 'x ', 'y', 'y  '), ELT(1 + seq MOD 5, 'p', 'p ', 'q', 'q  ', 'r'), seq MOD 17, seq FROM seq_0_to_999;
+CREATE TABLE mirror.tv LIKE test.tv;
+ALTER TABLE mirror.tv ENGINE=InnoDB;
+INSERT INTO mirror.tv SELECT * FROM test.tv;
+# PAD SPACE TAG grouped by value (key not shown: the spelling of a merged group is the plan's), the other TAG not grouped
+# SELECT COUNT(*) n, SUM(v) s, COUNT(DISTINCT c) d FROM tv GROUP BY a ORDER BY a; SELECT COUNT(*) n, SUM(v) s FROM tv WHERE b = 'q' GROUP BY a ORDER BY a
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=2)
+# NO PAD TAG grouped by value ('p' and 'p ' apart), the other TAG not grouped
+# SELECT b, COUNT(*) n, SUM(v) s, COUNT(DISTINCT c) d FROM tv GROUP BY b ORDER BY b; SELECT b, COUNT(DISTINCT c) d FROM tv WHERE a = 'x' GROUP BY b ORDER BY b DESC
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=2)
+# both binary TAGs, COUNT(DISTINCT) per pair
+# SELECT b, COUNT(*) n, COUNT(DISTINCT c) d FROM tv GROUP BY a, b ORDER BY a, b
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# top-N by an aggregate over one TAG key (the core breaks ties by the TAG value)
+# SELECT b, SUM(v) s FROM tv GROUP BY b ORDER BY s DESC, b LIMIT 2; SELECT COUNT(*) n FROM tv GROUP BY a ORDER BY n DESC, a LIMIT 3
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=2)
+# shortcuts taken: exact filters=0 core top-N=2
+DROP TABLE tv;
+DROP TABLE mirror.tv;
+# integer TAG grouped by value with COUNT(DISTINCT), the other TAGs not grouped
+# SELECT iface, COUNT(DISTINCT code) d, COUNT(*) c, SUM(bytes) s FROM g GROUP BY iface ORDER BY iface; SELECT iface, COUNT(*) c FROM g GROUP BY iface ORDER BY c DESC, iface LIMIT 2
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=2)
+# shortcuts taken: exact filters=0 core top-N=0
+# COUNT(DISTINCT) grouped by TAGs of a collation the core cannot merge (host is _ci), or by the distinct column itself: left to the server
 # SELECT host, COUNT(DISTINCT code) c FROM g GROUP BY host ORDER BY host; SELECT host, iface, proc, COUNT(DISTINCT code) d FROM g GROUP BY host, iface, proc ORDER BY host, iface, proc LIMIT 20; SELECT code, COUNT(DISTINCT code) d FROM g GROUP BY code ORDER BY code; SELECT code, COUNT(DISTINCT file) d FROM g GROUP BY code ORDER BY code; SELECT code, COUNT(DISTINCT file) d, file FROM g GROUP BY code, file ORDER BY code, file LIMIT 5
 # same output with and without pushdown and on InnoDB; the engine did not run it
 ##########################################################

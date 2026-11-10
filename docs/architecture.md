@@ -1308,11 +1308,12 @@ byte a byte: inteiro com constantes inteiras (constante fora do range da coluna
 binária NO PAD (`utf8mb4_nopad_bin`) ou binária PAD SPACE (`utf8mb4_bin`, `latin1_bin`; só em utf8mb4/utf8mb3/latin1/ascii, com `pad_space=1`: espaços finais 0x20 ignorados dos dois lados), cuja
 collation de comparação seja a da coluna e cujas constantes estejam no charset da
 coluna. Qualquer outro caso fica no dicionário + máscara. (2) *Top-N*:
-uma chave não-TAG, `ORDER BY` de um único agregado (COUNT/SUM/MIN/MAX, não AVG)
+uma chave (coluna, ou TAG de texto pelo valor), `ORDER BY` de um único agregado (COUNT/SUM/MIN/MAX, não AVG)
 com `LIMIT` (ou `ORDER BY agregado, a própria chave ASC`: ordem SQL total, 2º termo = desempate do core), sem HAVING, chave inteira (não `BIGINT UNSIGNED`), string
 binária NO PAD ou string **binária PAD SPACE** (`utf8mb4_bin`, `utf8mb3_bin`, `latin1_bin`, `ascii_bin`; ver abaixo); o desempate do core (chave crescente, na
-ordem da collation) é o do handler, então os K grupos são os mesmos. Chave TAG nunca usa (o core
-desempata por id de série, o handler pelo valor); `_ci`/`_ai` e demais collations
+ordem da collation) é o do handler, então os K grupos são os mesmos. Chave TAG de série
+(`_ci`) não usa (o core desempataria por id de série, o handler pelo valor), nem TAG inteira pelo
+valor (o core desempata pelo texto decimal, não pelo número); `_ci`/`_ai` e demais collations
 também não (exigiriam os pesos da collation no core; o handler continua agrupando
 por `strnncollsp` e ordenando todos os grupos). Status `Moosedb_gbh_exact_filters`
 e `Moosedb_gbh_topn`. O pós-processamento ordena em paralelo
@@ -1365,15 +1366,20 @@ HAVING, LIMIT/OFFSET, ORDER BY seguem no servidor. Agregados que o servidor já
 dobrou (`opt_sum_query`: `COUNT(*)` sem WHERE pelo nº de linhas da tabela, MIN/MAX
 por índice) são `const_item()` e não têm campo na tabela temporária: viram `CONST`
 no plano (sem isso o mapeamento de campos falha); se só sobrar isso, a consulta
-fica com o servidor. `COUNT(DISTINCT c)` (c INT/VARCHAR comum, uma só coluna) entra, com e sem GROUP BY, quando a colação de `c` é exata ou binária PAD SPACE (ou `c` é INT): o handler manda `c` como a última chave de `TFAggSpec` com `has_distinct=1`/`distinct_key`, o `COUNT(DISTINCT)` fora de `funcs`, e lê a contagem na última coluna de função do resultado (`moosedb_gbh::build_groups`; `c` não aparece no resultado e não pode ser referenciada no select/order). O core agrupa por todas as chaves (inclusive `c`), e ao fim de **cada passada** os grupos que diferem só em `c` viram um (estados fundidos como entre workers) e uma coluna de função extra conta os grupos com `c` não NULL; os resultados colapsados das passadas se fundem (cada par (chaves, c) cai numa só passada, então as contagens somam), logo o custo fica limitado pelo orçamento/passadas do core. O core compara bytes: só com igualdade de bytes = igualdade SQL (colação exata, ou PAD SPACE binário via `ColumnPad` na própria `c`); sem top-N (`ORDER BY d LIMIT k` vai pelo servidor sobre o resultado do core); sem chave `ColumnPad` além de `c`; sem linhas casando, o core devolve 0 grupos (o handler sintetiza o zero do escalar). Com TAGs no GROUP BY só quando **todas** as TAGs da tabela estão agrupadas e as de texto têm colação exata (cada série é um grupo; contagens por série não se somam). Colação não exata (`_ci`...): só sem GROUP BY, pelo caminho antigo (`count_distinct`, colapso no handler). Continuam fora: expressão sobre agregado (`COUNT(*)+1`), `COUNT(DISTINCT)` de TAG, de duas colunas ou da própria coluna do GROUP BY, `SUM(DISTINCT)`, coluna fora de agregado.
+fica com o servidor. `COUNT(DISTINCT c)` (c INT/VARCHAR comum, uma só coluna) entra, com e sem GROUP BY, quando a colação de `c` é exata ou binária PAD SPACE (ou `c` é INT): o handler manda `c` como a última chave de `TFAggSpec` com `has_distinct=1`/`distinct_key`, o `COUNT(DISTINCT)` fora de `funcs`, e lê a contagem na última coluna de função do resultado (`moosedb_gbh::build_groups`; `c` não aparece no resultado e não pode ser referenciada no select/order). O core agrupa por todas as chaves (inclusive `c`), e ao fim de **cada passada** os grupos que diferem só em `c` viram um (estados fundidos como entre workers) e uma coluna de função extra conta os grupos com `c` não NULL; os resultados colapsados das passadas se fundem (cada par (chaves, c) cai numa só passada, então as contagens somam), logo o custo fica limitado pelo orçamento/passadas do core. O core compara bytes: só com igualdade de bytes = igualdade SQL (colação exata, ou PAD SPACE binário via `ColumnPad` na própria `c`); sem top-N (`ORDER BY d LIMIT k` vai pelo servidor sobre o resultado do core); chave PAD (`ColumnPad`/`TagPad`) além de `c` entra: o colapso agrupa pela forma aparada e mantém o menor valor do grupo; sem linhas casando, o core devolve 0 grupos (o handler sintetiza o zero do escalar). TAGs no GROUP BY entram, inclusive só parte delas, quando todas as agrupadas vão pelo valor (inteiras, exatas ou PAD binárias); uma TAG agrupada `_ci`/`_ai` é chave de série e recusa (contagens por série não se somam). Coluna comum agrupada `_ci` também recusa (o colapso por bytes somaria contagens de `'a'` e `'A'`). Colação não exata (`_ci`...): só sem GROUP BY, pelo caminho antigo (`count_distinct`, colapso no handler). Continuam fora: expressão sobre agregado (`COUNT(*)+1`), `COUNT(DISTINCT)` de TAG, de duas colunas ou da própria coluna do GROUP BY, `SUM(DISTINCT)`, coluna fora de agregado.
 
 **Execução** (`init_scan`): mapeia `all_fields` para os campos da tmp table,
 resolve as séries do WHERE, abre a agregação (`moosedb_agg_open`, reconferindo
 `moosedb_series_version` até 64 vezes) e roda com `moosedb_agg_threads` threads
 e `moosedb_agg_max_memory` (o mesmo orçamento vale para a parte em C++, que
-fica sozinha com os grupos depois do `agg_close`). Chave TAG = uma chave de
-série; os valores vêm de `moosedb_series_list`. Grupos cujas chaves são iguais
-pela collation (séries com o mesmo valor, `a`/`A` em `_ci`) são fundidos com
+fica sozinha com os grupos depois do `agg_close`). Chave TAG inteira ou de texto
+com colação exata (`cs_exact`) ou binária PAD SPACE (`cs_pad_bin`) vai ao core pelo
+**valor** (`TF_AGG_KEY_TAG`/`TF_AGG_KEY_TAG_PAD`, `gkey::tag_val`): o core funde as
+séries de mesmo valor e devolve a chave como bytes (TAG inteira: texto decimal
+canônico, convertido de volta em `build_groups`), sem chave de série nem merge no
+handler. TAG de texto em colação fundida (`_ci`/`_ai`) continua chave de série
+(`gkey::is_tag`, `has_series`); seus valores vêm de `moosedb_series_list`. Grupos cujas chaves são iguais
+pela collation (séries com o mesmo valor `a`/`A` em `_ci`) são fundidos com
 `hash_sort` + `strnncollsp`; o valor mostrado é o menor pelos bytes
 (determinístico: o servidor mostra o primeiro que viu). A ordenação é a do
 ORDER BY (NULL primeiro no ASC, strings por `strnncollsp`, AVG depois da
@@ -1467,7 +1473,12 @@ scan não ordenado: só o commitado; o lote privado do statement é invisível).
 - **Chaves**: `Series` (um estado por série, laço apertado na janela) e
   `Bucket(i, largura_us)` (coluna Timestamp cortada em buckets de largura fixa alinhados à época; a chave é o início do bucket) e
   `Column(i)` (Int64/Timestamp/Bool como inteiro, Varchar/Decimal como bytes;
-  NULL é valor próprio). Imagem da chave em bytes numa tabela própria
+  NULL é valor próprio) e `Tag(i)`/`TagPad(i)` (`TF_AGG_KEY_TAG`/`TF_AGG_KEY_TAG_PAD`:
+  o **valor** da coluna TAG `i`, como bytes; as séries que o compartilham são um
+  grupo só, ao contrário de `Series`; `TagPad` apara 0x20 finais e devolve o menor
+  valor do grupo, como `ColumnPad`). A imagem da TAG sai da entrada de série do
+  chunk (`SeriesEntry::tags`) uma vez por trecho, nunca decodificada por linha
+  (a coluna TAG não é lida do bloco); na MemTable sai da própria linha. Imagem da chave em bytes numa tabela própria
   (arena de chaves + índice de endereçamento aberto com `u32`), hash
   SipHash-1-3 com chave aleatória por execução (`RandomState`: o valor vem do
   cliente; o `FastMap` é só para ids internos), hash guardado por grupo (merge
@@ -1494,8 +1505,8 @@ scan não ordenado: só o commitado; o lote privado do statement é invisível).
   melhores grupos por uma função (COUNT, SUM, MIN, MAX; ASC/DESC), melhor
   primeiro. NULL (grupo sem valores) é o menor valor; empate resolvido SEMPRE
   pela chave crescente (id da série, inteiro com sinal, ou bytes sem sinal
-  lexicográfico, prefixo menor primeiro; chave NULL primeiro; `KeySpec::ColumnPad`:
-  `pad_cmp`, ver acima). Seleção por
+  lexicográfico, prefixo menor primeiro; chave NULL primeiro; `KeySpec::ColumnPad`
+  e `KeySpec::TagPad`: `pad_cmp`, ver acima). Seleção por
   partição (`select_nth_unstable`) e depois global; `limit = 0` devolve nenhum
   grupo. Só vale quando essa ordem é a que o SQL pede (chave inteira, bytes
   em collation binária NO PAD ou chave `KeySpec::ColumnPad`, cujos grupos já são os do servidor).

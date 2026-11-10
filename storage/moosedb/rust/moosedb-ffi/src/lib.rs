@@ -1841,6 +1841,11 @@ pub const TF_AGG_KEY_COLUMN_PAD: u8 = 2;
 /// A TIMESTAMP column cut in buckets of `TFAggKey::width_us` microseconds aligned to the epoch
 /// (floor): the key value is the bucket start, in microseconds.
 pub const TF_AGG_KEY_BUCKET: u8 = 3;
+/// The value of the TAG column `col` (taken from the series, once per series): the series that
+/// share it are one group. Exact bytes (binary NO PAD collation).
+pub const TF_AGG_KEY_TAG: u8 = 4;
+/// `TF_AGG_KEY_TAG` under a binary PAD SPACE collation, as `TF_AGG_KEY_COLUMN_PAD`.
+pub const TF_AGG_KEY_TAG_PAD: u8 = 5;
 /// Function codes of `TFAggFunc::op`.
 pub const TF_AGG_COUNT_STAR: u8 = 0;
 pub const TF_AGG_COUNT: u8 = 1;
@@ -1856,7 +1861,8 @@ pub const TF_AGG_KEYCOL_BYTES: u8 = 2;
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct TFAggKey {
-    /// `TF_AGG_KEY_SERIES`, `TF_AGG_KEY_COLUMN`, `TF_AGG_KEY_COLUMN_PAD` or `TF_AGG_KEY_BUCKET`.
+    /// `TF_AGG_KEY_SERIES`, `TF_AGG_KEY_COLUMN`, `TF_AGG_KEY_COLUMN_PAD`, `TF_AGG_KEY_BUCKET`,
+    /// `TF_AGG_KEY_TAG` or `TF_AGG_KEY_TAG_PAD`.
     pub kind: u8,
     pub col: u32,
     /// Bucket width in microseconds (> 0), `TF_AGG_KEY_BUCKET` only; 0 otherwise.
@@ -1992,8 +1998,8 @@ pub struct TFAggSpec {
     pub float_filters: *const TFAggFloatFilter,
     pub float_filter_count: u32,
     /// COUNT(DISTINCT) of the key `keys[distinct_key]`, when `has_distinct != 0`
-    /// (0 = none, the zero value; `TF_ERR_INVALID_ARG` with a top-N, with an
-    /// index out of range or with a PAD key besides that one). The groups that
+    /// (0 = none, the zero value; `TF_ERR_INVALID_ARG` with a top-N or an
+    /// index out of range; a PAD key besides it keeps its shortest value). The groups that
     /// differ only in that key are collapsed (their functions merged); the
     /// result has one key column LESS (that key's, which is dropped) and one
     /// function MORE, the last (`func_count`, reported as `TF_AGG_COUNT`): its
@@ -2147,6 +2153,8 @@ pub unsafe extern "C" fn moosedb_agg_run(
                 TF_AGG_KEY_COLUMN => Ok(KeySpec::Column(k.col as usize)),
                 TF_AGG_KEY_COLUMN_PAD => Ok(KeySpec::ColumnPad(k.col as usize)),
                 TF_AGG_KEY_BUCKET => Ok(KeySpec::Bucket(k.col as usize, k.width_us)),
+                TF_AGG_KEY_TAG => Ok(KeySpec::Tag(k.col as usize)),
+                TF_AGG_KEY_TAG_PAD => Ok(KeySpec::TagPad(k.col as usize)),
                 other => Err(invalid(&format!("unknown key kind {other}"))),
             })
             .collect::<Result<Vec<_>, Error>>()?;

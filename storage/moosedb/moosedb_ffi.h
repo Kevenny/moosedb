@@ -39,6 +39,13 @@
 // (floor): the key value is the bucket start, in microseconds.
 #define TF_AGG_KEY_BUCKET 3
 
+// The value of the TAG column `col` (taken from the series, once per series): the series that
+// share it are one group. Exact bytes (binary NO PAD collation).
+#define TF_AGG_KEY_TAG 4
+
+// `TF_AGG_KEY_TAG` under a binary PAD SPACE collation, as `TF_AGG_KEY_COLUMN_PAD`.
+#define TF_AGG_KEY_TAG_PAD 5
+
 // Function codes of `TFAggFunc::op`.
 #define TF_AGG_COUNT_STAR 0
 
@@ -333,7 +340,8 @@ typedef struct {
 
 // One group-by key: the series (`col` ignored) or a column (`width_us` only for `TF_AGG_KEY_BUCKET`).
 typedef struct {
-  // `TF_AGG_KEY_SERIES`, `TF_AGG_KEY_COLUMN`, `TF_AGG_KEY_COLUMN_PAD` or `TF_AGG_KEY_BUCKET`.
+  // `TF_AGG_KEY_SERIES`, `TF_AGG_KEY_COLUMN`, `TF_AGG_KEY_COLUMN_PAD`, `TF_AGG_KEY_BUCKET`,
+  // `TF_AGG_KEY_TAG` or `TF_AGG_KEY_TAG_PAD`.
   uint8_t kind;
   uint32_t col;
   // Bucket width in microseconds (> 0), `TF_AGG_KEY_BUCKET` only; 0 otherwise.
@@ -442,8 +450,8 @@ typedef struct {
   const TFAggFloatFilter *float_filters;
   uint32_t float_filter_count;
   // COUNT(DISTINCT) of the key `keys[distinct_key]`, when `has_distinct != 0`
-  // (0 = none, the zero value; `TF_ERR_INVALID_ARG` with a top-N, with an
-  // index out of range or with a PAD key besides that one). The groups that
+  // (0 = none, the zero value; `TF_ERR_INVALID_ARG` with a top-N or an
+  // index out of range; a PAD key besides it keeps its shortest value). The groups that
   // differ only in that key are collapsed (their functions merged); the
   // result has one key column LESS (that key's, which is dropped) and one
   // function MORE, the last (`func_count`, reported as `TF_AGG_COUNT`): its

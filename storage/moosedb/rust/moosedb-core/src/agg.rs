@@ -7,9 +7,11 @@
 //! [`AggResult`]. Deletes are applied by [`crate::scan::visible_stretches`],
 //! the same code the scans use.
 //!
-//! * **Keys**: the series (one state per series, a tight loop over the window)
-//!   and/or common columns (Int64/Timestamp/Bool as integers, Varchar/Decimal
-//!   as bytes). NULL is a value of its own. Keys come from the client, so the
+//! * **Keys**: the series (one state per series, a tight loop over the window),
+//!   common columns (Int64/Timestamp/Bool as integers, Varchar/Decimal as
+//!   bytes) and/or the VALUE of a TAG ([`KeySpec::Tag`]: several series, one
+//!   group; read from the series entry once per window, never per row). NULL
+//!   is a value of its own. Keys come from the client, so the
 //!   group tables hash them with SipHash-1-3 under a random per-run key
 //!   (`RandomState`), never the fast internal hash. The table itself is an
 //!   open-addressing index over a key arena (one allocation for all keys of a
@@ -120,6 +122,13 @@ pub enum KeySpec {
     /// bucket, `floor(v / width) * width` (floor, so instants before 1970 fall in the bucket
     /// that contains them). NULL is its own group.
     Bucket(usize, i64),
+    /// The value of the TAG column `c` of the row's series (a string or NULL), taken
+    /// from the series entry once per window, never decoded per row: several series
+    /// that share the value are ONE group (unlike [`KeySpec::Series`]).
+    Tag(usize),
+    /// [`KeySpec::Tag`] under a binary PAD SPACE collation, as [`KeySpec::ColumnPad`]:
+    /// trailing 0x20 bytes ignored, the shortest value returned.
+    TagPad(usize),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -212,9 +221,8 @@ pub struct AggSpec {
     /// (keys, value) pair lives in one pass, so the per-pass counts add up to
     /// the exact distinct count. With no other key the result has one group,
     /// or none when no row qualified (the caller supplies the zero). Not with a
-    /// top-N, and not with a `ColumnPad` among the other keys (shortcut: the
-    /// shortest-value rule of a PAD key is not kept across the merge; do it
-    /// when a PAD SPACE `GROUP BY` needs it).
+    /// top-N. A PAD key among the others keeps its shortest value across the
+    /// collapse.
     pub distinct: Option<usize>,
     /// Budget in bytes (keys, states, overhead, result).
     pub max_memory: usize,
@@ -364,8 +372,9 @@ impl KeyCol {
         }
     }
 
-    /// Appends the identity of row `i` to `out` (unambiguous: NULL flag, length prefix).
-    fn encode(&self, i: usize, out: &mut Vec<u8>) {
+    /// Appends the identity of row `i` to `out` (unambiguous: NULL flag, length prefix);
+    /// `pad`: bytes without their trailing 0x20.
+    fn encode(&self, i: usize, pad: bool, out: &mut Vec<u8>) {
         match self {
             KeyCol::Series(v) => out.extend_from_slice(&v[i].to_le_bytes()),
             KeyCol::Int { nulls, vals } => {
@@ -375,8 +384,10 @@ impl KeyCol {
             KeyCol::Bytes { nulls, starts, lens, data } => {
                 out.push(u8::from(nulls[i]));
                 let s = starts[i] as usize;
-                out.extend_from_slice(&lens[i].to_le_bytes());
-                out.extend_from_slice(&data[s..s + lens[i] as usize]);
+                let b = &data[s..s + lens[i] as usize];
+                let b = if pad { trim_spaces(b) } else { b };
+                out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+                out.extend_from_slice(b);
             }
         }
     }
@@ -413,6 +424,13 @@ impl KeyCol {
 fn collapse(r: AggResult, spec: &AggSpec, raw_d: Option<usize>) -> Result<AggResult> {
     let nf = spec.funcs.len();
     let kept: Vec<usize> = (0..r.keys.len()).filter(|&i| Some(i) != raw_d).collect();
+    // The spec key of each column of `r` (a collapsed `r` has none for `distinct`).
+    let src: Vec<usize> = (0..spec.keys.len()).filter(|&i| raw_d.is_some() || Some(i) != spec.distinct).collect();
+    let is_pad = |k: usize| matches!(src.get(k).map(|&i| spec.keys[i]), Some(KeySpec::ColumnPad(_) | KeySpec::TagPad(_)));
+    // Positions in `kept` of the PAD keys: grouped trimmed, returned as the group's shortest value.
+    let pads: Vec<usize> = (0..kept.len()).filter(|&j| is_pad(kept[j])).collect();
+    let len_at = |k: usize, i: usize| if let KeyCol::Bytes { lens, .. } = &r.keys[k] { lens[i] } else { 0 };
+    let mut short: Vec<u32> = Vec::new();
     let mut index: HashMap<Vec<u8>, u32> = HashMap::new();
     let mut first: Vec<u32> = Vec::new();
     let mut accs: Vec<Acc> = Vec::new();
@@ -421,12 +439,20 @@ fn collapse(r: AggResult, spec: &AggSpec, raw_d: Option<usize>) -> Result<AggRes
     for i in 0..r.groups {
         buf.clear();
         for &k in &kept {
-            r.keys[k].encode(i, &mut buf);
+            r.keys[k].encode(i, is_pad(k), &mut buf);
         }
         let g = match index.get(&buf) {
-            Some(&g) => g as usize,
+            Some(&g) => {
+                let g = g as usize;
+                for (pi, &j) in pads.iter().enumerate() {
+                    let m = &mut short[g * pads.len() + pi];
+                    *m = (*m).min(len_at(kept[j], i));
+                }
+                g
+            }
             None => {
-                est = est.saturating_add(buf.len() + GROUP_OVERHEAD + 24 * (nf + 1));
+                short.extend(pads.iter().map(|&j| len_at(kept[j], i)));
+                est = est.saturating_add(buf.len() + GROUP_OVERHEAD + 24 * (nf + 1) + 4 * pads.len());
                 if est > spec.max_memory {
                     return Err(budget_error(spec.max_memory));
                 }
@@ -474,7 +500,16 @@ fn collapse(r: AggResult, spec: &AggSpec, raw_d: Option<usize>) -> Result<AggRes
             }
         }
     }
-    Ok(AggResult { groups: first.len(), keys: kept.iter().map(|&k| r.keys[k].take(&first)).collect(), funcs })
+    let mut keys: Vec<KeyCol> = kept.iter().map(|&k| r.keys[k].take(&first)).collect();
+    // Every value of a group is its trimmed bytes plus spaces: cutting one to the shortest length gives the shortest.
+    for (pi, &j) in pads.iter().enumerate() {
+        if let KeyCol::Bytes { lens, .. } = &mut keys[j] {
+            for (g, l) in lens.iter_mut().enumerate() {
+                *l = short[g * pads.len() + pi];
+            }
+        }
+    }
+    Ok(AggResult { groups: first.len(), keys, funcs })
 }
 
 // ─── handle ──────────────────────────────────────────────────────────────────
@@ -524,9 +559,6 @@ impl Agg {
         if let Some(d) = spec.distinct {
             if d >= spec.keys.len() || spec.top.is_some() {
                 return Err(invalid("distinct needs a key of the spec and no top-N"));
-            }
-            if spec.keys.iter().enumerate().any(|(i, k)| i != d && matches!(k, KeySpec::ColumnPad(_))) {
-                return Err(invalid("distinct does not support a PAD SPACE key besides its own"));
             }
         }
         // Over the budget, a run with a column key is redone in passes, each
@@ -793,7 +825,7 @@ struct Plan<'a> {
     snap: &'a Snapshot,
     filter: &'a ResolvedFilter,
     keys: Vec<KeySpec>,
-    /// The functions of the spec, then one hidden `Min` per [`KeySpec::ColumnPad`]
+    /// The functions of the spec, then one hidden `Min` per [`KeySpec::ColumnPad`] / [`KeySpec::TagPad`]
     /// (the shortest raw length seen in the group, see `pad_slots`).
     funcs: Vec<FuncSpec>,
     /// Functions of the spec: `funcs[..nuf]`.
@@ -887,6 +919,12 @@ impl<'a> Plan<'a> {
         for k in &spec.keys {
             match *k {
                 KeySpec::Series => kinds.push(Kind::Int),
+                KeySpec::Tag(c) | KeySpec::TagPad(c) => {
+                    if col(c)?.ty != ColumnType::Tag {
+                        return Err(invalid(format!("column {c} is not a TAG")));
+                    }
+                    kinds.push(Kind::Bytes);
+                }
                 KeySpec::Column(c) | KeySpec::ColumnPad(c) | KeySpec::Bucket(c, _) => {
                     let kind = key_kind(col(c)?.ty).ok_or_else(|| {
                         invalid(format!("column {c} cannot be a group key (use the series for TAGs)"))
@@ -934,7 +972,7 @@ impl<'a> Plan<'a> {
         let mut funcs = spec.funcs.clone();
         let mut pad_slots = Vec::new();
         for (j, k) in spec.keys.iter().enumerate() {
-            if let KeySpec::ColumnPad(c) = *k {
+            if let KeySpec::ColumnPad(c) | KeySpec::TagPad(c) = *k {
                 pad_slots.push((j, c, funcs.len()));
                 funcs.push(FuncSpec::Min(c));
             }
@@ -1369,6 +1407,29 @@ fn bucket_of(key: &KeySpec, v: i64) -> i64 {
     }
 }
 
+/// Appends the key image of value `v` under `key`, as [`Col::encode`] does for a decoded row.
+fn encode_value(key: &KeySpec, v: &Value, out: &mut Vec<u8>) -> Result<()> {
+    match v {
+        Value::Null => out.push(0),
+        Value::Int(i) | Value::Timestamp(i) => {
+            out.push(1);
+            out.extend_from_slice(&bucket_of(key, *i).to_le_bytes());
+        }
+        Value::Bool(b) => {
+            out.push(1);
+            out.extend_from_slice(&i64::from(*b).to_le_bytes());
+        }
+        Value::Bytes(b) => {
+            let b = if matches!(key, KeySpec::ColumnPad(_) | KeySpec::TagPad(_)) { trim_spaces(b) } else { b.as_slice() };
+            out.push(1);
+            out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+            out.extend_from_slice(b);
+        }
+        _ => return Err(corrupt("unexpected value type in a key column")),
+    }
+    Ok(())
+}
+
 impl FilterSet {
     fn accepts_row(&self, col: &Col<'_>, i: usize, last: &mut Option<(i64, bool)>) -> Result<bool> {
         if col.is_null(i) {
@@ -1596,6 +1657,8 @@ struct Local {
     /// Part of `bytes` not charged to the shared budget yet.
     pending: usize,
     scratch: Vec<u8>,
+    /// End of each series / TAG part of `scratch` in a stretch (see `stretch`).
+    fixed_ends: Vec<usize>,
     last: Vec<u8>,
     last_gid: u32,
     gids: Vec<u32>,
@@ -1619,6 +1682,7 @@ impl Local {
             bytes: 0,
             pending: 0,
             scratch: Vec::new(),
+            fixed_ends: Vec::new(),
             last: Vec::new(),
             last_gid: NONE,
             gids: Vec::new(),
@@ -1731,8 +1795,9 @@ impl Local {
         Ok(g)
     }
 
-    /// Rows `[a, b)` of the decoded window of a chunk entry of series `sid`.
-    fn stretch(&mut self, p: &Plan<'_>, win: &Window, sid: u64, a: usize, b: usize) -> Result<()> {
+    /// Rows `[a, b)` of the decoded window of a chunk entry of series `sid`
+    /// with TAG values `tags`.
+    fn stretch(&mut self, p: &Plan<'_>, win: &Window, sid: u64, tags: &[Value], a: usize, b: usize) -> Result<()> {
         let n = b - a;
         let filtered = !p.filters.is_empty();
         if filtered {
@@ -1748,23 +1813,37 @@ impl Local {
                 }
             }
         }
-        // Series part of the key (the same for the whole stretch).
+        // Series and TAG parts of the key (the same for the whole stretch), one after
+        // the other in key order; `fixed_ends` ends each.
         self.scratch.clear();
+        self.fixed_ends.clear();
         let mut cols: Vec<(usize, Col<'_>)> = Vec::new();
         for (k, key) in p.keys.iter().enumerate() {
             match *key {
                 KeySpec::Series => self.scratch.extend_from_slice(&sid.to_le_bytes()),
-                KeySpec::Column(c) | KeySpec::ColumnPad(c) | KeySpec::Bucket(c, _) => cols.push((k, Col::of(win, c, b)?)),
+                KeySpec::Tag(c) | KeySpec::TagPad(c) => {
+                    let v = p.snap.schema.tag_position(c).and_then(|t| tags.get(t));
+                    encode_value(key, v.ok_or_else(|| corrupt("series entry without the TAG"))?, &mut self.scratch)?;
+                }
+                KeySpec::Column(c) | KeySpec::ColumnPad(c) | KeySpec::Bucket(c, _) => {
+                    cols.push((k, Col::of(win, c, b)?));
+                    continue;
+                }
             }
+            self.fixed_ends.push(self.scratch.len());
         }
         let mut gids = std::mem::take(&mut self.gids);
         gids.clear();
         let g = if p.col_keys {
-            self.rows_to_groups(p, &cols, sid, a, b, &mut gids)?;
+            let fixed = std::mem::take(&mut self.scratch);
+            let fixed_ends = std::mem::take(&mut self.fixed_ends);
+            let r = self.rows_to_groups(p, &cols, &fixed, &fixed_ends, a, b, &mut gids);
+            (self.scratch, self.fixed_ends) = (fixed, fixed_ends);
+            r?;
             None
         } else {
-            // A stretch with no accepted row must not create its group.
-            if filtered && !self.keep.iter().any(|&k| k) {
+            // A stretch with no accepted row must not create its group; nor one of another pass.
+            if (filtered && !self.keep.iter().any(|&k| k)) || (p.passes > 1 && !p.in_pass(p.hash(&self.scratch))) {
                 self.gids = gids;
                 return Ok(());
             }
@@ -1780,7 +1859,7 @@ impl Local {
             Some(g) => Gid::One(g),
             None => Gid::Rows(&gids),
         };
-        let res = self.fold_all(p, win, a, b, gid);
+        let res = self.fold_all(p, win, tags, a, b, gid);
         self.gids = gids;
         res
     }
@@ -1789,11 +1868,14 @@ impl Local {
     /// (`NONE` for rows the filters dropped), creating groups as needed. A row
     /// whose key columns equal those of the kept row before it shares its
     /// image; the distinct images are looked up in batches (see `Groups::warm`).
+    /// `fixed` holds the series / TAG key parts of the stretch, `fixed_ends` ends each.
+    #[allow(clippy::too_many_arguments)]
     fn rows_to_groups(
         &mut self,
         p: &Plan<'_>,
         cols: &[(usize, Col<'_>)],
-        sid: u64,
+        fixed: &[u8],
+        fixed_ends: &[usize],
         a: usize,
         b: usize,
         gids: &mut Vec<u32>,
@@ -1821,10 +1903,15 @@ impl Local {
                     }
                 }
                 let start = bt.imgs.len();
-                let mut at = 0;
+                let (mut at, mut fx) = (0, 0);
                 for spec in &p.keys {
                     match spec {
-                        KeySpec::Series => bt.imgs.extend_from_slice(&sid.to_le_bytes()),
+                        KeySpec::Series | KeySpec::Tag(_) | KeySpec::TagPad(_) => {
+                            let from = if fx == 0 { 0 } else { fixed_ends[fx - 1] };
+                            let to = *fixed_ends.get(fx).ok_or_else(|| corrupt("fixed key list"))?;
+                            bt.imgs.extend_from_slice(&fixed[from..to]);
+                            fx += 1;
+                        }
                         KeySpec::Column(_) | KeySpec::ColumnPad(_) | KeySpec::Bucket(..) => {
                             let Some((_, c)) = cols.get(at) else { return Err(corrupt("key column list")) };
                             c.encode(spec, i, &mut bt.imgs)?;
@@ -1881,12 +1968,21 @@ impl Local {
         Ok(())
     }
 
-    fn fold_all(&mut self, p: &Plan<'_>, win: &Window, a: usize, b: usize, gid: Gid<'_>) -> Result<()> {
+    fn fold_all(&mut self, p: &Plan<'_>, win: &Window, tags: &[Value], a: usize, b: usize, gid: Gid<'_>) -> Result<()> {
         let nf = p.funcs.len();
         let ts = p.snap.schema.ts_index();
         let accs = &mut self.groups.accs;
         // Shortest raw length of each PAD key per group (the key image is trimmed).
-        for &(_, c, fi) in &p.pad_slots {
+        for &(j, c, fi) in &p.pad_slots {
+            if matches!(p.keys[j], KeySpec::TagPad(_)) {
+                // one length for the whole stretch; a NULL TAG leaves the minimum unset
+                if let Some(Value::Bytes(v)) = p.snap.schema.tag_position(c).and_then(|t| tags.get(t)) {
+                    self.padlens.clear();
+                    self.padlens.resize(b, v.len() as i64);
+                    kernel::<FMin>(accs, nf, fi, &self.padlens, &[], a, b, gid);
+                }
+                continue;
+            }
             let col = Col::of(win, c, b)?;
             self.padlens.clear();
             self.padlens.resize(a, 0);
@@ -1948,24 +2044,12 @@ impl Local {
             for key in &p.keys {
                 match *key {
                     KeySpec::Series => self.scratch.extend_from_slice(&m.series_id.to_le_bytes()),
-                    KeySpec::Column(c) | KeySpec::ColumnPad(c) | KeySpec::Bucket(c, _) => match cell(m, c)? {
-                        Value::Null => self.scratch.push(0),
-                        Value::Int(i) | Value::Timestamp(i) => {
-                            self.scratch.push(1);
-                            self.scratch.extend_from_slice(&bucket_of(key, *i).to_le_bytes());
-                        }
-                        Value::Bool(b) => {
-                            self.scratch.push(1);
-                            self.scratch.extend_from_slice(&i64::from(*b).to_le_bytes());
-                        }
-                        Value::Bytes(b) => {
-                            let b = if matches!(key, KeySpec::ColumnPad(_)) { trim_spaces(b) } else { b.as_slice() };
-                            self.scratch.push(1);
-                            self.scratch.extend_from_slice(&(b.len() as u32).to_le_bytes());
-                            self.scratch.extend_from_slice(b);
-                        }
-                        _ => return Err(corrupt("unexpected value type in a key column")),
-                    },
+                    // a MemTable row carries its TAG values
+                    KeySpec::Column(c)
+                    | KeySpec::ColumnPad(c)
+                    | KeySpec::Bucket(c, _)
+                    | KeySpec::Tag(c)
+                    | KeySpec::TagPad(c) => encode_value(key, cell(m, c)?, &mut self.scratch)?,
                 }
             }
             if p.passes > 1 && !p.in_pass(p.hash(&self.scratch)) {
@@ -2087,9 +2171,9 @@ impl Plan<'_> {
                         if tick % 16 == 0 && stop_requested(self) {
                             return Ok(());
                         }
-                        let sid = e.series_id;
+                        let (sid, tags) = (e.series_id, &e.tags);
                         visible_stretches(self.snap, chunk, si, (f.ts_min, f.ts_max), &self.want, |win, a, b| {
-                            local.stretch(self, win, sid, a, b)?;
+                            local.stretch(self, win, sid, tags, a, b)?;
                             local.maybe_flush(self)
                         })?;
                     }
@@ -2306,7 +2390,7 @@ impl Plan<'_> {
         match (self.keys[0], self.kinds[0]) {
             (KeySpec::Series, _) => series_of(a).cmp(&series_of(b)),
             (_, Kind::Int) => int_of(a).cmp(&int_of(b)),
-            (KeySpec::ColumnPad(_), _) => match (bytes_of(a), bytes_of(b)) {
+            (KeySpec::ColumnPad(_) | KeySpec::TagPad(_), _) => match (bytes_of(a), bytes_of(b)) {
                 (Some(x), Some(y)) => pad_cmp(x, y),
                 (x, y) => x.cmp(&y),
             },

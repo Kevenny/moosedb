@@ -136,13 +136,14 @@ enum class bfmt : uint8_t { NONE, DATE, DAY, HOUR, MIN, SEC };
 struct gkey
 {
   Field *field= nullptr;
-  bool is_tag= false;
+  bool is_tag= false;              /* TAG read from the series (collation-merged string): series key + merge */
+  bool tag_val= false;             /* TAG grouped by its value in the core (integer, exact or PAD binary) */
   int tag_pos= -1;
-  uint32_t col= 0;                 /* layout column (non-TAG keys)          */
+  uint32_t col= 0;                 /* layout column (non-is_tag keys)       */
   CHARSET_INFO *cs= nullptr;       /* strings                               */
   bool is_str= false;
   bool is_unsigned= false;
-  bool pad= false;                 /* non-TAG string, binary PAD SPACE: the core trims and groups it */
+  bool pad= false;                 /* non-is_tag string, binary PAD SPACE: the core trims and groups it */
   int res= -1;                     /* key index in the core's result        */
   bfmt bucket= bfmt::NONE;          /* a time bucket of the DATETIME column `field` (DATE() / DATE_FORMAT()) */
   int64_t width= 0;                /* bucket: width in microseconds         */
@@ -394,12 +395,15 @@ const char *key_refusal(gplan *p, Field *f)
       if (!is_int_field(f) && f->cmp_type() != STRING_RESULT)
         return "GROUP BY: unsupported column type";
       const tf_layout *l= p->handler->moosedb_layout();
-      k.is_tag= true;
       k.tag_pos= l ? l->tag_position(f->field_index) : -1;
-      if (k.tag_pos < 0)
+      if (k.tag_pos < 0 || p->layout_col(f) < 0)
         return "GROUP BY: unsupported column type";
       k.is_str= !is_int_field(f);
-      p->has_series= true;
+      /* the core groups by the TAG bytes: only where equal bytes (or trimmed bytes) is the collation's equality */
+      k.tag_val= !k.is_str || cs_exact(f->charset()) || cs_pad_bin(f->charset());
+      k.is_tag= !k.tag_val;
+      k.col= (uint32_t) p->layout_col(f);
+      p->has_series|= k.is_tag;
     }
     else if (c == tf_conv::INT && is_int_field(f))
     {
@@ -1138,14 +1142,15 @@ const char *analyze(THD *thd, Query *q, gplan *p)
     the handler's own tiebreak (cmp_raw) for these keys, so the K groups kept are
     the same. A binary PAD SPACE key (gkey::pad) is grouped by the core on the
     trimmed value, so need_merge stays false, and its tiebreak is the collation
-    order (pad_cmp in agg.rs = strnncollsp). Not for a TAG key (tiebreak by
-    series id, not by TAG value, and series may need merging), a _ci/_ai or
-    other collation-merged string (the core would need the collation weights),
-    BIGINT UNSIGNED (core compares signed), AVG, HAVING, a second ORDER BY term
-    other than the key ASC, or no GROUP BY.
+    order (pad_cmp in agg.rs = strnncollsp). A string TAG grouped by value
+    (tag_val) ties the same way. Not for a series-keyed TAG (tiebreak by series
+    id), an integer TAG (the core ties by its decimal text, not by the number),
+    a _ci/_ai or other collation-merged string (the core would need the
+    collation weights), BIGINT UNSIGNED (core compares signed), AVG, HAVING, a
+    second ORDER BY term other than the key ASC, or no GROUP BY.
   */
   if (!p->has_having && p->limit != HA_POS_ERROR && p->limit > 0 && !p->has_series && p->dkey < 0 &&
-      !p->need_merge && p->keys.size() == 1 &&
+      !p->need_merge && p->keys.size() == 1 && !(p->keys[0].tag_val && !p->keys[0].is_str) &&
       (p->order.size() == 1 ||
        /* ORDER BY aggregate, the key ASC: the SQL order is total and the second term is exactly the core's
           tiebreak (signed integer, unsigned bytes with the shorter prefix first, NULL first). For a binary
@@ -1165,30 +1170,12 @@ const char *analyze(THD *thd, Query *q, gplan *p)
   if (p->core_distinct)
   {
     for (size_t j= 0; j < p->keys.size(); j++)
-      if ((int) j != p->dkey && p->keys[j].pad)   /* the core refuses a PAD key other than the distinct one */
-        return "aggregate: COUNT(DISTINCT) with a PAD SPACE group key";
-      else if ((int) j != p->dkey && !p->keys[j].is_tag && p->keys[j].is_str && !cs_exact(p->keys[j].cs))
+      if ((int) j != p->dkey && !p->keys[j].is_tag && p->keys[j].is_str && !cs_exact(p->keys[j].cs) && !p->keys[j].pad)
         /* the core groups by bytes; merging 'a' and 'A' afterwards would add up distinct counts */
         return "aggregate: COUNT(DISTINCT) with a collation-merged group key";
+    /* only a collation-merged (_ci/_ai) TAG keeps the series key: its per-series counts cannot be summed */
     if (p->has_series)
-    {
-      /* per-series counts cannot be summed: only when every series is its own group (all TAGs grouped, exact) */
-      const tf_layout *l= p->handler->moosedb_layout();
-      if (!l)
-        return "internal: no layout";
-      size_t ntag= 0, ngrouped= 0;
-      for (const tf_column &c : l->columns)
-        ntag+= c.conv == tf_conv::TAG;
-      for (const gkey &k : p->keys)
-        if (k.is_tag)
-        {
-          ngrouped++;
-          if (k.is_str && !cs_exact(k.cs))
-            return "aggregate: COUNT(DISTINCT) with a collation-merged TAG group key";
-        }
-      if (ngrouped != ntag)
-        return "aggregate: COUNT(DISTINCT) grouped by some of the TAGs";
-    }
+      return "aggregate: COUNT(DISTINCT) with a collation-merged TAG group key";
   }
   /* The core's own limits (agg.rs MAX_KEYS, MAX_FUNCS, MAX_FILTERS): beyond them it fails, the normal path must run instead. */
   if (p->keys.size() > 16 || p->funcs.size() > 64 || p->filters.size() > 16)
@@ -1558,7 +1545,10 @@ int moosedb_gbh::compute()
     keys.push_back(TFAggKey{TF_AGG_KEY_SERIES, 0, 0});
   for (const gkey &k : p_.keys)
     if (!k.is_tag)
-      keys.push_back(TFAggKey{(uint8_t) (k.bucket != bfmt::NONE ? TF_AGG_KEY_BUCKET : k.pad ? TF_AGG_KEY_COLUMN_PAD : TF_AGG_KEY_COLUMN), k.col, (int64_t) k.width});
+      keys.push_back(TFAggKey{(uint8_t) (k.tag_val ? (k.pad ? TF_AGG_KEY_TAG_PAD : TF_AGG_KEY_TAG)
+                                         : k.bucket != bfmt::NONE ? TF_AGG_KEY_BUCKET
+                                         : k.pad ? TF_AGG_KEY_COLUMN_PAD : TF_AGG_KEY_COLUMN),
+                              k.col, (int64_t) k.width});
 
   /*
     The series ids of a TAG filter and the aggregation snapshot are two calls:
@@ -1710,7 +1700,7 @@ int moosedb_gbh::compute()
       return fail("internal: bad COUNT(DISTINCT) plan");
     cfuncs.erase(cfuncs.begin() + p_.dfunc);   /* the core appends the distinct count as its last function */
     spec.has_distinct= 1;
-    spec.distinct_key= (uint32_t) keys.size() - 1;   /* c is the last non-TAG key: added after the GROUP BY ones */
+    spec.distinct_key= (uint32_t) keys.size() - 1;   /* c is the last key: added after the GROUP BY ones */
   }
   spec.funcs= cfuncs.empty() ? nullptr : cfuncs.data();
   spec.func_count= (uint32_t) cfuncs.size();
@@ -1946,6 +1936,16 @@ int moosedb_gbh::build_mask(const gfilter &f, std::vector<uint8_t> *mask,
   return rc;
 }
 
+/* An integer TAG value: its canonical decimal text. */
+static bool parse_int_tag(const char *p, size_t len, bool is_unsigned, int64_t *out)
+{
+  const std::string txt(p, len);
+  char *end= nullptr;
+  errno= 0;
+  *out= is_unsigned ? (int64_t) strtoull(txt.c_str(), &end, 10) : (int64_t) strtoll(txt.c_str(), &end, 10);
+  return !errno && end && end != txt.c_str() && !*end;
+}
+
 /* Series ids -> the TAG values of the key columns. */
 int moosedb_gbh::fetch_tags(const uint64_t *ids, uint64_t n)
 {
@@ -1986,15 +1986,7 @@ int moosedb_gbh::fetch_tags(const uint64_t *ids, uint64_t n)
       }
       else
       {
-        /* integer TAG: canonical decimal text */
-        const std::string txt(sp, s.len);
-        char *end= nullptr;
-        errno= 0;
-        if (k.is_unsigned)
-          c.v= (int64_t) strtoull(txt.c_str(), &end, 10);
-        else
-          c.v= (int64_t) strtoll(txt.c_str(), &end, 10);
-        if (errno || !end || end == txt.c_str() || *end)
+        if (!parse_int_tag(sp, s.len, k.is_unsigned, &c.v))
           return fail("unreadable integer TAG value");
       }
     }
@@ -2129,15 +2121,23 @@ int moosedb_gbh::build_groups(const TFAggBatch &b)
         c.null= 1;
         continue;
       }
-      if (k.is_str)
+      if (k.is_str || k.tag_val)
       {
         if (kb.kind != TF_AGG_KEYCOL_BYTES || !kb.starts || !kb.lens ||
             (!kb.data && kb.lens[g]) || kb.starts[g] + kb.lens[g] > kb.data_len)
           return fail("internal: bad string key column");
-        if (!arena_add(kb.lens[g] ? (const char *) kb.data + kb.starts[g] : "",
-                       kb.lens[g], &c.v))
-          return HA_ERR_RECORD_FILE_FULL;
-        c.len= kb.lens[g];
+        const char *bp= kb.lens[g] ? (const char *) kb.data + kb.starts[g] : "";
+        if (!k.is_str)
+        {
+          if (!parse_int_tag(bp, kb.lens[g], k.is_unsigned, &c.v))
+            return fail("unreadable integer TAG value");
+        }
+        else
+        {
+          if (!arena_add(bp, kb.lens[g], &c.v))
+            return HA_ERR_RECORD_FILE_FULL;
+          c.len= kb.lens[g];
+        }
       }
       else
       {

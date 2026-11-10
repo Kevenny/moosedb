@@ -276,8 +276,9 @@ pub(crate) fn rows_delete_entry(seq: u64, mem: &[&[Value]], hits: &[RowsTomb]) -
 pub(crate) const MAX_DELETE_ENTRY: usize = 8 << 20;
 /// Largest COMMIT_UPDATE the writer produces (only the DELETE part embedded in
 /// it is decoded with this bound; a standalone DELETE keeps `MAX_DELETE_ENTRY`).
-/// A statement whose pairs need more is refused.
-pub(crate) const MAX_UPDATE_ENTRY: usize = 32 << 20;
+/// A statement whose pairs need more is refused. 128 MiB is under `MAX_ENTRY` (1 GiB, what the reader
+/// and `append` accept), so replay reads it like any entry; ~4 x the default MEMTABLE_SIZE of pairs fits (measured below in moosedb-tests/tests/big_update.rs).
+pub(crate) const MAX_UPDATE_ENTRY: usize = 128 << 20;
 
 pub(crate) fn decode_delete_capped(payload: &[u8], cap: usize) -> Result<DeleteEntry> {
     if payload.len() > cap {

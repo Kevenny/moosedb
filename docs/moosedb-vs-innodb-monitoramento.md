@@ -18,7 +18,7 @@ Storage engine **time-series** para MariaDB 11.4+, carregada como plugin
 | Leitura | varredura em streaming, poda por chunk (zone maps), Bloom por chunk, pushdown de `=`/`IN` em colunas TAG, índices compostos `(TAGs…, tempo)` |
 | Chave única | `PRIMARY KEY`/`UNIQUE` no formato `(TAGs…, tempo[, extras])` — a PK do histórico do Zabbix funciona |
 | `DELETE` | suportado (tombstones); caminho direto por série + faixa de tempo em µs–ms |
-| `UPDATE` | suportado (fase 1): `UPDATE`, `REPLACE` e `ON DUPLICATE KEY UPDATE` sobre chave existente, atômicos por statement; colunas da chave única não mudam; até ~150 k linhas por statement |
+| `UPDATE` | suportado (fase 1): `UPDATE`, `REPLACE` e `ON DUPLICATE KEY UPDATE` sobre chave existente, atômicos por statement; colunas da chave única não mudam; até ~600 k linhas por statement (4 x MEMTABLE_SIZE) |
 | Retenção | `RETENTION_PERIOD` por tabela: apaga chunks inteiros |
 | Compressão | delta-of-delta, Simple8b, Gorilla, RLE + LZ4 (quente) / ZSTD (frio) |
 | Agregação na engine | `group_by_handler` opcional (`moosedb_group_by_pushdown`, padrão ON) |
@@ -80,10 +80,10 @@ Com o Zabbix 7.0.31 real (DDL oficial + `COMMENT 'TAG'` + `TIMESTAMP_COLUMN`):
 | Situação | Impacto | Números |
 |---|---|---|
 | Filtro em coluna **não-TAG** (ex.: `file = 'x'`) | sem índice secundário: Bloom por série poda ~98 % e a engine filtra as linhas, mas ainda lê a coluna das séries restantes | 20 M linhas: 0,048 s vs **0,011 s** do InnoDB com `KEY(file)` (com 1 dia: 0,012 vs 0,009 s); valor popular (587 mil linhas) 0,64 s vs 28 s do InnoDB |
-| **Milhões de séries com poucas linhas** cada | custo por série | 1 M séries: `COUNT(*) WHERE` 1,4–1,6 s vs 0,07 s; `COUNT(DISTINCT)` ~1,45 s vs ~0,2 s |
+| **Milhões de séries com poucas linhas** cada | custo por série (2–3 buscas no cache de blocos por série) | 1 M séries × 5 linhas: `COUNT(DISTINCT itemid)` 1,47 s vs 0,68 s; `COUNT(*) WHERE` 0,19 s vs 0,30 s com a agregação na engine (padrão), 1,7 s sem ela; 1ª abertura da tabela 2,4 s |
 | Housekeeper **por item** (DELETE por itemid) | fsync por statement | 8,4 s vs 5,7 s (1,5x mais lento) — use `RETENTION_PERIOD` |
 | `INSERT … ON DUPLICATE KEY UPDATE` de linhas existentes | cada linha é procurada três vezes (checagem da chave, releitura pelo servidor, busca por conteúdo no commit) | 5.000 linhas: 27–55 ms vs **17–25 ms** (1,5–2,2x mais lento; pior com a tabela grande em chunks) |
-| `UPDATE` grande ou frequente | statement inteiro precisa caber no buffer do lote; trava a tabela para escrita; linhas antigas ficam mortas até a compactação | teto ~150 k linhas/statement (64 MiB); repetir UPDATE de 100 k nas mesmas linhas sobe de ~255 para ~350 ms (linhas recém-atualizadas ficam no MemTable) |
+| `UPDATE` grande ou frequente | statement inteiro precisa caber em 4 x o buffer do lote (e no orçamento global de lotes); trava a tabela para escrita; linhas antigas ficam mortas até a compactação | teto ~600 k linhas/statement (4 x 64 MiB); repetir UPDATE de 100 k nas mesmas linhas sobe de ~255 para ~350 ms (linhas recém-atualizadas ficam no MemTable) |
 | `UPDATE` que muda a chave única, ou dentro de trigger/função de outro statement | **recusado** com erro | — |
 | Transação com rollback | `ROLLBACK` **não desfaz** statements MooseDB já terminados (como MyISAM); sem XA real | — |
 | Backup com `mariadb-backup` | **não copia** tabelas MooseDB (a engine faz o backup falhar em vez de ficar incompleto) | use `BACKUP STAGE` + snapshot de volume ou `mariadb-dump --lock-all-tables` |
@@ -126,11 +126,11 @@ Com o Zabbix 7.0.31 real (DDL oficial + `COMMENT 'TAG'` + `TIMESTAMP_COLUMN`):
 ### Checklist antes de produção
 
 - [ ] Ambiente aceita plugin `EXPERIMENTAL`.
-- [ ] `UPDATE`/upsert nas tabelas candidatas é ocasional, com menos de ~150 k linhas por statement e sem mudar a chave única.
+- [ ] `UPDATE`/upsert nas tabelas candidatas é ocasional, com menos de ~600 k linhas por statement e sem mudar a chave única.
 - [ ] Nenhuma escrita depende de `ROLLBACK` de transação multi-statement.
 - [ ] Backup ajustado (`BACKUP STAGE` + snapshot ou `mariadb-dump --lock-all-tables`).
 - [ ] Consultas principais filtram por TAG + tempo (conferir com `EXPLAIN`).
-- [ ] Número de séries dimensionado (~295 B de RAM por série no catálogo).
+- [ ] Número de séries dimensionado (~1 KB de RAM por série medido no processo ao abrir a tabela).
 
 ## 5. Não medido / limites deste documento
 
@@ -139,5 +139,5 @@ Com o Zabbix 7.0.31 real (DDL oficial + `COMMENT 'TAG'` + `TIMESTAMP_COLUMN`):
 * Ambiente do cliente: os labs rodam em Docker Desktop/WSL2 (24 vCPU, 32 GiB,
   SSD local) com tudo em memória; tempos absolutos mudam, as proporções tendem a
   se manter (o lab reproduziu as ordens de grandeza de um relatório de cliente).
-* Medidas de 1 M de séries do commit `c956438` (2026-10-30), com variação
+* Medidas de 1 M de séries remedidas em 2026-11-09 (commit `a1e9654`, 5 M linhas, 1 chunk), com variação
   alta entre rodadas.

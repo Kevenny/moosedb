@@ -138,6 +138,8 @@ pub struct Batch {
     /// Staged chunks, not listed in the MANIFEST.
     staged: Vec<Arc<ChunkMeta>>,
     spill_limit: usize,
+    /// What a statement with UPDATE pairs may hold: `UPDATE_LIMIT_FACTOR` x `spill_limit`.
+    update_limit: usize,
     /// Commit reached its point of no return, or the batch was cleaned up.
     finished: bool,
     /// UNIQUE key checks on (the default); off = `unique_checks = 0`.
@@ -168,10 +170,21 @@ struct Updates {
     pairs: Vec<(usize, Row)>,
 }
 
+/// An UPDATE statement may buffer this many times `MEMTABLE_SIZE`: its pairs wait
+/// in memory for the single COMMIT_UPDATE (`moosedb_batch_memory_budget` caps the sum).
+const UPDATE_LIMIT_FACTOR: usize = 4;
+
 fn update_too_big(limit: usize) -> Error {
     Error::Unsupported(format!(
-        "the statement's UPDATE rows do not fit the {limit} byte statement buffer; an UPDATE is applied atomically \
-         in memory and never spilled to staged chunks (split the statement)"
+        "the statement's UPDATE rows do not fit the {limit} byte limit (4 x MEMTABLE_SIZE, or the WAL entry cap); \
+         an UPDATE is applied atomically in memory and never spilled to staged chunks (split the statement)"
+    ))
+}
+
+fn update_over_budget(budget: u64) -> Error {
+    Error::Unsupported(format!(
+        "the UPDATE rows of the open statements would pass the {budget} byte moosedb_batch_memory_budget \
+         (retry when other statements finish, or split the statement)"
     ))
 }
 
@@ -236,6 +249,7 @@ impl Table {
             spilled: false,
             staged: Vec::new(),
             spill_limit,
+            update_limit: spill_limit.saturating_mul(UPDATE_LIMIT_FACTOR),
             finished: false,
             unique_checks: true,
             claimed: reserved(hint_series, unique_hint),
@@ -302,7 +316,7 @@ impl Batch {
         // alone instead of reporting an error for a row that was kept.
         if !self.rows.is_empty() && self.should_spill() {
             if self.upd.is_some() {
-                return Err(update_too_big(self.spill_limit));
+                return Err(update_too_big(self.update_limit));
             }
             self.spill()?;
         }
@@ -329,7 +343,7 @@ impl Batch {
     /// be equal in both rows, else `Unsupported`: the new row inherits the key
     /// of the old one and is not admitted again. `Unsupported` too if the
     /// statement already spilled or the pairs would pass the statement buffer
-    /// (`MEMTABLE_SIZE`): an update is never spilled. After an error the pair
+    /// (4 x `MEMTABLE_SIZE`, or the global batch budget): an update is never spilled. After an error the pair
     /// is not part of the batch and the batch stays usable.
     pub fn update(&mut self, old: Row, new: Row) -> Result<()> {
         if self.finished {
@@ -366,8 +380,14 @@ impl Batch {
         // index key, about its size) and its tags.
         let group_cost = if seen { 0 } else { row_bytes(&old) + row_bytes(&row_tags(&table.schema, &old)) };
         let cost = row_bytes(&old) + row_bytes(&new) + group_cost + std::mem::size_of::<(usize, Row)>();
-        if self.bytes + self.series_bytes + cost >= self.spill_limit {
-            return Err(update_too_big(self.spill_limit));
+        if self.bytes + self.series_bytes + cost >= self.update_limit {
+            return Err(update_too_big(self.update_limit));
+        }
+        // As for spills: a statement under MIN_FORCED_SPILL is never failed by
+        // the others' memory (the load/add race overshoots by one pair per thread).
+        let local = self.bytes + self.series_bytes + cost;
+        if local >= MIN_FORCED_SPILL && BATCH_BYTES.load(Ordering::Relaxed).saturating_add(cost as u64) > budget() {
+            return Err(update_over_budget(budget()));
         }
         let u = self.upd.get_or_insert_with(Default::default);
         let g = u.groups.add(&table.schema, old);
@@ -635,7 +655,7 @@ impl Batch {
     /// Whether the next write must first move the buffer to staged chunks.
     fn should_spill(&self) -> bool {
         let local = self.bytes + self.series_bytes;
-        if local >= self.spill_limit {
+        if local >= if self.upd.is_some() { self.update_limit } else { self.spill_limit } {
             return true;
         }
         // Pinning too many WAL segments (only a batch that still logs pins any).
@@ -768,7 +788,7 @@ impl Batch {
                         u.pairs.iter().zip(applied).filter(|(_, &ok)| ok).map(|(p, _)| p.1.as_slice()).collect();
                     let entry = wal::update_commit_entry(self.id, &news, &plan.entry(&*inner)?);
                     if entry.len() > wal::MAX_UPDATE_ENTRY {
-                        return Err(update_too_big(self.spill_limit));
+                        return Err(update_too_big(wal::MAX_UPDATE_ENTRY));
                     }
                     entry
                 }

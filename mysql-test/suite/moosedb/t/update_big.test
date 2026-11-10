@@ -1,0 +1,21 @@
+#
+# An UPDATE statement may buffer 4 x MEMTABLE_SIZE of pairs (a statement without
+# pairs spills at 1 x). 300 k rows: twice the old ceiling (~150 k), under the new
+# one (~600 k at the default 64 MiB). 800 k rows: refused, nothing applied.
+#
+--source include/have_sequence.inc
+--source suite/moosedb/include/have_moosedb.inc
+
+CREATE TABLE u (ts DATETIME NOT NULL, host VARCHAR(8) NOT NULL COMMENT 'TAG', v DOUBLE NOT NULL, INDEX(ts)) ENGINE=MooseDB CHUNK_INTERVAL='1 DAY';
+INSERT INTO u SELECT '2026-01-01' + INTERVAL seq SECOND, CONCAT('h', seq MOD 50), 1 FROM seq_1_to_300000;
+UPDATE u SET v = 2;
+SELECT COUNT(*) AS n, SUM(v) AS s FROM u;
+--echo # the same UPDATE again, over rows now in the MemTable and chunks
+UPDATE u SET v = v + 1;
+SELECT COUNT(*) AS n, SUM(v) AS s FROM u;
+
+INSERT INTO u SELECT '2026-02-01' + INTERVAL seq SECOND, CONCAT('h', seq MOD 50), 1 FROM seq_1_to_500000;
+--error ER_GET_ERRMSG
+UPDATE u SET v = 9;
+SELECT COUNT(*) AS n, SUM(v) AS s FROM u;
+DROP TABLE u;

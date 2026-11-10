@@ -257,7 +257,7 @@ SELECT * FROM metricas WHERE host = 'srv01' ORDER BY ts DESC LIMIT 10;
   `UPDATE` dentro de trigger ou função chamada por outro statement é **recusado**. Se a
   linha a atualizar sumir no meio do statement (DELETE concorrente), o statement falha
   (não é no-op). O statement inteiro precisa caber no buffer do lote (`MEMTABLE_SIZE`,
-  padrão 64 MiB; medido com `ts, host TAG, v DOUBLE`: 150 k linhas passam, 175 k não; ~450 B por par):
+  padrão 64 MiB) **vezes 4** (256 MiB), e também no orçamento global `moosedb_batch_memory_budget`; medido com `ts, host TAG, v DOUBLE`: ~628 k pares passam no padrão (antes 150 k), ~430 B por par:
   divida em statements menores. `UPDATE` e `DELETE` da mesma tabela no mesmo statement
   (multi-tabela) não são atômicos entre si: o DELETE é aplicado antes (caso raro).
   `DELETE` é suportado — ver [DELETE](#delete).

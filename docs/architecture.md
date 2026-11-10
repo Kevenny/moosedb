@@ -454,8 +454,9 @@ linhas ficam visíveis antes do fsync, como no INSERT. Tabela com chave única:
 TAGs, tempo e colunas extras têm de ser iguais nas duas linhas
 (`Unsupported`); a linha nova herda a chave e não passa pela admissão (o estado
 da série é invalidado, como num DELETE). Limite: o UPDATE **nunca faz spill** — se as
-linhas do lote com pares passarem de `MEMTABLE_SIZE` (ou a entrada de WAL de
-`MAX_UPDATE_ENTRY`, 32 MiB), `update`/`write`/`commit` recusam com
+linhas do lote com pares passarem de 4 × `MEMTABLE_SIZE` (ou do orçamento global
+de lotes, a partir de 1 MiB do próprio statement, ou a entrada de WAL de
+`MAX_UPDATE_ENTRY`, 128 MiB), `update`/`write`/`commit` recusam com
 `Unsupported`/erro e nada é aplicado. Em tabela UNIQUE, repetir a mesma linha
 antiga no lote (statement que atualiza a mesma chave duas vezes, p.ex. `REPLACE`
 com chave repetida) é recusado com `Unsupported`. No caminho estrito um fsync
@@ -475,8 +476,8 @@ por outro tipo de statement não é visto por `store_lock` (roda em `TL_WRITE_AL
 `update_row` o **recusa** (erro "UPDATE inside a trigger or stored function called by
 another statement is not supported on MooseDB tables"), exceto no applier de réplica
 (`slave_thread`). O par cuja linha antiga sumiu é **erro** do core (não no-op). Teto: o
-statement inteiro precisa caber no buffer do lote (`MEMTABLE_SIZE`, padrão 64 MiB; medido
-com (ts, host TAG, v DOUBLE): 150 k linhas passam, 175 k não; ~450 B por par, MEMTABLE_SIZE 64 MiB) — divida em statements menores. UPDATE+DELETE da mesma tabela no mesmo statement
+statement inteiro precisa caber em 4 x `MEMTABLE_SIZE` (padrão 64 MiB = 256 MiB) e no orçamento global de lotes (`moosedb_batch_memory_budget`, 1 GiB; recusa `Unsupported`); medido
+com (ts, host TAG, v DOUBLE): ~628 k pares passam no padrão, ~430 B por par; antes do "Design A" o teto era 1 x, 150 k; a entrada COMMIT_UPDATE do WAL passou de 32 para 128 MiB, abaixo de MAX_ENTRY = 1 GiB que o replay já aceita) — divida em statements menores. UPDATE+DELETE da mesma tabela no mesmo statement
 (multi-tabela) não são atômicos entre si: o DELETE é aplicado antes (caso raro). Sem projeção de colunas em
 `INSERT..SELECT`/`REPLACE..SELECT` com REPLACE/ODKU, e `update_row` recusa uma
 varredura projetada.

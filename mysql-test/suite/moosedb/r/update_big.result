@@ -1,0 +1,18 @@
+CREATE TABLE u (ts DATETIME NOT NULL, host VARCHAR(8) NOT NULL COMMENT 'TAG', v DOUBLE NOT NULL, INDEX(ts)) ENGINE=MooseDB CHUNK_INTERVAL='1 DAY';
+INSERT INTO u SELECT '2026-01-01' + INTERVAL seq SECOND, CONCAT('h', seq MOD 50), 1 FROM seq_1_to_300000;
+UPDATE u SET v = 2;
+SELECT COUNT(*) AS n, SUM(v) AS s FROM u;
+n	s
+300000	600000
+# the same UPDATE again, over rows now in the MemTable and chunks
+UPDATE u SET v = v + 1;
+SELECT COUNT(*) AS n, SUM(v) AS s FROM u;
+n	s
+300000	900000
+INSERT INTO u SELECT '2026-02-01' + INTERVAL seq SECOND, CONCAT('h', seq MOD 50), 1 FROM seq_1_to_500000;
+UPDATE u SET v = 9;
+ERROR HY000: Got error 1209 'unsupported: the statement's UPDATE rows do not fit the 268435456 byte limit (4 x MEMTABLE_SIZE, or the WAL entry cap); an UPDATE is applied atomically in memory and never spilled to staged chunks (sp' from MooseDB
+SELECT COUNT(*) AS n, SUM(v) AS s FROM u;
+n	s
+800000	1400000
+DROP TABLE u;

@@ -26,6 +26,9 @@ Note	1051	Unknown table 'mirror.t'
 # utf8mb4_general_ci: HAVING on the merged count
 # SELECT COUNT(*) c FROM t GROUP BY tg HAVING c > 150 ORDER BY c, tg
 # same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# utf8mb4_general_ci: COUNT(DISTINCT) of the plain column (NULLs skipped), alone and in one region
+# SELECT COUNT(DISTINCT pc) d, COUNT(pc) n, COUNT(*) c FROM t; SELECT COUNT(DISTINCT pc) d, SUM(v) s FROM t WHERE rg = 'r1'
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=2)
 # distinct groups: the engine merges exactly as the server does
 DROP TABLE test.t;
 DROP TABLE mirror.t;
@@ -55,6 +58,9 @@ Note	1051	Unknown table 'mirror.t'
 # uca1400_ai_ci: HAVING on the merged count
 # SELECT COUNT(*) c FROM t GROUP BY tg HAVING c > 150 ORDER BY c, tg
 # same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# uca1400_ai_ci: COUNT(DISTINCT) of the plain column (NULLs skipped), alone and in one region
+# SELECT COUNT(DISTINCT pc) d, COUNT(pc) n, COUNT(*) c FROM t; SELECT COUNT(DISTINCT pc) d, SUM(v) s FROM t WHERE rg = 'r1'
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=2)
 # distinct groups: the engine merges exactly as the server does
 DROP TABLE test.t;
 DROP TABLE mirror.t;
@@ -84,6 +90,9 @@ Note	1051	Unknown table 'mirror.t'
 # utf8mb4_bin: HAVING on the merged count
 # SELECT COUNT(*) c FROM t GROUP BY tg HAVING c > 150 ORDER BY c, tg
 # same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# utf8mb4_bin: COUNT(DISTINCT) of the plain column (NULLs skipped), alone and in one region
+# SELECT COUNT(DISTINCT pc) d, COUNT(pc) n, COUNT(*) c FROM t; SELECT COUNT(DISTINCT pc) d, SUM(v) s FROM t WHERE rg = 'r1'
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=2)
 # utf8mb4_bin: the key itself (exact collation)
 # SELECT tg, COUNT(*) c, SUM(v) s FROM t GROUP BY tg ORDER BY tg
 # same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
@@ -122,6 +131,9 @@ Note	1051	Unknown table 'mirror.t'
 # utf8mb4_nopad_bin: HAVING on the merged count
 # SELECT COUNT(*) c FROM t GROUP BY tg HAVING c > 150 ORDER BY c, tg
 # same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# utf8mb4_nopad_bin: COUNT(DISTINCT) of the plain column (NULLs skipped), alone and in one region
+# SELECT COUNT(DISTINCT pc) d, COUNT(pc) n, COUNT(*) c FROM t; SELECT COUNT(DISTINCT pc) d, SUM(v) s FROM t WHERE rg = 'r1'
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=2)
 # utf8mb4_nopad_bin: the key itself (exact collation)
 # SELECT tg, COUNT(*) c, SUM(v) s FROM t GROUP BY tg ORDER BY tg
 # same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
@@ -160,6 +172,9 @@ Note	1051	Unknown table 'mirror.t'
 # latin1_swedish_ci: HAVING on the merged count
 # SELECT COUNT(*) c FROM t GROUP BY tg HAVING c > 150 ORDER BY c, tg
 # same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# latin1_swedish_ci: COUNT(DISTINCT) of the plain column (NULLs skipped), alone and in one region
+# SELECT COUNT(DISTINCT pc) d, COUNT(pc) n, COUNT(*) c FROM t; SELECT COUNT(DISTINCT pc) d, SUM(v) s FROM t WHERE rg = 'r1'
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=2)
 # distinct groups: the engine merges exactly as the server does
 DROP TABLE test.t;
 DROP TABLE mirror.t;

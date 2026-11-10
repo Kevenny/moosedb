@@ -227,6 +227,12 @@ struct gplan
   bool scalar= false;              /* aggregates without GROUP BY: one group, one row, even over no rows */
   int top_func= -1;                /* core top-N: index into funcs, -1 = off */
   bool top_desc= false;
+  /*
+    COUNT(DISTINCT c), no GROUP BY: `c` is the only group key (dkey); dfunc is
+    a COUNT(c) of its own, made 0/1 per value of c and summed when the groups
+    are collapsed into the one row.
+  */
+  int dkey= -1, dfunc= -1;
 
   bool in_group(const Field *f) const
   {
@@ -268,7 +274,7 @@ struct gplan
   int add_func(uint8_t op, uint32_t col)
   {
     for (size_t i= 0; i < funcs.size(); i++)
-      if (funcs[i].op == op && funcs[i].col == col)
+      if ((int) i != dfunc && funcs[i].op == op && funcs[i].col == col)
         return (int) i;
     funcs.push_back(TFAggFunc{op, col});
     return (int) funcs.size() - 1;
@@ -336,6 +342,8 @@ bool bucket_key_of(gplan *p, Item *item, gkey *k)
   return true;
 }
 
+const char *key_refusal(gplan *p, Field *f);
+
 const char *group_by_refusal(gplan *p, ORDER *group_by)
 {
   for (ORDER *o= group_by; o; o= o->next)
@@ -355,7 +363,20 @@ const char *group_by_refusal(gplan *p, ORDER *group_by)
         continue;
       }
     }
-    Field *f= column_of(*o->item, p->table);
+    if (const char *r= key_refusal(p, column_of(*o->item, p->table)))
+      return r;
+  }
+  /* Result key layout: the series (if any), then the column keys. */
+  int next= p->has_series ? 1 : 0;
+  for (gkey &k : p->keys)
+    k.res= k.is_tag ? 0 : next++;
+  return nullptr;
+}
+
+/* Adds the column `f` as a group key (once). */
+const char *key_refusal(gplan *p, Field *f)
+{
+  {
     if (!f)
       return "GROUP BY: not a column";
     tf_conv c;
@@ -395,10 +416,6 @@ const char *group_by_refusal(gplan *p, ORDER *group_by)
     if (p->key_of(f) < 0)
       p->keys.push_back(k);
   }
-  /* Result key layout: the series (if any), then the column keys. */
-  int next= p->has_series ? 1 : 0;
-  for (gkey &k : p->keys)
-    k.res= k.is_tag ? 0 : next++;
   return nullptr;
 }
 
@@ -485,8 +502,45 @@ const char *agg_refusal(gplan *p, Item_sum *s, int *out)
                         (uint32_t) p->layout_col(f));
     break;
   }
+  case Item_sum::COUNT_DISTINCT_FUNC:
+  {
+    /* exact, as the server's: one group per value of c under its collation, counted after the merge */
+    if (nargs != 1)
+      return "aggregate: unsupported argument";
+    /*
+      shortcut: no GROUP BY only; with one the handler would hold every
+      (keys, c) pair (tens of millions: over the budget), and per-series
+      counts cannot be summed. Upgrade: count the distinct values per group
+      in the core, keyed by the TAG values instead of the series.
+    */
+    if (!p->scalar)
+      return "aggregate: COUNT(DISTINCT) with GROUP BY";
+    Field *f= column_of(s->get_arg(0), p->table);
+    tf_conv cc;
+    if (!f || p->layout_col(f) < 0 || !p->handler->moosedb_column_conv(f, &cc))
+      return "aggregate: unsupported argument";
+    if (cc == tf_conv::TAG)
+      return "aggregate: COUNT(DISTINCT) of a TAG column";
+    if (p->dkey >= 0 && p->keys[p->dkey].field != f)
+      return "aggregate: COUNT(DISTINCT) of two columns";
+    if (p->dkey < 0)
+    {
+      if (const char *r= key_refusal(p, f))
+        return r;
+      p->dkey= p->key_of(f);
+      if (p->dkey != 0)                   /* the only key: result column 0 */
+        return "aggregate: unsupported argument";
+      p->keys[0].res= 0;
+      /* not add_func: a COUNT(c) of the query keeps its own state */
+      p->funcs.push_back(TFAggFunc{TF_AGG_COUNT, (uint32_t) p->layout_col(f)});
+      p->dfunc= (int) p->funcs.size() - 1;
+    }
+    a.k= aggk::COUNT;
+    a.func= p->dfunc;
+    break;
+  }
   default:
-    return "aggregate: unsupported function";   /* DISTINCT, GROUP_CONCAT, STD... */
+    return "aggregate: unsupported function";   /* SUM(DISTINCT), GROUP_CONCAT, STD... */
   }
   p->aggs.push_back(a);
   *out= (int) p->aggs.size() - 1;
@@ -533,7 +587,7 @@ const char *item_refusal(gplan *p, Item *item, const char *expr_reason,
   {
     Field *f= column_of(real, p->table);
     const int k= f ? p->key_of(f) : -1;
-    if (k < 0)
+    if (k < 0 || k == p->dkey)          /* the COUNT(DISTINCT) key is not a group of the query */
       return "column not in GROUP BY";
     out->k= ikind::KEY;
     out->idx= k;
@@ -1084,7 +1138,7 @@ const char *analyze(THD *thd, Query *q, gplan *p)
     BIGINT UNSIGNED (core compares signed), AVG, HAVING, a second ORDER BY term
     other than the key ASC, or no GROUP BY.
   */
-  if (!p->has_having && p->limit != HA_POS_ERROR && p->limit > 0 && !p->has_series &&
+  if (!p->has_having && p->limit != HA_POS_ERROR && p->limit > 0 && !p->has_series && p->dkey < 0 &&
       !p->need_merge && p->keys.size() == 1 &&
       (p->order.size() == 1 ||
        /* ORDER BY aggregate, the key ASC: the SQL order is total and the second term is exactly the core's
@@ -1291,6 +1345,7 @@ private:
   int build_groups(const TFAggBatch &b);
   int fetch_tags(const uint64_t *ids, uint64_t n);
   int merge_groups();
+  int count_distinct();
   int order_groups();
   int cmp_key(uint32_t a, uint32_t b, size_t j) const;
   int cmp_raw(uint32_t a, uint32_t b) const;
@@ -1322,6 +1377,7 @@ private:
   std::vector<uint32_t> live_;
   std::vector<std::vector<my_decimal>> avg_;   /* per aggregate, ORDER BY AVG only */
   size_t pos_= 0;
+  int skip_key_= -1;                           /* key key_hash/keys_equal ignore (count_distinct) */
   std::unique_ptr<MooseDBAgg, agg_closer> agg_;
 };
 
@@ -1652,6 +1708,8 @@ int moosedb_gbh::compute()
     return r;
   agg_.reset();                             /* the snapshot is not needed any more */
   if (p_.need_merge && (r= merge_groups()))
+    return r;
+  if (p_.dkey >= 0 && (r= count_distinct()))
     return r;
   r= order_groups();
   moosedb_gbh_phase(dict_us, agg_us, dict_values, eval_us_, us_since(t_post));
@@ -2117,7 +2175,7 @@ int moosedb_gbh::cmp_raw(uint32_t a, uint32_t b) const
 bool moosedb_gbh::keys_equal(uint32_t a, uint32_t b) const
 {
   for (size_t j= 0; j < nk_; j++)
-    if (cmp_key(a, b, j) != 0)
+    if ((int) j != skip_key_ && cmp_key(a, b, j) != 0)
       return false;
   return true;
 }
@@ -2127,6 +2185,8 @@ uint64_t moosedb_gbh::key_hash(uint32_t g) const
   uint64_t h= 0x9E3779B97F4A7C15ULL;
   for (size_t j= 0; j < nk_; j++)
   {
+    if ((int) j == skip_key_)
+      continue;
     const kcell &c= kc(g, j);
     uint64_t x;
     if (c.null)
@@ -2228,6 +2288,25 @@ int moosedb_gbh::merge_groups()
   }
   live_.swap(out);
   return 0;
+}
+
+/*
+  After merge_groups every group is one distinct value of c under its
+  collation: its COUNT(c) becomes 1 (0 for NULL, which COUNT(DISTINCT) skips),
+  then all groups are merged into the one row (c ignored), which sums those
+  into the count of distinct values; the other states merge as across series.
+*/
+int moosedb_gbh::count_distinct()
+{
+  for (uint32_t g : live_)
+  {
+    acell &c= ac(g, p_.dfunc);
+    c.count= c.count ? 1 : 0;
+  }
+  skip_key_= p_.dkey;
+  const int r= merge_groups();
+  skip_key_= -1;
+  return r;
 }
 
 int moosedb_gbh::cmp_term(uint32_t a, uint32_t b, const gorder &t) const

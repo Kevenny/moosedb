@@ -350,3 +350,19 @@ exato). O ClickHouse ganha em `COUNT(DISTINCT)` de coluna com 2 M valores (115x;
 índice), em agregação da tabela inteira (`GROUP BY op`, 4,5x) e em GROUP BY de alta cardinalidade (q04, 1,5x). Na 1ª
 execução o ClickHouse ganha de q01 a q05 (ex.: q01 0,038 vs 0,159 s): o cache de chunks frio custa 5 a 60x o quente na
 MooseDB, contra 1,4 a 2,7x no ClickHouse.
+
+### `COUNT(DISTINCT)` na engine (2026-11-10, sobre `fa7cfc0`)
+
+`COUNT(DISTINCT c)` sem GROUP BY passa a ser feito pela agregação na engine (exato, mesma collation do servidor);
+acima de `moosedb_agg_max_memory` o core refaz a execução em passadas por fatia de hash. md5 igual ao InnoDB
+(640a744c). Brutos em `results/bench_20m_2026-11-10_distinct3.txt`; tempos com ~0,1 s de `docker exec`.
+
+| `SELECT COUNT(DISTINCT file)` | antes (servidor) | agora: 1ª execução | agora: melhor de 5 | agregação no core |
+|---|---:|---:|---:|---:|
+| moose (host+process TAG) | 35,71 | 4,09 | 2,49 | 2,02 |
+| moose_h | 38,83 | 3,27 | 2,46 | 1,98 |
+| moose_hn | 41,77 | 1,48 | 1,23 | 0,83 |
+| InnoDB / ClickHouse | 33,27 / 0,310 | | | |
+
+`host, COUNT(DISTINCT file) ... GROUP BY host` continua com o servidor (30,1 s em moose_hn, md5 igual): na engine o
+handler teria de guardar cada par (host, file) e estourava o orçamento de 1 GiB.

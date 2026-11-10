@@ -235,12 +235,22 @@ ALTER TABLE mirror.e ENGINE=InnoDB;
 --let $pre= PREPARE s FROM 'SELECT COUNT(*), SUM(v) FROM p WHERE ts >= ? AND host = ?'; SET @a = '2024-03-03'; SET @b = 'h3'; EXECUTE s USING @a, @b; SET @a = '2100-01-01';
 --let $q= EXECUTE s USING @a, @b
 --source suite/moosedb/include/gbh_sc.inc
---let $label= not taken: expression over an aggregate, DISTINCT inside the aggregate, a plain query
+--let $label= COUNT(DISTINCT) of BIGINT and of PAD SPACE / NO PAD / _ci strings
+--let $refused= 0
+--let $q= SELECT COUNT(DISTINCT v) FROM p
+--source suite/moosedb/include/gbh_sc.inc
+--let $q= SELECT COUNT(DISTINCT kp), COUNT(kp) FROM p
+--source suite/moosedb/include/gbh_sc.inc
+--let $q= SELECT COUNT(DISTINCT kb) FROM p
+--source suite/moosedb/include/gbh_sc.inc
+--let $q= SELECT COUNT(DISTINCT kc) d FROM p
+--source suite/moosedb/include/gbh_sc.inc
+--let $label= not taken: expression over an aggregate, DISTINCT inside SUM, a plain query
 --let $refused= 1
 --let $q= SELECT COUNT(*) + 1, SUM(v) FROM p
 --source suite/moosedb/include/gbh_sc.inc
 --let $refused= 1
---let $q= SELECT COUNT(DISTINCT v) FROM p
+--let $q= SELECT SUM(DISTINCT v) FROM p
 --source suite/moosedb/include/gbh_sc.inc
 --let $refused= 1
 --let $q= SELECT v FROM p WHERE host = 'h1' ORDER BY ts LIMIT 3

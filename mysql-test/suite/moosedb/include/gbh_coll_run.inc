@@ -68,6 +68,10 @@ INSERT INTO mirror.t SELECT * FROM test.t;
 --let $q= SELECT COUNT(*) c FROM t GROUP BY tg HAVING c > 150 ORDER BY c, tg
 --source suite/moosedb/include/gbh_diff.inc
 
+--let $label= $coll: COUNT(DISTINCT) of the plain column (NULLs skipped), alone and in one region
+--let $q= SELECT COUNT(DISTINCT pc) d, COUNT(pc) n, COUNT(*) c FROM t; SELECT COUNT(DISTINCT pc) d, SUM(v) s FROM t WHERE rg = 'r1'
+--source suite/moosedb/include/gbh_diff.inc
+
 if ($exact)
 {
   --let $label= $coll: the key itself (exact collation)

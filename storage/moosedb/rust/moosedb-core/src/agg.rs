@@ -38,7 +38,10 @@
 //!   result are charged to one shared budget (in batches, so workers do not
 //!   contend on it); running over it is an error. The worker tables stay alive
 //!   while the partitions are merged, so a parallel run peaks at about twice
-//!   the memory of the groups the workers saw.
+//!   the memory of the groups the workers saw. A run with a column key that
+//!   runs over it is redone in passes (a power of two, at most 256, sized from
+//!   how far the failed run got), each keeping only the groups of one slice of
+//!   the hash space: the same groups, at the price of one scan per pass.
 
 use std::cmp::Ordering as Cmp;
 use std::collections::hash_map::RandomState;
@@ -61,6 +64,8 @@ pub const MAX_KEYS: usize = 16;
 pub const MAX_FUNCS: usize = 64;
 pub const MAX_FILTERS: usize = 16;
 pub const MAX_THREADS: usize = 64;
+/// Most passes an over-budget run is split into (see [`Agg::run`]).
+const MAX_PASSES: usize = 256;
 
 /// Rows per work unit (a unit always holds whole series entries, at most
 /// [`UNIT_ENTRIES`] of them).
@@ -294,6 +299,11 @@ pub struct AggResult {
 }
 
 impl AggResult {
+    fn heap_bytes(&self) -> usize {
+        let funcs: usize = self.funcs.iter().map(|f| (f.count.len() + f.sum_lo.len() + f.sum_hi.len() + f.val.len()) * 8).sum();
+        self.keys.iter().map(KeyCol::heap_bytes).sum::<usize>() + funcs
+    }
+
     /// Appends the groups of `o` (same plan) after these.
     fn append(&mut self, o: AggResult) -> Result<()> {
         let oom = || Error::Full("out of memory while joining the result".into());
@@ -359,29 +369,87 @@ impl Agg {
     /// A panic in a worker thread is re-raised here.
     pub fn run(&mut self, spec: &AggSpec, mut cancel: Option<&mut dyn FnMut() -> bool>) -> Result<()> {
         self.result = AggResult::default();
+        // Over the budget, a run with a column key is redone in passes, each
+        // keeping the groups of one slice of the hash space: every group lives
+        // in exactly one pass, so the result is the same, only scanned again.
+        let split = spec.top.is_none() && spec.keys.iter().any(|k| !matches!(k, KeySpec::Series));
+        let hasher = RandomState::new();
+        let mut passes = 1usize;
+        let result = 'retry: loop {
+            let mut acc = AggResult::default();
+            let n = passes;
+            for pass in 0..n {
+                let (mut over, mut done) = (false, 1.0f64);
+                let held = acc.heap_bytes();
+                match self.run_pass(spec, &hasher, pass, passes, held, &mut over, &mut done, reborrow(&mut cancel)) {
+                    Ok(r) if pass == 0 => acc = r,
+                    Ok(r) => acc.append(r)?,
+                    Err(_) if over && split && passes < MAX_PASSES => {
+                        // `done` of the units filled the budget: aim at half of it per pass
+                        let need = (2.0 / done.max(1.0 / MAX_PASSES as f64)).ceil() as usize;
+                        passes = passes.saturating_mul(need.max(2)).next_power_of_two().min(MAX_PASSES);
+                        continue 'retry;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            break acc;
+        };
+        // The distinct values of a column, in result order, are its dictionary.
+        let plain = spec.filters.is_empty() && spec.value_filters.is_empty() && spec.float_filters.is_empty();
+        if let ([KeySpec::Column(c)], true, true, true) = (&spec.keys[..], plain, spec.funcs.is_empty(), spec.top.is_none()) {
+            if result.heap_bytes().saturating_add(result.keys[0].heap_bytes()) > spec.max_memory {
+                return Err(budget_error(spec.max_memory));
+            }
+            self.dicts.insert(*c, result.keys[0].clone());
+        }
+        self.result = result;
+        Ok(())
+    }
+
+    /// One pass of [`Agg::run`]: the groups whose hash falls in slice `pass` of
+    /// `passes` (all of them for 1 pass), with `held` bytes already in use. On
+    /// error, `over` says whether the budget ran out and `done` the fraction of
+    /// the work units claimed by then.
+    #[allow(clippy::too_many_arguments)]
+    fn run_pass(
+        &self,
+        spec: &AggSpec,
+        hasher: &RandomState,
+        pass: usize,
+        passes: usize,
+        held: usize,
+        over: &mut bool,
+        done: &mut f64,
+        mut cancel: Option<&mut dyn FnMut() -> bool>,
+    ) -> Result<AggResult> {
         let filters = self.compile_filters(spec)?;
         let mut plan = Plan::new(&self.snap, &self.filter, spec, filters)?;
+        plan.hasher = hasher.clone();
+        plan.pass = pass;
+        plan.passes = passes;
         let units = plan.units();
         let wanted = spec.threads.clamp(1, MAX_THREADS);
         let threads = if units.est_rows < self.min_parallel_rows { 1 } else { wanted.min(units.list.len().max(1)) };
         plan.parts = if threads > 1 { (threads * PARTS_PER_THREAD).next_power_of_two().min(MAX_PARTS) } else { 1 };
         let next = AtomicUsize::new(0);
-        let locals: Vec<Local> = if threads == 1 {
-            vec![plan.work(&units, &next, reborrow(&mut cancel))?]
-        } else {
-            run_parallel(&plan, threads, reborrow(&mut cancel), &|poll| plan.work(&units, &next, poll))?
-        };
-        plan.check_stop()?;
-        let result = plan.reduce(locals, threads, reborrow(&mut cancel))?;
-        plan.check_stop()?;
-        // The distinct values of a column, in result order, are its dictionary.
-        let plain = spec.filters.is_empty() && spec.value_filters.is_empty() && spec.float_filters.is_empty();
-        if let ([KeySpec::Column(c)], true, true, true) = (&spec.keys[..], plain, spec.funcs.is_empty(), spec.top.is_none()) {
-            plan.charge(result.keys[0].heap_bytes())?;
-            self.dicts.insert(*c, result.keys[0].clone());
+        let r = (|| {
+            plan.charge(held)?;
+            let locals: Vec<Local> = if threads == 1 {
+                vec![plan.work(&units, &next, reborrow(&mut cancel))?]
+            } else {
+                run_parallel(&plan, threads, reborrow(&mut cancel), &|poll| plan.work(&units, &next, poll))?
+            };
+            plan.check_stop()?;
+            let result = plan.reduce(locals, threads, reborrow(&mut cancel))?;
+            plan.check_stop()?;
+            Ok(result)
+        })();
+        if r.is_err() {
+            *over = plan.over.load(Ordering::Relaxed) && !plan.cancelled.load(Ordering::Relaxed);
+            *done = next.load(Ordering::Relaxed).min(units.list.len()) as f64 / units.list.len().max(1) as f64;
         }
-        self.result = result;
-        Ok(())
+        r
     }
 
     fn compile_filters(&self, spec: &AggSpec) -> Result<Vec<(usize, FilterSet)>> {
@@ -575,6 +643,12 @@ struct Plan<'a> {
     hasher: RandomState,
     /// Hash partitions of the merge (a power of two; 1 = no partitioning).
     parts: usize,
+    /// This run keeps only the groups of hash slice `pass` of `passes` (a
+    /// power of two; 1 = all), see [`Agg::run`].
+    pass: usize,
+    passes: usize,
+    /// The shared budget ran out (as opposed to any other error).
+    over: AtomicBool,
     max: usize,
     /// Bytes a worker accumulates before charging the shared budget.
     charge_batch: usize,
@@ -719,6 +793,9 @@ impl<'a> Plan<'a> {
             top: spec.top,
             hasher: RandomState::new(),
             parts: 1,
+            pass: 0,
+            passes: 1,
+            over: AtomicBool::new(false),
             max: spec.max_memory,
             charge_batch: (spec.max_memory / 64).clamp(1, 32 << 10),
             used: AtomicUsize::new(0),
@@ -730,6 +807,7 @@ impl<'a> Plan<'a> {
 
     fn charge(&self, n: usize) -> Result<()> {
         if self.used.fetch_add(n, Ordering::Relaxed).saturating_add(n) > self.max {
+            self.over.store(true, Ordering::Relaxed);
             self.abort.store(true, Ordering::Relaxed);
             return Err(budget_error(self.max));
         }
@@ -777,6 +855,13 @@ impl<'a> Plan<'a> {
     #[inline]
     fn part_of(&self, hash: u64) -> usize {
         (hash >> 40) as usize & (self.parts - 1)
+    }
+
+    /// The group of `hash` belongs to this pass (the top bits, apart from the
+    /// partition and slot bits).
+    #[inline]
+    fn in_pass(&self, hash: u64) -> bool {
+        self.passes == 1 || (hash >> 56) as usize & (self.passes - 1) == self.pass
     }
 
     /// Entries of the chunks and rows of the MemTable that can hold wanted
@@ -1559,6 +1644,11 @@ impl Local {
         let mut start = 0;
         for r in 0..n {
             let key = &bt.imgs[start..bt.ends[r]];
+            if !p.in_pass(bt.hashes[r]) {
+                bt.gids.push(NONE);
+                start = bt.ends[r];
+                continue;
+            }
             let (g, new) = self.groups.find_or_add(bt.hashes[r], key, &p.init, p.max)?;
             if new {
                 let cost = p.group_bytes(key.len());
@@ -1659,6 +1749,9 @@ impl Local {
                         _ => return Err(corrupt("unexpected value type in a key column")),
                     },
                 }
+            }
+            if p.passes > 1 && !p.in_pass(p.hash(&self.scratch)) {
+                continue;
             }
             let g = self.group_of(p)? as usize;
             for &(_, c, fi) in &p.pad_slots {

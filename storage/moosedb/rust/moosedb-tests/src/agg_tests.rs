@@ -396,8 +396,8 @@ fn argument_errors_budget_and_cancellation() {
     ] {
         assert!(matches!(agg.run(&s, None), Err(Error::InvalidArg(_))), "{s:?}");
     }
-    // one group per series and per name needs more than 2 KiB
-    let mut tiny = spec(true, true, 1);
+    // one group per series needs more than 2 KiB (no column key: no passes, see the next test)
+    let mut tiny = spec(true, false, 1);
     tiny.max_memory = 2048;
     let e = agg.run(&tiny, None).unwrap_err();
     assert!(matches!(e, Error::Full(_)) && e.to_string().contains("moosedb_agg_max_memory"), "{e}");
@@ -422,6 +422,33 @@ fn argument_errors_budget_and_cancellation() {
     let mut cancel = || false;
     agg.run(&spec(true, false, 4), Some(&mut cancel)).unwrap();
     assert_eq!(groups_of(&agg, true, false), naive(&t, i64::MIN, i64::MAX, None, true, false, None));
+}
+
+#[test]
+fn over_the_budget_a_column_key_runs_in_passes_with_the_same_groups() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_new(&dir.path().join("t"));
+    build(&t, 12);
+    let counts = |agg: &Agg| -> BTreeMap<Option<i64>, u64> {
+        let r = agg.result();
+        let KeyCol::Int { nulls, vals } = &r.keys[0] else { panic!() };
+        let m: BTreeMap<_, _> = (0..r.groups).map(|g| ((!nulls[g]).then_some(vals[g]), r.funcs[0].count[g])).collect();
+        assert_eq!(m.len(), r.groups, "a group in two passes");
+        m
+    };
+    // ~1000 values of `n`: about 100 KiB of groups per worker, the result ~20 KiB
+    let sp = AggSpec { keys: vec![KeySpec::Column(2)], funcs: vec![FuncSpec::CountStar], ..AggSpec::default() };
+    let mut agg = parallel_agg(&t);
+    agg.run(&sp, None).unwrap();
+    let want = counts(&agg);
+    assert!(want.len() > 900);
+    for threads in [1, 4] {
+        agg.run(&AggSpec { max_memory: 64 << 10, threads, ..sp.clone() }, None).unwrap();
+        assert_eq!(counts(&agg), want, "threads={threads}");
+    }
+    // a budget no number of passes can meet is still an error
+    let e = agg.run(&AggSpec { max_memory: 4 << 10, ..sp.clone() }, None).unwrap_err();
+    assert!(matches!(e, Error::Full(_)), "{e}");
 }
 
 fn parallel_agg(t: &Table) -> Agg {

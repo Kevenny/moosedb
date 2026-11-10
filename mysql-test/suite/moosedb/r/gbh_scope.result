@@ -332,11 +332,11 @@ Note	1105	gbh: refused: select list: expression
 # same as InnoDB
 result_rows	vs_innodb
 1	SAME
-# COUNT(DISTINCT), no GROUP BY
-SELECT COUNT(DISTINCT n) c FROM g
-SELECT COUNT(DISTINCT n) c FROM g;
+# SUM(DISTINCT), no GROUP BY (COUNT(DISTINCT) is accepted, see gbh_basic)
+SELECT SUM(DISTINCT n) c FROM g
+SELECT SUM(DISTINCT n) c FROM g;
 c
-50
+1225
 Warnings:
 Note	1105	gbh: refused: aggregate: unsupported function
 # same as InnoDB
@@ -715,15 +715,15 @@ Note	1105	gbh: refused: aggregate: unsupported argument type
 # same as InnoDB
 result_rows	vs_innodb
 5	SAME
-# COUNT(DISTINCT)
-SELECT host, COUNT(DISTINCT n) s FROM g GROUP BY host ORDER BY host
-SELECT host, COUNT(DISTINCT n) s FROM g GROUP BY host ORDER BY host;
+# SUM(DISTINCT)
+SELECT host, SUM(DISTINCT n) s FROM g GROUP BY host ORDER BY host
+SELECT host, SUM(DISTINCT n) s FROM g GROUP BY host ORDER BY host;
 host	s
-h0	10
-h1	10
-h2	10
-h3	10
-h4	10
+h0	225
+h1	235
+h2	245
+h3	255
+h4	265
 Warnings:
 Note	1105	gbh: refused: aggregate: unsupported function
 # same as InnoDB

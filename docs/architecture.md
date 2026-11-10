@@ -1365,8 +1365,8 @@ HAVING, LIMIT/OFFSET, ORDER BY seguem no servidor. Agregados que o servidor já
 dobrou (`opt_sum_query`: `COUNT(*)` sem WHERE pelo nº de linhas da tabela, MIN/MAX
 por índice) são `const_item()` e não têm campo na tabela temporária: viram `CONST`
 no plano (sem isso o mapeamento de campos falha); se só sobrar isso, a consulta
-fica com o servidor. Continuam fora: expressão sobre agregado (`COUNT(*)+1`),
-`COUNT(DISTINCT)`, coluna fora de agregado.
+fica com o servidor. `COUNT(DISTINCT c)` **sem GROUP BY** (c comum INT/VARCHAR, uma só coluna) entra: `c` vira a única chave, o `merge_groups` junta os valores iguais pela collation, cada grupo vale 1 (0 se `c` NULL) e todos colapsam na linha única (`count_distinct`); exato como o do servidor. Continuam fora: expressão sobre agregado (`COUNT(*)+1`),
+`COUNT(DISTINCT)` com GROUP BY (o handler teria de guardar cada par (chaves, c), e contagens por série não somam), de TAG ou de duas colunas, `SUM(DISTINCT)`, coluna fora de agregado.
 
 **Execução** (`init_scan`): mapeia `all_fields` para os campos da tmp table,
 resolve as séries do WHERE, abre a agregação (`moosedb_agg_open`, reconferindo
@@ -1521,7 +1521,12 @@ scan não ordenado: só o commitado; o lote privado do statement é invisível).
   estourar = `Error::Full("aggregation exceeds moosedb_agg_max_memory ...")`.
   As tabelas dos workers ficam vivas durante o merge, então uma execução
   paralela com muitos grupos chega a ~2x a memória dos grupos vistos pelos
-  workers; a concatenação final cobra uma cópia a mais do resultado.
+  workers; a concatenação final cobra uma cópia a mais do resultado. Uma
+  execução com chave de coluna (sem top-N) que estoura é refeita em passadas
+  (potência de 2, até 256, estimadas por quanto a tentativa andou), cada uma
+  com uma fatia do hash (bits 56..) e cobrando o resultado já acumulado: os
+  mesmos grupos, ao custo de uma leitura por passada (20 M linhas, 2 M valores
+  de `file`: `COUNT(DISTINCT file)` 1,2–2,5 s em vez de erro).
   Cada worker decodifica uma janela por vez, então a decodificação simultânea
   é limitada pelo nº de threads.
 - **Cache de blocos** (`cache.rs`): o LRU de blocos/colunas/séries é dividido em

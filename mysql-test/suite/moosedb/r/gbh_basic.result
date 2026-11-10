@@ -280,13 +280,28 @@ SET GLOBAL moosedb_agg_threads = 8;
 # same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
 SET GLOBAL moosedb_agg_threads = DEFAULT;
 ##########################################################
+# COUNT(DISTINCT) of a common column, no GROUP BY (exact)
+##########################################################
+# COUNT(DISTINCT) with the other aggregates and a COUNT of the same column
+# SELECT COUNT(DISTINCT file) d, COUNT(file) n, COUNT(*) c, SUM(bytes) s, MIN(latency) mn, MAX(latency) mx, AVG(latency) a, COUNT(DISTINCT file) d2 FROM g
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# COUNT(DISTINCT) of an INT with NULLs, over a time window, and over no row
+# SELECT COUNT(DISTINCT code) d FROM g; SELECT COUNT(DISTINCT latency) d FROM g WHERE ts >= '2024-03-03 00:00:00' AND ts < '2024-03-05 00:00:00'; SELECT COUNT(DISTINCT latency) d, COUNT(*) c FROM g WHERE ts > '2100-01-01'
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=3)
+# COUNT(DISTINCT) with a TAG filter and a WHERE on the column itself
+# SELECT COUNT(DISTINCT file) d FROM g WHERE host = 'h3'; SELECT COUNT(DISTINCT code) d FROM g WHERE code <> 3
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=2)
+# COUNT(DISTINCT) with GROUP BY: left to the server
+# SELECT host, COUNT(DISTINCT code) c FROM g GROUP BY host ORDER BY host; SELECT code, COUNT(DISTINCT file) d FROM g GROUP BY code ORDER BY code
+# same output with and without pushdown and on InnoDB; the engine did not run it
+##########################################################
 # Refused shapes keep their answer
 ##########################################################
 # expression over an aggregate
 # SELECT host, SUM(bytes) / 2 q FROM g GROUP BY host ORDER BY host
 # same output with and without pushdown and on InnoDB; the engine did not run it
-# COUNT(DISTINCT)
-# SELECT host, COUNT(DISTINCT code) c FROM g GROUP BY host ORDER BY host
+# COUNT(DISTINCT) of a TAG, of two columns, of two different columns
+# SELECT COUNT(DISTINCT host) FROM g; SELECT COUNT(DISTINCT code, file) FROM g; SELECT COUNT(DISTINCT code), COUNT(DISTINCT file) FROM g; SELECT COUNT(DISTINCT code) d, code FROM g WHERE ts > '2100-01-01'
 # same output with and without pushdown and on InnoDB; the engine did not run it
 # GROUP BY the time column
 # SELECT ts, COUNT(*) c FROM g WHERE ts < '2024-03-01 00:01:00' GROUP BY ts ORDER BY ts

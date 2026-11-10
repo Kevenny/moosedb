@@ -283,15 +283,31 @@ ALTER TABLE mirror.e ENGINE=InnoDB;
 # EXECUTE s USING @a, @b
 # same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=2)
 # shortcuts taken: exact filters=0 core top-N=0
-# not taken: expression over an aggregate, DISTINCT inside the aggregate, a plain query
+# COUNT(DISTINCT) of BIGINT and of PAD SPACE / NO PAD / _ci strings
+# SELECT COUNT(DISTINCT v) FROM p
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=0 core top-N=0
+# COUNT(DISTINCT) of BIGINT and of PAD SPACE / NO PAD / _ci strings
+# SELECT COUNT(DISTINCT kp), COUNT(kp) FROM p
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=0 core top-N=0
+# COUNT(DISTINCT) of BIGINT and of PAD SPACE / NO PAD / _ci strings
+# SELECT COUNT(DISTINCT kb) FROM p
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=0 core top-N=0
+# COUNT(DISTINCT) of BIGINT and of PAD SPACE / NO PAD / _ci strings
+# SELECT COUNT(DISTINCT kc) d FROM p
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=0 core top-N=0
+# not taken: expression over an aggregate, DISTINCT inside SUM, a plain query
 # SELECT COUNT(*) + 1, SUM(v) FROM p
 # same output with and without pushdown and on InnoDB; the engine did not run it
 # shortcuts taken: exact filters=0 core top-N=0
-# not taken: expression over an aggregate, DISTINCT inside the aggregate, a plain query
-# SELECT COUNT(DISTINCT v) FROM p
+# not taken: expression over an aggregate, DISTINCT inside SUM, a plain query
+# SELECT SUM(DISTINCT v) FROM p
 # same output with and without pushdown and on InnoDB; the engine did not run it
 # shortcuts taken: exact filters=0 core top-N=0
-# not taken: expression over an aggregate, DISTINCT inside the aggregate, a plain query
+# not taken: expression over an aggregate, DISTINCT inside SUM, a plain query
 # SELECT v FROM p WHERE host = 'h1' ORDER BY ts LIMIT 3
 # same output with and without pushdown and on InnoDB; the engine did not run it
 # shortcuts taken: exact filters=0 core top-N=0

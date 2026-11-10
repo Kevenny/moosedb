@@ -29,6 +29,18 @@ Note	1051	Unknown table 'mirror.t'
 # utf8mb4_general_ci: COUNT(DISTINCT) of the plain column (NULLs skipped), alone and in one region
 # SELECT COUNT(DISTINCT pc) d, COUNT(pc) n, COUNT(*) c FROM t; SELECT COUNT(DISTINCT pc) d, SUM(v) s FROM t WHERE rg = 'r1'
 # same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=2)
+# COUNT(DISTINCT pc) per region: tg is a TAG not grouped, so series are summed: the server answers in every collation
+# utf8mb4_general_ci: COUNT(DISTINCT pc) GROUP BY the region TAG only
+# SELECT rg, COUNT(DISTINCT pc) d, COUNT(*) c FROM t GROUP BY rg ORDER BY rg
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# both TAGs grouped: rg has the default (merged) collation, so the server answers here; the engine path is in gbh_basic (dn) and gbh_pad_scalar
+# utf8mb4_general_ci: COUNT(DISTINCT pc) GROUP BY both TAGs
+# SELECT rg, COUNT(DISTINCT pc) d, COUNT(*) c FROM t GROUP BY tg, rg
+# same output with and without pushdown and on InnoDB; the server answered by itself (the engine did not run it)
+# grouped by the plain column pc: the engine counts under a NO PAD binary collation; PAD SPACE and merged ones ('a' = 'A') are left to the server
+# utf8mb4_general_ci: COUNT(DISTINCT v) GROUP BY the plain column
+# SELECT COUNT(DISTINCT v) d, COUNT(*) c FROM t GROUP BY pc ORDER BY d, c
+# same output with and without pushdown and on InnoDB; the server answered by itself (the engine did not run it)
 # distinct groups: the engine merges exactly as the server does
 DROP TABLE test.t;
 DROP TABLE mirror.t;
@@ -61,6 +73,18 @@ Note	1051	Unknown table 'mirror.t'
 # uca1400_ai_ci: COUNT(DISTINCT) of the plain column (NULLs skipped), alone and in one region
 # SELECT COUNT(DISTINCT pc) d, COUNT(pc) n, COUNT(*) c FROM t; SELECT COUNT(DISTINCT pc) d, SUM(v) s FROM t WHERE rg = 'r1'
 # same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=2)
+# COUNT(DISTINCT pc) per region: tg is a TAG not grouped, so series are summed: the server answers in every collation
+# uca1400_ai_ci: COUNT(DISTINCT pc) GROUP BY the region TAG only
+# SELECT rg, COUNT(DISTINCT pc) d, COUNT(*) c FROM t GROUP BY rg ORDER BY rg
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# both TAGs grouped: rg has the default (merged) collation, so the server answers here; the engine path is in gbh_basic (dn) and gbh_pad_scalar
+# uca1400_ai_ci: COUNT(DISTINCT pc) GROUP BY both TAGs
+# SELECT rg, COUNT(DISTINCT pc) d, COUNT(*) c FROM t GROUP BY tg, rg
+# same output with and without pushdown and on InnoDB; the server answered by itself (the engine did not run it)
+# grouped by the plain column pc: the engine counts under a NO PAD binary collation; PAD SPACE and merged ones ('a' = 'A') are left to the server
+# uca1400_ai_ci: COUNT(DISTINCT v) GROUP BY the plain column
+# SELECT COUNT(DISTINCT v) d, COUNT(*) c FROM t GROUP BY pc ORDER BY d, c
+# same output with and without pushdown and on InnoDB; the server answered by itself (the engine did not run it)
 # distinct groups: the engine merges exactly as the server does
 DROP TABLE test.t;
 DROP TABLE mirror.t;
@@ -93,6 +117,18 @@ Note	1051	Unknown table 'mirror.t'
 # utf8mb4_bin: COUNT(DISTINCT) of the plain column (NULLs skipped), alone and in one region
 # SELECT COUNT(DISTINCT pc) d, COUNT(pc) n, COUNT(*) c FROM t; SELECT COUNT(DISTINCT pc) d, SUM(v) s FROM t WHERE rg = 'r1'
 # same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=2)
+# COUNT(DISTINCT pc) per region: tg is a TAG not grouped, so series are summed: the server answers in every collation
+# utf8mb4_bin: COUNT(DISTINCT pc) GROUP BY the region TAG only
+# SELECT rg, COUNT(DISTINCT pc) d, COUNT(*) c FROM t GROUP BY rg ORDER BY rg
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# both TAGs grouped: rg has the default (merged) collation, so the server answers here; the engine path is in gbh_basic (dn) and gbh_pad_scalar
+# utf8mb4_bin: COUNT(DISTINCT pc) GROUP BY both TAGs
+# SELECT rg, COUNT(DISTINCT pc) d, COUNT(*) c FROM t GROUP BY tg, rg
+# same output with and without pushdown and on InnoDB; the server answered by itself (the engine did not run it)
+# grouped by the plain column pc: the engine counts under a NO PAD binary collation; PAD SPACE and merged ones ('a' = 'A') are left to the server
+# utf8mb4_bin: COUNT(DISTINCT v) GROUP BY the plain column
+# SELECT COUNT(DISTINCT v) d, COUNT(*) c FROM t GROUP BY pc ORDER BY d, c
+# same output with and without pushdown and on InnoDB; the server answered by itself (the engine did not run it)
 # utf8mb4_bin: the key itself (exact collation)
 # SELECT tg, COUNT(*) c, SUM(v) s FROM t GROUP BY tg ORDER BY tg
 # same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
@@ -134,6 +170,18 @@ Note	1051	Unknown table 'mirror.t'
 # utf8mb4_nopad_bin: COUNT(DISTINCT) of the plain column (NULLs skipped), alone and in one region
 # SELECT COUNT(DISTINCT pc) d, COUNT(pc) n, COUNT(*) c FROM t; SELECT COUNT(DISTINCT pc) d, SUM(v) s FROM t WHERE rg = 'r1'
 # same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=2)
+# COUNT(DISTINCT pc) per region: tg is a TAG not grouped, so series are summed: the server answers in every collation
+# utf8mb4_nopad_bin: COUNT(DISTINCT pc) GROUP BY the region TAG only
+# SELECT rg, COUNT(DISTINCT pc) d, COUNT(*) c FROM t GROUP BY rg ORDER BY rg
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# both TAGs grouped: rg has the default (merged) collation, so the server answers here; the engine path is in gbh_basic (dn) and gbh_pad_scalar
+# utf8mb4_nopad_bin: COUNT(DISTINCT pc) GROUP BY both TAGs
+# SELECT rg, COUNT(DISTINCT pc) d, COUNT(*) c FROM t GROUP BY tg, rg
+# same output with and without pushdown and on InnoDB; the server answered by itself (the engine did not run it)
+# grouped by the plain column pc: the engine counts under a NO PAD binary collation; PAD SPACE and merged ones ('a' = 'A') are left to the server
+# utf8mb4_nopad_bin: COUNT(DISTINCT v) GROUP BY the plain column
+# SELECT COUNT(DISTINCT v) d, COUNT(*) c FROM t GROUP BY pc ORDER BY d, c
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
 # utf8mb4_nopad_bin: the key itself (exact collation)
 # SELECT tg, COUNT(*) c, SUM(v) s FROM t GROUP BY tg ORDER BY tg
 # same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
@@ -175,6 +223,18 @@ Note	1051	Unknown table 'mirror.t'
 # latin1_swedish_ci: COUNT(DISTINCT) of the plain column (NULLs skipped), alone and in one region
 # SELECT COUNT(DISTINCT pc) d, COUNT(pc) n, COUNT(*) c FROM t; SELECT COUNT(DISTINCT pc) d, SUM(v) s FROM t WHERE rg = 'r1'
 # same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=2)
+# COUNT(DISTINCT pc) per region: tg is a TAG not grouped, so series are summed: the server answers in every collation
+# latin1_swedish_ci: COUNT(DISTINCT pc) GROUP BY the region TAG only
+# SELECT rg, COUNT(DISTINCT pc) d, COUNT(*) c FROM t GROUP BY rg ORDER BY rg
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# both TAGs grouped: rg has the default (merged) collation, so the server answers here; the engine path is in gbh_basic (dn) and gbh_pad_scalar
+# latin1_swedish_ci: COUNT(DISTINCT pc) GROUP BY both TAGs
+# SELECT rg, COUNT(DISTINCT pc) d, COUNT(*) c FROM t GROUP BY tg, rg
+# same output with and without pushdown and on InnoDB; the server answered by itself (the engine did not run it)
+# grouped by the plain column pc: the engine counts under a NO PAD binary collation; PAD SPACE and merged ones ('a' = 'A') are left to the server
+# latin1_swedish_ci: COUNT(DISTINCT v) GROUP BY the plain column
+# SELECT COUNT(DISTINCT v) d, COUNT(*) c FROM t GROUP BY pc ORDER BY d, c
+# same output with and without pushdown and on InnoDB; the server answered by itself (the engine did not run it)
 # distinct groups: the engine merges exactly as the server does
 DROP TABLE test.t;
 DROP TABLE mirror.t;

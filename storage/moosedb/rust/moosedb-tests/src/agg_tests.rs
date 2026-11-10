@@ -1130,3 +1130,210 @@ fn float_filters_match_the_ieee_model_on_chunks_and_memtable() {
         assert!(matches!(agg.run(&sp, None), Err(Error::InvalidArg(_))));
     }
 }
+
+/// Per series, over `n` (NULL ignored): (distinct n, COUNT(*), COUNT(n), SUM(n), MIN(n), MAX(n)).
+fn distinct_naive(t: &Table) -> BTreeMap<u64, (usize, u64, u64, i128, i64, i64)> {
+    let ids = sid_of(t);
+    let mut seen: BTreeMap<u64, std::collections::BTreeSet<i64>> = BTreeMap::new();
+    let mut out: BTreeMap<u64, (usize, u64, u64, i128, i64, i64)> = BTreeMap::new();
+    let mut s = t.scan(&ScanFilter::range(i64::MIN, i64::MAX), false).unwrap();
+    while let Some((_, r)) = s.next_row().unwrap() {
+        let Value::Bytes(host) = &r[1] else { panic!() };
+        let id = ids[host];
+        let st = out.entry(id).or_insert((0, 0, 0, 0, i64::MAX, i64::MIN));
+        st.1 += 1;
+        if let Value::Int(n) = r[2] {
+            seen.entry(id).or_default().insert(n);
+            st.2 += 1;
+            st.3 += i128::from(n);
+            st.4 = st.4.min(n);
+            st.5 = st.5.max(n);
+        }
+    }
+    for (id, st) in out.iter_mut() {
+        st.0 = seen.get(id).map_or(0, |s| s.len());
+    }
+    out
+}
+
+#[test]
+fn count_distinct_collapses_in_the_core_also_in_passes() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_new(&dir.path().join("t"));
+    build(&t, 12);
+    let want = distinct_naive(&t);
+    let funcs = vec![FuncSpec::CountStar, FuncSpec::Count(2), FuncSpec::Sum(2), FuncSpec::Min(2), FuncSpec::Max(2)];
+    let base_spec = AggSpec { keys: vec![KeySpec::Series, KeySpec::Column(2)], funcs, distinct: Some(1), ..AggSpec::default() };
+    let mut agg = parallel_agg(&t);
+    // (max_memory, threads): the small budget cannot hold the ~12k (series, n) groups at once
+    for (mem, threads) in [(1 << 30, 1), (1 << 30, 4), (256 << 10, 1), (256 << 10, 4)] {
+        agg.run(&AggSpec { max_memory: mem, threads, ..base_spec.clone() }, None).unwrap();
+        let r = agg.result();
+        assert_eq!((r.keys.len(), r.funcs.len(), r.groups), (1, 6, want.len()), "mem={mem} threads={threads}");
+        let KeyCol::Series(ids) = &r.keys[0] else { panic!() };
+        for g in 0..r.groups {
+            let w = want[&ids[g]];
+            let f = &r.funcs;
+            let got = (
+                f[5].count[g] as usize,
+                f[0].count[g],
+                f[1].count[g],
+                (i128::from(f[2].sum_hi[g]) << 64) | i128::from(f[2].sum_lo[g]),
+                f[3].val[g],
+                f[4].val[g],
+            );
+            assert_eq!(got, (w.0, w.1, w.2, w.3, w.4, w.5), "series {} mem={mem} threads={threads}", ids[g]);
+        }
+        assert_eq!(r.groups, ids.iter().collect::<std::collections::BTreeSet<_>>().len(), "a series twice");
+    }
+}
+
+#[test]
+fn scalar_count_distinct_has_one_group_or_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_new(&dir.path().join("t"));
+    build(&t, 12);
+    let all = distinct_naive(&t);
+    let mut vals = std::collections::BTreeSet::new();
+    let mut s = t.scan(&ScanFilter::range(i64::MIN, i64::MAX), false).unwrap();
+    while let Some((_, r)) = s.next_row().unwrap() {
+        if let Value::Int(n) = r[2] {
+            vals.insert(n);
+        }
+    }
+    assert!(all.values().any(|a| a.0 > 0) && vals.len() > 900);
+    let sp = AggSpec { keys: vec![KeySpec::Column(2)], distinct: Some(0), ..AggSpec::default() };
+    for (mem, threads) in [(1 << 30, 1), (64 << 10, 4)] {
+        let mut agg = parallel_agg(&t);
+        agg.run(&AggSpec { max_memory: mem, threads, ..sp.clone() }, None).unwrap();
+        let r = agg.result();
+        assert_eq!((r.groups, r.keys.len(), r.funcs.len()), (1, 0, 1));
+        assert_eq!(r.funcs[0].count[0] as usize, vals.len(), "mem={mem} threads={threads}");
+    }
+    // no row qualifies: no group
+    let vf = ValueFilter { col: 3, bytes: vec![b"nope".to_vec()], ..Default::default() };
+    let mut agg = parallel_agg(&t);
+    agg.run(&AggSpec { value_filters: vec![vf], ..sp.clone() }, None).unwrap();
+    assert_eq!(agg.result().groups, 0);
+    // invalid combinations
+    let mut agg = parallel_agg(&t);
+    for bad in [
+        AggSpec { distinct: Some(1), ..sp.clone() },
+        AggSpec { top: Some(TopN { func: 0, desc: true, limit: 1 }), funcs: vec![FuncSpec::CountStar], ..sp.clone() },
+        AggSpec { keys: vec![KeySpec::ColumnPad(3), KeySpec::Column(2)], distinct: Some(1), ..sp.clone() },
+    ] {
+        assert!(matches!(agg.run(&bad, None), Err(Error::InvalidArg(_))));
+    }
+}
+
+/// A table of `rows` rows over 16 series whose `n` is `n_of(i)`: flushed in chunks, the last rows in the MemTable.
+fn hi_table(dir: &Path, rows: i64, n_of: impl Fn(i64) -> i64) -> Arc<Table> {
+    let t = open_new(dir);
+    for k in 0..rows / 100_000 {
+        let r = (k * 100_000..(k + 1) * 100_000).map(|i| {
+            vec![
+                Value::Timestamp(base() + (i % 4320) * 60 * MICROS_PER_SEC),
+                Value::Bytes(format!("h{}", i % 16).into_bytes()),
+                Value::Int(n_of(i)),
+                Value::Null,
+                Value::Float64(i as f64),
+            ]
+        });
+        put(&t, r);
+        if (k + 1) * 100_000 + 100_000 <= rows {
+            t.flush().unwrap();
+        }
+    }
+    t
+}
+
+/// Groups of a `Column(2)` run (`CountStar`, `Sum(2)`, `Min(2)`) in result order.
+fn by_n(agg: &Agg) -> Vec<(Option<i64>, (u64, i128, i64))> {
+    let r = agg.result();
+    let KeyCol::Int { nulls, vals } = &r.keys[0] else { panic!() };
+    (0..r.groups)
+        .map(|g| {
+            let sum = (i128::from(r.funcs[1].sum_hi[g]) << 64) | i128::from(r.funcs[1].sum_lo[g]);
+            ((!nulls[g]).then_some(vals[g]), (r.funcs[0].count[g], sum, r.funcs[2].val[g]))
+        })
+        .collect()
+}
+
+fn sorted(mut v: Vec<(Option<i64>, (u64, i128, i64))>) -> Vec<(Option<i64>, (u64, i128, i64))> {
+    v.sort();
+    assert!(v.windows(2).all(|w| w[0].0 != w[1].0), "a group appears twice");
+    v
+}
+
+#[test]
+fn workers_share_partition_tables_above_the_flush_threshold() {
+    let dir = tempfile::tempdir().unwrap();
+    let key_funcs = vec![FuncSpec::CountStar, FuncSpec::Sum(2), FuncSpec::Min(2)];
+    let sp = AggSpec { keys: vec![KeySpec::Column(2)], funcs: key_funcs.clone(), max_memory: 1 << 30, ..AggSpec::default() };
+    // (a) 200 k distinct keys, 3 rows each: every worker crosses the 64 k-group threshold
+    let t = hi_table(&dir.path().join("a"), 600_000, |i| i % 200_000);
+    let mut agg = parallel_agg(&t);
+    agg.run(&AggSpec { threads: 1, ..sp.clone() }, None).unwrap();
+    let want = sorted(by_n(&agg));
+    assert_eq!(want.len(), 200_000);
+    // ~1.5x what one thread holds (200 k groups of ~160 B): 8 private tables would not fit, shared ones do
+    let tight = 200_000 * 160 * 3 / 2;
+    let top = |limit| Some(TopN { func: 0, desc: true, limit });
+    agg.run(&AggSpec { threads: 1, top: top(20), max_memory: tight, ..sp.clone() }, None).unwrap();
+    let want_top = by_n(&agg);
+    for threads in [1, 4, 8] {
+        agg.run(&AggSpec { threads, max_memory: tight, ..sp.clone() }, None).unwrap();
+        assert_eq!(sorted(by_n(&agg)), want, "threads={threads}");
+        // (e) top-N has no passes to fall back on: the memory itself must fit
+        agg.run(&AggSpec { threads, top: top(20), max_memory: tight, ..sp.clone() }, None).unwrap();
+        assert_eq!(by_n(&agg), want_top, "top threads={threads}");
+    }
+    // (d) COUNT(DISTINCT n) per series, with the same tight budget
+    let dsp = AggSpec {
+        keys: vec![KeySpec::Series, KeySpec::Column(2)],
+        funcs: key_funcs.clone(),
+        distinct: Some(1),
+        max_memory: 1 << 30,
+        ..AggSpec::default()
+    };
+    let dist = |agg: &Agg| -> BTreeMap<u64, (u64, u64, i128)> {
+        let r = agg.result();
+        let KeyCol::Series(ids) = &r.keys[0] else { panic!() };
+        let m: BTreeMap<_, _> = (0..r.groups)
+            .map(|g| {
+                let sum = (i128::from(r.funcs[1].sum_hi[g]) << 64) | i128::from(r.funcs[1].sum_lo[g]);
+                (ids[g], (r.funcs[3].count[g], r.funcs[0].count[g], sum))
+            })
+            .collect();
+        assert_eq!(m.len(), r.groups, "a series twice");
+        m
+    };
+    agg.run(&AggSpec { threads: 1, ..dsp.clone() }, None).unwrap();
+    let want_d = dist(&agg);
+    assert_eq!(want_d.len(), 16);
+    assert!(want_d.values().all(|v| v.0 == 12_500), "distinct n per series");
+    for threads in [4, 8] {
+        agg.run(&AggSpec { threads, max_memory: tight * 2, ..dsp.clone() }, None).unwrap();
+        assert_eq!(dist(&agg), want_d, "distinct threads={threads}");
+    }
+    // (b) low cardinality stays in the private tables
+    let t = hi_table(&dir.path().join("b"), 600_000, |i| i % 50);
+    let mut agg = parallel_agg(&t);
+    agg.run(&AggSpec { threads: 1, ..sp.clone() }, None).unwrap();
+    let want = sorted(by_n(&agg));
+    assert_eq!(want.len(), 50);
+    for threads in [4, 8] {
+        agg.run(&AggSpec { threads, ..sp.clone() }, None).unwrap();
+        assert_eq!(sorted(by_n(&agg)), want, "low threads={threads}");
+    }
+    // (c) a few hot keys plus mostly unique ones: workers cross the threshold midway and keep folding hot keys
+    let t = hi_table(&dir.path().join("c"), 800_000, |i| if i % 4 == 0 { i % 40 } else { i });
+    let mut agg = parallel_agg(&t);
+    agg.run(&AggSpec { threads: 1, ..sp.clone() }, None).unwrap();
+    let want = sorted(by_n(&agg));
+    assert!(want.len() > 600_000);
+    for (threads, mem) in [(4, 1 << 30), (8, 1 << 30), (8, 64 << 20)] {
+        agg.run(&AggSpec { threads, max_memory: mem, ..sp.clone() }, None).unwrap();
+        assert_eq!(sorted(by_n(&agg)), want, "mix threads={threads} mem={mem}");
+    }
+}

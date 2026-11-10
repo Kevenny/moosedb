@@ -441,6 +441,18 @@ typedef struct {
   // Exact float filters (`TFAggFloatFilter`), ANDed with `filters`. May be NULL with 0.
   const TFAggFloatFilter *float_filters;
   uint32_t float_filter_count;
+  // COUNT(DISTINCT) of the key `keys[distinct_key]`, when `has_distinct != 0`
+  // (0 = none, the zero value; `TF_ERR_INVALID_ARG` with a top-N, with an
+  // index out of range or with a PAD key besides that one). The groups that
+  // differ only in that key are collapsed (their functions merged); the
+  // result has one key column LESS (that key's, which is dropped) and one
+  // function MORE, the last (`func_count`, reported as `TF_AGG_COUNT`): its
+  // `count` is the number of collapsed groups whose key is not NULL, i.e.
+  // the distinct count. Only for keys whose byte / integer equality is the
+  // SQL one. With no other key the result has one group, or none when no
+  // row qualified (the caller supplies the zero).
+  uint8_t has_distinct;
+  uint32_t distinct_key;
 } TFAggSpec;
 
 // Polled about every 10 ms on the calling thread; a non-zero return cancels

@@ -299,6 +299,34 @@ ALTER TABLE mirror.e ENGINE=InnoDB;
 # SELECT COUNT(DISTINCT kc) d FROM p
 # same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
 # shortcuts taken: exact filters=0 core top-N=0
+# COUNT(DISTINCT) with GROUP BY: a PAD SPACE / NO PAD / BIGINT column counted per group of a plain key (the core collapses it)
+# SELECT w, COUNT(DISTINCT kp) d, COUNT(kp) n, COUNT(*) c FROM p GROUP BY w ORDER BY w
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=0 core top-N=0
+# COUNT(DISTINCT) with GROUP BY: a PAD SPACE / NO PAD / BIGINT column counted per group of a plain key (the core collapses it)
+# SELECT w, COUNT(DISTINCT kb) d, SUM(v) s FROM p GROUP BY w ORDER BY w
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=0 core top-N=0
+# COUNT(DISTINCT) with GROUP BY: a PAD SPACE / NO PAD / BIGINT column counted per group of a plain key (the core collapses it)
+# SELECT kb, COUNT(DISTINCT kp) d, COUNT(DISTINCT kp) d2, COUNT(*) c FROM p GROUP BY kb ORDER BY kb
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=0 core top-N=0
+# COUNT(DISTINCT) with GROUP BY: a PAD SPACE / NO PAD / BIGINT column counted per group of a plain key (the core collapses it)
+# SELECT w, COUNT(DISTINCT v) d FROM p WHERE ts >= '2024-03-04' GROUP BY w ORDER BY w LIMIT 5
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# shortcuts taken: exact filters=0 core top-N=0
+# COUNT(DISTINCT) with GROUP BY not taken: a PAD SPACE group key, a _ci distinct column, TAGs of a merged collation
+# SELECT kp, COUNT(DISTINCT v) d FROM p GROUP BY kp ORDER BY kp
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# shortcuts taken: exact filters=0 core top-N=0
+# COUNT(DISTINCT) with GROUP BY not taken: a PAD SPACE group key, a _ci distinct column, TAGs of a merged collation
+# SELECT w, COUNT(DISTINCT kc) d FROM p GROUP BY w ORDER BY w
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# shortcuts taken: exact filters=0 core top-N=0
+# COUNT(DISTINCT) with GROUP BY not taken: a PAD SPACE group key, a _ci distinct column, TAGs of a merged collation
+# SELECT host, COUNT(DISTINCT kp) d FROM p GROUP BY host ORDER BY host
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# shortcuts taken: exact filters=0 core top-N=0
 # not taken: expression over an aggregate, DISTINCT inside SUM, a plain query
 # SELECT COUNT(*) + 1, SUM(v) FROM p
 # same output with and without pushdown and on InnoDB; the engine did not run it

@@ -1,0 +1,17 @@
+evento_moose COUNT(DISTINCT file) #1         2.03 s  engine=1 agg=1.154 s post=0.000 s md5=640a744c
+evento_moose COUNT(DISTINCT file) #2         1.34 s  engine=1 agg=0.892 s post=0.000 s md5=640a744c
+evento_moose COUNT(DISTINCT file) #3         1.14 s  engine=1 agg=0.753 s post=0.000 s md5=640a744c
+evento_moose_h COUNT(DISTINCT file) #1       1.64 s  engine=1 agg=1.259 s post=0.000 s md5=640a744c
+evento_moose_h COUNT(DISTINCT file) #2       1.23 s  engine=1 agg=0.922 s post=0.000 s md5=640a744c
+evento_moose_h COUNT(DISTINCT file) #3       1.14 s  engine=1 agg=0.807 s post=0.000 s md5=640a744c
+evento_moose_hn COUNT(DISTINCT file) #1      1.39 s  engine=1 agg=1.029 s post=0.000 s md5=640a744c
+evento_moose_hn COUNT(DISTINCT file) #2      1.11 s  engine=1 agg=0.712 s post=0.000 s md5=640a744c
+evento_moose_hn COUNT(DISTINCT file) #3      1.03 s  engine=1 agg=0.696 s post=0.000 s md5=640a744c
+moose COUNT(DISTINCT folder) #1              0.85 s  engine=1 agg=0.517 s post=0.000 s md5=2ebd3caa
+moose COUNT(DISTINCT folder) #2              0.60 s  engine=1 agg=0.269 s post=0.000 s md5=2ebd3caa
+moose top20 file dia #1                      0.52 s  engine=1 agg=0.171 s post=0.000 s md5=b5f1cc33
+moose top20 file dia #2                      0.45 s  engine=1 agg=0.118 s post=0.000 s md5=b5f1cc33
+moose top10 host dia #1                      0.40 s  engine=1 agg=0.032 s post=0.014 s md5=a134f075
+moose top10 host dia #2                      0.42 s  engine=1 agg=0.024 s post=0.016 s md5=a134f075
+moose_h GROUP BY host COUNT(DISTINCT) #1    30.07 s  engine=0 agg=0.000 s post=0.000 s md5=a3822454
+moose_h GROUP BY host COUNT(DISTINCT) #2    28.89 s  engine=0 agg=0.000 s post=0.000 s md5=a3822454

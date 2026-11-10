@@ -245,6 +245,25 @@ ALTER TABLE mirror.e ENGINE=InnoDB;
 --source suite/moosedb/include/gbh_sc.inc
 --let $q= SELECT COUNT(DISTINCT kc) d FROM p
 --source suite/moosedb/include/gbh_sc.inc
+--let $label= COUNT(DISTINCT) with GROUP BY: a PAD SPACE / NO PAD / BIGINT column counted per group of a plain key (the core collapses it)
+--let $q= SELECT w, COUNT(DISTINCT kp) d, COUNT(kp) n, COUNT(*) c FROM p GROUP BY w ORDER BY w
+--source suite/moosedb/include/gbh_sc.inc
+--let $q= SELECT w, COUNT(DISTINCT kb) d, SUM(v) s FROM p GROUP BY w ORDER BY w
+--source suite/moosedb/include/gbh_sc.inc
+--let $q= SELECT kb, COUNT(DISTINCT kp) d, COUNT(DISTINCT kp) d2, COUNT(*) c FROM p GROUP BY kb ORDER BY kb
+--source suite/moosedb/include/gbh_sc.inc
+--let $q= SELECT w, COUNT(DISTINCT v) d FROM p WHERE ts >= '2024-03-04' GROUP BY w ORDER BY w LIMIT 5
+--source suite/moosedb/include/gbh_sc.inc
+--let $label= COUNT(DISTINCT) with GROUP BY not taken: a PAD SPACE group key, a _ci distinct column, TAGs of a merged collation
+--let $refused= 1
+--let $q= SELECT kp, COUNT(DISTINCT v) d FROM p GROUP BY kp ORDER BY kp
+--source suite/moosedb/include/gbh_sc.inc
+--let $refused= 1
+--let $q= SELECT w, COUNT(DISTINCT kc) d FROM p GROUP BY w ORDER BY w
+--source suite/moosedb/include/gbh_sc.inc
+--let $refused= 1
+--let $q= SELECT host, COUNT(DISTINCT kp) d FROM p GROUP BY host ORDER BY host
+--source suite/moosedb/include/gbh_sc.inc
 --let $label= not taken: expression over an aggregate, DISTINCT inside SUM, a plain query
 --let $refused= 1
 --let $q= SELECT COUNT(*) + 1, SUM(v) FROM p

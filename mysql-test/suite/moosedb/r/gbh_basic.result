@@ -291,8 +291,33 @@ SET GLOBAL moosedb_agg_threads = DEFAULT;
 # COUNT(DISTINCT) with a TAG filter and a WHERE on the column itself
 # SELECT COUNT(DISTINCT file) d FROM g WHERE host = 'h3'; SELECT COUNT(DISTINCT code) d FROM g WHERE code <> 3
 # same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=2)
-# COUNT(DISTINCT) with GROUP BY: left to the server
-# SELECT host, COUNT(DISTINCT code) c FROM g GROUP BY host ORDER BY host; SELECT code, COUNT(DISTINCT file) d FROM g GROUP BY code ORDER BY code
+# COUNT(DISTINCT) grouped by a plain column (NULL group), with HAVING on the distinct
+# SELECT code, COUNT(DISTINCT latency) d, COUNT(latency) n FROM g GROUP BY code ORDER BY code; SELECT code, COUNT(DISTINCT bytes) d FROM g GROUP BY code HAVING d > 10000 ORDER BY code
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=2)
+# COUNT(DISTINCT) grouped by two plain columns, and by a day bucket
+# SELECT code, latency, COUNT(DISTINCT bytes) d, MAX(latency) mx FROM g GROUP BY code, latency ORDER BY code, latency LIMIT 30; SELECT DATE(ts) dd, COUNT(DISTINCT code) d, COUNT(*) c FROM g GROUP BY DATE(ts) ORDER BY dd
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=2)
+# COUNT(DISTINCT) ordered by the distinct count with LIMIT (the server orders: no core top-N)
+# SELECT code, COUNT(DISTINCT latency) d FROM g GROUP BY code ORDER BY d DESC, code LIMIT 3
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# COUNT(DISTINCT) of an INT in a window and WHERE on a TAG
+# SELECT code, COUNT(DISTINCT latency) d FROM g WHERE host = 'h3' AND ts >= '2024-03-03' GROUP BY code ORDER BY code
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+CREATE TABLE dn (ts DATETIME NOT NULL, h VARCHAR(4) CHARACTER SET utf8mb4 COLLATE utf8mb4_nopad_bin NOT NULL COMMENT 'TAG', k INT, c INT, INDEX(ts)) ENGINE=MooseDB CHUNK_INTERVAL='1 DAY';
+CREATE TABLE mirror.dn LIKE test.dn;
+ALTER TABLE mirror.dn ENGINE=InnoDB;
+# COUNT(DISTINCT) over an empty table, grouped and not
+# SELECT k, COUNT(DISTINCT c) d FROM dn GROUP BY k; SELECT h, COUNT(DISTINCT c) d FROM dn GROUP BY h; SELECT COUNT(DISTINCT c) d FROM dn
+# same output with and without pushdown and on InnoDB; the server answered by itself (the engine did not run it)
+INSERT INTO dn VALUES ('2024-03-01 00:00:00', 'a', 1, NULL), ('2024-03-01 00:00:01', 'a', 1, NULL), ('2024-03-01 00:00:02', 'a', 2, 5), ('2024-03-01 00:00:03', 'b', 2, 5), ('2024-03-01 00:00:04', 'b', 2, NULL), ('2024-03-01 00:00:05', 'b', NULL, 7), ('2024-03-01 00:00:06', 'a', 2, 5), ('2024-03-01 00:00:07', 'b', 2, 6);
+INSERT INTO mirror.dn SELECT * FROM test.dn;
+# COUNT(DISTINCT) of a column that is NULL in a whole group (0), and in a NULL group
+# SELECT k, COUNT(DISTINCT c) d, COUNT(*) n FROM dn GROUP BY k ORDER BY k; SELECT h, COUNT(DISTINCT c) d, SUM(k) s, COUNT(*) n FROM dn GROUP BY h ORDER BY h; SELECT h, k, COUNT(DISTINCT c) d FROM dn GROUP BY h, k ORDER BY h, k
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=3)
+DROP TABLE dn;
+DROP TABLE mirror.dn;
+# COUNT(DISTINCT) grouped by TAGs of a collation the core cannot merge, by only some of the TAGs, or by the distinct column itself: left to the server
+# SELECT host, COUNT(DISTINCT code) c FROM g GROUP BY host ORDER BY host; SELECT host, iface, proc, COUNT(DISTINCT code) d FROM g GROUP BY host, iface, proc ORDER BY host, iface, proc LIMIT 20; SELECT code, COUNT(DISTINCT code) d FROM g GROUP BY code ORDER BY code; SELECT code, COUNT(DISTINCT file) d FROM g GROUP BY code ORDER BY code; SELECT code, COUNT(DISTINCT file) d, file FROM g GROUP BY code, file ORDER BY code, file LIMIT 5
 # same output with and without pushdown and on InnoDB; the engine did not run it
 ##########################################################
 # Refused shapes keep their answer

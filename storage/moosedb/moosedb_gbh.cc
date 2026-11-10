@@ -228,11 +228,15 @@ struct gplan
   int top_func= -1;                /* core top-N: index into funcs, -1 = off */
   bool top_desc= false;
   /*
-    COUNT(DISTINCT c), no GROUP BY: `c` is the only group key (dkey); dfunc is
-    a COUNT(c) of its own, made 0/1 per value of c and summed when the groups
-    are collapsed into the one row.
+    COUNT(DISTINCT c): `c` is a group key of the core (dkey) that is not a group
+    of the query; dfunc is a COUNT(c) of its own. core_distinct (c byte-exact or
+    binary PAD SPACE, with or without GROUP BY): the core collapses c and returns
+    the distinct count as its last function column (dfunc is not sent in funcs).
+    Otherwise (scalar only): c is the only key, dfunc is made 0/1 per value of c
+    and summed when the groups are collapsed into the one row.
   */
   int dkey= -1, dfunc= -1;
+  bool core_distinct= false;
 
   bool in_group(const Field *f) const
   {
@@ -504,33 +508,35 @@ const char *agg_refusal(gplan *p, Item_sum *s, int *out)
   }
   case Item_sum::COUNT_DISTINCT_FUNC:
   {
-    /* exact, as the server's: one group per value of c under its collation, counted after the merge */
+    /* exact, as the server's: the distinct values of c under its collation */
     if (nargs != 1)
       return "aggregate: unsupported argument";
-    /*
-      shortcut: no GROUP BY only; with one the handler would hold every
-      (keys, c) pair (tens of millions: over the budget), and per-series
-      counts cannot be summed. Upgrade: count the distinct values per group
-      in the core, keyed by the TAG values instead of the series.
-    */
-    if (!p->scalar)
-      return "aggregate: COUNT(DISTINCT) with GROUP BY";
     Field *f= column_of(s->get_arg(0), p->table);
     tf_conv cc;
     if (!f || p->layout_col(f) < 0 || !p->handler->moosedb_column_conv(f, &cc))
       return "aggregate: unsupported argument";
-    if (cc == tf_conv::TAG)
+    if (cc == tf_conv::TAG)                /* a TAG as the distinct key would be a series key: left to the server */
       return "aggregate: COUNT(DISTINCT) of a TAG column";
     if (p->dkey >= 0 && p->keys[p->dkey].field != f)
       return "aggregate: COUNT(DISTINCT) of two columns";
     if (p->dkey < 0)
     {
+      if (!p->scalar && p->key_of(f) >= 0)   /* c is also a group of the query: the core drops the key */
+        return "aggregate: COUNT(DISTINCT) of a GROUP BY column";
       if (const char *r= key_refusal(p, f))
         return r;
       p->dkey= p->key_of(f);
-      if (p->dkey != 0)                   /* the only key: result column 0 */
-        return "aggregate: unsupported argument";
-      p->keys[0].res= 0;
+      const gkey &dk= p->keys[p->dkey];
+      /* the core compares bytes: only a byte-exact (or trimmed PAD SPACE) collation collapses in it */
+      p->core_distinct= !dk.is_str || cs_exact(dk.cs) || dk.pad;
+      if (!p->core_distinct)
+      {
+        if (!p->scalar)
+          return "aggregate: COUNT(DISTINCT) with GROUP BY on a non-exact collation";
+        if (p->dkey != 0)                  /* the only key: result column 0 */
+          return "aggregate: unsupported argument";
+        p->keys[0].res= 0;
+      }
       /* not add_func: a COUNT(c) of the query keeps its own state */
       p->funcs.push_back(TFAggFunc{TF_AGG_COUNT, (uint32_t) p->layout_col(f)});
       p->dfunc= (int) p->funcs.size() - 1;
@@ -1156,6 +1162,34 @@ const char *analyze(THD *thd, Query *q, gplan *p)
     p->top_func= p->aggs[p->order[0].idx].func;
     p->top_desc= p->order[0].desc;
   }
+  if (p->core_distinct)
+  {
+    for (size_t j= 0; j < p->keys.size(); j++)
+      if ((int) j != p->dkey && p->keys[j].pad)   /* the core refuses a PAD key other than the distinct one */
+        return "aggregate: COUNT(DISTINCT) with a PAD SPACE group key";
+      else if ((int) j != p->dkey && !p->keys[j].is_tag && p->keys[j].is_str && !cs_exact(p->keys[j].cs))
+        /* the core groups by bytes; merging 'a' and 'A' afterwards would add up distinct counts */
+        return "aggregate: COUNT(DISTINCT) with a collation-merged group key";
+    if (p->has_series)
+    {
+      /* per-series counts cannot be summed: only when every series is its own group (all TAGs grouped, exact) */
+      const tf_layout *l= p->handler->moosedb_layout();
+      if (!l)
+        return "internal: no layout";
+      size_t ntag= 0, ngrouped= 0;
+      for (const tf_column &c : l->columns)
+        ntag+= c.conv == tf_conv::TAG;
+      for (const gkey &k : p->keys)
+        if (k.is_tag)
+        {
+          ngrouped++;
+          if (k.is_str && !cs_exact(k.cs))
+            return "aggregate: COUNT(DISTINCT) with a collation-merged TAG group key";
+        }
+      if (ngrouped != ntag)
+        return "aggregate: COUNT(DISTINCT) grouped by some of the TAGs";
+    }
+  }
   /* The core's own limits (agg.rs MAX_KEYS, MAX_FUNCS, MAX_FILTERS): beyond them it fails, the normal path must run instead. */
   if (p->keys.size() > 16 || p->funcs.size() > 64 || p->filters.size() > 16)
     return "too many keys, aggregates or filtered columns for the engine";
@@ -1669,8 +1703,17 @@ int moosedb_gbh::compute()
   TFAggSpec spec{};
   spec.keys= keys.empty() ? nullptr : keys.data();
   spec.key_count= (uint32_t) keys.size();
-  spec.funcs= p_.funcs.empty() ? nullptr : p_.funcs.data();
-  spec.func_count= (uint32_t) p_.funcs.size();
+  std::vector<TFAggFunc> cfuncs= p_.funcs;
+  if (p_.core_distinct)
+  {
+    if (p_.dfunc < 0 || (size_t) p_.dfunc >= cfuncs.size() || keys.empty())
+      return fail("internal: bad COUNT(DISTINCT) plan");
+    cfuncs.erase(cfuncs.begin() + p_.dfunc);   /* the core appends the distinct count as its last function */
+    spec.has_distinct= 1;
+    spec.distinct_key= (uint32_t) keys.size() - 1;   /* c is the last non-TAG key: added after the GROUP BY ones */
+  }
+  spec.funcs= cfuncs.empty() ? nullptr : cfuncs.data();
+  spec.func_count= (uint32_t) cfuncs.size();
   spec.filters= tfs.empty() ? nullptr : tfs.data();
   spec.filter_count= (uint32_t) tfs.size();
   spec.float_filters= ffs.empty() ? nullptr : ffs.data();
@@ -1709,7 +1752,7 @@ int moosedb_gbh::compute()
   agg_.reset();                             /* the snapshot is not needed any more */
   if (p_.need_merge && (r= merge_groups()))
     return r;
-  if (p_.dkey >= 0 && (r= count_distinct()))
+  if (p_.dkey >= 0 && !p_.core_distinct && (r= count_distinct()))
     return r;
   r= order_groups();
   moosedb_gbh_phase(dict_us, agg_us, dict_values, eval_us_, us_since(t_post));
@@ -2030,7 +2073,7 @@ int moosedb_gbh::build_groups(const TFAggBatch &b)
     return fail("too many groups", HA_ERR_RECORD_FILE_FULL);
   const size_t expect_keys= (p_.has_series ? 1 : 0) +
       (size_t) std::count_if(p_.keys.begin(), p_.keys.end(),
-                             [](const gkey &k) { return !k.is_tag; });
+                             [](const gkey &k) { return !k.is_tag; }) - (p_.core_distinct ? 1 : 0);
   if (b.key_count != expect_keys || b.func_count != nf_ ||
       (expect_keys && !b.keys) || (nf_ && !b.funcs))
     return fail("internal: aggregation result has an unexpected shape");
@@ -2041,7 +2084,9 @@ int moosedb_gbh::build_groups(const TFAggBatch &b)
 
   for (size_t f= 0; f < nf_; f++)
   {
-    const TFAggFuncBatch &fb= b.funcs[f];
+    /* the core's distinct count is its last function column; the indexes after dfunc shift down */
+    const size_t cf= !p_.core_distinct ? f : (int) f == p_.dfunc ? nf_ - 1 : (int) f > p_.dfunc ? f - 1 : f;
+    const TFAggFuncBatch &fb= b.funcs[cf];
     if (!fb.count)
       return fail("internal: aggregation result misses a count column");
     for (uint64_t g= 0; g < ngroups_; g++)
@@ -2071,7 +2116,7 @@ int moosedb_gbh::build_groups(const TFAggBatch &b)
   for (size_t j= 0; j < nk_; j++)
   {
     const gkey &k= p_.keys[j];
-    if (k.is_tag)
+    if (k.is_tag || (p_.core_distinct && (int) j == p_.dkey))
       continue;
     if ((size_t) k.res >= b.key_count)
       return fail("internal: aggregation result misses a key column");

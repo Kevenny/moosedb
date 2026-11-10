@@ -99,6 +99,8 @@ fn spec(keys: &[TFAggKey], funcs: &[TFAggFunc], filters: &[TFAggFilter], max_mem
         pred_count: 0,
         float_filters: ptr::null(),
         float_filter_count: 0,
+        has_distinct: 0,
+        distinct_key: 0,
     }
 }
 
@@ -385,6 +387,18 @@ fn aggregation_lifecycle_results_dictionaries_and_errors_through_c_abi() {
         TFStatus::TF_ERR_INVALID_ARG
     );
     assert_eq!(unsafe { moosedb_agg_close(ptr::null_mut()) }, TFStatus::TF_OK);
+
+    // COUNT(DISTINCT name): the key column is dropped, one count column is added
+    let dkeys = [column(3)];
+    let mut d = spec(&dkeys, &[], &[], 1 << 28, 1);
+    d.has_distinct = 1;
+    check(unsafe { moosedb_agg_run(agg, &d, None, ptr::null_mut()) }).unwrap();
+    check(unsafe { moosedb_agg_result(agg, 0, 10, &mut batch) }).unwrap();
+    assert_eq!((batch.total_groups, batch.key_count, batch.func_count), (1, 0, 1));
+    let f = unsafe { &*batch.funcs };
+    assert_eq!((f.op, unsafe { *f.count }), (TF_AGG_COUNT, 2), "a and b; NULL does not count");
+    d.distinct_key = 1;
+    assert_eq!(unsafe { moosedb_agg_run(agg, &d, None, ptr::null_mut()) }, TFStatus::TF_ERR_INVALID_ARG);
 
     // a snapshot outlives writes; an empty series list means no rows
     write(t, 1, "h0", Some(1), Some("a"));

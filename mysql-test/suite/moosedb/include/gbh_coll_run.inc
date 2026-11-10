@@ -72,6 +72,25 @@ INSERT INTO mirror.t SELECT * FROM test.t;
 --let $q= SELECT COUNT(DISTINCT pc) d, COUNT(pc) n, COUNT(*) c FROM t; SELECT COUNT(DISTINCT pc) d, SUM(v) s FROM t WHERE rg = 'r1'
 --source suite/moosedb/include/gbh_diff.inc
 
+--echo # COUNT(DISTINCT pc) per region: tg is a TAG not grouped, so series are summed: the server answers in every collation
+--let $refused= 1
+--let $label= $coll: COUNT(DISTINCT pc) GROUP BY the region TAG only
+--let $q= SELECT rg, COUNT(DISTINCT pc) d, COUNT(*) c FROM t GROUP BY rg ORDER BY rg
+--source suite/moosedb/include/gbh_diff.inc
+
+--echo # both TAGs grouped: rg has the default (merged) collation, so the server answers here; the engine path is in gbh_basic (dn) and gbh_pad_scalar
+--let $sorted= 1
+--let $either= 1
+--let $label= $coll: COUNT(DISTINCT pc) GROUP BY both TAGs
+--let $q= SELECT rg, COUNT(DISTINCT pc) d, COUNT(*) c FROM t GROUP BY tg, rg
+--source suite/moosedb/include/gbh_diff.inc
+
+--echo # grouped by the plain column pc: the engine counts under a NO PAD binary collation; PAD SPACE and merged ones ('a' = 'A') are left to the server
+--let $either= 1
+--let $label= $coll: COUNT(DISTINCT v) GROUP BY the plain column
+--let $q= SELECT COUNT(DISTINCT v) d, COUNT(*) c FROM t GROUP BY pc ORDER BY d, c
+--source suite/moosedb/include/gbh_diff.inc
+
 if ($exact)
 {
   --let $label= $coll: the key itself (exact collation)

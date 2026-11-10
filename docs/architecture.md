@@ -1365,8 +1365,7 @@ HAVING, LIMIT/OFFSET, ORDER BY seguem no servidor. Agregados que o servidor já
 dobrou (`opt_sum_query`: `COUNT(*)` sem WHERE pelo nº de linhas da tabela, MIN/MAX
 por índice) são `const_item()` e não têm campo na tabela temporária: viram `CONST`
 no plano (sem isso o mapeamento de campos falha); se só sobrar isso, a consulta
-fica com o servidor. `COUNT(DISTINCT c)` **sem GROUP BY** (c comum INT/VARCHAR, uma só coluna) entra: `c` vira a única chave, o `merge_groups` junta os valores iguais pela collation, cada grupo vale 1 (0 se `c` NULL) e todos colapsam na linha única (`count_distinct`); exato como o do servidor. Continuam fora: expressão sobre agregado (`COUNT(*)+1`),
-`COUNT(DISTINCT)` com GROUP BY (o handler teria de guardar cada par (chaves, c), e contagens por série não somam), de TAG ou de duas colunas, `SUM(DISTINCT)`, coluna fora de agregado.
+fica com o servidor. `COUNT(DISTINCT c)` (c INT/VARCHAR comum, uma só coluna) entra, com e sem GROUP BY, quando a colação de `c` é exata ou binária PAD SPACE (ou `c` é INT): o handler manda `c` como a última chave de `TFAggSpec` com `has_distinct=1`/`distinct_key`, o `COUNT(DISTINCT)` fora de `funcs`, e lê a contagem na última coluna de função do resultado (`moosedb_gbh::build_groups`; `c` não aparece no resultado e não pode ser referenciada no select/order). O core agrupa por todas as chaves (inclusive `c`), e ao fim de **cada passada** os grupos que diferem só em `c` viram um (estados fundidos como entre workers) e uma coluna de função extra conta os grupos com `c` não NULL; os resultados colapsados das passadas se fundem (cada par (chaves, c) cai numa só passada, então as contagens somam), logo o custo fica limitado pelo orçamento/passadas do core. O core compara bytes: só com igualdade de bytes = igualdade SQL (colação exata, ou PAD SPACE binário via `ColumnPad` na própria `c`); sem top-N (`ORDER BY d LIMIT k` vai pelo servidor sobre o resultado do core); sem chave `ColumnPad` além de `c`; sem linhas casando, o core devolve 0 grupos (o handler sintetiza o zero do escalar). Com TAGs no GROUP BY só quando **todas** as TAGs da tabela estão agrupadas e as de texto têm colação exata (cada série é um grupo; contagens por série não se somam). Colação não exata (`_ci`...): só sem GROUP BY, pelo caminho antigo (`count_distinct`, colapso no handler). Continuam fora: expressão sobre agregado (`COUNT(*)+1`), `COUNT(DISTINCT)` de TAG, de duas colunas ou da própria coluna do GROUP BY, `SUM(DISTINCT)`, coluna fora de agregado.
 
 **Execução** (`init_scan`): mapeia `all_fields` para os campos da tmp table,
 resolve as séries do WHERE, abre a agregação (`moosedb_agg_open`, reconferindo
@@ -1502,11 +1501,17 @@ scan não ordenado: só o commitado; o lote privado do statement é invisível).
   em collation binária NO PAD ou chave `KeySpec::ColumnPad`, cujos grupos já são os do servidor).
 - **Paralelismo**: `std::thread::scope`; unidades de ~32 Ki linhas (entradas de
   chunk inteiras, no máximo 1024) e de 64 Ki linhas da MemTable via
-  `AtomicUsize`; uma tabela de grupos por worker. Com mais de um worker o
-  merge é **por partição de hash** (4 partições por thread, potência de 2, até
-  256): cada worker agrupa seus grupos por partição ao terminar, as partições
-  são reivindicadas pelos workers, cada uma é fundida (hash guardado, tabela
-  pré-dimensionada) e já vira colunas de resultado (ou candidatos do top-N) na
+  `AtomicUsize`; cada worker tem uma tabela de grupos privada (pré-agregação:
+  baixa cardinalidade nunca sai dela). Com mais de um worker há também uma
+  tabela **compartilhada por partição de hash** (4 partições por thread,
+  potência de 2, até 256, cada uma sob um `Mutex`): quando a tabela privada
+  chega a 64 Ki grupos ou a orçamento/threads/8 bytes, o worker a **despeja**
+  (ordena por partição, um lock por partição, nunca dois aninhados, começando
+  por uma partição diferente por worker; `Acc::merge`) e recomeça vazia, então
+  uma chave de alta cardinalidade fica guardada ~uma vez, não uma por worker.
+  Ao fim, o merge é **por partição**: as partições são reivindicadas pelos
+  workers, cada uma parte da tabela compartilhada, funde o que sobrou nas
+  tabelas privadas (hash guardado) e já vira colunas de resultado (ou candidatos do top-N) na
   mesma thread; os pedaços são concatenados na thread chamadora. Menos de
   `DEFAULT_MIN_PARALLEL_ROWS` (128 Ki) linhas estimadas ou menos de 8192
   grupos: sem threads de fundo / merge na thread chamadora
@@ -1519,14 +1524,16 @@ scan não ordenado: só o commitado; o lote privado do statement é invisível).
   por grupo em cada tabela, cobrado em lotes de até 32 KiB por worker para não
   disputar o contador; conjuntos dos filtros, resultado, dicionário);
   estourar = `Error::Full("aggregation exceeds moosedb_agg_max_memory ...")`.
-  As tabelas dos workers ficam vivas durante o merge, então uma execução
-  paralela com muitos grupos chega a ~2x a memória dos grupos vistos pelos
-  workers; a concatenação final cobra uma cópia a mais do resultado. Uma
+  O que foi despejado é liberado do worker e cobrado na tabela da partição;
+  as privadas restantes ficam vivas durante o merge (no máximo o limiar por
+  worker em alta cardinalidade; em baixa, todos os seus poucos grupos); a concatenação final cobra uma cópia a mais do resultado. Uma
   execução com chave de coluna (sem top-N) que estoura é refeita em passadas
   (potência de 2, até 256, estimadas por quanto a tentativa andou), cada uma
   com uma fatia do hash (bits 56..) e cobrando o resultado já acumulado: os
   mesmos grupos, ao custo de uma leitura por passada (20 M linhas, 2 M valores
-  de `file`: `COUNT(DISTINCT file)` 1,2–2,5 s em vez de erro).
+  de `file`: `COUNT(DISTINCT file)` 1,2–2,5 s em vez de erro). Com as tabelas
+  compartilhadas, ~165 B × 2 M grupos cabem no orçamento padrão de 1 GiB sem
+  passadas (lab, 8 threads: agregação de 1,13 s para 0,70–0,89 s). Mutex envenenado (pânico com lock) vira `Error::Corrupt`.
   Cada worker decodifica uma janela por vez, então a decodificação simultânea
   é limitada pelo nº de threads.
 - **Cache de blocos** (`cache.rs`): o LRU de blocos/colunas/séries é dividido em

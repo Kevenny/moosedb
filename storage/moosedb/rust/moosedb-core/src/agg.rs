@@ -23,11 +23,16 @@
 //!   filters are ANDed. Values a mask's dictionary does not hold are rejected.
 //! * **Parallelism**: `std::thread::scope`; units of ~[`UNIT_ROWS`] rows (chunk
 //!   entries and slices of MemTable segments) are claimed through an atomic
-//!   counter; every worker owns a group table. With more than one worker the
-//!   groups are then merged **by hash partition** (a power of two of
-//!   partitions, claimed by the workers again), each partition is turned into
-//!   result columns by the thread that merged it, and the pieces are
-//!   concatenated. A run over few rows stays on the calling thread. The result
+//!   counter; every worker owns a private group table (pre-aggregation: a low
+//!   cardinality never leaves it). With more than one worker, a private table
+//!   that reaches [`FLUSH_GROUPS`] groups, or a share of the budget (budget /
+//!   threads / 8), is **flushed** into per-partition tables shared by all the
+//!   workers (one lock per partition per flush) and starts over empty, so a
+//!   high-cardinality key is stored once, not once per worker. The groups are
+//!   then merged **by hash partition** (a power of two of partitions, claimed
+//!   by the workers again: the shared table plus what is left in the private
+//!   tables), each partition is turned into result columns by the thread that
+//!   merged it, and the pieces are concatenated. A run over few rows stays on the calling thread. The result
 //!   is the same for any number of threads (integers only).
 //! * **Top-N** ([`TopN`]): with a single key, the K best groups by one
 //!   function, selected per partition and then overall, so the caller does not
@@ -36,12 +41,18 @@
 //!   (about every 10 ms); workers poll an `AtomicBool`.
 //! * **Memory**: keys + states + overhead of every group table and of the
 //!   result are charged to one shared budget (in batches, so workers do not
-//!   contend on it); running over it is an error. The worker tables stay alive
-//!   while the partitions are merged, so a parallel run peaks at about twice
-//!   the memory of the groups the workers saw. A run with a column key that
+//!   contend on it); running over it is an error. A flushed group is released
+//!   from the worker and charged to its partition table, so a high-cardinality
+//!   run holds about one copy of the groups plus the small private tables; the
+//!   private tables left at the end stay alive while the partitions are merged
+//!   (at most the threshold per worker, or all of a low-cardinality run's
+//!   groups). A run with a column key that
 //!   runs over it is redone in passes (a power of two, at most 256, sized from
 //!   how far the failed run got), each keeping only the groups of one slice of
 //!   the hash space: the same groups, at the price of one scan per pass.
+//!   With [`AggSpec::distinct`] each pass is collapsed (see `collapse`) before
+//!   the next one starts, so only the small collapsed result is kept between
+//!   passes; the pass itself still holds every (keys, value) group.
 
 use std::cmp::Ordering as Cmp;
 use std::collections::hash_map::RandomState;
@@ -88,6 +99,11 @@ const GROUP_OVERHEAD: usize = 80;
 /// Partitions per worker thread (a power of two overall, at most `MAX_PARTS`).
 const PARTS_PER_THREAD: usize = 4;
 const MAX_PARTS: usize = 256;
+/// A worker's private table is moved into the shared partition tables when it
+/// holds this many groups (or `Plan::flush_bytes` bytes): small tables
+/// (GROUP BY host) stay private and pre-aggregate; large ones keep each key in
+/// the shared tables once instead of once per worker.
+const FLUSH_GROUPS: usize = 1 << 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeySpec {
@@ -186,6 +202,20 @@ pub struct AggSpec {
     /// the exact evaluation stays in `filters`.
     pub preds: Vec<ColPred>,
     pub top: Option<TopN>,
+    /// COUNT(DISTINCT) of the key `keys[d]` (a column key, compared as bytes /
+    /// integers, so the caller may use it only when that equality is the SQL
+    /// one). The run groups by ALL the keys, then each pass is collapsed: the
+    /// groups that differ only in `keys[d]` become one, their `funcs` merged as
+    /// between workers, and the result has no column for `keys[d]` but one
+    /// function more, the LAST (`funcs.len()`), counting the collapsed groups
+    /// whose `keys[d]` is not NULL (as `Count`: only `count` is filled). Every
+    /// (keys, value) pair lives in one pass, so the per-pass counts add up to
+    /// the exact distinct count. With no other key the result has one group,
+    /// or none when no row qualified (the caller supplies the zero). Not with a
+    /// top-N, and not with a `ColumnPad` among the other keys (shortcut: the
+    /// shortest-value rule of a PAD key is not kept across the merge; do it
+    /// when a PAD SPACE `GROUP BY` needs it).
+    pub distinct: Option<usize>,
     /// Budget in bytes (keys, states, overhead, result).
     pub max_memory: usize,
     /// Worker threads (1 = run on the calling thread).
@@ -202,6 +232,7 @@ impl Default for AggSpec {
             float_filters: Vec::new(),
             preds: Vec::new(),
             top: None,
+            distinct: None,
             max_memory: 1 << 30,
             threads: 1,
         }
@@ -325,6 +356,127 @@ impl AggResult {
     }
 }
 
+impl KeyCol {
+    fn is_null(&self, i: usize) -> bool {
+        match self {
+            KeyCol::Series(_) => false,
+            KeyCol::Int { nulls, .. } | KeyCol::Bytes { nulls, .. } => nulls[i],
+        }
+    }
+
+    /// Appends the identity of row `i` to `out` (unambiguous: NULL flag, length prefix).
+    fn encode(&self, i: usize, out: &mut Vec<u8>) {
+        match self {
+            KeyCol::Series(v) => out.extend_from_slice(&v[i].to_le_bytes()),
+            KeyCol::Int { nulls, vals } => {
+                out.push(u8::from(nulls[i]));
+                out.extend_from_slice(&vals[i].to_le_bytes());
+            }
+            KeyCol::Bytes { nulls, starts, lens, data } => {
+                out.push(u8::from(nulls[i]));
+                let s = starts[i] as usize;
+                out.extend_from_slice(&lens[i].to_le_bytes());
+                out.extend_from_slice(&data[s..s + lens[i] as usize]);
+            }
+        }
+    }
+
+    /// The rows `idx`, in that order.
+    fn take(&self, idx: &[u32]) -> KeyCol {
+        match self {
+            KeyCol::Series(v) => KeyCol::Series(idx.iter().map(|&i| v[i as usize]).collect()),
+            KeyCol::Int { nulls, vals } => KeyCol::Int {
+                nulls: idx.iter().map(|&i| nulls[i as usize]).collect(),
+                vals: idx.iter().map(|&i| vals[i as usize]).collect(),
+            },
+            KeyCol::Bytes { nulls, starts, lens, data } => {
+                let (mut n2, mut s2, mut l2, mut d2) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+                for &i in idx {
+                    let i = i as usize;
+                    n2.push(nulls[i]);
+                    s2.push(d2.len() as u64);
+                    l2.push(lens[i]);
+                    d2.extend_from_slice(&data[starts[i] as usize..starts[i] as usize + lens[i] as usize]);
+                }
+                KeyCol::Bytes { nulls: n2, starts: s2, lens: l2, data: d2 }
+            }
+        }
+    }
+}
+
+/// Collapses the groups of `r` that agree on every key but `raw_d` into one,
+/// folding their function states as the merge between workers does (see
+/// [`AggSpec::distinct`]). `raw_d = Some(d)`: `r` is a pass result: `keys[d]`
+/// is dropped and the distinct count of a group is 1 if it was not NULL, else
+/// 0. `None`: `r` is already collapsed (several passes appended): groups that
+/// repeat are merged, the distinct counts added.
+fn collapse(r: AggResult, spec: &AggSpec, raw_d: Option<usize>) -> Result<AggResult> {
+    let nf = spec.funcs.len();
+    let kept: Vec<usize> = (0..r.keys.len()).filter(|&i| Some(i) != raw_d).collect();
+    let mut index: HashMap<Vec<u8>, u32> = HashMap::new();
+    let mut first: Vec<u32> = Vec::new();
+    let mut accs: Vec<Acc> = Vec::new();
+    let mut est = 0usize;
+    let mut buf = Vec::new();
+    for i in 0..r.groups {
+        buf.clear();
+        for &k in &kept {
+            r.keys[k].encode(i, &mut buf);
+        }
+        let g = match index.get(&buf) {
+            Some(&g) => g as usize,
+            None => {
+                est = est.saturating_add(buf.len() + GROUP_OVERHEAD + 24 * (nf + 1));
+                if est > spec.max_memory {
+                    return Err(budget_error(spec.max_memory));
+                }
+                let g = first.len();
+                index.insert(buf.clone(), u32::try_from(g).map_err(|_| budget_error(spec.max_memory))?);
+                first.push(i as u32);
+                accs.extend(spec.funcs.iter().map(|&f| Acc::init(f)).chain([Acc::init(FuncSpec::CountStar)]));
+                g
+            }
+        };
+        let row = &mut accs[g * (nf + 1)..(g + 1) * (nf + 1)];
+        for (fi, &f) in spec.funcs.iter().enumerate() {
+            let c = &r.funcs[fi];
+            let o = Acc {
+                n: c.count[i],
+                v: match f {
+                    FuncSpec::Sum(_) => c.sum_lo[i] as i64,
+                    FuncSpec::Min(_) | FuncSpec::Max(_) => c.val[i],
+                    _ => 0,
+                },
+                hi: if matches!(f, FuncSpec::Sum(_)) { c.sum_hi[i] } else { 0 },
+            };
+            if !row[fi].merge(&o, f) {
+                return Err(overflow());
+            }
+        }
+        row[nf].n += match raw_d {
+            Some(d) => u64::from(!r.keys[d].is_null(i)),
+            None => r.funcs[nf].count[i],
+        };
+    }
+    let mut funcs = vec![FuncCol::default(); nf + 1];
+    for (fi, fc) in funcs.iter_mut().enumerate() {
+        let f = spec.funcs.get(fi).copied().unwrap_or(FuncSpec::CountStar);
+        for g in 0..first.len() {
+            let a = &accs[g * (nf + 1) + fi];
+            fc.count.push(a.n);
+            match f {
+                FuncSpec::Sum(_) => {
+                    fc.sum_lo.push(a.v as u64);
+                    fc.sum_hi.push(a.hi);
+                }
+                FuncSpec::Min(_) | FuncSpec::Max(_) => fc.val.push(a.v),
+                _ => {}
+            }
+        }
+    }
+    Ok(AggResult { groups: first.len(), keys: kept.iter().map(|&k| r.keys[k].take(&first)).collect(), funcs })
+}
+
 // ─── handle ──────────────────────────────────────────────────────────────────
 
 /// An aggregation over one snapshot (see the module docs). Not shared between
@@ -369,6 +521,14 @@ impl Agg {
     /// A panic in a worker thread is re-raised here.
     pub fn run(&mut self, spec: &AggSpec, mut cancel: Option<&mut dyn FnMut() -> bool>) -> Result<()> {
         self.result = AggResult::default();
+        if let Some(d) = spec.distinct {
+            if d >= spec.keys.len() || spec.top.is_some() {
+                return Err(invalid("distinct needs a key of the spec and no top-N"));
+            }
+            if spec.keys.iter().enumerate().any(|(i, k)| i != d && matches!(k, KeySpec::ColumnPad(_))) {
+                return Err(invalid("distinct does not support a PAD SPACE key besides its own"));
+            }
+        }
         // Over the budget, a run with a column key is redone in passes, each
         // keeping the groups of one slice of the hash space: every group lives
         // in exactly one pass, so the result is the same, only scanned again.
@@ -382,8 +542,17 @@ impl Agg {
                 let (mut over, mut done) = (false, 1.0f64);
                 let held = acc.heap_bytes();
                 match self.run_pass(spec, &hasher, pass, passes, held, &mut over, &mut done, reborrow(&mut cancel)) {
-                    Ok(r) if pass == 0 => acc = r,
-                    Ok(r) => acc.append(r)?,
+                    Ok(r) => {
+                        let r = if spec.distinct.is_some() { collapse(r, spec, spec.distinct)? } else { r };
+                        if pass == 0 {
+                            acc = r;
+                        } else {
+                            acc.append(r)?;
+                            if spec.distinct.is_some() {
+                                acc = collapse(acc, spec, None)?;
+                            }
+                        }
+                    }
                     Err(_) if over && split && passes < MAX_PASSES => {
                         // `done` of the units filled the budget: aim at half of it per pass
                         let need = (2.0 / done.max(1.0 / MAX_PASSES as f64)).ceil() as usize;
@@ -397,7 +566,7 @@ impl Agg {
         };
         // The distinct values of a column, in result order, are its dictionary.
         let plain = spec.filters.is_empty() && spec.value_filters.is_empty() && spec.float_filters.is_empty();
-        if let ([KeySpec::Column(c)], true, true, true) = (&spec.keys[..], plain, spec.funcs.is_empty(), spec.top.is_none()) {
+        if let ([KeySpec::Column(c)], true, true, true) = (&spec.keys[..], plain, spec.funcs.is_empty(), spec.top.is_none() && spec.distinct.is_none()) {
             if result.heap_bytes().saturating_add(result.keys[0].heap_bytes()) > spec.max_memory {
                 return Err(budget_error(spec.max_memory));
             }
@@ -432,6 +601,10 @@ impl Agg {
         let wanted = spec.threads.clamp(1, MAX_THREADS);
         let threads = if units.est_rows < self.min_parallel_rows { 1 } else { wanted.min(units.list.len().max(1)) };
         plan.parts = if threads > 1 { (threads * PARTS_PER_THREAD).next_power_of_two().min(MAX_PARTS) } else { 1 };
+        if plan.parts > 1 {
+            plan.shared = (0..plan.parts).map(|_| Mutex::new(Groups::new())).collect();
+            plan.flush_bytes = (spec.max_memory / threads / 8).max(1);
+        }
         let next = AtomicUsize::new(0);
         let r = (|| {
             plan.charge(held)?;
@@ -643,6 +816,11 @@ struct Plan<'a> {
     hasher: RandomState,
     /// Hash partitions of the merge (a power of two; 1 = no partitioning).
     parts: usize,
+    /// One table per partition, shared by the workers (`parts` of them when
+    /// `parts > 1`): where private tables are flushed and the merge starts from.
+    shared: Vec<Mutex<Groups>>,
+    /// Bytes of private table (budget / threads / 8) that trigger a flush.
+    flush_bytes: usize,
     /// This run keeps only the groups of hash slice `pass` of `passes` (a
     /// power of two; 1 = all), see [`Agg::run`].
     pass: usize,
@@ -793,6 +971,8 @@ impl<'a> Plan<'a> {
             top: spec.top,
             hasher: RandomState::new(),
             parts: 1,
+            shared: Vec::new(),
+            flush_bytes: usize::MAX,
             pass: 0,
             passes: 1,
             over: AtomicBool::new(false),
@@ -1428,6 +1608,8 @@ struct Local {
     /// (empty when the run is not partitioned).
     part_order: Vec<u32>,
     part_start: Vec<usize>,
+    /// Times the table was flushed to the shared tables.
+    flushes: usize,
 }
 
 impl Local {
@@ -1445,6 +1627,7 @@ impl Local {
             batch: Batch::default(),
             part_order: Vec::new(),
             part_start: Vec::new(),
+            flushes: 0,
         };
         if p.keys.is_empty() {
             // Implicit aggregation: one group even over no rows.
@@ -1470,30 +1653,65 @@ impl Local {
         let n = std::mem::take(&mut self.pending);
         p.charge(n)?;
         if p.parts > 1 {
-            let (np, n) = (p.parts, self.groups.len());
-            let oom = |_| budget_error(p.max);
-            let cost = n * 4 + (np + 1) * 8;
-            p.charge(cost)?;
-            self.bytes += cost;
-            let mut start = vec![0usize; np + 1];
-            for &h in &self.groups.hashes {
-                start[p.part_of(h) + 1] += 1;
-            }
-            for i in 0..np {
-                start[i + 1] += start[i];
-            }
-            let mut fill = start.clone();
-            let mut order: Vec<u32> = Vec::new();
-            order.try_reserve_exact(n).map_err(oom)?;
-            order.resize(n, 0);
-            for (g, &h) in self.groups.hashes.iter().enumerate() {
-                let q = p.part_of(h);
-                order[fill[q]] = g as u32;
-                fill[q] += 1;
-            }
-            self.part_order = order;
-            self.part_start = start;
+            self.order_parts(p)?;
         }
+        Ok(())
+    }
+
+    /// Sorts the groups by partition (`part_order`, `part_start`); the index is charged.
+    fn order_parts(&mut self, p: &Plan<'_>) -> Result<()> {
+        let (np, n) = (p.parts, self.groups.len());
+        let oom = |_| budget_error(p.max);
+        let cost = n * 4 + (np + 1) * 8;
+        p.charge(cost)?;
+        self.bytes += cost;
+        let mut start = vec![0usize; np + 1];
+        for &h in &self.groups.hashes {
+            start[p.part_of(h) + 1] += 1;
+        }
+        for i in 0..np {
+            start[i + 1] += start[i];
+        }
+        let mut fill = start.clone();
+        let mut order: Vec<u32> = Vec::new();
+        order.try_reserve_exact(n).map_err(oom)?;
+        order.resize(n, 0);
+        for (g, &h) in self.groups.hashes.iter().enumerate() {
+            let q = p.part_of(h);
+            order[fill[q]] = g as u32;
+            fill[q] += 1;
+        }
+        self.part_order = order;
+        self.part_start = start;
+        Ok(())
+    }
+
+    /// Over the threshold in a parallel run: merges the private groups into the
+    /// shared partition tables (one lock per partition, never nested) and starts
+    /// over empty. Only called between rows or stretches, when no group number is held.
+    fn maybe_flush(&mut self, p: &Plan<'_>) -> Result<()> {
+        if p.parts == 1 || p.keys.is_empty() || (self.groups.len() < FLUSH_GROUPS && self.bytes < p.flush_bytes) {
+            return Ok(());
+        }
+        p.charge(std::mem::take(&mut self.pending))?;
+        self.order_parts(p)?;
+        // workers start at different partitions so they rarely meet on a lock
+        let first = self.groups.hashes.first().map_or(0, |&h| (h >> 8) as usize).wrapping_add(self.flushes);
+        for i in 0..p.parts {
+            let part = first.wrapping_add(i) % p.parts;
+            if self.part_start[part] == self.part_start[part + 1] {
+                continue;
+            }
+            let mut table = p.shared[part].lock().map_err(|_| corrupt("aggregation table poisoned"))?;
+            p.merge_local(&mut table, self, part)?;
+        }
+        p.release(self.bytes);
+        self.bytes = 0;
+        self.groups = Groups::new();
+        self.last_gid = NONE;
+        self.part_order = Vec::new();
+        self.part_start = Vec::new();
+        self.flushes += 1;
         Ok(())
     }
 
@@ -1753,6 +1971,7 @@ impl Local {
             if p.passes > 1 && !p.in_pass(p.hash(&self.scratch)) {
                 continue;
             }
+            self.maybe_flush(p)?;
             let g = self.group_of(p)? as usize;
             for &(_, c, fi) in &p.pad_slots {
                 if let Value::Bytes(b) = cell(m, c)? {
@@ -1870,7 +2089,8 @@ impl Plan<'_> {
                         }
                         let sid = e.series_id;
                         visible_stretches(self.snap, chunk, si, (f.ts_min, f.ts_max), &self.want, |win, a, b| {
-                            local.stretch(self, win, sid, a, b)
+                            local.stretch(self, win, sid, a, b)?;
+                            local.maybe_flush(self)
                         })?;
                     }
                     Ok(())
@@ -1892,14 +2112,15 @@ impl Plan<'_> {
     fn reduce(&self, mut locals: Vec<Local>, threads: usize, cancel: Option<&mut dyn FnMut() -> bool>) -> Result<AggResult> {
         let one = match locals.len() {
             0 => Some(Local::new(self)?),
-            1 => locals.pop(),
+            1 if self.parts == 1 => locals.pop(),
             _ => None,
         };
         if let Some(l) = one {
             let (r, _) = self.output(&l.groups)?;
             return Ok(r);
         }
-        let total: usize = locals.iter().map(|l| l.groups.len()).sum();
+        let shared: usize = self.shared.iter().map(|t| t.lock().map_or(0, |g| g.len())).sum();
+        let total: usize = shared + locals.iter().map(|l| l.groups.len()).sum::<usize>();
         let next = AtomicUsize::new(0);
         let tasks = |poll: Option<&mut dyn FnMut() -> bool>| self.merge_tasks(&locals, &next, poll);
         let outs: Vec<Vec<(usize, Out)>> = if threads > 1 && total >= MERGE_PARALLEL_GROUPS {
@@ -1997,48 +2218,59 @@ impl Plan<'_> {
         Ok(outs)
     }
 
-    /// One partition of every worker's groups, merged. Returns the table and
-    /// the bytes accounted for it.
+    /// One partition: the shared table (what the workers flushed) plus the
+    /// rest of every worker's groups, merged. Returns the table and the bytes
+    /// accounted for it (the shared table's were charged when it grew).
     fn merge_part(&self, locals: &[Local], part: usize) -> Result<(Groups, usize)> {
         let nf = self.funcs.len();
-        let mut out = Groups::new();
+        let slot = self.shared.get(part).ok_or_else(|| corrupt("partition out of range"))?;
+        let mut out = std::mem::replace(&mut *slot.lock().map_err(|_| corrupt("aggregation table poisoned"))?, Groups::new());
+        let mut bytes = out.len() * self.group_bytes(0) + out.arena.len();
         out.presize(locals.iter().map(|l| l.part_start[part + 1] - l.part_start[part]).sum(), nf);
+        for l in locals {
+            bytes += self.merge_local(&mut out, l, part)?;
+        }
+        Ok((out, bytes))
+    }
+
+    /// Merges partition `part` of `l`'s groups into `out`; returns the bytes
+    /// `out` grew by, charged to the budget.
+    fn merge_local(&self, out: &mut Groups, l: &Local, part: usize) -> Result<usize> {
+        let nf = self.funcs.len();
         let (mut bytes, mut pending) = (0usize, 0usize);
         let (mut hs, mut warm): (Vec<u64>, Vec<u32>) = (Vec::new(), Vec::new());
-        for l in locals {
-            let (s, e) = (l.part_start[part], l.part_start[part + 1]);
-            for chunk in l.part_order[s..e].chunks(BATCH_REPS) {
-                if self.abort.load(Ordering::Relaxed) {
-                    return Err(Error::Cancelled("aggregation stopped".into()));
-                }
-                hs.clear();
-                hs.extend(chunk.iter().map(|&g| l.groups.hashes[g as usize]));
-                out.reserve_groups(chunk.len(), self.max)?;
-                out.warm(&hs, &mut warm);
-                for (&g, &h) in chunk.iter().zip(&hs) {
-                    let g = g as usize;
-                    let key = l.groups.key(g);
-                    let (ng, new) = out.find_or_add(h, key, &self.init, self.max)?;
-                    if new {
-                        let cost = self.group_bytes(key.len());
-                        bytes += cost;
-                        pending += cost;
-                        if pending >= self.charge_batch {
-                            self.charge(std::mem::take(&mut pending))?;
-                        }
+        let (s, e) = (l.part_start[part], l.part_start[part + 1]);
+        for chunk in l.part_order[s..e].chunks(BATCH_REPS) {
+            if self.abort.load(Ordering::Relaxed) {
+                return Err(Error::Cancelled("aggregation stopped".into()));
+            }
+            hs.clear();
+            hs.extend(chunk.iter().map(|&g| l.groups.hashes[g as usize]));
+            out.reserve_groups(chunk.len(), self.max)?;
+            out.warm(&hs, &mut warm);
+            for (&g, &h) in chunk.iter().zip(&hs) {
+                let g = g as usize;
+                let key = l.groups.key(g);
+                let (ng, new) = out.find_or_add(h, key, &self.init, self.max)?;
+                if new {
+                    let cost = self.group_bytes(key.len());
+                    bytes += cost;
+                    pending += cost;
+                    if pending >= self.charge_batch {
+                        self.charge(std::mem::take(&mut pending))?;
                     }
-                    let ng = ng as usize * nf;
-                    let src = &l.groups.accs[g * nf..(g + 1) * nf];
-                    for ((d, s), f) in out.accs[ng..ng + nf].iter_mut().zip(src).zip(&self.funcs) {
-                        if !d.merge(s, *f) {
-                            return Err(overflow());
-                        }
+                }
+                let ng = ng as usize * nf;
+                let src = &l.groups.accs[g * nf..(g + 1) * nf];
+                for ((d, s), f) in out.accs[ng..ng + nf].iter_mut().zip(src).zip(&self.funcs) {
+                    if !d.merge(s, *f) {
+                        return Err(overflow());
                     }
                 }
             }
         }
         self.charge(pending)?;
-        Ok((out, bytes))
+        Ok(bytes)
     }
 
     /// The result of a table of groups: all of them, or the top-N.

@@ -1,0 +1,184 @@
+# profile_distinct 2026-11-10 HEAD 444b84a; plugin md5 16e61788 (= build/)
+stats dbwatch-mcp-run-b4cd0624570a cpu=0.00% mem=62.07MiB / 30.16GiB
+stats dbwatch-dbwatch-1 cpu=15.21% mem=257.1MiB / 30.16GiB
+stats fileacc-mariadb cpu=0.02% mem=1.717GiB / 10GiB
+base thr4 (default) COUNT(DISTINCT file)	run1	wall_ms=4339 agg_ms=3442 post_ms=115 dict_ms=0 eval_ms=0 gbh_q=1 
+base thr4 (default) COUNT(DISTINCT file)	run2	wall_ms=2214 agg_ms=2099 post_ms=111 dict_ms=0 eval_ms=0 gbh_q=1 
+base thr4 (default) COUNT(DISTINCT file)	run3	wall_ms=2306 agg_ms=2193 post_ms=103 dict_ms=0 eval_ms=0 gbh_q=1 
+base thr4 (default) COUNT(DISTINCT file)	run4	wall_ms=2381 agg_ms=2268 post_ms=105 dict_ms=0 eval_ms=0 gbh_q=1 
+base thr8 COUNT(DISTINCT file)	run1	wall_ms=1354 agg_ms=1246 post_ms=102 dict_ms=0 eval_ms=0 gbh_q=1 
+base thr8 COUNT(DISTINCT file)	run2	wall_ms=1240 agg_ms=1118 post_ms=116 dict_ms=0 eval_ms=0 gbh_q=1 
+base thr8 COUNT(DISTINCT file)	run3	wall_ms=1259 agg_ms=1142 post_ms=111 dict_ms=0 eval_ms=0 gbh_q=1 
+base thr8 COUNT(DISTINCT file)	run4	wall_ms=1333 agg_ms=1200 post_ms=128 dict_ms=0 eval_ms=0 gbh_q=1 
+DISTINCT file thr=1 mem=1GiB	run1	wall_ms=2593 agg_ms=2490 post_ms=97 dict_ms=0 eval_ms=0 gbh_q=1 
+DISTINCT file thr=1 mem=1GiB	run2	wall_ms=2534 agg_ms=2434 post_ms=95 dict_ms=0 eval_ms=0 gbh_q=1 
+DISTINCT file thr=1 mem=1GiB	run3	wall_ms=2550 agg_ms=2449 post_ms=96 dict_ms=0 eval_ms=0 gbh_q=1 
+DISTINCT file thr=2 mem=1GiB	run1	wall_ms=1586 agg_ms=1481 post_ms=100 dict_ms=0 eval_ms=0 gbh_q=1 
+DISTINCT file thr=2 mem=1GiB	run2	wall_ms=1521 agg_ms=1421 post_ms=96 dict_ms=0 eval_ms=0 gbh_q=1 
+DISTINCT file thr=2 mem=1GiB	run3	wall_ms=1608 agg_ms=1509 post_ms=94 dict_ms=0 eval_ms=0 gbh_q=1 
+DISTINCT file thr=4 mem=1GiB	run1	wall_ms=2181 agg_ms=2080 post_ms=96 dict_ms=0 eval_ms=0 gbh_q=1 
+DISTINCT file thr=4 mem=1GiB	run2	wall_ms=2259 agg_ms=2158 post_ms=97 dict_ms=0 eval_ms=0 gbh_q=1 
+DISTINCT file thr=4 mem=1GiB	run3	wall_ms=2140 agg_ms=2038 post_ms=97 dict_ms=0 eval_ms=0 gbh_q=1 
+DISTINCT file thr=8 mem=1GiB	run1	wall_ms=1272 agg_ms=1169 post_ms=99 dict_ms=0 eval_ms=0 gbh_q=1 
+DISTINCT file thr=8 mem=1GiB	run2	wall_ms=1235 agg_ms=1109 post_ms=120 dict_ms=0 eval_ms=0 gbh_q=1 
+DISTINCT file thr=8 mem=1GiB	run3	wall_ms=1269 agg_ms=1163 post_ms=102 dict_ms=0 eval_ms=0 gbh_q=1 
+DISTINCT file thr=1 mem=4GiB	run1	wall_ms=2607 agg_ms=2498 post_ms=105 dict_ms=0 eval_ms=0 gbh_q=1 
+DISTINCT file thr=1 mem=4GiB	run2	wall_ms=2596 agg_ms=2476 post_ms=113 dict_ms=0 eval_ms=0 gbh_q=1 
+DISTINCT file thr=1 mem=4GiB	run3	wall_ms=2607 agg_ms=2504 post_ms=98 dict_ms=0 eval_ms=0 gbh_q=1 
+DISTINCT file thr=8 mem=4GiB	run1	wall_ms=676 agg_ms=571 post_ms=99 dict_ms=0 eval_ms=0 gbh_q=1 
+DISTINCT file thr=8 mem=4GiB	run2	wall_ms=659 agg_ms=544 post_ms=109 dict_ms=0 eval_ms=0 gbh_q=1 
+DISTINCT file thr=8 mem=4GiB	run3	wall_ms=677 agg_ms=575 post_ms=97 dict_ms=0 eval_ms=0 gbh_q=1 
+stats dbwatch-mcp-run-b4cd0624570a cpu=0.00% mem=62.07MiB / 30.16GiB
+stats dbwatch-dbwatch-1 cpu=8.75% mem=257.5MiB / 30.16GiB
+stats fileacc-mariadb cpu=0.02% mem=4.582GiB / 10GiB
+DISTINCT file thr=2 mem=4GiB	run1	wall_ms=1696 agg_ms=1592 post_ms=99 dict_ms=0 eval_ms=0 gbh_q=1 
+DISTINCT file thr=2 mem=4GiB	run2	wall_ms=1555 agg_ms=1452 post_ms=98 dict_ms=0 eval_ms=0 gbh_q=1 
+DISTINCT file thr=2 mem=4GiB	run3	wall_ms=1664 agg_ms=1547 post_ms=111 dict_ms=0 eval_ms=0 gbh_q=1 
+DISTINCT file thr=4 mem=4GiB	run1	wall_ms=1005 agg_ms=902 post_ms=100 dict_ms=0 eval_ms=0 gbh_q=1 
+DISTINCT file thr=4 mem=4GiB	run2	wall_ms=947 agg_ms=843 post_ms=98 dict_ms=0 eval_ms=0 gbh_q=1 
+DISTINCT file thr=4 mem=4GiB	run3	wall_ms=983 agg_ms=877 post_ms=100 dict_ms=0 eval_ms=0 gbh_q=1 
+H2 COUNT(*) thr8	run1	wall_ms=0 agg_ms=0 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=0 
+H2 COUNT(*) thr8	run2	wall_ms=0 agg_ms=0 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=0 
+H2 COUNT(*) thr8	run3	wall_ms=0 agg_ms=0 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=0 
+H2 SUM(LENGTH(file)) thr8	run1	wall_ms=1605 agg_ms=0 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=0 
+H2 SUM(LENGTH(file)) thr8	run2	wall_ms=1617 agg_ms=0 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=0 
+H2 SUM(LENGTH(file)) thr8	run3	wall_ms=1613 agg_ms=0 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=0 
+H2 SUM(bytes) thr8	run1	wall_ms=265 agg_ms=264 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=1 
+H2 SUM(bytes) thr8	run2	wall_ms=157 agg_ms=157 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=1 
+H2 SUM(bytes) thr8	run3	wall_ms=65 agg_ms=64 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=1 
+H2 COUNT(DISTINCT op) thr8	run1	wall_ms=333 agg_ms=332 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=1 
+H2 COUNT(DISTINCT op) thr8	run2	wall_ms=129 agg_ms=128 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=1 
+H2 COUNT(DISTINCT op) thr8	run3	wall_ms=124 agg_ms=124 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=1 
+H2 COUNT(DISTINCT user_name) thr8	run1	wall_ms=381 agg_ms=380 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=1 
+H2 COUNT(DISTINCT user_name) thr8	run2	wall_ms=111 agg_ms=111 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=1 
+H2 COUNT(DISTINCT user_name) thr8	run3	wall_ms=100 agg_ms=100 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=1 
+H3 GROUP BY file subq mem4G thr8	run1	wall_ms=95735 agg_ms=0 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=0 
+H3 GROUP BY file subq mem4G thr8	run2	wall_ms=0 agg_ms=-54252 post_ms=-3308 dict_ms=0 eval_ms=0 gbh_q=-41 ERROR 2013 (HY000) at line 1: Lost connection to server during query
+## NOTA: GROUP BY file em subconsulta nao desce (gbh_q=0), rodou >95 s no servidor e a conexao caiu (servidor reiniciou; causa nao investigada). Descartado.
+COUNT(DISTINCT folder) thr8 mem4G	run1	wall_ms=1426 agg_ms=1424 post_ms=1 dict_ms=0 eval_ms=0 gbh_q=1 
+COUNT(DISTINCT folder) thr8 mem4G	run2	wall_ms=646 agg_ms=644 post_ms=1 dict_ms=0 eval_ms=0 gbh_q=1 
+COUNT(DISTINCT folder) thr8 mem4G	run3	wall_ms=461 agg_ms=458 post_ms=2 dict_ms=0 eval_ms=0 gbh_q=1 
+COUNT(DISTINCT folder) thr8 mem1G	run1	wall_ms=472 agg_ms=470 post_ms=1 dict_ms=0 eval_ms=0 gbh_q=1 
+COUNT(DISTINCT folder) thr8 mem1G	run2	wall_ms=300 agg_ms=298 post_ms=2 dict_ms=0 eval_ms=0 gbh_q=1 
+COUNT(DISTINCT folder) thr8 mem1G	run3	wall_ms=305 agg_ms=303 post_ms=1 dict_ms=0 eval_ms=0 gbh_q=1 
+COUNT(DISTINCT process) thr8	run1	wall_ms=227 agg_ms=0 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=0 
+COUNT(DISTINCT process) thr8	run2	wall_ms=195 agg_ms=0 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=0 
+COUNT(DISTINCT process) thr8	run3	wall_ms=166 agg_ms=0 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=0 
+GROUP BY file top1 thr8 mem4G	run1	wall_ms=2132 agg_ms=2132 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=1 
+GROUP BY file top1 thr8 mem4G	run2	wall_ms=1170 agg_ms=1169 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=1 
+GROUP BY file top1 thr8 mem4G	run3	wall_ms=981 agg_ms=981 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=1 
+GROUP BY op COUNT(*) thr8	run1	wall_ms=464 agg_ms=464 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=1 
+GROUP BY op COUNT(*) thr8	run2	wall_ms=168 agg_ms=168 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=1 
+GROUP BY op COUNT(*) thr8	run3	wall_ms=153 agg_ms=154 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=1 
+GROUP BY folder top1 thr8	run1	wall_ms=1245 agg_ms=1245 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=1 
+GROUP BY folder top1 thr8	run2	wall_ms=784 agg_ms=784 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=1 
+GROUP BY folder top1 thr8	run3	wall_ms=439 agg_ms=439 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=1 
+DISTINCT file _h thr8 mem4G	run1	wall_ms=1716 agg_ms=1522 post_ms=116 dict_ms=0 eval_ms=0 gbh_q=1 
+DISTINCT file _h thr8 mem4G	run2	wall_ms=1198 agg_ms=1081 post_ms=111 dict_ms=0 eval_ms=0 gbh_q=1 
+DISTINCT file _h thr8 mem4G	run3	wall_ms=788 agg_ms=664 post_ms=115 dict_ms=0 eval_ms=0 gbh_q=1 
+DISTINCT file _hn thr8 mem4G	run1	wall_ms=1264 agg_ms=1098 post_ms=129 dict_ms=0 eval_ms=0 gbh_q=1 
+DISTINCT file _hn thr8 mem4G	run2	wall_ms=882 agg_ms=745 post_ms=127 dict_ms=0 eval_ms=0 gbh_q=1 
+DISTINCT file _hn thr8 mem4G	run3	wall_ms=695 agg_ms=579 post_ms=109 dict_ms=0 eval_ms=0 gbh_q=1 
+MAX(file) thr8	run1	wall_ms=4106 agg_ms=0 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=0 
+MAX(file) thr8	run2	wall_ms=3263 agg_ms=0 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=0 
+MAX(file) thr8	run3	wall_ms=3113 agg_ms=0 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=0 
+COUNT(*) WHERE file='x' thr8	run1	wall_ms=50 agg_ms=50 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=1 
+COUNT(*) WHERE file='x' thr8	run2	wall_ms=32 agg_ms=31 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=1 
+COUNT(*) WHERE file='x' thr8	run3	wall_ms=31 agg_ms=31 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=1 
+WARM DISTINCT file thr8 mem1G	run1	wall_ms=2607 agg_ms=2473 post_ms=125 dict_ms=0 eval_ms=0 gbh_q=1 
+WARM DISTINCT file thr8 mem1G	run2	wall_ms=2150 agg_ms=2041 post_ms=104 dict_ms=0 eval_ms=0 gbh_q=1 
+WARM DISTINCT file thr8 mem1G	run3	wall_ms=2038 agg_ms=1876 post_ms=155 dict_ms=0 eval_ms=0 gbh_q=1 
+WARM DISTINCT file thr8 mem1G	run4	wall_ms=2020 agg_ms=1896 post_ms=119 dict_ms=0 eval_ms=0 gbh_q=1 
+H3 GROUP BY file subq mem4G thr8	run3	wall_ms=103004 agg_ms=25220 post_ms=1221 dict_ms=0 eval_ms=0 gbh_q=28 
+H3 GROUP BY op,COUNT(*) thr8	run1	wall_ms=1021 agg_ms=1021 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=1 
+H3 GROUP BY op,COUNT(*) thr8	run2	wall_ms=1269 agg_ms=1268 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=1 
+WARM DISTINCT file thr8 mem1G	run5	wall_ms=3725 agg_ms=5887 post_ms=120 dict_ms=0 eval_ms=0 gbh_q=4 
+H3 GROUP BY op,COUNT(*) thr8	run3	wall_ms=257 agg_ms=3853 post_ms=120 dict_ms=0 eval_ms=0 gbh_q=1 
+WARM DISTINCT file thr8 mem4G	run1	wall_ms=1443 agg_ms=1343 post_ms=94 dict_ms=0 eval_ms=0 gbh_q=1 
+WARM DISTINCT file thr8 mem4G	run2	wall_ms=1191 agg_ms=1081 post_ms=104 dict_ms=0 eval_ms=0 gbh_q=1 
+WARM DISTINCT file thr8 mem4G	run3	wall_ms=909 agg_ms=808 post_ms=95 dict_ms=0 eval_ms=0 gbh_q=1 
+WARM DISTINCT file thr8 mem4G	run4	wall_ms=951 agg_ms=845 post_ms=101 dict_ms=0 eval_ms=0 gbh_q=1 
+WARM DISTINCT file thr8 mem4G	run5	wall_ms=1006 agg_ms=905 post_ms=95 dict_ms=0 eval_ms=0 gbh_q=1 
+WARM DISTINCT file thr4 mem4G	run1	wall_ms=1321 agg_ms=1210 post_ms=108 dict_ms=0 eval_ms=0 gbh_q=1 
+WARM DISTINCT file thr4 mem4G	run2	wall_ms=1283 agg_ms=1180 post_ms=97 dict_ms=0 eval_ms=0 gbh_q=1 
+WARM DISTINCT file thr4 mem4G	run3	wall_ms=1324 agg_ms=1205 post_ms=111 dict_ms=0 eval_ms=0 gbh_q=1 
+WARM DISTINCT file thr1 mem1G	run1	wall_ms=3661 agg_ms=3559 post_ms=96 dict_ms=0 eval_ms=0 gbh_q=1 
+WARM DISTINCT file thr1 mem1G	run2	wall_ms=3959 agg_ms=3836 post_ms=117 dict_ms=0 eval_ms=0 gbh_q=1 
+WARM DISTINCT file thr1 mem1G	run3	wall_ms=4214 agg_ms=4081 post_ms=125 dict_ms=0 eval_ms=0 gbh_q=1 
+WARM DISTINCT folder thr1	run1	wall_ms=4260 agg_ms=4257 post_ms=2 dict_ms=0 eval_ms=0 gbh_q=1 
+WARM DISTINCT folder thr1	run2	wall_ms=2013 agg_ms=2011 post_ms=1 dict_ms=0 eval_ms=0 gbh_q=1 
+WARM DISTINCT folder thr1	run3	wall_ms=1853 agg_ms=1851 post_ms=2 dict_ms=0 eval_ms=0 gbh_q=1 
+WARM DISTINCT op thr1	run1	wall_ms=2041 agg_ms=2041 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=1 
+WARM DISTINCT op thr1	run2	wall_ms=1058 agg_ms=1059 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=1 
+WARM DISTINCT op thr1	run3	wall_ms=939 agg_ms=939 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=1 
+WARM DISTINCT file thr8 mem4G	run1	wall_ms=2093 agg_ms=1954 post_ms=130 dict_ms=0 eval_ms=0 gbh_q=1 
+WARM DISTINCT file thr8 mem4G	run2	wall_ms=1209 agg_ms=1110 post_ms=94 dict_ms=0 eval_ms=0 gbh_q=1 
+WARM DISTINCT file thr8 mem4G	run3	wall_ms=1047 agg_ms=933 post_ms=107 dict_ms=0 eval_ms=0 gbh_q=1 
+H3 GROUP BY folder subq thr8	run1	wall_ms=53611 agg_ms=36207 post_ms=1479 dict_ms=0 eval_ms=0 gbh_q=19 
+50000
+stats dbwatch-mcp-run-b4cd0624570a cpu=0.00% mem=62.07MiB / 30.16GiB
+stats dbwatch-dbwatch-1 cpu=8.97% mem=263.9MiB / 30.16GiB
+stats fileacc-mariadb cpu=97.40% mem=9.969GiB / 10GiB
+## ATENCAO: um laco em segundo plano (GROUP BY folder em subconsulta, via servidor, ~10 GiB RSS, 1 CPU) rodou em paralelo com os blocos acima desta linha a partir de 'COUNT(DISTINCT folder) thr8 mem4G'; esses blocos estao CONTAMINADOS. Reinicio do conteiner e remedicao limpa abaixo. Blocos validos acima: ate 'H2 COUNT(DISTINCT user_name)' e thr=1/2/4/8 mem 1G/4G (excluindo o que vem depois).
+## CLEAN (conteiner reiniciado; 1 warmup + 4 runs)
+stats dbwatch-mcp-run-b4cd0624570a cpu=0.00% mem=62.07MiB / 30.16GiB
+stats dbwatch-dbwatch-1 cpu=0.88% mem=263.2MiB / 30.16GiB
+stats fileacc-mariadb cpu=2.42% mem=1.7GiB / 10GiB
+C DISTINCT file thr8 mem1G (warmup+4)	run1	wall_ms=2406 agg_ms=1757 post_ms=129 dict_ms=0 eval_ms=0 gbh_q=1 
+C DISTINCT file thr8 mem1G (warmup+4)	run2	wall_ms=1235 agg_ms=1130 post_ms=100 dict_ms=0 eval_ms=0 gbh_q=1 
+C DISTINCT file thr8 mem1G (warmup+4)	run3	wall_ms=1212 agg_ms=1111 post_ms=96 dict_ms=0 eval_ms=0 gbh_q=1 
+C DISTINCT file thr8 mem1G (warmup+4)	run4	wall_ms=1297 agg_ms=1182 post_ms=107 dict_ms=0 eval_ms=0 gbh_q=1 
+C DISTINCT file thr8 mem1G (warmup+4)	run5	wall_ms=1249 agg_ms=1130 post_ms=112 dict_ms=0 eval_ms=0 gbh_q=1 
+C DISTINCT file thr8 mem4G	run1	wall_ms=653 agg_ms=546 post_ms=102 dict_ms=0 eval_ms=0 gbh_q=1 
+C DISTINCT file thr8 mem4G	run2	wall_ms=645 agg_ms=532 post_ms=109 dict_ms=0 eval_ms=0 gbh_q=1 
+C DISTINCT file thr8 mem4G	run3	wall_ms=676 agg_ms=567 post_ms=103 dict_ms=0 eval_ms=0 gbh_q=1 
+C DISTINCT file thr8 mem4G	run4	wall_ms=652 agg_ms=538 post_ms=108 dict_ms=0 eval_ms=0 gbh_q=1 
+C DISTINCT file thr1 mem4G	run1	wall_ms=2483 agg_ms=2360 post_ms=117 dict_ms=0 eval_ms=0 gbh_q=1 
+C DISTINCT file thr1 mem4G	run2	wall_ms=2602 agg_ms=2480 post_ms=116 dict_ms=0 eval_ms=0 gbh_q=1 
+C DISTINCT file thr1 mem4G	run3	wall_ms=2487 agg_ms=2375 post_ms=106 dict_ms=0 eval_ms=0 gbh_q=1 
+C DISTINCT file thr2 mem4G	run1	wall_ms=1584 agg_ms=1473 post_ms=102 dict_ms=0 eval_ms=0 gbh_q=1 
+C DISTINCT file thr2 mem4G	run2	wall_ms=1515 agg_ms=1406 post_ms=101 dict_ms=0 eval_ms=0 gbh_q=1 
+C DISTINCT file thr2 mem4G	run3	wall_ms=1561 agg_ms=1445 post_ms=110 dict_ms=0 eval_ms=0 gbh_q=1 
+C DISTINCT file thr4 mem4G	run1	wall_ms=1016 agg_ms=900 post_ms=111 dict_ms=0 eval_ms=0 gbh_q=1 
+C DISTINCT file thr4 mem4G	run2	wall_ms=986 agg_ms=872 post_ms=107 dict_ms=0 eval_ms=0 gbh_q=1 
+C DISTINCT file thr4 mem4G	run3	wall_ms=949 agg_ms=838 post_ms=105 dict_ms=0 eval_ms=0 gbh_q=1 
+## CLEAN baselines (folder: 50000 distintos)
+C thr1 SUM(bytes)	run1	wall_ms=797 agg_ms=797 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=1 
+C thr1 SUM(bytes)	run2	wall_ms=486 agg_ms=486 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=1 
+C thr1 SUM(bytes)	run3	wall_ms=287 agg_ms=286 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=1 
+C thr1 SUM(bytes)	run4	wall_ms=282 agg_ms=281 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=1 
+C thr1 DISTINCT op(5 vals)	run1	wall_ms=1829 agg_ms=1829 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=1 
+C thr1 DISTINCT op(5 vals)	run2	wall_ms=951 agg_ms=950 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=1 
+C thr1 DISTINCT op(5 vals)	run3	wall_ms=907 agg_ms=906 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=1 
+C thr1 DISTINCT op(5 vals)	run4	wall_ms=881 agg_ms=881 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=1 
+C thr1 DISTINCT folder(50k)	run1	wall_ms=4080 agg_ms=4079 post_ms=2 dict_ms=0 eval_ms=0 gbh_q=1 
+C thr1 DISTINCT folder(50k)	run2	wall_ms=1709 agg_ms=1707 post_ms=2 dict_ms=0 eval_ms=0 gbh_q=1 
+C thr1 DISTINCT folder(50k)	run3	wall_ms=1847 agg_ms=1845 post_ms=2 dict_ms=0 eval_ms=0 gbh_q=1 
+C thr1 DISTINCT folder(50k)	run4	wall_ms=1341 agg_ms=1339 post_ms=1 dict_ms=0 eval_ms=0 gbh_q=1 
+C thr1 GROUP BY folder top1	run1	wall_ms=1482 agg_ms=1481 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=1 
+C thr1 GROUP BY folder top1	run2	wall_ms=1378 agg_ms=1378 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=1 
+C thr1 GROUP BY folder top1	run3	wall_ms=1583 agg_ms=1583 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=1 
+C thr1 GROUP BY folder top1	run4	wall_ms=1313 agg_ms=1313 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=1 
+C thr1 GROUP BY file top1	run1	wall_ms=6298 agg_ms=6298 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=1 
+C thr1 GROUP BY file top1	run2	wall_ms=3057 agg_ms=3056 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=1 
+C thr1 GROUP BY file top1	run3	wall_ms=3082 agg_ms=3082 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=1 
+C thr8 SUM(bytes)	run1	wall_ms=319 agg_ms=320 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=1 
+C thr8 SUM(bytes)	run2	wall_ms=107 agg_ms=106 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=1 
+C thr8 SUM(bytes)	run3	wall_ms=61 agg_ms=60 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=1 
+C thr8 SUM(bytes)	run4	wall_ms=64 agg_ms=63 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=1 
+C thr8 DISTINCT op(5 vals)	run1	wall_ms=486 agg_ms=486 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=1 
+C thr8 DISTINCT op(5 vals)	run2	wall_ms=170 agg_ms=169 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=1 
+C thr8 DISTINCT op(5 vals)	run3	wall_ms=146 agg_ms=146 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=1 
+C thr8 DISTINCT op(5 vals)	run4	wall_ms=129 agg_ms=129 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=1 
+C thr8 DISTINCT folder(50k)	run1	wall_ms=1162 agg_ms=1160 post_ms=2 dict_ms=0 eval_ms=0 gbh_q=1 
+C thr8 DISTINCT folder(50k)	run2	wall_ms=583 agg_ms=572 post_ms=7 dict_ms=0 eval_ms=0 gbh_q=1 
+C thr8 DISTINCT folder(50k)	run3	wall_ms=483 agg_ms=481 post_ms=2 dict_ms=0 eval_ms=0 gbh_q=1 
+C thr8 DISTINCT folder(50k)	run4	wall_ms=408 agg_ms=406 post_ms=2 dict_ms=0 eval_ms=0 gbh_q=1 
+C thr8 GROUP BY folder top1	run1	wall_ms=350 agg_ms=349 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=1 
+C thr8 GROUP BY folder top1	run2	wall_ms=378 agg_ms=377 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=1 
+C thr8 GROUP BY folder top1	run3	wall_ms=357 agg_ms=356 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=1 
+C thr8 GROUP BY folder top1	run4	wall_ms=357 agg_ms=357 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=1 
+C thr8 GROUP BY file top1	run1	wall_ms=1865 agg_ms=1864 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=1 
+C thr8 GROUP BY file top1	run2	wall_ms=975 agg_ms=975 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=1 
+C thr8 GROUP BY file top1	run3	wall_ms=725 agg_ms=724 post_ms=0 dict_ms=0 eval_ms=0 gbh_q=1 
+stats fileacc-mariadb cpu=2.66% mem=6.336GiB / 10GiB

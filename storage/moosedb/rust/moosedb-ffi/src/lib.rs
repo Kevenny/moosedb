@@ -1991,6 +1991,18 @@ pub struct TFAggSpec {
     /// Exact float filters (`TFAggFloatFilter`), ANDed with `filters`. May be NULL with 0.
     pub float_filters: *const TFAggFloatFilter,
     pub float_filter_count: u32,
+    /// COUNT(DISTINCT) of the key `keys[distinct_key]`, when `has_distinct != 0`
+    /// (0 = none, the zero value; `TF_ERR_INVALID_ARG` with a top-N, with an
+    /// index out of range or with a PAD key besides that one). The groups that
+    /// differ only in that key are collapsed (their functions merged); the
+    /// result has one key column LESS (that key's, which is dropped) and one
+    /// function MORE, the last (`func_count`, reported as `TF_AGG_COUNT`): its
+    /// `count` is the number of collapsed groups whose key is not NULL, i.e.
+    /// the distinct count. Only for keys whose byte / integer equality is the
+    /// SQL one. With no other key the result has one group, or none when no
+    /// row qualified (the caller supplies the zero).
+    pub has_distinct: u8,
+    pub distinct_key: u32,
 }
 
 /// Polled about every 10 ms on the calling thread; a non-zero return cancels
@@ -2210,6 +2222,7 @@ pub unsafe extern "C" fn moosedb_agg_run(
             // SAFETY: caller contract for `preds`.
             preds: unsafe { col_preds(s.preds, s.pred_count) }?,
             top,
+            distinct: (s.has_distinct != 0).then_some(s.distinct_key as usize),
             max_memory: usize::try_from(s.max_memory).unwrap_or(usize::MAX),
             threads: s.threads as usize,
         };
@@ -2222,6 +2235,9 @@ pub unsafe extern "C" fn moosedb_agg_run(
         let poll: Option<&mut dyn FnMut() -> bool> = poll.as_mut().map(|p| p as &mut dyn FnMut() -> bool);
         a.agg.run(&spec, poll)?;
         a.ops = ops;
+        if spec.distinct.is_some() {
+            a.ops.push(TF_AGG_COUNT); // the extra distinct count column
+        }
         Ok(())
     })
 }

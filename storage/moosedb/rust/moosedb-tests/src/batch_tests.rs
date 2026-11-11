@@ -445,3 +445,44 @@ fn spilled_batch_does_not_release_segments_another_open_batch_needs() {
     assert_eq!(count(&t, "a"), 400);
     assert_eq!(count(&t, "z"), 1);
 }
+
+#[test]
+fn write_counters_rise_by_the_expected_delta() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_new(&dir.path().join("t"), RawOptions::default());
+    let before = moosedb_core::write_stats();
+    for _ in 0..2 {
+        let mut b = t.begin_batch().unwrap();
+        write_all(&mut b, &host_rows("w", 10));
+        b.commit(true).unwrap();
+        t.flush().unwrap();
+    }
+    t.compact(i64::MIN, i64::MAX, base_ts()).unwrap();
+    let d = moosedb_core::write_stats();
+    // Global counters: other tests may add on top, never subtract.
+    assert!(d.rows_inserted - before.rows_inserted >= 20);
+    assert!(d.batches_committed - before.batches_committed >= 2);
+    assert!(d.wal_bytes - before.wal_bytes > 0);
+    assert!(d.wal_fsyncs - before.wal_fsyncs >= 1);
+    assert!(d.memtable_flushes - before.memtable_flushes >= 2);
+    assert!(d.compactions - before.compactions >= 1);
+    assert!(d.compaction_us >= before.compaction_us);
+}
+
+#[test]
+fn spilled_batch_rows_are_counted_at_commit_and_aborted_ones_are_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_new(&dir.path().join("t"), small());
+    let rows = host_rows("s", 600);
+    let mut a = t.begin_batch().unwrap();
+    write_all(&mut a, &rows);
+    a.abort();
+    let before = moosedb_core::write_stats();
+    let mut b = t.begin_batch().unwrap();
+    write_all(&mut b, &rows);
+    b.commit(false).unwrap();
+    assert_eq!(count(&t, "s"), 600);
+    let d = moosedb_core::write_stats();
+    // Parallel tests only add; the aborted batch would show as >= 1200 only by luck of others.
+    assert!(d.rows_inserted - before.rows_inserted >= 600);
+}

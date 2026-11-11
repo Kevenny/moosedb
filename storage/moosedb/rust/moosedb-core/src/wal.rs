@@ -542,6 +542,7 @@ impl Wal {
             return Err(e.into());
         }
         self.offset += (ENTRY_HEADER + body.len()) as u64;
+        crate::wstats::add(&crate::wstats::WAL_BYTES, (ENTRY_HEADER + body.len()) as u64);
         self.unsynced = true;
         Ok(())
     }
@@ -581,6 +582,7 @@ impl Wal {
         let synced = self.out.flush().map_err(Error::from).and_then(|()| {
             self.os_offset = self.offset;
             if durable {
+                crate::wstats::add(&crate::wstats::WAL_FSYNCS, 1);
                 fsutil::sync_data(self.out.get_ref())
             } else {
                 Ok(())

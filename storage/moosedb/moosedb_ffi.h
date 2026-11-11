@@ -292,6 +292,17 @@ typedef struct {
   uint64_t block_read_ns;
 } TFPruneStats;
 
+// Process-wide write-path counters (monotonic since the library loaded).
+typedef struct {
+  uint64_t rows_inserted;
+  uint64_t batches_committed;
+  uint64_t wal_bytes;
+  uint64_t wal_fsyncs;
+  uint64_t memtable_flushes;
+  uint64_t compactions;
+  uint64_t compaction_us;
+} TFWriteStats;
+
 // One column of a `TFBatch` (see `moosedb_scan_next_batch`). All pointers
 // belong to the scan and follow the lifetime of the batch.
 //
@@ -881,6 +892,12 @@ TFStatus moosedb_scan_open_pruned(MooseDBTable *table,
 // # Safety
 // `out` must be writable.
 TFStatus moosedb_prune_stats(TFPruneStats *out);
+
+// Reads the write counters.
+//
+// # Safety
+// `out` must be writable.
+TFStatus moosedb_write_stats(TFWriteStats *out);
 
 // Zeroes the pruning counters.
 TFStatus moosedb_prune_stats_reset(void);

@@ -650,7 +650,45 @@ static int show_prune_stats(THD *, SHOW_VAR *var, void *buff,
   return 0;
 }
 
+/* Global write counters of the core (Moosedb_write_*); 0 if the FFI call fails. */
+static int show_write_stats(THD *, SHOW_VAR *var, void *buff,
+                            system_status_var *, enum_var_type)
+{
+  struct out_t
+  {
+    ulonglong v[7];
+    SHOW_VAR vars[8];
+  };
+  static_assert(sizeof(out_t) <= SHOW_VAR_FUNC_BUFF_SIZE, "status buffer");
+  if (!var || !buff)
+    return 1;
+  out_t *o= static_cast<out_t *>(buff);
+  TFWriteStats st{};
+  if (moosedb_write_stats(&st) != TF_OK)
+  {
+    take_last_error();
+    st= TFWriteStats{};
+  }
+  const ulonglong vals[7]= {st.rows_inserted, st.batches_committed,
+                            st.wal_bytes, st.wal_fsyncs,
+                            st.memtable_flushes, st.compactions,
+                            st.compaction_us};
+  static const char *const names[7]= {
+    "rows_inserted", "batches_committed", "wal_bytes", "wal_fsyncs",
+    "memtable_flushes", "compactions", "compaction_us"};
+  for (int i= 0; i < 7; i++)
+  {
+    o->v[i]= vals[i];
+    o->vars[i]= {names[i], (char *) &o->v[i], SHOW_LONGLONG};
+  }
+  o->vars[7]= {NullS, NullS, SHOW_LONG};
+  var->type= SHOW_ARRAY;
+  var->value= (char *) o->vars;
+  return 0;
+}
+
 static SHOW_VAR moosedb_status_variables[]= {
+  {"write", (char *) &show_write_stats, SHOW_FUNC},
   {"prune", (char *) &show_prune_stats, SHOW_FUNC},
   {"gbh_queries", (char *) &srv_gbh_queries, SHOW_LONGLONG},
   {"gbh_dict_us", (char *) &srv_gbh_dict_us, SHOW_LONGLONG},

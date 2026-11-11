@@ -252,8 +252,11 @@ impl Table {
             let n = group.len();
             let mut key: Vec<u64> = group.iter().map(|c| c.id).collect();
             key.sort_unstable();
+            let t0 = std::time::Instant::now();
             match self.compact_group(group, now) {
                 Ok(Some(out)) => {
+                    crate::wstats::add(&crate::wstats::COMPACTIONS, 1);
+                    crate::wstats::add(&crate::wstats::COMPACTION_US, t0.elapsed().as_micros() as u64);
                     report.groups += 1;
                     report.chunks_in += n;
                     report.chunks_out += out.len();

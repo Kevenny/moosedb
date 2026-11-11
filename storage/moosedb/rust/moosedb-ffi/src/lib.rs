@@ -1532,6 +1532,40 @@ pub unsafe extern "C" fn moosedb_prune_stats(out: *mut TFPruneStats) -> TFStatus
     })
 }
 
+/// Process-wide write-path counters (monotonic since the library loaded).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TFWriteStats {
+    pub rows_inserted: u64,
+    pub batches_committed: u64,
+    pub wal_bytes: u64,
+    pub wal_fsyncs: u64,
+    pub memtable_flushes: u64,
+    pub compactions: u64,
+    pub compaction_us: u64,
+}
+
+/// Reads the write counters.
+///
+/// # Safety
+/// `out` must be writable.
+#[no_mangle]
+pub unsafe extern "C" fn moosedb_write_stats(out: *mut TFWriteStats) -> TFStatus {
+    guard(|| {
+        let s = moosedb_core::write_stats();
+        *handle_mut(out, "out")? = TFWriteStats {
+            rows_inserted: s.rows_inserted,
+            batches_committed: s.batches_committed,
+            wal_bytes: s.wal_bytes,
+            wal_fsyncs: s.wal_fsyncs,
+            memtable_flushes: s.memtable_flushes,
+            compactions: s.compactions,
+            compaction_us: s.compaction_us,
+        };
+        Ok(())
+    })
+}
+
 /// Zeroes the pruning counters.
 #[no_mangle]
 pub extern "C" fn moosedb_prune_stats_reset() -> TFStatus {

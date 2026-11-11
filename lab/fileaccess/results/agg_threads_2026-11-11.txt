@@ -1,0 +1,162 @@
+RUN q=a n=1 i=1 wall=3.412 agg=3.395
+RUN q=a n=1 i=2 wall=6.202 agg=6.183
+RUN q=a n=1 i=3 wall=4.244 agg=4.226
+RUN q=a n=1 i=4 wall=3.059 agg=3.044
+RUN q=a n=1 i=5 wall=2.677 agg=2.661
+RUN q=b n=1 i=1 wall=14.871 agg=14.854
+RUN q=b n=1 i=2 wall=15.691 agg=15.671
+RUN q=b n=1 i=3 wall=13.546 agg=13.529
+RUN q=b n=1 i=4 wall=15.086 agg=15.068
+RUN q=b n=1 i=5 wall=14.324 agg=14.306
+RUN q=c n=1 i=1 wall=0.503 agg=0.486
+RUN q=c n=1 i=2 wall=0.550 agg=0.531
+RUN q=c n=1 i=3 wall=0.632 agg=0.613
+RUN q=c n=1 i=4 wall=0.509 agg=0.490
+RUN q=c n=1 i=5 wall=0.509 agg=0.492
+RUN q=d n=1 i=1 wall=0.028 agg=0.011
+RUN q=d n=1 i=2 wall=0.027 agg=0.011
+RUN q=d n=1 i=3 wall=0.028 agg=0.011
+RUN q=d n=1 i=4 wall=0.028 agg=0.011
+RUN q=d n=1 i=5 wall=0.027 agg=0.011
+RUN q=e n=1 i=1 wall=0.020 agg=0.000
+RUN q=e n=1 i=2 wall=0.020 agg=0.000
+RUN q=e n=1 i=3 wall=0.020 agg=0.000
+RUN q=e n=1 i=4 wall=0.021 agg=0.000
+RUN q=e n=1 i=5 wall=0.020 agg=0.000
+RUN q=a n=2 i=1 wall=2.087 agg=2.069
+RUN q=a n=2 i=2 wall=1.797 agg=1.778
+RUN q=a n=2 i=3 wall=1.714 agg=1.698
+RUN q=a n=2 i=4 wall=1.632 agg=1.616
+RUN q=a n=2 i=5 wall=1.837 agg=1.820
+RUN q=b n=2 i=1 wall=7.670 agg=7.651
+RUN q=b n=2 i=2 wall=7.542 agg=7.524
+RUN q=b n=2 i=3 wall=7.408 agg=7.392
+RUN q=b n=2 i=4 wall=7.348 agg=7.329
+RUN q=b n=2 i=5 wall=7.044 agg=7.027
+RUN q=c n=2 i=1 wall=0.399 agg=0.382
+RUN q=c n=2 i=2 wall=0.305 agg=0.288
+RUN q=c n=2 i=3 wall=0.404 agg=0.387
+RUN q=c n=2 i=4 wall=0.295 agg=0.279
+RUN q=c n=2 i=5 wall=0.507 agg=0.490
+RUN q=d n=2 i=1 wall=0.024 agg=0.006
+RUN q=d n=2 i=2 wall=0.025 agg=0.006
+RUN q=d n=2 i=3 wall=0.023 agg=0.006
+RUN q=d n=2 i=4 wall=0.024 agg=0.006
+RUN q=d n=2 i=5 wall=0.024 agg=0.006
+RUN q=e n=2 i=1 wall=0.020 agg=0.000
+RUN q=e n=2 i=2 wall=0.022 agg=0.000
+RUN q=e n=2 i=3 wall=0.020 agg=0.000
+RUN q=e n=2 i=4 wall=0.019 agg=0.000
+RUN q=e n=2 i=5 wall=0.020 agg=0.000
+RUN q=a n=4 i=1 wall=1.194 agg=1.175
+RUN q=a n=4 i=2 wall=1.029 agg=1.012
+RUN q=a n=4 i=3 wall=0.891 agg=0.873
+RUN q=a n=4 i=4 wall=1.003 agg=0.986
+RUN q=a n=4 i=5 wall=0.902 agg=0.883
+RUN q=b n=4 i=1 wall=4.803 agg=4.784
+RUN q=b n=4 i=2 wall=5.934 agg=5.918
+RUN q=b n=4 i=3 wall=4.357 agg=4.340
+RUN q=b n=4 i=4 wall=4.418 agg=4.399
+RUN q=b n=4 i=5 wall=4.112 agg=4.094
+RUN q=c n=4 i=1 wall=0.197 agg=0.179
+RUN q=c n=4 i=2 wall=0.224 agg=0.208
+RUN q=c n=4 i=3 wall=0.193 agg=0.176
+RUN q=c n=4 i=4 wall=0.603 agg=0.585
+RUN q=c n=4 i=5 wall=0.184 agg=0.166
+RUN q=d n=4 i=1 wall=0.021 agg=0.004
+RUN q=d n=4 i=2 wall=0.021 agg=0.004
+RUN q=d n=4 i=3 wall=0.021 agg=0.004
+RUN q=d n=4 i=4 wall=0.019 agg=0.004
+RUN q=d n=4 i=5 wall=0.020 agg=0.004
+RUN q=e n=4 i=1 wall=0.020 agg=0.000
+RUN q=e n=4 i=2 wall=0.019 agg=0.000
+RUN q=e n=4 i=3 wall=0.019 agg=0.000
+RUN q=e n=4 i=4 wall=0.019 agg=0.000
+RUN q=e n=4 i=5 wall=0.019 agg=0.000
+RUN q=a n=8 i=1 wall=0.713 agg=0.697
+RUN q=a n=8 i=2 wall=0.574 agg=0.556
+RUN q=a n=8 i=3 wall=0.584 agg=0.567
+RUN q=a n=8 i=4 wall=0.491 agg=0.474
+RUN q=a n=8 i=5 wall=0.545 agg=0.526
+RUN q=b n=8 i=1 wall=3.796 agg=3.773
+RUN q=b n=8 i=2 wall=3.252 agg=3.229
+RUN q=b n=8 i=3 wall=2.777 agg=2.759
+RUN q=b n=8 i=4 wall=4.175 agg=4.154
+RUN q=b n=8 i=5 wall=3.729 agg=3.700
+RUN q=c n=8 i=1 wall=0.167 agg=0.144
+RUN q=c n=8 i=2 wall=0.156 agg=0.136
+RUN q=c n=8 i=3 wall=0.156 agg=0.137
+RUN q=c n=8 i=4 wall=0.154 agg=0.135
+RUN q=c n=8 i=5 wall=0.168 agg=0.150
+RUN q=d n=8 i=1 wall=0.022 agg=0.003
+RUN q=d n=8 i=2 wall=0.023 agg=0.004
+RUN q=d n=8 i=3 wall=0.026 agg=0.004
+RUN q=d n=8 i=4 wall=0.021 agg=0.004
+RUN q=d n=8 i=5 wall=0.022 agg=0.003
+RUN q=e n=8 i=1 wall=0.026 agg=0.000
+RUN q=e n=8 i=2 wall=0.022 agg=0.000
+RUN q=e n=8 i=3 wall=0.022 agg=0.000
+RUN q=e n=8 i=4 wall=0.032 agg=0.000
+RUN q=e n=8 i=5 wall=0.021 agg=0.000
+RUN q=a n=16 i=1 wall=0.925 agg=0.902
+RUN q=a n=16 i=2 wall=0.794 agg=0.776
+RUN q=a n=16 i=3 wall=0.739 agg=0.720
+RUN q=a n=16 i=4 wall=0.662 agg=0.645
+RUN q=a n=16 i=5 wall=0.685 agg=0.668
+RUN q=b n=16 i=1 wall=3.891 agg=3.870
+RUN q=b n=16 i=2 wall=3.522 agg=3.502
+RUN q=b n=16 i=3 wall=3.455 agg=3.437
+RUN q=b n=16 i=4 wall=3.270 agg=3.251
+RUN q=b n=16 i=5 wall=3.462 agg=3.444
+RUN q=c n=16 i=1 wall=0.162 agg=0.144
+RUN q=c n=16 i=2 wall=0.109 agg=0.092
+RUN q=c n=16 i=3 wall=0.143 agg=0.126
+RUN q=c n=16 i=4 wall=0.154 agg=0.137
+RUN q=c n=16 i=5 wall=0.153 agg=0.135
+RUN q=d n=16 i=1 wall=0.022 agg=0.003
+RUN q=d n=16 i=2 wall=0.022 agg=0.003
+RUN q=d n=16 i=3 wall=0.021 agg=0.003
+RUN q=d n=16 i=4 wall=0.021 agg=0.004
+RUN q=d n=16 i=5 wall=0.021 agg=0.003
+RUN q=e n=16 i=1 wall=0.020 agg=0.000
+RUN q=e n=16 i=2 wall=0.021 agg=0.000
+RUN q=e n=16 i=3 wall=0.021 agg=0.000
+RUN q=e n=16 i=4 wall=0.020 agg=0.000
+RUN q=e n=16 i=5 wall=0.020 agg=0.000
+CONC n=4 rep=1 s=1 wall=2.564
+CONC n=4 rep=1 s=2 wall=2.570
+CONC n=4 rep=1 s=4 wall=2.575
+CONC n=4 rep=1 s=3 wall=2.587
+RSS n=4 conc rep=1 VmHWM:	10223880 kB VmRSS:	 9926596 kB 
+CONC n=4 rep=2 s=1 wall=2.451
+CONC n=4 rep=2 s=2 wall=2.456
+CONC n=4 rep=2 s=3 wall=2.459
+CONC n=4 rep=2 s=4 wall=2.461
+RSS n=4 conc rep=2 VmHWM:	10293224 kB VmRSS:	 9960420 kB 
+CONC n=4 rep=3 s=4 wall=2.257
+CONC n=4 rep=3 s=1 wall=2.264
+CONC n=4 rep=3 s=2 wall=2.267
+CONC n=4 rep=3 s=3 wall=2.270
+RSS n=4 conc rep=3 VmHWM:	10282196 kB VmRSS:	 9916652 kB 
+RSS n=4 single rep=1 VmHWM:	 9920488 kB VmRSS:	 9829140 kB 
+RSS n=4 single rep=2 VmHWM:	 9920724 kB VmRSS:	 9829304 kB 
+RSS n=4 single rep=3 VmHWM:	 9926264 kB VmRSS:	 9834728 kB 
+CONC n=8 rep=1 s=3 wall=3.269
+CONC n=8 rep=1 s=1 wall=3.274
+CONC n=8 rep=1 s=2 wall=3.277
+CONC n=8 rep=1 s=4 wall=3.287
+RSS n=8 conc rep=1 VmHWM:	10416884 kB VmRSS:	10089912 kB 
+CONC n=8 rep=2 s=3 wall=3.558
+CONC n=8 rep=2 s=2 wall=3.574
+CONC n=8 rep=2 s=1 wall=3.602
+CONC n=8 rep=2 s=4 wall=3.728
+RSS n=8 conc rep=2 VmHWM:	10426076 kB VmRSS:	10218316 kB 
+CONC n=8 rep=3 s=3 wall=3.335
+CONC n=8 rep=3 s=1 wall=3.339
+CONC n=8 rep=3 s=4 wall=3.349
+CONC n=8 rep=3 s=2 wall=3.370
+RSS n=8 conc rep=3 VmHWM:	10374220 kB VmRSS:	10061220 kB 
+RSS n=8 single rep=1 VmHWM:	10245912 kB VmRSS:	10154440 kB 
+RSS n=8 single rep=2 VmHWM:	10349996 kB VmRSS:	10258292 kB 
+RSS n=8 single rep=3 VmHWM:	10342580 kB VmRSS:	10250840 kB 
+moosedb_agg_threads	4

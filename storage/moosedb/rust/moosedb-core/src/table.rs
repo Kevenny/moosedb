@@ -1118,6 +1118,7 @@ impl Table {
         // Every rotation fsyncs the old segment before the new one exists
         // (flush, collect), or a TRUNCATE made its rows irrelevant; syncing the
         // current segment is merely redundant for a target in an older one.
+        crate::wstats::add(&crate::wstats::WAL_FSYNCS, 1);
         if let Err(e) = crate::fsutil::sync_data(&handle) {
             if let Ok(mut guard) = self.lock() {
                 guard.wal.mark_failed();
@@ -1318,6 +1319,7 @@ impl Table {
             m.wal_seq = covered;
             m.replay_seq = replay_seq;
         })?;
+        crate::wstats::add(&crate::wstats::FLUSHES, 1);
         inner.flushing = MemTable::default();
         inner.flush_running = false;
         inner.mem_generation += 1;

@@ -510,7 +510,21 @@ Na restauração, copie os diretórios de volta com o mesmo
 | `moosedb_unique_lock_wait_timeout` | 50 | segundos que um INSERT espera outro statement que escreve a mesma série (tabelas com PK/UNIQUE); 0 = falha na hora |
 | `moosedb_group_by_pushdown` | `ON` | (sessão) `ON` (padrão) = a engine calcula o GROUP BY de TAG/VARCHAR/INT com COUNT/SUM/AVG/MIN/MAX, inclusive `GROUP BY DATE(ts)` e `DATE_FORMAT(ts, F)` com F `%Y-%m-%d`, `%Y-%m-%d %H`, `%Y-%m-%d %H:%i` ou `%Y-%m-%d %H:%i:%s` em coluna DATETIME (série por dia/hora/minuto; TIMESTAMP, `UNIX_TIMESTAMP`, `HOUR()` e outras formas ficam com o servidor), agregados sem GROUP BY (uma linha, mesmo sem dados), `COUNT(DISTINCT c)` de uma coluna INT/VARCHAR de colação exata ou binária (com ou sem GROUP BY; `_ci` só sem GROUP BY; com TAGs no GROUP BY, inclusive só parte delas, se as TAGs agrupadas forem inteiras ou de colação binária — `utf8mb4_bin`, `utf8mb4_nopad_bin`...; TAG `_ci` agrupada fica com o servidor) e `ORDER BY agregado, chave LIMIT n` em chave VARCHAR ou TAG de texto binária (`utf8mb4_bin`, `latin1_bin`...; `_ci` continua no caminho geral) (ver architecture.md); o WHERE pode filtrar `FLOAT`/`DOUBLE` simples (sem `(M,D)`) com `<`, `<=`, `>`, `>=`, `=`, `BETWEEN` e `IN` de constantes (`OR`, `NOT IN`, `<>`, `IS NULL`, função da coluna e `DOUBLE(M,D)` ficam com o servidor); o resultado não muda, salvo qual dos valores `'a'`/`'a '` de um mesmo grupo PAD SPACE (ou `'Alpha'`/`'alpha'` de um mesmo grupo `_ci`) é mostrado (o servidor mostra o que o plano vê primeiro, a engine o mais curto; num grupo `_ci` a engine pode mostrar outro membro, sem garantia de qual); `OFF` desliga a engine e volta ao caminho normal; consultas fora do escopo seguem o caminho normal em qualquer caso (`moosedb_gbh_debug` mostra o motivo); `Handler_read_*` e `EXPLAIN` de uma consulta tomada pela engine mudam (`Storage engine handles GROUP BY`) |
 | `moosedb_agg_max_memory` | 1 GiB | (sessão) memória máxima dos grupos de um GROUP BY empurrado (mín. 16 MiB) |
-| `moosedb_agg_threads` | min(4, CPUs) | threads de um GROUP BY empurrado (1 a 64) |
+| `moosedb_agg_threads` | min(4, CPUs) | threads de um GROUP BY empurrado (1 a 64). Medido em 8 CPUs, 20 M linhas (2026-11-11): 8 threads fazem `COUNT(DISTINCT)` em 0,57 s contra 1,00 s com uma sessão, mas 3,34 s contra 2,46 s por sessão com 4 sessões simultâneas; suba só se roda uma consulta pesada por vez |
+
+### Variáveis de status de escrita
+
+Contadores globais desde o início do servidor (`SHOW GLOBAL STATUS LIKE 'Moosedb_write%'`); valem para todas as tabelas. Linhas recuperadas do WAL na partida não contam.
+
+| Status | Significado |
+|---|---|
+| `Moosedb_write_rows_inserted` | linhas gravadas por INSERT, e as linhas novas de UPDATE/REPLACE |
+| `Moosedb_write_batches_committed` | statements de INSERT/UPDATE confirmados (DELETE não conta) |
+| `Moosedb_write_wal_bytes` | bytes escritos no WAL |
+| `Moosedb_write_wal_fsyncs` | fsyncs de commit do WAL (os de rotação de segmento não contam) |
+| `Moosedb_write_memtable_flushes` | flushes de MemTable para chunk |
+| `Moosedb_write_compactions` | grupos de chunks compactados (um grupo = uma compactação) |
+| `Moosedb_write_compaction_us` | tempo dos grupos compactados com sucesso, em microssegundos |
 
 ## Replicação
 

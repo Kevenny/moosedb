@@ -135,6 +135,8 @@ pub struct Batch {
     logged: bool,
     /// The batch moved to the spill path: no more WAL logging.
     spilled: bool,
+    /// Rows already written to staged chunks (for the write counters).
+    spilled_rows: u64,
     /// Staged chunks, not listed in the MANIFEST.
     staged: Vec<Arc<ChunkMeta>>,
     spill_limit: usize,
@@ -247,6 +249,7 @@ impl Table {
             wal_buf: Vec::new(),
             logged: false,
             spilled: false,
+            spilled_rows: 0,
             staged: Vec::new(),
             spill_limit,
             update_limit: spill_limit.saturating_mul(UPDATE_LIMIT_FACTOR),
@@ -678,6 +681,7 @@ impl Batch {
         let local_tags = self.local_tags();
         let metas = stage_rows(&self.table, &self.rows, &local_tags, self.epoch)?;
         self.staged.extend(metas.into_iter().map(Arc::new));
+        self.spilled_rows += self.rows.len() as u64;
         self.rows = Vec::new();
         self.bytes = 0;
         self.series_bytes = 0;
@@ -876,6 +880,8 @@ impl Batch {
                 }
                 self.key_buf = key;
             }
+            crate::wstats::add(&crate::wstats::ROWS, rows.len() as u64);
+            crate::wstats::add(&crate::wstats::BATCHES, 1);
             if !rows.is_empty() {
                 inner.memtable.append(rows, bytes, ts_min, ts_max);
             }
@@ -933,6 +939,8 @@ impl Batch {
         chunks.extend(staged);
         let tombs = (*inner.tombs).clone();
         inner.publish(&table.config.dir, chunks, tombs, |_| {})?;
+        crate::wstats::add(&crate::wstats::ROWS, self.spilled_rows);
+        crate::wstats::add(&crate::wstats::BATCHES, 1);
         self.release_claims_locked(inner);
         // The rows this batch logged before spilling are dead weight in the
         // WAL: collect them now, unless another batch still needs those

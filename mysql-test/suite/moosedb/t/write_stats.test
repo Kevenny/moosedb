@@ -1,0 +1,27 @@
+#
+# Global write counters (Moosedb_write_*): checked by DELTA only, since they
+# are server-wide and depend on test order.
+#
+--source include/not_embedded.inc
+--source include/have_sequence.inc
+--source suite/moosedb/include/have_moosedb.inc
+
+CREATE TABLE w (ts DATETIME NOT NULL, v INT, INDEX(ts)) ENGINE=MooseDB;
+
+--disable_query_log
+let $r0= `SELECT VARIABLE_VALUE FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME='MOOSEDB_WRITE_ROWS_INSERTED'`;
+let $b0= `SELECT VARIABLE_VALUE FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME='MOOSEDB_WRITE_WAL_BYTES'`;
+let $f0= `SELECT VARIABLE_VALUE FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME='MOOSEDB_WRITE_MEMTABLE_FLUSHES'`;
+INSERT INTO w SELECT '2024-03-01' + INTERVAL seq MINUTE, seq FROM seq_1_to_100;
+FLUSH TABLES w;
+--enable_query_log
+
+--echo # rows_inserted rose by exactly 100; wal_bytes and memtable_flushes rose
+--disable_query_log
+eval SELECT
+  (SELECT VARIABLE_VALUE FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME='MOOSEDB_WRITE_ROWS_INSERTED') - $r0 AS rows_delta,
+  (SELECT VARIABLE_VALUE FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME='MOOSEDB_WRITE_WAL_BYTES') > $b0 AS wal_bytes_up,
+  (SELECT VARIABLE_VALUE FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME='MOOSEDB_WRITE_MEMTABLE_FLUSHES') > $f0 AS flushes_up;
+
+--enable_query_log
+DROP TABLE w;

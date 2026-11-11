@@ -1096,7 +1096,12 @@ impl<'a> Plan<'a> {
     fn fail(&self, e: Error) {
         self.abort.store(true, Ordering::Relaxed);
         let mut slot = self.err.lock().unwrap_or_else(PoisonError::into_inner);
-        slot.get_or_insert(e);
+        // A derived "stopped" Cancelled must not mask the real error (user cancel is `cancelled`).
+        match slot.as_ref() {
+            Some(Error::Cancelled(_)) if !matches!(e, Error::Cancelled(_)) => *slot = Some(e),
+            Some(_) => {}
+            None => *slot = Some(e),
+        }
     }
 
     /// The error or cancellation that stopped the run, if any.

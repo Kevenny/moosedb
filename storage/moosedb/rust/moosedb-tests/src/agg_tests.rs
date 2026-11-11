@@ -402,7 +402,10 @@ fn argument_errors_budget_and_cancellation() {
     let e = agg.run(&tiny, None).unwrap_err();
     assert!(matches!(e, Error::Full(_)) && e.to_string().contains("moosedb_agg_max_memory"), "{e}");
     tiny.threads = 4;
-    assert!(matches!(agg.run(&tiny, None), Err(Error::Full(_))));
+    for _ in 0..200 {
+        // a worker's derived "stopped" must not mask the budget error
+        assert!(matches!(agg.run(&tiny, None), Err(Error::Full(_))));
+    }
     assert_eq!(agg.result().groups, 0, "a failed run leaves no result");
     // the same handle still works afterwards
     agg.run(&spec(true, true, 4), None).unwrap();
@@ -1606,7 +1609,7 @@ fn distinct_over_a_budget_that_holds_the_pass_but_not_the_collapse_is_exact_or_f
     let mut agg = parallel_agg(&t);
     let mut full = 0;
     // from "holds the ~12k groups of the pass" down to "holds almost nothing"
-    for mem in [2 << 20, 1 << 20, 768 << 10, 512 << 10, 384 << 10, 256 << 10, 192 << 10, 128 << 10, 96 << 10, 80 << 10, 64 << 10, 56 << 10, 48 << 10, 40 << 10, 32 << 10, 28 << 10, 24 << 10, 20 << 10, 16 << 10, 12 << 10, 8 << 10] {
+    for mem in [2 << 20, 1 << 20, 768 << 10, 512 << 10, 384 << 10, 256 << 10, 192 << 10, 128 << 10, 96 << 10, 80 << 10, 64 << 10, 56 << 10, 48 << 10, 40 << 10, 32 << 10, 28 << 10, 24 << 10, 20 << 10, 16 << 10, 12 << 10, 8 << 10, 4 << 10, 2 << 10, 1 << 10] {
         match agg.run(&AggSpec { max_memory: mem, ..base_spec.clone() }, None) {
             Ok(()) => {
                 let r = agg.result();

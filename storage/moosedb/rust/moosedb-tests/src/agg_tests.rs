@@ -1452,3 +1452,198 @@ fn tag_value_keys_merge_series_and_count_distinct_also_under_pad_space() {
     agg.run(&AggSpec { keys: vec![KeySpec::Tag(2), KeySpec::Series], funcs: funcs.clone(), ..AggSpec::default() }, None).unwrap();
     assert_eq!(agg.result().groups, t.series().unwrap().len());
 }
+
+/// `(ts, h TAG, p TAG, n INT64, file VARCHAR)`: `h` in 300 hosts and `p` in 40 values (some with trailing
+/// spaces), `file` with trailing spaces too; 3 flushed batches + the rest in the MemTable.
+fn pad_table(dir: &Path) -> Arc<Table> {
+    let schema = Schema::new(
+        vec![
+            Column { name: "ts".into(), ty: ColumnType::Timestamp },
+            Column { name: "h".into(), ty: ColumnType::Tag },
+            Column { name: "p".into(), ty: ColumnType::Tag },
+            Column { name: "n".into(), ty: ColumnType::Int64 },
+            Column { name: "file".into(), ty: ColumnType::Varchar },
+        ],
+        0,
+    )
+    .unwrap();
+    let cfg = TableConfig::new(dir, schema, &RawOptions::default()).unwrap();
+    Table::create(&cfg).unwrap();
+    let t = Arc::new(Table::open(cfg).unwrap());
+    let mk = |i: i64| -> Row {
+        let sp = |k: i64| " ".repeat((k % 3) as usize);
+        vec![
+            Value::Timestamp(base() + i * MICROS_PER_SEC),
+            Value::Bytes(format!("h{}{}", i % 300, sp(i / 300)).into_bytes()),
+            Value::Bytes(format!("p{}{}", i % 40, sp(i / 40)).into_bytes()),
+            if i % 11 == 0 { Value::Null } else { Value::Int(i * 31 % 1000 - 500) },
+            if i % 17 == 0 { Value::Null } else { Value::Bytes(format!("f{}{}", i * 7 % 1300, sp(i / 7)).into_bytes()) },
+        ]
+    };
+    for k in 0..3 {
+        put(&t, (k * 6000..(k + 1) * 6000).map(mk));
+        t.flush().unwrap();
+    }
+    put(&t, (18_000..22_000).map(mk));
+    t
+}
+
+fn trim_end(v: &[u8]) -> Vec<u8> {
+    v[..v.iter().rposition(|&c| c != b' ').map_or(0, |i| i + 1)].to_vec()
+}
+
+/// The group key of the test: every key as shown, the last (the PAD one) trimmed.
+fn trimmed_last(shown: &[Option<Vec<u8>>]) -> Vec<Option<Vec<u8>>> {
+    let mut k = shown.to_vec();
+    if let Some(Some(v)) = k.last_mut() {
+        *v = trim_end(v);
+    }
+    k
+}
+
+fn bytes_at(k: &KeyCol, g: usize) -> Option<Vec<u8>> {
+    let KeyCol::Bytes { nulls, starts, lens, data } = k else { panic!() };
+    (!nulls[g]).then(|| data[starts[g] as usize..][..lens[g] as usize].to_vec())
+}
+
+#[test]
+fn tag_only_keys_in_passes_equal_the_unconstrained_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = pad_table(&dir.path().join("t"));
+    let funcs = vec![FuncSpec::CountStar, FuncSpec::Sum(3)];
+    let mut agg = parallel_agg(&t);
+    // per group: (trimmed byte keys, (shown values, COUNT(*), SUM(n)))
+    type Got = BTreeMap<Vec<Option<Vec<u8>>>, (Vec<Option<Vec<u8>>>, u64, i128)>;
+    let run = |agg: &mut Agg, keys: &[KeySpec], mem: usize, threads: usize| -> Got {
+        agg.run(&AggSpec { keys: keys.to_vec(), funcs: funcs.clone(), max_memory: mem, threads, ..AggSpec::default() }, None).unwrap();
+        let r = agg.result();
+        let m: Got = (0..r.groups)
+            .map(|g| {
+                let sum = (i128::from(r.funcs[1].sum_hi[g]) << 64) | i128::from(r.funcs[1].sum_lo[g]);
+                let shown: Vec<_> = r.keys.iter().map(|k| bytes_at(k, g)).collect();
+                (trimmed_last(&shown), (shown, r.funcs[0].count[g], sum))
+            })
+            .collect();
+        assert_eq!(m.len(), r.groups, "a group twice");
+        m
+    };
+    let mem = 160 << 10; // the ~1800 groups of the first key set take over 200 KiB in one table
+    for keys in [vec![KeySpec::Tag(1), KeySpec::TagPad(2)], vec![KeySpec::TagPad(2)]] {
+        let want = run(&mut agg, &keys, 1 << 30, 1);
+        assert!(want.len() >= 40);
+        for threads in [1, 4] {
+            assert_eq!(run(&mut agg, &keys, mem, threads), want, "keys={keys:?} threads={threads}");
+        }
+    }
+    // series + TAG value together
+    let sk = [KeySpec::Series, KeySpec::TagPad(2)];
+    agg.run(&AggSpec { keys: sk.to_vec(), funcs: funcs.clone(), ..AggSpec::default() }, None).unwrap();
+    let want = agg.result().groups;
+    for threads in [1, 4] {
+        agg.run(&AggSpec { keys: sk.to_vec(), funcs: funcs.clone(), max_memory: mem, threads, ..AggSpec::default() }, None).unwrap();
+        assert_eq!(agg.result().groups, want, "threads={threads}");
+    }
+}
+
+#[test]
+fn column_pad_with_distinct_as_the_key_or_as_another_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = pad_table(&dir.path().join("t"));
+    let mut agg = parallel_agg(&t);
+    // (i) distinct trimmed `file` per host `h`; (ii) per trimmed `file`: shortest raw value, distinct `n`, COUNT(*)
+    let mut per_h: BTreeMap<Vec<u8>, std::collections::BTreeSet<Vec<u8>>> = BTreeMap::new();
+    type PerFile = (Option<Vec<u8>>, std::collections::BTreeSet<i64>, u64);
+    let mut per_f: BTreeMap<Option<Vec<u8>>, PerFile> = BTreeMap::new();
+    let mut s = t.scan(&ScanFilter::range(i64::MIN, i64::MAX), false).unwrap();
+    while let Some((_, r)) = s.next_row().unwrap() {
+        let (Value::Bytes(h), file) = (&r[1], &r[4]) else { panic!() };
+        let raw = if let Value::Bytes(f) = file { Some(f.clone()) } else { None };
+        let set = per_h.entry(h.clone()).or_default();
+        if let Some(f) = &raw {
+            set.insert(trim_end(f));
+        }
+        let e = per_f.entry(raw.as_deref().map(trim_end)).or_insert((raw.clone(), Default::default(), 0));
+        if raw.as_ref().map(Vec::len) < e.0.as_ref().map(Vec::len) {
+            e.0 = raw;
+        }
+        if let Value::Int(n) = r[3] {
+            e.1.insert(n);
+        }
+        e.2 += 1;
+    }
+    assert!(per_f.len() > 1000 && per_h.values().any(|s| s.len() > 10));
+    // 512 KiB cannot hold the ~10k (key, value) groups of a pass: passes; 1 GiB: none
+    for (mem, threads) in [(1 << 30, 1), (1 << 30, 4), (512 << 10, 1), (512 << 10, 4)] {
+        let sp = AggSpec { keys: vec![KeySpec::Tag(1), KeySpec::ColumnPad(4)], funcs: vec![FuncSpec::CountStar], distinct: Some(1), max_memory: mem, threads, ..AggSpec::default() };
+        agg.run(&sp, None).unwrap();
+        let r = agg.result();
+        assert_eq!(r.groups, per_h.len(), "(i) mem={mem} threads={threads}");
+        for g in 0..r.groups {
+            let h = bytes_at(&r.keys[0], g).unwrap();
+            assert_eq!(r.funcs[1].count[g] as usize, per_h[&h].len(), "(i) host {h:?} mem={mem} threads={threads}");
+        }
+        let sp = AggSpec { keys: vec![KeySpec::ColumnPad(4), KeySpec::Column(3)], funcs: vec![FuncSpec::CountStar], distinct: Some(1), max_memory: mem, threads, ..AggSpec::default() };
+        agg.run(&sp, None).unwrap();
+        let r = agg.result();
+        assert_eq!(r.groups, per_f.len(), "(ii) mem={mem} threads={threads}");
+        for g in 0..r.groups {
+            let shown = bytes_at(&r.keys[0], g);
+            let w = &per_f[&shown.as_deref().map(trim_end)];
+            assert_eq!(shown, w.0, "shortest value mem={mem} threads={threads}");
+            assert_eq!((r.funcs[0].count[g], r.funcs[1].count[g] as usize), (w.2, w.1.len()), "(ii) {shown:?} mem={mem} threads={threads}");
+        }
+    }
+}
+
+#[test]
+fn distinct_over_a_budget_that_holds_the_pass_but_not_the_collapse_is_exact_or_full() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_new(&dir.path().join("t"));
+    build(&t, 12);
+    let want = distinct_naive(&t);
+    let funcs = vec![FuncSpec::CountStar, FuncSpec::Count(2), FuncSpec::Sum(2), FuncSpec::Min(2), FuncSpec::Max(2)];
+    let base_spec = AggSpec { keys: vec![KeySpec::Series, KeySpec::Column(2)], funcs, distinct: Some(1), threads: 1, ..AggSpec::default() };
+    let mut agg = parallel_agg(&t);
+    let mut full = 0;
+    // from "holds the ~12k groups of the pass" down to "holds almost nothing"
+    for mem in [2 << 20, 1 << 20, 768 << 10, 512 << 10, 384 << 10, 256 << 10, 192 << 10, 128 << 10, 96 << 10, 80 << 10, 64 << 10, 56 << 10, 48 << 10, 40 << 10, 32 << 10, 28 << 10, 24 << 10, 20 << 10, 16 << 10, 12 << 10, 8 << 10] {
+        match agg.run(&AggSpec { max_memory: mem, ..base_spec.clone() }, None) {
+            Ok(()) => {
+                let r = agg.result();
+                assert_eq!(r.groups, want.len(), "mem={mem}");
+                let KeyCol::Series(ids) = &r.keys[0] else { panic!() };
+                for g in 0..r.groups {
+                    let f = &r.funcs;
+                    let sum = (i128::from(f[2].sum_hi[g]) << 64) | i128::from(f[2].sum_lo[g]);
+                    let got = (f[5].count[g] as usize, f[0].count[g], f[1].count[g], sum, f[3].val[g], f[4].val[g]);
+                    assert_eq!(got, want[&ids[g]], "series {} mem={mem}", ids[g]);
+                }
+            }
+            Err(Error::Full(_)) => full += 1,
+            Err(e) => panic!("mem={mem}: {e}"),
+        }
+
+    }
+    assert!(full > 0, "the sweep must reach a budget no pass count can meet");
+}
+
+/// 20k groups (n, series) that collapse one to one: the pass result, the accumulated result, the collapse tables
+/// and its output are all live in the collapse. Measured with threads = 1: from ~4.5 MiB the run succeeds (the
+/// limits here leave a margin), at 4 MiB the old collapse, which counted only its own tables, still accepted the run and used about
+/// twice the budget; now the run ends with a clean `Full`.
+#[test]
+fn distinct_collapse_charges_its_input_and_output_to_the_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = hi_table(&dir.path().join("t"), 100_000, |i| i % 20_000);
+    let mut agg = parallel_agg(&t);
+    let sp = AggSpec { keys: vec![KeySpec::Column(2), KeySpec::Series], funcs: vec![FuncSpec::CountStar], distinct: Some(1), threads: 1, ..AggSpec::default() };
+    for mem in [64 << 20, 6 << 20] {
+        agg.run(&AggSpec { max_memory: mem, ..sp.clone() }, None).unwrap();
+        let r = agg.result();
+        assert_eq!(r.groups, 20_000, "mem={mem}");
+        assert!((0..r.groups).all(|g| r.funcs[0].count[g] == 5 && r.funcs[1].count[g] == 1), "mem={mem}");
+    }
+    let e = agg.run(&AggSpec { max_memory: 4 << 20, ..sp.clone() }, None).unwrap_err();
+    assert!(matches!(e, Error::Full(_)), "{e}");
+    assert_eq!(agg.result().groups, 0);
+}

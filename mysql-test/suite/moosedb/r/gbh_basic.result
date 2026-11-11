@@ -339,6 +339,45 @@ INSERT INTO mirror.tv SELECT * FROM test.tv;
 # shortcuts taken: exact filters=0 core top-N=2
 DROP TABLE tv;
 DROP TABLE mirror.tv;
+# Mixed GROUP BY: a collation-merged (_ci) TAG next to TAGs grouped by value (PAD SPACE binary, INT)
+CREATE TABLE tm (ts DATETIME NOT NULL, a VARCHAR(8) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci COMMENT 'TAG', b VARCHAR(8) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin COMMENT 'TAG', c INT COMMENT 'TAG', v INT, INDEX(ts)) ENGINE=MooseDB CHUNK_INTERVAL='1 DAY';
+INSERT INTO tm SELECT '2024-03-01' + INTERVAL seq * 20 SECOND, ELT(1 + seq MOD 4, 'x', 'X', 'y', 'Y'), ELT(1 + seq MOD 3, 'k', 'k ', 'm'), seq MOD 5, IF(seq MOD 6 = 0, NULL, seq) FROM seq_0_to_2999;
+FLUSH TABLES tm;
+INSERT INTO tm SELECT '2024-03-03' + INTERVAL seq * 20 SECOND, ELT(1 + seq MOD 4, 'X', 'x', 'Y', 'y'), ELT(1 + seq MOD 3, 'k ', 'k', 'm'), seq MOD 7, IF(seq MOD 5 = 0, NULL, seq) FROM seq_0_to_499;
+CREATE TABLE mirror.tm LIKE test.tm;
+ALTER TABLE mirror.tm ENGINE=InnoDB;
+INSERT INTO mirror.tm SELECT * FROM test.tm;
+# _ci TAG (merged in the handler) and PAD SPACE binary TAG (by value), keys not shown
+# SELECT COUNT(*) n, SUM(v) s, MIN(v) lo, MAX(v) hi FROM tm GROUP BY a, b ORDER BY n, s, lo, hi
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# _ci TAG and INT TAG
+# SELECT c, COUNT(*) n, SUM(v) s, MIN(v) lo, MAX(v) hi FROM tm GROUP BY a, c ORDER BY c, n, s, lo, hi
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# PAD SPACE binary TAG and INT TAG (no _ci TAG: nothing to merge)
+# SELECT c, COUNT(*) n, SUM(v) s, MIN(v) lo, MAX(v) hi FROM tm GROUP BY b, c ORDER BY c, n, s, lo, hi
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# COUNT(DISTINCT) with a merged TAG key: refused
+# SELECT COUNT(*) n, COUNT(DISTINCT v) d FROM tm GROUP BY a, b ORDER BY n, d
+# same output with and without pushdown and on InnoDB; the engine did not run it
+# the reason
+SET SESSION moosedb_gbh_debug = ON;
+SELECT COUNT(*) n, COUNT(DISTINCT v) d FROM tm GROUP BY a, b ORDER BY n, d;
+n	d
+583	500
+583	500
+1167	783
+1167	784
+Warnings:
+Note	1105	gbh: refused: aggregate: COUNT(DISTINCT) with a collation-merged TAG group key
+SET SESSION moosedb_gbh_debug = OFF;
+# COUNT(DISTINCT) without a _ci TAG: accepted
+# SELECT COUNT(*) n, COUNT(DISTINCT v) d FROM tm GROUP BY b, c ORDER BY n, d
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=1)
+# one _ci TAG with several series per value, HAVING, ORDER BY ... LIMIT
+# SELECT COUNT(*) n, SUM(v) s FROM tm GROUP BY a HAVING n > 100 ORDER BY s DESC, n LIMIT 3; SELECT COUNT(*) n, MAX(v) hi FROM tm GROUP BY a HAVING hi > 10 ORDER BY n DESC, hi LIMIT 1
+# same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=2)
+DROP TABLE tm;
+DROP TABLE mirror.tm;
 # integer TAG grouped by value with COUNT(DISTINCT), the other TAGs not grouped
 # SELECT iface, COUNT(DISTINCT code) d, COUNT(*) c, SUM(bytes) s FROM g GROUP BY iface ORDER BY iface; SELECT iface, COUNT(*) c FROM g GROUP BY iface ORDER BY c DESC, iface LIMIT 2
 # same output with and without pushdown and on InnoDB; the engine ran the GROUP BY only with pushdown ON (runs: OFF=0 ON=2)

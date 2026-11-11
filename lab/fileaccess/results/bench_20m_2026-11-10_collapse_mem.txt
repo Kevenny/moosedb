@@ -1,0 +1,23 @@
+evento_moose COUNT(DISTINCT file) #1         1.17 s  engine=1 agg=0.815 s post=0.000 s md5=640a744c
+evento_moose COUNT(DISTINCT file) #2         1.05 s  engine=1 agg=0.726 s post=0.000 s md5=640a744c
+evento_moose COUNT(DISTINCT file) #3         1.06 s  engine=1 agg=0.712 s post=0.000 s md5=640a744c
+evento_moose_h COUNT(DISTINCT file) #1       1.87 s  engine=1 agg=1.460 s post=0.000 s md5=640a744c
+evento_moose_h COUNT(DISTINCT file) #2       1.38 s  engine=1 agg=1.042 s post=0.000 s md5=640a744c
+evento_moose_h COUNT(DISTINCT file) #3       1.22 s  engine=1 agg=0.867 s post=0.000 s md5=640a744c
+evento_moose_hn COUNT(DISTINCT file) #1      1.47 s  engine=1 agg=1.095 s post=0.000 s md5=640a744c
+evento_moose_hn COUNT(DISTINCT file) #2      1.08 s  engine=1 agg=0.724 s post=0.000 s md5=640a744c
+evento_moose_hn COUNT(DISTINCT file) #3      1.05 s  engine=1 agg=0.712 s post=0.000 s md5=640a744c
+moose COUNT(DISTINCT folder) #1              0.87 s  engine=1 agg=0.531 s post=0.000 s md5=2ebd3caa
+moose COUNT(DISTINCT folder) #2              0.59 s  engine=1 agg=0.249 s post=0.000 s md5=2ebd3caa
+moose top20 file dia #1                      0.51 s  engine=1 agg=0.176 s post=0.000 s md5=b5f1cc33
+moose top20 file dia #2                      0.48 s  engine=1 agg=0.143 s post=0.000 s md5=b5f1cc33
+moose top10 host dia #1                      0.37 s  engine=1 agg=0.037 s post=0.000 s md5=a134f075
+moose top10 host dia #2                      0.37 s  engine=1 agg=0.018 s post=0.000 s md5=a134f075
+evento_moose_h GROUP BY host COUNT(DISTINCT) #1   4.23 s  engine=1 agg=3.894 s post=0.000 s md5=a3822454
+evento_moose_h GROUP BY host COUNT(DISTINCT) #2   3.42 s  engine=1 agg=3.087 s post=0.000 s md5=a3822454
+evento_moose_h GROUP BY host COUNT(DISTINCT) #3   3.33 s  engine=1 agg=2.933 s post=0.000 s md5=a3822454
+evento_moose GROUP BY host COUNT(DISTINCT) #1   5.40 s  engine=1 agg=5.053 s post=0.000 s md5=a3822454
+evento_moose GROUP BY host COUNT(DISTINCT) #2   3.99 s  engine=1 agg=3.633 s post=0.000 s md5=a3822454
+evento_moose GROUP BY host COUNT(DISTINCT) #3   3.83 s  engine=1 agg=3.472 s post=0.000 s md5=a3822454
+innodb GROUP BY host COUNT(DISTINCT) #1     80.07 s  engine=0 agg=0.000 s post=0.000 s md5=a3822454
+innodb GROUP BY host COUNT(DISTINCT) #2     36.93 s  engine=0 agg=0.000 s post=0.000 s md5=a3822454

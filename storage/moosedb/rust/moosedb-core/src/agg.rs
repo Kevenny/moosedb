@@ -54,7 +54,9 @@
 //!   the hash space: the same groups, at the price of one scan per pass.
 //!   With [`AggSpec::distinct`] each pass is collapsed (see `collapse`) before
 //!   the next one starts, so only the small collapsed result is kept between
-//!   passes; the pass itself still holds every (keys, value) group.
+//!   passes; the pass itself still holds every (keys, value) group. The collapse
+//!   charges its input, the accumulated result, its tables and its output to the
+//!   budget; if that overruns, the run is redone in more passes like any other overrun.
 
 use std::cmp::Ordering as Cmp;
 use std::collections::hash_map::RandomState;
@@ -420,8 +422,11 @@ impl KeyCol {
 /// [`AggSpec::distinct`]). `raw_d = Some(d)`: `r` is a pass result: `keys[d]`
 /// is dropped and the distinct count of a group is 1 if it was not NULL, else
 /// 0. `None`: `r` is already collapsed (several passes appended): groups that
-/// repeat are merged, the distinct counts added.
-fn collapse(r: AggResult, spec: &AggSpec, raw_d: Option<usize>) -> Result<AggResult> {
+/// repeat are merged, the distinct counts added. `held` is what the caller
+/// keeps alive meanwhile; `r`, `held`, the tables and the output are all
+/// charged to `max_memory`, and an overrun is a [`budget_error`].
+fn collapse(r: AggResult, spec: &AggSpec, raw_d: Option<usize>, held: usize) -> Result<AggResult> {
+    let oom = |_| budget_error(spec.max_memory);
     let nf = spec.funcs.len();
     let kept: Vec<usize> = (0..r.keys.len()).filter(|&i| Some(i) != raw_d).collect();
     // The spec key of each column of `r` (a collapsed `r` has none for `distinct`).
@@ -434,7 +439,12 @@ fn collapse(r: AggResult, spec: &AggSpec, raw_d: Option<usize>) -> Result<AggRes
     let mut index: HashMap<Vec<u8>, u32> = HashMap::new();
     let mut first: Vec<u32> = Vec::new();
     let mut accs: Vec<Acc> = Vec::new();
-    let mut est = 0usize;
+    let mut est = held.saturating_add(r.heap_bytes());
+    if est > spec.max_memory {
+        return Err(budget_error(spec.max_memory));
+    }
+    // shortcut: `buf` (one encoded key) and `KeyCol::take` below grow infallibly; the output
+    // they build is charged per group (2x key bytes, 48 B/func); evolve with a fallible `take`.
     let mut buf = Vec::new();
     for i in 0..r.groups {
         buf.clear();
@@ -451,14 +461,22 @@ fn collapse(r: AggResult, spec: &AggSpec, raw_d: Option<usize>) -> Result<AggRes
                 g
             }
             None => {
-                short.extend(pads.iter().map(|&j| len_at(kept[j], i)));
-                est = est.saturating_add(buf.len() + GROUP_OVERHEAD + 24 * (nf + 1) + 4 * pads.len());
+                est = est.saturating_add(2 * buf.len() + GROUP_OVERHEAD + 48 * (nf + 1) + 4 * pads.len());
                 if est > spec.max_memory {
                     return Err(budget_error(spec.max_memory));
                 }
                 let g = first.len();
-                index.insert(buf.clone(), u32::try_from(g).map_err(|_| budget_error(spec.max_memory))?);
+                let id = u32::try_from(g).map_err(|_| budget_error(spec.max_memory))?;
+                short.try_reserve(pads.len()).map_err(oom)?;
+                short.extend(pads.iter().map(|&j| len_at(kept[j], i)));
+                let mut key = Vec::new();
+                key.try_reserve_exact(buf.len()).map_err(oom)?;
+                key.extend_from_slice(&buf);
+                index.try_reserve(1).map_err(oom)?;
+                index.insert(key, id);
+                first.try_reserve(1).map_err(oom)?;
                 first.push(i as u32);
+                accs.try_reserve(nf + 1).map_err(oom)?;
                 accs.extend(spec.funcs.iter().map(|&f| Acc::init(f)).chain([Acc::init(FuncSpec::CountStar)]));
                 g
             }
@@ -487,6 +505,15 @@ fn collapse(r: AggResult, spec: &AggSpec, raw_d: Option<usize>) -> Result<AggRes
     let mut funcs = vec![FuncCol::default(); nf + 1];
     for (fi, fc) in funcs.iter_mut().enumerate() {
         let f = spec.funcs.get(fi).copied().unwrap_or(FuncSpec::CountStar);
+        fc.count.try_reserve_exact(first.len()).map_err(oom)?;
+        match f {
+            FuncSpec::Sum(_) => {
+                fc.sum_lo.try_reserve_exact(first.len()).map_err(oom)?;
+                fc.sum_hi.try_reserve_exact(first.len()).map_err(oom)?;
+            }
+            FuncSpec::Min(_) | FuncSpec::Max(_) => fc.val.try_reserve_exact(first.len()).map_err(oom)?,
+            _ => {}
+        }
         for g in 0..first.len() {
             let a = &accs[g * (nf + 1) + fi];
             fc.count.push(a.n);
@@ -573,18 +600,35 @@ impl Agg {
             for pass in 0..n {
                 let (mut over, mut done) = (false, 1.0f64);
                 let held = acc.heap_bytes();
-                match self.run_pass(spec, &hasher, pass, passes, held, &mut over, &mut done, reborrow(&mut cancel)) {
+                let step = match self.run_pass(spec, &hasher, pass, passes, held, &mut over, &mut done, reborrow(&mut cancel)) {
                     Ok(r) => {
-                        let r = if spec.distinct.is_some() { collapse(r, spec, spec.distinct)? } else { r };
-                        if pass == 0 {
-                            acc = r;
+                        let first = if spec.distinct.is_some() {
+                            // Over the budget here (done stays 1.0), more passes help: the groups of a
+                            // pass shrink with them. Not so below: the joined result does not shrink,
+                            // and a SUM overflow is the same error at any number of passes.
+                            collapse(r, spec, spec.distinct, held).map_err(|e| {
+                                over = matches!((&e, budget_error(spec.max_memory)), (Error::Full(a), Error::Full(b)) if *a == b);
+                                e
+                            })
                         } else {
-                            acc.append(r)?;
-                            if spec.distinct.is_some() {
-                                acc = collapse(acc, spec, None)?;
+                            Ok(r)
+                        };
+                        first.and_then(|r| {
+                            if pass == 0 {
+                                acc = r;
+                            } else {
+                                acc.append(r)?;
+                                if spec.distinct.is_some() {
+                                    acc = collapse(std::mem::take(&mut acc), spec, None, 0)?;
+                                }
                             }
-                        }
+                            Ok(())
+                        })
                     }
+                    Err(e) => Err(e),
+                };
+                match step {
+                    Ok(()) => {}
                     Err(_) if over && split && passes < MAX_PASSES => {
                         // `done` of the units filled the budget: aim at half of it per pass
                         let need = (2.0 / done.max(1.0 / MAX_PASSES as f64)).ceil() as usize;
@@ -927,7 +971,7 @@ impl<'a> Plan<'a> {
                 }
                 KeySpec::Column(c) | KeySpec::ColumnPad(c) | KeySpec::Bucket(c, _) => {
                     let kind = key_kind(col(c)?.ty).ok_or_else(|| {
-                        invalid(format!("column {c} cannot be a group key (use the series for TAGs)"))
+                        invalid(format!("column {c} cannot be a group key"))
                     })?;
                     if matches!(k, KeySpec::ColumnPad(_)) && !matches!(kind, Kind::Bytes) {
                         return Err(invalid(format!("column {c}: PAD SPACE needs a string key")));
@@ -1979,7 +2023,9 @@ impl Local {
                 if let Some(Value::Bytes(v)) = p.snap.schema.tag_position(c).and_then(|t| tags.get(t)) {
                     self.padlens.clear();
                     self.padlens.resize(b, v.len() as i64);
-                    kernel::<FMin>(accs, nf, fi, &self.padlens, &[], a, b, gid);
+                    if !kernel::<FMin>(accs, nf, fi, &self.padlens, &[], a, b, gid) {
+                        return Err(overflow());
+                    }
                 }
                 continue;
             }

@@ -1520,6 +1520,11 @@ scan não ordenado: só o commitado; o lote privado do statement é invisível).
   (ordena por partição, um lock por partição, nunca dois aninhados, começando
   por uma partição diferente por worker; `Acc::merge`) e recomeça vazia, então
   uma chave de alta cardinalidade fica guardada ~uma vez, não uma por worker.
+  Se no primeiro despejo mais de 90 % das consultas de chave criaram grupo (a
+  tabela privada quase não repete chave), o worker passa a despejar a cada 4 Ki
+  grupos pelo resto da execução: cada grupo seria fundido uma vez de qualquer
+  jeito e uma tabela que cabe no cache custa menos para preencher e reler (20 M
+  de linhas distintas de ~50 B, 8 threads: -19 % a -40 % de tempo de parede).
   Ao fim, o merge é **por partição**: as partições são reivindicadas pelos
   workers, cada uma parte da tabela compartilhada, funde o que sobrou nas
   tabelas privadas (hash guardado) e já vira colunas de resultado (ou candidatos do top-N) na

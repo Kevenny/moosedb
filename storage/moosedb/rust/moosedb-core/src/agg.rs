@@ -30,7 +30,10 @@
 //!   that reaches [`FLUSH_GROUPS`] groups, or a share of the budget (budget /
 //!   threads / 8), is **flushed** into per-partition tables shared by all the
 //!   workers (one lock per partition per flush) and starts over empty, so a
-//!   high-cardinality key is stored once, not once per worker. The groups are
+//!   high-cardinality key is stored once, not once per worker. A worker whose
+//!   first flush shows that over 90 % of its key lookups created a group (the table
+//!   hardly repeats a key) then flushes every [`FLUSH_GROUPS_COLD`] groups: a table
+//!   that fits the cache is cheaper to fill and read back. The groups are
 //!   then merged **by hash partition** (a power of two of partitions, claimed
 //!   by the workers again: the shared table plus what is left in the private
 //!   tables), each partition is turned into result columns by the thread that
@@ -108,6 +111,9 @@ const MAX_PARTS: usize = 256;
 /// (GROUP BY host) stay private and pre-aggregate; large ones keep each key in
 /// the shared tables once instead of once per worker.
 const FLUSH_GROUPS: usize = 1 << 16;
+/// Flush threshold of a worker whose table found (almost) no repeated key: its groups are
+/// merged once anyway, and a table that fits the cache is cheaper to fill and to read back.
+const FLUSH_GROUPS_COLD: usize = 1 << 12;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeySpec {
@@ -451,8 +457,10 @@ fn collapse(r: AggResult, spec: &AggSpec, raw_d: Option<usize>, held: usize) -> 
         for &k in &kept {
             r.keys[k].encode(i, is_pad(k), &mut buf);
         }
-        let g = match index.get(&buf) {
-            Some(&g) => {
+        // no other key: every row belongs to the one group, no need to hash an empty image per row
+        let found = if kept.is_empty() { first.first().map(|_| 0) } else { index.get(&buf).copied() };
+        let g = match found {
+            Some(g) => {
                 let g = g as usize;
                 for (pi, &j) in pads.iter().enumerate() {
                     let m = &mut short[g * pads.len() + pi];
@@ -1717,6 +1725,10 @@ struct Local {
     part_start: Vec<usize>,
     /// Times the table was flushed to the shared tables.
     flushes: usize,
+    /// Group count that flushes the table (see `FLUSH_GROUPS_COLD`).
+    flush_at: usize,
+    /// Key lookups since the last flush.
+    lookups: usize,
 }
 
 impl Local {
@@ -1736,6 +1748,8 @@ impl Local {
             part_order: Vec::new(),
             part_start: Vec::new(),
             flushes: 0,
+            flush_at: FLUSH_GROUPS,
+            lookups: 0,
         };
         if p.keys.is_empty() {
             // Implicit aggregation: one group even over no rows.
@@ -1798,7 +1812,7 @@ impl Local {
     /// shared partition tables (one lock per partition, never nested) and starts
     /// over empty. Only called between rows or stretches, when no group number is held.
     fn maybe_flush(&mut self, p: &Plan<'_>) -> Result<()> {
-        if p.parts == 1 || p.keys.is_empty() || (self.groups.len() < FLUSH_GROUPS && self.bytes < p.flush_bytes) {
+        if p.parts == 1 || p.keys.is_empty() || (self.groups.len() < self.flush_at && self.bytes < p.flush_bytes) {
             return Ok(());
         }
         p.charge(std::mem::take(&mut self.pending))?;
@@ -1813,6 +1827,12 @@ impl Local {
             let mut table = p.shared[part].lock().map_err(|_| corrupt("aggregation table poisoned"))?;
             p.merge_local(&mut table, self, part)?;
         }
+        // Judged on a full table only: a flush forced early by flush_bytes has seen too few rows.
+        // shortcut: once cold, stays cold for the run; re-test if a run turns repetitive late
+        if self.flush_at == FLUSH_GROUPS && self.groups.len() >= FLUSH_GROUPS && self.groups.len() * 10 > self.lookups * 9 {
+            self.flush_at = FLUSH_GROUPS_COLD;
+        }
+        self.lookups = 0;
         p.release(self.bytes);
         self.bytes = 0;
         self.groups = Groups::new();
@@ -1828,6 +1848,7 @@ impl Local {
         if self.last_gid != NONE && self.scratch == self.last {
             return Ok(self.last_gid);
         }
+        self.lookups += 1;
         let hash = p.hash(&self.scratch);
         let (g, new) = self.groups.find_or_add(hash, &self.scratch, &p.init, p.max)?;
         if new {
@@ -1988,6 +2009,7 @@ impl Local {
         if n == 0 {
             return Ok(());
         }
+        self.lookups += n;
         self.groups.reserve_groups(n, p.max)?;
         self.groups.warm(&bt.hashes, &mut bt.warm);
         let mut start = 0;

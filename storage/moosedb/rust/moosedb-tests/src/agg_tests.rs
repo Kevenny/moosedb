@@ -1647,3 +1647,34 @@ fn distinct_collapse_charges_its_input_and_output_to_the_budget() {
     assert!(matches!(e, Error::Full(_)), "{e}");
     assert_eq!(agg.result().groups, 0);
 }
+
+#[test]
+fn distinct_keys_over_the_flush_threshold_flush_small_and_stay_exact() {
+    let dir = tempfile::tempdir().unwrap();
+    let t = open_new(&dir.path().join("t"));
+    // 400 000 names, each twice: two workers pass 64 Ki private groups with (almost) no repeat,
+    // so they switch to the small flush threshold and merge the same groups all the same.
+    for k in 0..4 {
+        put(&t, (k * 100_000..(k + 1) * 100_000).map(|i| {
+            let mut r = row(i, 4);
+            r[3] = Value::Bytes(format!("/srv/dept/file{:07}", i % 200_000).into_bytes());
+            r
+        }));
+        t.flush().unwrap();
+    }
+    let mut agg = parallel_agg(&t);
+    let counts = |agg: &Agg| -> BTreeMap<Vec<u8>, u64> {
+        let r = agg.result();
+        let KeyCol::Bytes { starts, lens, data, .. } = &r.keys[0] else { panic!() };
+        (0..r.groups).map(|g| (data[starts[g] as usize..][..lens[g] as usize].to_vec(), r.funcs[0].count[g])).collect()
+    };
+    let one = AggSpec { keys: vec![KeySpec::Column(3)], funcs: vec![FuncSpec::CountStar], threads: 1, ..AggSpec::default() };
+    agg.run(&one, None).unwrap();
+    let serial = counts(&agg);
+    assert_eq!(serial.len(), 200_000);
+    assert!(serial.values().all(|&c| c == 2));
+    for threads in [2, 8] {
+        agg.run(&AggSpec { threads, ..one.clone() }, None).unwrap();
+        assert_eq!(counts(&agg), serial, "threads={threads}");
+    }
+}

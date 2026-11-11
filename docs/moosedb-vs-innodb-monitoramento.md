@@ -53,8 +53,8 @@ Com o Zabbix 7.0.31 real (DDL oficial + `COMMENT 'TAG'` + `TIMESTAMP_COLUMN`):
 | Top processos de 1 host, dia | 13,6 ms | **3,8 ms** (0,8 ms com agregação na engine) |
 | Top 10 hosts por volume, dia | 3,07 s | 1,98 s (**3,9 ms** com agregação na engine) |
 | Top 20 arquivos, dia (GROUP BY 3,7 M distintos) | 14,8 s | 14,6 s (**1,15 s** com agregação na engine) |
-| `COUNT(DISTINCT file)`, 20 M linhas, 2 M valores (2026-11-10) | 29–33 s | **0,75–0,9 s** de agregação (ClickHouse 0,31 s) |
-| `host, COUNT(DISTINCT file) … GROUP BY host` (2.000 hosts, 2026-11-10) | 38 s | **3,3–4,1 s** (TAG `utf8mb4_bin`; TAG `_ci` fica com o servidor) |
+| `COUNT(DISTINCT file)`, 20 M linhas, 2 M valores (2026-11-10) | 29–33 s | **0,5–0,8 s** de agregação (ClickHouse 0,31 s) |
+| `host, COUNT(DISTINCT file) … GROUP BY host` (2.000 hosts, 2026-11-10) | 38 s | **2,9–3,6 s** (TAG `utf8mb4_bin`; TAG `_ci` fica com o servidor) |
 
 ### Contagem/agrupamento por série (10 M linhas, 2.000 séries, 2026-10-30)
 
